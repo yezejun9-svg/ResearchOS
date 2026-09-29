@@ -54,6 +54,13 @@ func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
 		if version < 2 {
 			continue
 		}
+		var applied int
+		if err := tx.QueryRow("SELECT count(*) FROM schema_migrations WHERE version=?", version).Scan(&applied); err != nil {
+			return nil, err
+		}
+		if applied != 0 {
+			continue
+		}
 		b, err := os.ReadFile(file)
 		if err != nil {
 			return nil, err
