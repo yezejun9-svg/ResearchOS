@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Validate frozen contract package and selected-route dependency declarations."""
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -10,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def main():
-    if os.getenv("RESEARCHOS_TASK_ID", "W02") != "W02" or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", "W02-G01", "W02-G02", "W02-G03") or os.getenv("RESEARCHOS_CASE_ID"):
+    task = os.getenv("RESEARCHOS_TASK_ID", "W02")
+    if task not in ("W02", "W03") or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", *(f"{task}-G0{n}" for n in (1, 2, 3))) or os.getenv("RESEARCHOS_CASE_ID"):
         raise NotImplementedError("unbound task/check/case selection")
     command = [sys.executable, str(ROOT / "spec" / "v2.0" / "tools" / "validate_package.py")]
     result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=120)
@@ -30,6 +32,25 @@ def main():
     if route["selected_route"] != "THIN_CORE" or any(root_lock[k] != pkg[k] for k in ("dependencies", "devDependencies")):
         raise RuntimeError("route or web lock declarations drifted")
     ids.append("W02-CONTRACT-ROUTE-LOCK")
+    if task == "W03":
+        coverage = json.loads((ROOT / "contracts/operation_coverage.json").read_text(encoding="utf-8"))
+        expected = {operation["operationId"]: (method.upper(), path)
+                    for path, methods in api["paths"].items()
+                    for method, operation in methods.items()
+                    if method in ("get", "post", "put", "patch", "delete", "options", "head")}
+        operations = coverage["operations"]
+        known_tasks = {t["task_id"] for t in json.loads((ROOT / "spec/v2.0/contracts/tasks.json").read_text(encoding="utf-8"))["tasks"]}
+        observed = {op["operation_id"]: (op["method"], op["path"]) for op in operations}
+        if not expected or observed != expected or len(operations) != len(observed):
+            raise RuntimeError("operation coverage is incomplete, duplicated, or drifted")
+        if any(op["status"] not in ("IMPLEMENTED_CORE", "DEFERRED") or op["owner_task"] not in known_tasks for op in operations):
+            raise RuntimeError("operation coverage has invalid status or owner")
+        ids.append("W03-CONTRACT-OPERATION-INVENTORY")
+        for name in ("domain.schema.json", "openapi.json"):
+            digest = hashlib.sha256((ROOT / "spec/v2.0/contracts" / name).read_bytes()).hexdigest()
+            if coverage["contract_hashes"].get(name) != digest:
+                raise RuntimeError("operation coverage references a different frozen contract")
+        ids.append("W03-CONTRACT-COVERAGE-HASHES")
     return {"status": "PASS", "assertions": len(ids), "assertion_ids": ids,
             "scope": "DEVELOPMENT_ONLY", "package_checks": len(report["checks"]),
             "command": command, "exit_code": result.returncode}
