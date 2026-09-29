@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def main():
     task = os.getenv("RESEARCHOS_TASK_ID", "W02")
-    if task not in ("W02", "W03", "W04", "W05", "W07") or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", *(f"{task}-G0{n}" for n in (1, 2, 3))) or os.getenv("RESEARCHOS_CASE_ID"):
+    if task not in ("W02", "W03", "W04", "W05", "W06", "W07") or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", *(f"{task}-G0{n}" for n in (1, 2, 3))) or os.getenv("RESEARCHOS_CASE_ID"):
         raise NotImplementedError("unbound task/check/case selection")
     command = [sys.executable, str(ROOT / "spec" / "v2.0" / "tools" / "validate_package.py")]
     result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=120)
