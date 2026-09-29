@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -37,6 +38,13 @@ func (s *Service) searchEvidence(tx *sql.Tx, p Principal, project string, b Obje
 		return nil, err
 	}
 	q := Str(b, "query")
+	if len(q) > 4096 {
+		return nil, Fail(400, "INVALID_REQUEST", "search query too long")
+	}
+	matcher, err := regexp.Compile("(?i)" + regexp.QuoteMeta(q))
+	if err != nil {
+		return nil, Fail(400, "INVALID_REQUEST", "invalid search query")
+	}
 	type candidate struct {
 		artifact   Object
 		bytes      []byte
@@ -141,15 +149,16 @@ func (s *Service) searchEvidence(tx *sql.Tx, p Principal, project string, b Obje
 			continue
 		}
 		body := string(c.bytes)
-		position := strings.Index(strings.ToLower(body), strings.ToLower(q))
-		if position < 0 {
+		match := matcher.FindStringIndex(body)
+		if match == nil {
 			continue
 		}
+		position := match[0]
 		start := position - 80
 		if start < 0 {
 			start = 0
 		}
-		end := position + len(q) + 120
+		end := match[1] + 120
 		if end > len(body) {
 			end = len(body)
 		}
@@ -217,6 +226,25 @@ func (s *Service) validateBundleSnapshots(tx *sql.Tx, p Principal, project strin
 		if !valid[id.(string)] {
 			return Fail(412, "STALE_INPUT", "context snapshot changed or permission revoked")
 		}
+	}
+	return nil
+}
+
+// requireCurrentArtifactBody gates every path that would expose sealed bytes.
+// The historical Artifact metadata remains readable after invalidation.
+func (s *Service) requireCurrentArtifactBody(tx *sql.Tx, project string, a Object) error {
+	if a["validity"] != "CURRENT" {
+		return Fail(409, "STATE_CONFLICT", "artifact body is no longer current")
+	}
+	if a["kind"] != "SOURCE_SNAPSHOT" {
+		return nil
+	}
+	data, local, err := readLocalSnapshot(tx, project, Str(a, "id"))
+	if err != nil {
+		return err
+	}
+	if local && (data == nil || Digest(data) != a["content_hash"]) {
+		return Fail(412, "STALE_INPUT", "local source changed or root authorization moved")
 	}
 	return nil
 }

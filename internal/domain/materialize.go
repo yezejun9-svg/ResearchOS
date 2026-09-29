@@ -82,6 +82,9 @@ func (s *Service) MaterializeTaskContext(ctx context.Context, token, project, ta
 					return Fail(403, "FORBIDDEN", "input unavailable")
 				}
 				if kind == "Artifact" {
+					if e = s.requireCurrentArtifactBody(tx, project, obj); e != nil {
+						return e
+					}
 					if obj["access_class"] != "PROJECT" {
 						return Fail(503, "RESOURCE_UNAVAILABLE", "protected content requires W17")
 					}

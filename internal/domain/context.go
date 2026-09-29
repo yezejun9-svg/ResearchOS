@@ -57,6 +57,11 @@ func (s *Service) effectiveGraph(tx *sql.Tx, project string, r Object, seen map[
 	if current["validity"] == "STALE" || current["validity"] == "REVOKED" {
 		return Fail(409, "STATE_CONFLICT", "input is no longer effective")
 	}
+	if r["entity_type"] == "Artifact" {
+		if e = s.requireCurrentArtifactBody(tx, project, current); e != nil {
+			return e
+		}
+	}
 	if r["entity_type"] == "DecisionReceipt" {
 		state, e := singleton(tx, project, "ProjectState")
 		if e != nil {

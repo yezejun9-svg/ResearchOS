@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"os"
 	"path/filepath"
 	"researchos.local/research-os/adapters/retrieval"
 	"strings"
@@ -25,11 +24,10 @@ func (s *Service) RegisterLocalRoot(ctx context.Context, token, project, path st
 	if err != nil {
 		return "", err
 	}
-	root, err := os.OpenRoot(path)
+	identity, err := retrieval.Identity(path)
 	if err != nil {
 		return "", err
 	}
-	root.Close()
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
@@ -43,7 +41,7 @@ func (s *Service) RegisterLocalRoot(ctx context.Context, token, project, path st
 		return "", Fail(403, "FORBIDDEN", "Owner project grant required")
 	}
 	id := ID()
-	_, err = tx.Exec("INSERT INTO retrieval_roots(project,id,path,revision) VALUES(?,?,?,1)", project, id, path)
+	_, err = tx.Exec("INSERT INTO retrieval_roots(project,id,path,root_identity,revision) VALUES(?,?,?,?,1)", project, id, path, identity)
 	if err != nil {
 		return "", err
 	}
@@ -66,13 +64,14 @@ func (s *Service) CaptureLocalSnapshot(ctx context.Context, token, project, root
 		return nil, Fail(403, "FORBIDDEN", "Owner project grant required")
 	}
 	var rootPath string
+	var rootIdentity string
 	var rootRev int64
 	var revoked bool
-	err = tx.QueryRow("SELECT path,revision,revoked FROM retrieval_roots WHERE project=? AND id=?", project, rootID).Scan(&rootPath, &rootRev, &revoked)
+	err = tx.QueryRow("SELECT path,root_identity,revision,revoked FROM retrieval_roots WHERE project=? AND id=?", project, rootID).Scan(&rootPath, &rootIdentity, &rootRev, &revoked)
 	if err != nil || revoked {
 		return nil, Fail(404, "NOT_FOUND", "authorized root unavailable")
 	}
-	data, err := retrieval.ReadFile(rootPath, relative)
+	data, err := retrieval.ReadFileBound(rootPath, rootIdentity, relative)
 	if err != nil {
 		return nil, Fail(422, "GATE_FAILED", "root-scoped file unavailable")
 	}
@@ -292,19 +291,19 @@ func (s *Service) RefreshLocalSnapshots(ctx context.Context, token, project stri
 	if !p.HasRole("OWNER") || !p.Allowed(project, "", "", false) {
 		return 0, Fail(403, "FORBIDDEN", "Owner project grant required")
 	}
-	rows, err := tx.Query("SELECT s.artifact_id,s.root_id,s.relative_path,s.content_hash,r.path,r.revoked,r.revision,s.root_revision FROM retrieval_snapshots s JOIN retrieval_roots r ON r.project=s.project AND r.id=s.root_id WHERE s.project=? AND s.status='CURRENT'", project)
+	rows, err := tx.Query("SELECT s.artifact_id,s.root_id,s.relative_path,s.content_hash,r.path,r.root_identity,r.revoked,r.revision,s.root_revision FROM retrieval_snapshots s JOIN retrieval_roots r ON r.project=s.project AND r.id=s.root_id WHERE s.project=? AND s.status='CURRENT'", project)
 	if err != nil {
 		return 0, err
 	}
 	type item struct {
-		id, rootID, relative, hash, root string
-		revoked                          bool
-		rootRev, snapRev                 int64
+		id, rootID, relative, hash, root, identity string
+		revoked                                    bool
+		rootRev, snapRev                           int64
 	}
 	var items []item
 	for rows.Next() {
 		var x item
-		if err = rows.Scan(&x.id, &x.rootID, &x.relative, &x.hash, &x.root, &x.revoked, &x.rootRev, &x.snapRev); err != nil {
+		if err = rows.Scan(&x.id, &x.rootID, &x.relative, &x.hash, &x.root, &x.identity, &x.revoked, &x.rootRev, &x.snapRev); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -325,7 +324,7 @@ func (s *Service) RefreshLocalSnapshots(ctx context.Context, token, project stri
 		if x.revoked {
 			validity = "REVOKED"
 		} else {
-			data, readErr := retrieval.ReadFile(x.root, x.relative)
+			data, readErr := retrieval.ReadFileBound(x.root, x.identity, x.relative)
 			if readErr != nil || Digest(data) != x.hash || x.rootRev != x.snapRev {
 				validity = "STALE"
 			}
@@ -416,19 +415,19 @@ func (s *Service) RevokeLocalRoot(ctx context.Context, token, project, rootID st
 }
 
 func readLocalSnapshot(tx *sql.Tx, project, artifactID string) ([]byte, bool, error) {
-	rows, err := tx.Query("SELECT r.path,s.relative_path,s.content_hash,s.status,r.revoked,r.revision,s.root_revision FROM retrieval_snapshots s JOIN retrieval_roots r ON r.project=s.project AND r.id=s.root_id WHERE s.project=? AND s.artifact_id=?", project, artifactID)
+	rows, err := tx.Query("SELECT r.path,r.root_identity,s.relative_path,s.content_hash,s.status,r.revoked,r.revision,s.root_revision FROM retrieval_snapshots s JOIN retrieval_roots r ON r.project=s.project AND r.id=s.root_id WHERE s.project=? AND s.artifact_id=?", project, artifactID)
 	if err != nil {
 		return nil, false, err
 	}
 	type location struct {
-		root, relative, hash, status string
-		revoked                      bool
-		rootRev, snapRev             int64
+		root, identity, relative, hash, status string
+		revoked                                bool
+		rootRev, snapRev                       int64
 	}
 	var paths []location
 	for rows.Next() {
 		var x location
-		if err = rows.Scan(&x.root, &x.relative, &x.hash, &x.status, &x.revoked, &x.rootRev, &x.snapRev); err != nil {
+		if err = rows.Scan(&x.root, &x.identity, &x.relative, &x.hash, &x.status, &x.revoked, &x.rootRev, &x.snapRev); err != nil {
 			rows.Close()
 			return nil, false, err
 		}
@@ -443,7 +442,7 @@ func readLocalSnapshot(tx *sql.Tx, project, artifactID string) ([]byte, bool, er
 		if x.status != "CURRENT" || x.revoked || x.rootRev != x.snapRev {
 			continue
 		}
-		data, e := retrieval.ReadFile(x.root, x.relative)
+		data, e := retrieval.ReadFileBound(x.root, x.identity, x.relative)
 		if e == nil && Digest(data) == x.hash {
 			return data, true, nil
 		}

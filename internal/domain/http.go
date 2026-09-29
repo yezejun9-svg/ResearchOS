@@ -493,6 +493,10 @@ func (s *Service) content(w http.ResponseWriter, r *http.Request, tx *sql.Tx, p 
 		s.writeError(w, cid, e)
 		return
 	}
+	if e = s.requireCurrentArtifactBody(tx, project, o); e != nil {
+		s.writeError(w, cid, e)
+		return
+	}
 	if o["access_class"] == "VERIFIER_ONLY" {
 		s.writeError(w, cid, Fail(503, "RESOURCE_UNAVAILABLE", "protected content store requires W17 qualification"))
 		return
