@@ -428,7 +428,7 @@ func (s *Service) replayAllowed(tx *sql.Tx, p Principal, op Operation, raw []byt
 	if e != nil {
 		return false
 	}
-	if project := Str(o, "project_id"); project != "" && !p.Allowed(project, "", "", false) && !s.runtimeScope(tx, p, project, Str(o, "id"), op.ID, o) {
+	if project := Str(o, "project_id"); project != "" && !p.Allowed(project, "", "", false) && !s.runtimeScope(tx, p, project, Str(o, "id"), op.ID, o) && !(op.ID == "sealArtifact" && s.artifactUseScope(tx, p, project, Str(o, "id"))) {
 		return false
 	}
 	return s.visible(tx, p, Str(o, "project_id"), o)

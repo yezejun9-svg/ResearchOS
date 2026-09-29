@@ -122,25 +122,25 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 	}
 	artifacts, refs := Empty(), Empty()
 	for _, v := range Arr(t, "output_artifact_ids") {
-		a, e := load(tx, project, "Artifact", v.(string))
+		a, use, e := s.artifactUse(tx, project, r, v.(string), true)
 		if e != nil {
 			return nil, e
 		}
-		if a["run_id"] != r["id"] || a["produced_by"] != r["executor_principal_id"] || a["measurement_mode"] != "FIXTURE" || a["access_class"] == "VERIFIER_ONLY" {
+		if use["measurement_mode"] != "FIXTURE" || a["access_class"] == "VERIFIER_ONLY" {
 			return nil, Fail(422, "GATE_FAILED", "output provenance or isolation mismatch")
 		}
 		if e = s.effective(tx, project, Ref(a, "Artifact")); e != nil {
 			return nil, e
 		}
 		var raw []byte
-		if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, a["storage_key"]).Scan(&raw); e != nil {
+		if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, use["storage_key"]).Scan(&raw); e != nil {
 			return nil, e
 		}
 		size, _ := Num(a, "byte_size")
 		if Digest(raw) != a["content_hash"] || size != int64(len(raw)) {
 			return nil, Fail(422, "CONTENT_HASH_MISMATCH", "output bytes no longer match seal")
 		}
-		artifacts = append(artifacts, Object{"artifact": a, "bytes": raw})
+		artifacts = append(artifacts, Object{"artifact": a, "use": use, "bytes": raw})
 		refs = append(refs, Ref(a, "Artifact"))
 	}
 	if len(artifacts) == 0 || Hash(refs) != Hash(b["artifact_refs"]) {
