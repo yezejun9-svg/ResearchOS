@@ -258,6 +258,7 @@ func (s *Service) seal(tx *sql.Tx, p Principal, project string, b Object) (Objec
 	if b["access_class"] == "VERIFIER_ONLY" {
 		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "protected content store requires W17 qualification")
 	}
+	var contributionRun Object
 	if b["run_id"] != nil {
 		r, e := load(tx, project, "Run", Str(b, "run_id"))
 		if e != nil {
@@ -266,6 +267,16 @@ func (s *Service) seal(tx *sql.Tx, p Principal, project string, b Object) (Objec
 		if !p.Allowed(project, Str(r, "task_id"), Str(r, "id"), false) {
 			return nil, Fail(403, "FORBIDDEN", "run scope denied")
 		}
+		if !p.HasRole("EXECUTOR") {
+			return nil, Fail(403, "FORBIDDEN", "current executor role required")
+		}
+		if e = validExecutorRun(tx, p, project, r); e != nil {
+			return nil, e
+		}
+		if runTerminal(r) {
+			return nil, Fail(409, "STATE_CONFLICT", "terminal run cannot seal new output")
+		}
+		contributionRun = r
 	}
 	if !s.visible(tx, Principal{ID: p.ID, Roles: []string{"READER"}, Grants: []Grant{{ProjectID: project}}}, project, b) {
 		return nil, Fail(403, "FORBIDDEN", "restricted lineage cannot be declassified")
@@ -286,9 +297,19 @@ func (s *Service) seal(tx *sql.Tx, p Principal, project string, b Object) (Objec
 	}
 	var content []byte
 	var hash, owner, expires string
-	e := tx.QueryRow("SELECT bytes,content_hash,principal,expires_at FROM uploaded_content WHERE project=? AND storage_key=?", project, b["storage_key"]).Scan(&content, &hash, &owner, &expires)
+	var wasSealed int
+	e := tx.QueryRow("SELECT bytes,content_hash,principal,expires_at,sealed FROM uploaded_content WHERE project=? AND storage_key=?", project, b["storage_key"]).Scan(&content, &hash, &owner, &expires, &wasSealed)
 	if e != nil {
 		return nil, Fail(422, "GATE_FAILED", "upload unavailable")
+	}
+	if contributionRun != nil && wasSealed != 0 {
+		var proven int
+		if e = tx.QueryRow("SELECT count(*) FROM artifact_uses WHERE project=? AND storage_key=? AND run=? AND epoch=? AND principal=?", project, b["storage_key"], contributionRun["id"], contributionRun["lease_epoch"], p.ID).Scan(&proven); e != nil {
+			return nil, e
+		}
+		if proven != 1 {
+			return nil, Fail(403, "FORBIDDEN", "new run contribution requires its own unsealed upload")
+		}
 	}
 	if owner != p.ID {
 		return nil, Fail(403, "FORBIDDEN", "upload belongs to another principal")
@@ -333,11 +354,36 @@ func (s *Service) seal(tx *sql.Tx, p Principal, project string, b Object) (Objec
 		}
 	}
 	Merge(o, Object{"validity": validity, "sealed_at": Now()})
+	var priorRaw string
+	lookupErr := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.content_hash')=? AND json_extract(body,'$.kind')=?", project, hash, b["kind"]).Scan(&priorRaw)
+	if lookupErr == nil {
+		prior, e := Decode([]byte(priorRaw))
+		if e != nil {
+			return nil, e
+		}
+		if e = s.reusableArtifact(tx, p, project, prior, b, contributionRun); e != nil {
+			return nil, e
+		}
+		if _, e = tx.Exec("UPDATE uploaded_content SET sealed=1 WHERE storage_key=?", b["storage_key"]); e != nil {
+			return nil, e
+		}
+		if e = s.recordArtifactUse(tx, p, project, contributionRun, prior, b); e != nil {
+			return nil, e
+		}
+		return prior, nil
+	}
+	if lookupErr != sql.ErrNoRows {
+		return nil, lookupErr
+	}
+
 	if e = s.put(tx, "Artifact", o); e != nil {
 		return nil, e
 	}
 	_, e = tx.Exec("UPDATE uploaded_content SET sealed=1 WHERE storage_key=?", b["storage_key"])
 	if e != nil {
+		return nil, e
+	}
+	if e = s.recordArtifactUse(tx, p, project, contributionRun, o, b); e != nil {
 		return nil, e
 	}
 	for _, field := range []string{"input_refs", "source_refs"} {

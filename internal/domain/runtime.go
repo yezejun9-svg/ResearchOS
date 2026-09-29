@@ -186,6 +186,11 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 		if old := Str(r, "external_run_id"); old != "" && old != Str(b, "external_run_id") {
 			return nil, "", 0, Fail(409, "STATE_CONFLICT", "external identity changed")
 		}
+		if checkpoint := Str(b, "checkpoint_artifact_id"); checkpoint != "" {
+			if _, _, err := s.artifactUse(tx, project, r, checkpoint, false); err != nil {
+				return nil, "", 0, Fail(422, "GATE_FAILED", "heartbeat checkpoint has no current run contribution")
+			}
+		}
 		r["heartbeat_at"] = Now()
 		r["lease_expires_at"] = time.Now().UTC().Add(90 * time.Second).Format(time.RFC3339Nano)
 		r["external_run_id"] = b["external_run_id"]
@@ -223,8 +228,8 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 		seen := map[string]bool{}
 		for _, v := range Arr(b, "result_artifact_ids") {
 			artifactID := v.(string)
-			a, err := load(tx, project, "Artifact", artifactID)
-			if err != nil || a["run_id"] != id || a["produced_by"] != p.ID || seen[artifactID] {
+			a, _, err := s.artifactUse(tx, project, r, artifactID, true)
+			if err != nil || seen[artifactID] {
 				return nil, "", 0, Fail(422, "GATE_FAILED", "result must be a unique artifact sealed by this run")
 			}
 			seen[artifactID] = true
@@ -235,8 +240,8 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 			manifest[key]--
 		}
 		if checkpoint := Str(b, "checkpoint_artifact_id"); checkpoint != "" {
-			a, err := load(tx, project, "Artifact", checkpoint)
-			if err != nil || a["run_id"] != id || a["produced_by"] != p.ID {
+			_, _, err := s.artifactUse(tx, project, r, checkpoint, false)
+			if err != nil {
 				return nil, "", 0, Fail(422, "GATE_FAILED", "checkpoint must be sealed by this run")
 			}
 		}
@@ -303,11 +308,15 @@ func (s *Service) runtimeReceipt(tx *sql.Tx, project string, r Object, value any
 		return Fail(422, "GATE_FAILED", "receipt reference required")
 	}
 	a, e := version(tx, project, ref)
-	if e != nil || ref["entity_type"] != "Artifact" || a["run_id"] != r["id"] {
+	if e != nil || ref["entity_type"] != "Artifact" {
 		return Fail(422, "GATE_FAILED", "receipt run mismatch")
 	}
+	_, use, e := s.artifactUse(tx, project, r, Str(a, "id"), false)
+	if e != nil {
+		return e
+	}
 	var b []byte
-	if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, a["storage_key"]).Scan(&b); e != nil {
+	if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, use["storage_key"]).Scan(&b); e != nil {
 		return e
 	}
 	record, e := Decode(b)
@@ -336,6 +345,9 @@ func (s *Service) runtimeScope(tx *sql.Tx, p Principal, project, id, op string, 
 		return e == nil && r["executor_principal_id"] == p.ID && !runTerminal(r)
 	}
 	if op == "getArtifact" || op == "getArtifactContent" {
+		if s.artifactUseScope(tx, p, project, id) {
+			return true
+		}
 		a, e := load(tx, project, "Artifact", id)
 		if e != nil {
 			return false
