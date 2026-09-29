@@ -60,6 +60,20 @@ func (s *Service) BeginRuntimeQualification(ctx context.Context, token, project,
 	if e = tx.QueryRow("SELECT roles,revoked FROM auth_principals WHERE id=?", executor).Scan(&roles, &revoked); e != nil || revoked != 0 || !strings.Contains(roles, `"EXECUTOR"`) {
 		return nil, "", Fail(403, "FORBIDDEN", "executor principal unavailable")
 	}
+	r, lease, e := s.createRuntimeRun(tx, project, task, runtimeID, executor)
+	if e != nil {
+		return nil, "", e
+	}
+	if e = s.event(tx, project, "Run", r, p.ID, ID(), "RUN_CHANGED"); e != nil {
+		return nil, "", e
+	}
+	return r, lease, tx.Commit()
+}
+
+// createRuntimeRun shares the Run identity, epoch and ownership transaction with normal claims.
+func (s *Service) createRuntimeRun(tx *sql.Tx, project string, task Object, runtimeID, executor string) (Object, string, error) {
+	taskID := Str(task, "id")
+	var e error
 	var epoch int64
 	if e = tx.QueryRow("SELECT coalesce(max(CAST(json_extract(body,'$.lease_epoch') AS INTEGER)),0)+1 FROM domain_objects WHERE project=? AND kind='Run' AND json_extract(body,'$.task_id')=?", project, taskID).Scan(&epoch); e != nil {
 		return nil, "", e
@@ -80,10 +94,7 @@ func (s *Service) BeginRuntimeQualification(ctx context.Context, token, project,
 	if e = s.put(tx, "Task", task); e != nil {
 		return nil, "", e
 	}
-	if e = s.event(tx, project, "Run", r, p.ID, ID(), "RUN_CHANGED"); e != nil {
-		return nil, "", e
-	}
-	return r, lease, tx.Commit()
+	return r, lease, nil
 }
 
 // ObserveRuntime is only called by the trusted worker bridge. There is no HTTP write endpoint.
@@ -279,6 +290,9 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 		return nil, "", 0, Fail(503, "RESOURCE_UNAVAILABLE", "runtime operation unavailable")
 	}
 	if e = bump(r); e != nil {
+		return nil, "", 0, e
+	}
+	if e = s.runtimeTaskTerminal(tx, p, project, r); e != nil {
 		return nil, "", 0, e
 	}
 	return r, "Run", 200, s.put(tx, "Run", r)

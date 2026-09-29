@@ -64,6 +64,15 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		s.writeError(w, cid, Fail(400, "INVALID_REQUEST", "invalid, timed out or oversized body"))
 		return
 	}
+	var prepared *preparedAcceptance
+	var preparationError error
+	if op.ID == "recordAcceptance" {
+		if input, err := Decode(raw); err == nil && s.Contracts.Validate(op.Request, input) == nil {
+			if ref, ok := input["subject_ref"].(map[string]any); ok && ref["entity_type"] == "Task" {
+				prepared, preparationError = s.prepareTaskAcceptance(r.Context(), strings.TrimPrefix(auth, "Bearer "), r.PathValue("project_id"), input)
+			}
+		}
+	}
 	tx, e := s.DB.BeginTx(r.Context(), nil)
 	if e != nil {
 		s.writeError(w, cid, e)
@@ -221,6 +230,24 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 	case "createTask":
 		result, e = s.createTask(tx, project, b)
 		kind = "Task"
+		status = 201
+	case "recordAcceptance":
+		if b["subject_ref"].(map[string]any)["entity_type"] == "Task" {
+			if preparationError != nil {
+				e = preparationError
+			} else {
+				result, e = s.acceptTask(tx, p, project, b, prepared)
+			}
+		} else {
+			result, e = s.acceptChange(tx, p, project, b)
+		}
+		kind = "AcceptanceReceipt"
+		status = 201
+	case "actOnGoal":
+		result, e = s.actGoal(tx, project, id, b)
+		kind = "Goal"
+	case "claimTask":
+		result, e = s.claimTask(tx, p, project, id, b)
 		status = 201
 	case "actOnTask":
 		result, e = s.actTask(tx, project, id, b)
