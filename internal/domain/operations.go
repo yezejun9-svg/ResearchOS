@@ -112,7 +112,9 @@ func (s *Service) actRequirement(tx *sql.Tx, project, id string, b Object) (Obje
 	refs := Arr(o, "source_refs")
 	refs = append(refs, Arr(b, "source_validation_refs")...)
 	o["source_refs"] = refs
-	bump(o)
+	if e = bump(o); e != nil {
+		return nil, e
+	}
 	o["status"] = "ACCEPTED"
 	if e = s.put(tx, "Requirement", o); e != nil {
 		return nil, e
@@ -121,7 +123,9 @@ func (s *Service) actRequirement(tx *sql.Tx, project, id string, b Object) (Obje
 	if e != nil {
 		return nil, e
 	}
-	bump(state)
+	if e = bump(state); e != nil {
+		return nil, e
+	}
 	state["current_requirement_refs"] = append(Arr(state, "current_requirement_refs"), Ref(o, "Requirement"))
 	return o, s.put(tx, "ProjectState", state)
 }
@@ -205,7 +209,9 @@ func (s *Service) createTask(tx *sql.Tx, project string, b Object) (Object, erro
 	if e = s.put(tx, "Task", o); e != nil {
 		return nil, e
 	}
-	bump(goal)
+	if e = bump(goal); e != nil {
+		return nil, e
+	}
 	goal["task_ids"] = append(Arr(goal, "task_ids"), o["id"])
 	return o, s.put(tx, "Goal", goal)
 }
@@ -227,7 +233,9 @@ func (s *Service) actTask(tx *sql.Tx, project, id string, b Object) (Object, err
 	default:
 		return nil, Fail(409, "STATE_CONFLICT", "illegal task transition")
 	}
-	bump(o)
+	if e = bump(o); e != nil {
+		return nil, e
+	}
 	return o, s.put(tx, "Task", o)
 }
 func (s *Service) upload(tx *sql.Tx, p Principal, project string, b []byte) (Object, error) {
@@ -280,7 +288,11 @@ func (s *Service) seal(tx *sql.Tx, p Principal, project string, b Object) (Objec
 	if e != nil || time.Now().After(expiry) {
 		return nil, Fail(422, "GATE_FAILED", "upload expired")
 	}
-	if hash != Digest(content) || b["content_hash"] != hash || Num(b, "byte_size") != int64(len(content)) {
+	size, e := Num(b, "byte_size")
+	if e != nil {
+		return nil, e
+	}
+	if hash != Digest(content) || b["content_hash"] != hash || size != int64(len(content)) {
 		return nil, Fail(422, "CONTENT_HASH_MISMATCH", "content hash or size mismatch")
 	}
 	if b["kind"] == "TEST_RESULT" {
@@ -306,4 +318,10 @@ func (s *Service) seal(tx *sql.Tx, p Principal, project string, b Object) (Objec
 	_, e = tx.Exec("UPDATE uploaded_content SET sealed=1 WHERE storage_key=?", b["storage_key"])
 	return o, e
 }
-func ETag(o Object) string { return fmt.Sprintf("\"r%d\"", Num(o, "revision")) }
+func ETag(o Object) (string, error) {
+	n, e := Num(o, "revision")
+	if e != nil {
+		return "", e
+	}
+	return fmt.Sprintf("\"r%d\"", n), nil
+}

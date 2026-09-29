@@ -44,19 +44,32 @@ func (s *Service) writeError(w http.ResponseWriter, cid string, e error) {
 
 var etagPattern = regexp.MustCompile(`^"r[1-9][0-9]*"$`)
 
+const BodyReadTimeout = 5 * time.Second
+
 func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 	cid := ID()
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		s.writeError(w, cid, Fail(401, "UNAUTHENTICATED", "Bearer credential required"))
+		return
+	}
+	// Read bounded input before acquiring SQLite's single authoritative connection.
+	controller := http.NewResponseController(w)
+	if e := controller.SetReadDeadline(time.Now().Add(BodyReadTimeout)); e != nil && !errors.Is(e, http.ErrNotSupported) {
+		s.writeError(w, cid, Fail(400, "INVALID_REQUEST", "body read unavailable"))
+		return
+	}
+	raw, e := io.ReadAll(io.LimitReader(r.Body, 64*1024*1024+1))
+	if e != nil || len(raw) > 64*1024*1024 {
+		s.writeError(w, cid, Fail(400, "INVALID_REQUEST", "invalid, timed out or oversized body"))
+		return
+	}
 	tx, e := s.DB.BeginTx(r.Context(), nil)
 	if e != nil {
 		s.writeError(w, cid, e)
 		return
 	}
 	defer tx.Rollback()
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
-		s.writeError(w, cid, Fail(401, "UNAUTHENTICATED", "Bearer credential required"))
-		return
-	}
 	p, e := authenticate(tx, strings.TrimPrefix(auth, "Bearer "))
 	if e != nil {
 		s.writeError(w, cid, e)
@@ -87,11 +100,6 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		s.writeError(w, cid, Fail(403, "FORBIDDEN", "project creation is not granted"))
 		return
 	}
-	raw, e := io.ReadAll(io.LimitReader(r.Body, 64*1024*1024+1))
-	if e != nil || len(raw) > 64*1024*1024 {
-		s.writeError(w, cid, Fail(400, "INVALID_REQUEST", "invalid or oversized body"))
-		return
-	}
 	b := Object{}
 	if op.Request != "" {
 		b, e = Decode(raw)
@@ -114,8 +122,13 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 	key := r.Header.Get("Idempotency-Key")
 	var requestHash string
 	if write {
-		if len(key) < 16 || len(key) > 256 {
-			s.writeError(w, cid, Fail(428, "PRECONDITION_REQUIRED", "Idempotency-Key must contain 16 to 256 characters"))
+		values, present := r.Header[http.CanonicalHeaderKey("Idempotency-Key")]
+		if !present {
+			s.writeError(w, cid, Fail(428, "PRECONDITION_REQUIRED", "Idempotency-Key required"))
+			return
+		}
+		if len(values) != 1 || s.Contracts.Validate("Idempotency-Key", key) != nil {
+			s.writeError(w, cid, Fail(400, "INVALID_REQUEST", "Idempotency-Key violates header schema"))
 			return
 		}
 		var body any = b
@@ -164,8 +177,18 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 				s.writeError(w, cid, e)
 				return
 			}
-			if match != ETag(target) {
-				s.writeError(w, cid, &Fault{412, "STALE_REVISION", "aggregate changed", Num(target, "revision")})
+			tag, e := ETag(target)
+			if e != nil {
+				s.writeError(w, cid, e)
+				return
+			}
+			if match != tag {
+				current, e := Num(target, "revision")
+				if e != nil {
+					s.writeError(w, cid, e)
+					return
+				}
+				s.writeError(w, cid, &Fault{412, "STALE_REVISION", "aggregate changed", current})
 				return
 			}
 		}
@@ -266,7 +289,12 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		}
 	}
 	if _, ok := result["revision"]; ok {
-		headers["ETag"] = ETag(result)
+		tag, e := ETag(result)
+		if e != nil {
+			s.writeError(w, cid, e)
+			return
+		}
+		headers["ETag"] = tag
 	}
 	response := Bytes(result)
 	if write {
@@ -361,7 +389,8 @@ func (s *Service) content(w http.ResponseWriter, r *http.Request, tx *sql.Tx, p 
 	}
 	var b []byte
 	e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, o["storage_key"]).Scan(&b)
-	if e != nil || Digest(b) != o["content_hash"] || int64(len(b)) != Num(o, "byte_size") {
+	size, numberErr := Num(o, "byte_size")
+	if e != nil || numberErr != nil || Digest(b) != o["content_hash"] || int64(len(b)) != size {
 		s.writeError(w, cid, Fail(422, "CONTENT_HASH_MISMATCH", "sealed content verification failed"))
 		return
 	}
@@ -372,7 +401,12 @@ func (s *Service) content(w http.ResponseWriter, r *http.Request, tx *sql.Tx, p 
 	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
 	w.Header().Set("Content-Disposition", "attachment")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("ETag", ETag(o))
+	tag, e := ETag(o)
+	if e != nil {
+		s.writeError(w, cid, e)
+		return
+	}
+	w.Header().Set("ETag", tag)
 	w.Write(b)
 }
 func (s *Service) page(tx *sql.Tx, p Principal, project string, op Operation, r *http.Request) (Object, error) {
@@ -417,7 +451,10 @@ func (s *Service) page(tx *sql.Tx, p Principal, project string, op Operation, r 
 			return nil, e
 		}
 		items = Arr(o, "items")
-		seq = Num(o, "snapshot_event_sequence")
+		seq, e = Num(o, "snapshot_event_sequence")
+		if e != nil {
+			return nil, e
+		}
 	} else {
 		kind := strings.TrimPrefix(op.ID, "list")
 		if op.ID == "listProjects" {
@@ -431,7 +468,10 @@ func (s *Service) page(tx *sql.Tx, p Principal, project string, op Operation, r 
 			if e != nil {
 				return nil, e
 			}
-			seq = Num(state, "event_sequence")
+			seq, e = Num(state, "event_sequence")
+			if e != nil {
+				return nil, e
+			}
 		}
 		query := "SELECT body FROM domain_objects WHERE kind=?"
 		args := []any{kind}

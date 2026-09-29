@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -31,12 +33,12 @@ func (localOnly) Load(url string) (any, error) {
 	return nil, fmt.Errorf("unregistered schema resource: %s", url)
 }
 func Decode(raw []byte) (Object, error) {
-	b, e := canonical.JSON(raw)
+	_, e := canonical.JSON(raw)
 	if e != nil {
 		return nil, e
 	}
 	var o Object
-	d := json.NewDecoder(bytes.NewReader(b))
+	d := json.NewDecoder(bytes.NewReader(raw))
 	d.UseNumber()
 	e = d.Decode(&o)
 	if o == nil && e == nil {
@@ -69,19 +71,23 @@ func Receipt(o Object) string {
 	return Hash(c)
 }
 func Str(o Object, k string) string { s, _ := o[k].(string); return s }
-func Num(o Object, k string) int64 {
+func Num(o Object, k string) (int64, error) {
+	var text string
 	switch n := o[k].(type) {
 	case json.Number:
-		v, _ := n.Int64()
-		return v
+		text = n.String()
 	case int:
-		return int64(n)
+		return int64(n), nil
 	case int64:
-		return n
+		return n, nil
 	case float64:
-		return int64(n)
+		text = strconv.FormatFloat(n, 'g', -1, 64)
 	}
-	return 0
+	n, ok := new(big.Rat).SetString(text)
+	if !ok || !n.IsInt() || !n.Num().IsInt64() {
+		return 0, Fail(400, "INVALID_REQUEST", k+" must be an exact signed 64-bit integer")
+	}
+	return n.Num().Int64(), nil
 }
 func Arr(o Object, k string) []any { a, _ := o[k].([]any); return a }
 func Ref(o Object, kind string) Object {
@@ -145,6 +151,11 @@ func LoadContracts(dir string) (*Contracts, error) {
 	if e = compiler.AddResource("https://researchos.invalid/openapi.json", api); e != nil {
 		return nil, e
 	}
+	keySchema, e := compiler.Compile("https://researchos.invalid/openapi.json#/components/parameters/IdempotencyKey/schema")
+	if e != nil {
+		return nil, e
+	}
+	c.Schemas["Idempotency-Key"] = keySchema
 	for name := range api["components"].(map[string]any)["schemas"].(map[string]any) {
 		if _, ok := c.Schemas[name]; !ok {
 			sch, e := compiler.Compile("https://researchos.invalid/openapi.json#/components/schemas/" + name)

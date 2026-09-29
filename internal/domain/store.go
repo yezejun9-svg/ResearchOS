@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	_ "time/tzdata"
 )
 
 type Service struct {
@@ -92,7 +93,18 @@ func singleton(tx *sql.Tx, project, kind string) (Object, error) {
 	}
 	return Decode([]byte(raw))
 }
-func bump(o Object) { o["revision"] = Num(o, "revision") + 1; o["updated_at"] = Now() }
+func bump(o Object) error {
+	n, e := Num(o, "revision")
+	if e != nil {
+		return e
+	}
+	if n == 1<<63-1 {
+		return Fail(409, "STATE_CONFLICT", "revision exhausted")
+	}
+	o["revision"] = n + 1
+	o["updated_at"] = Now()
+	return nil
+}
 
 var idTargets = map[string]string{
 	"budget_policy_id": "BudgetPolicy", "run_policy_id": "RunPolicy", "goal_id": "Goal", "task_id": "Task", "task_ids": "Task", "dependency_task_ids": "Task", "active_run_id": "Run", "run_id": "Run", "run_ids": "Run", "runtime_id": "RuntimeRegistration", "context_bundle_id": "ContextBundle", "no_progress_record_id": "NoProgressRecord", "acceptance_id": "AcceptanceReceipt", "acceptance_ids": "AcceptanceReceipt", "output_artifact_ids": "Artifact", "result_artifact_ids": "Artifact", "checkpoint_artifact_id": "Artifact", "blocking_conflict_ids": "Conflict", "conflict_ids": "Conflict", "active_goal_ids": "Goal", "active_cycle_id": "ResearchCycle", "latest_release_id": "MilestoneRelease", "pending_change_ids": "ChangeProposal", "origin_evidence_id": "Evidence", "verified_by_run_id": "Run", "candidate_evidence_ids": "Evidence", "required_experiment_ids": "Experiment", "decision_ids": "DecisionReceipt", "follow_up_task_ids": "Task", "cycle_id": "ResearchCycle", "qualification_id": "Qualification", "qualification_ids": "Qualification", "impact_link_ids": "ImpactLink", "semantic_review_run_id": "Run", "blocked_task_ids": "Task", "continuable_task_ids": "Task", "parent_release_id": "MilestoneRelease", "open_resource_request_ids": "ResourceRequest", "baseline_skill_id": "SkillVersion", "experiment_id": "Experiment", "rollback_skill_id": "SkillVersion", "regression_acceptance_id": "AcceptanceReceipt", "canary_acceptance_id": "AcceptanceReceipt", "rollback_verified_receipt_id": "AcceptanceReceipt", "last_cycle_id": "ResearchCycle", "policy_id": "BudgetPolicy", "reservation_id": "BudgetLedgerEntry", "release_id": "MilestoneRelease", "resource_request_id": "ResourceRequest", "resolution_proposal_id": "ChangeProposal",
@@ -107,13 +119,20 @@ func (s *Service) put(tx *sql.Tx, kind string, o Object) error {
 	}
 	project := Str(o, "project_id")
 	id := Str(o, "id")
-	rev := Num(o, "revision")
+	rev, e := Num(o, "revision")
+	if e != nil {
+		return e
+	}
 	old, e := load(tx, project, kind, id)
 	if e == nil {
 		if _, immutable := old["receipt_hash"]; immutable {
 			return Fail(409, "STATE_CONFLICT", "receipt immutable")
 		}
-		if rev != Num(old, "revision")+1 {
+		oldRevision, e := Num(old, "revision")
+		if e != nil {
+			return e
+		}
+		if oldRevision == 1<<63-1 || rev != oldRevision+1 {
 			return Fail(409, "STATE_CONFLICT", "revision must advance once")
 		}
 		if kind == "Task" && o["status"] != old["status"] && !(old["status"] == "DRAFT" && (o["status"] == "CANCELLED" || o["status"] == "BLOCKED")) {
@@ -151,7 +170,11 @@ func (s *Service) refs(tx *sql.Tx, project, kind, id string, rev int64, path str
 			if e := s.Contracts.Validate("VersionRef", v); e != nil {
 				return Fail(400, "INVALID_REQUEST", "invalid reference")
 			}
-			return s.ref(tx, project, kind, id, rev, path, project, Str(v, "entity_type"), Str(v, "id"), Num(v, "revision"), v["content_hash"], true)
+			version, e := Num(v, "revision")
+			if e != nil {
+				return e
+			}
+			return s.ref(tx, project, kind, id, rev, path, project, Str(v, "entity_type"), Str(v, "id"), version, v["content_hash"], true)
 		}
 		for field, x := range v {
 			if field == "id" || field == "project_id" {
@@ -186,7 +209,11 @@ func (s *Service) refs(tx *sql.Tx, project, kind, id string, rev int64, path str
 					if e != nil {
 						return Fail(422, "GATE_FAILED", "related object unavailable")
 					}
-					if e = s.ref(tx, project, kind, id, rev, path+"/"+field, tp, target, tid, Num(obj, "revision"), nil, false); e != nil {
+					version, e := Num(obj, "revision")
+					if e != nil {
+						return e
+					}
+					if e = s.ref(tx, project, kind, id, rev, path+"/"+field, tp, target, tid, version, nil, false); e != nil {
 						return e
 					}
 				}
@@ -225,8 +252,18 @@ func (s *Service) invariants(kind string, o Object) error {
 			return Fail(400, "INVALID_REQUEST", "invalid IANA timezone")
 		}
 	}
-	if kind == "RunPolicy" && Num(o, "lease_seconds") <= Num(o, "heartbeat_seconds") {
-		return Fail(422, "GATE_FAILED", "lease must exceed heartbeat")
+	if kind == "RunPolicy" {
+		lease, e := Num(o, "lease_seconds")
+		if e != nil {
+			return e
+		}
+		heartbeat, e := Num(o, "heartbeat_seconds")
+		if e != nil {
+			return e
+		}
+		if lease <= heartbeat {
+			return Fail(422, "GATE_FAILED", "lease must exceed heartbeat")
+		}
 	}
 	if kind == "BudgetPolicy" || kind == "RunPolicy" {
 		scope := Str(o, "scope_type")
@@ -241,8 +278,17 @@ func (s *Service) event(tx *sql.Tx, project, kind string, o Object, actor, corre
 	if e != nil {
 		return e
 	}
-	seq := Num(state, "event_sequence") + 1
-	bump(state)
+	seq, e := Num(state, "event_sequence")
+	if e != nil {
+		return e
+	}
+	if seq == 1<<63-1 {
+		return Fail(409, "STATE_CONFLICT", "event sequence exhausted")
+	}
+	seq++
+	if e = bump(state); e != nil {
+		return e
+	}
 	state["event_sequence"] = seq
 	if e = s.put(tx, "ProjectState", state); e != nil {
 		return e

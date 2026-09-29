@@ -64,6 +64,7 @@ func main() {
 		Addr:              listen,
 		Handler:           api.Handler(db, webDir, service),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
