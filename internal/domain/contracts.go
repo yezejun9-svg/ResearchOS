@@ -207,11 +207,17 @@ func schemaName(o Object) string {
 var implemented = map[string]bool{}
 
 func init() {
-	for _, s := range strings.Fields("listProjects createProject getProjectProfile getProjectState listRequirement getRequirement createRequirement actOnRequirement listGoal getGoal createGoal listTask getTask createTask actOnTask listArtifact getArtifact uploadContent sealArtifact getArtifactContent getGlobalBudgetPolicy getGlobalRunPolicy getBudgetPolicy getRunPolicy getGoalBudgetPolicy listEvents") {
+	for _, s := range strings.Fields("listProjects createProject getProjectProfile getProjectState listRequirement getRequirement createRequirement actOnRequirement listGoal getGoal createGoal listTask getTask createTask actOnTask listArtifact getArtifact uploadContent sealArtifact getArtifactContent getGlobalBudgetPolicy getGlobalRunPolicy getBudgetPolicy getRunPolicy getGoalBudgetPolicy listEvents listEvidence getEvidence createEvidence listSourceCursor getSourceCursor") {
 		implemented[s] = true
 	}
 }
 func operationOwner(id string) string {
+	if id == "searchEvidence" {
+		return "W09"
+	}
+	if strings.Contains(id, "Evidence") || strings.Contains(id, "SourceCursor") {
+		return "W07"
+	}
 	if implemented[id] {
 		return "W03"
 	}

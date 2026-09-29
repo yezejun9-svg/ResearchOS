@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	_ "time/tzdata"
@@ -32,8 +34,11 @@ func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
 	if e != nil {
 		return nil, e
 	}
-	b, e := os.ReadFile(migrationFile)
+	files, e := filepath.Glob(filepath.Join(filepath.Dir(migrationFile), "[0-9][0-9][0-9][0-9]_*.sql"))
 	if e != nil {
+		return nil, e
+	}
+	if _, e = os.Stat(migrationFile); e != nil {
 		return nil, e
 	}
 	tx, e := db.Begin()
@@ -41,11 +46,24 @@ func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
 		return nil, e
 	}
 	defer tx.Rollback()
-	if _, e = tx.Exec(string(b)); e != nil {
-		return nil, e
-	}
-	if _, e = tx.Exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES(2)"); e != nil {
-		return nil, e
+	for _, file := range files {
+		version, err := strconv.Atoi(filepath.Base(file)[:4])
+		if err != nil {
+			return nil, err
+		}
+		if version < 2 {
+			continue
+		}
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(string(b)); err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", version); err != nil {
+			return nil, err
+		}
 	}
 	if e = tx.Commit(); e != nil {
 		return nil, e
