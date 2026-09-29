@@ -72,34 +72,54 @@ func (s *Service) effectiveGraph(tx *sql.Tx, project string, r Object, seen map[
 			return Fail(409, "STATE_CONFLICT", "decision is not current")
 		}
 	}
-	var inspect func(any) error
-	inspect = func(v any) error {
-		switch o := v.(type) {
+	return s.effectiveInputs(tx, project, Str(r, "entity_type"), current, seen)
+}
+
+// Semantic references exclude identity-only and historical links such as supersedes_id.
+// The same set drives current-input checks and deterministic impact links.
+func semanticReferences(kind string, o Object) []Object {
+	fields := []string{"input_refs", "source_refs", "source_document_refs", "facts"}
+	if kind == "DecisionReceipt" {
+		fields = append(fields, "subject_ref", "rubric_ref", "evidence_refs", "deterministic_results")
+	}
+	refs := []Object{}
+	seen := map[string]bool{}
+	var inspect func(any)
+	inspect = func(v any) {
+		switch x := v.(type) {
 		case map[string]any:
-			if Str(o, "entity_type") != "" {
-				return s.effectiveGraph(tx, project, o, seen)
-			}
-			for _, v := range o {
-				if e := inspect(v); e != nil {
-					return e
+			if Str(x, "entity_type") != "" {
+				key := Hash(x)
+				if !seen[key] {
+					refs = append(refs, x)
+					seen[key] = true
 				}
+				return
+			}
+			for _, v := range x {
+				inspect(v)
 			}
 		case []any:
-			for _, v := range o {
-				if e := inspect(v); e != nil {
-					return e
-				}
+			for _, v := range x {
+				inspect(v)
 			}
 		}
-		return nil
 	}
-	for _, field := range []string{"input_refs", "source_refs", "source_document_refs", "facts"} {
-		if e := inspect(current[field]); e != nil {
+	for _, field := range fields {
+		inspect(o[field])
+	}
+	sort.Slice(refs, func(i, j int) bool { return Hash(refs[i]) < Hash(refs[j]) })
+	return refs
+}
+func (s *Service) effectiveInputs(tx *sql.Tx, project, kind string, o Object, seen map[string]bool) error {
+	for _, ref := range semanticReferences(kind, o) {
+		if e := s.effectiveGraph(tx, project, ref, seen); e != nil {
 			return e
 		}
 	}
 	return nil
 }
+
 func (s *Service) taskContext(tx *sql.Tx, project string, task Object) error {
 	if task["status"] == "NEEDS_REVALIDATION" || task["status"] == "CANCELLED" {
 		return Fail(409, "STATE_CONFLICT", "task needs new validated inputs")
