@@ -203,6 +203,20 @@ func (s *Service) createContext(tx *sql.Tx, p Principal, project string, b Objec
 		}
 		if dep["status"] != "ACCEPTED" {
 			commitments = append(commitments, "Dependency "+v.(string)+" remains "+Str(dep, "status"))
+		} else {
+			if e = s.acceptedTaskBinding(tx, project, dep); e != nil {
+				return nil, e
+			}
+			receipt, e := load(tx, project, "AcceptanceReceipt", Str(dep, "acceptance_id"))
+			if e != nil {
+				return nil, e
+			}
+			for _, ref := range append([]any{Ref(dep, "Task"), Ref(receipt, "AcceptanceReceipt")}, Arr(receipt, "artifact_refs")...) {
+				if !seen[Hash(ref)] {
+					refs = append(refs, ref)
+					seen[Hash(ref)] = true
+				}
+			}
 		}
 	}
 	summary := Str(profile, "intent") + "\nTask: " + Str(task, "title") + "\nNext: follow the frozen acceptance contract; execution is not acceptance."

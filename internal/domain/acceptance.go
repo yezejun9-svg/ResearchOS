@@ -43,6 +43,10 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 	if r["id"] != b["run_id"] || r["task_id"] != t["id"] || r["status"] != "SETTLED" || r["children_stopped"] != true || r["queue_empty"] != true || r["context_bundle_id"] != t["context_bundle_id"] || Hash(r["input_refs"]) != Hash(t["input_refs"]) || Hash(r["result_artifact_ids"]) != Hash(t["output_artifact_ids"]) {
 		return nil, Fail(422, "GATE_FAILED", "settled current epoch and exact output/context binding required")
 	}
+	dependencies, e := s.runDependenciesCurrent(tx, project, t, r)
+	if e != nil {
+		return nil, e
+	}
 	observation, e := runtimeObservation(tx, project, r)
 	if e != nil {
 		return nil, e
@@ -142,7 +146,7 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 	if len(artifacts) == 0 || Hash(refs) != Hash(b["artifact_refs"]) {
 		return nil, Fail(422, "GATE_FAILED", "exact output artifact vector required")
 	}
-	return Object{"task": t, "run": r, "contract": c, "artifacts": artifacts, "artifact_refs": refs, "policy_revision": state["policy_revision"], "runtime": rt, "authority": root, "observation": observation}, nil
+	return Object{"task": t, "run": r, "contract": c, "artifacts": artifacts, "artifact_refs": refs, "policy_revision": state["policy_revision"], "runtime": rt, "authority": root, "observation": observation, "dependency_refs": dependencies}, nil
 }
 
 type preparedAcceptance struct {
