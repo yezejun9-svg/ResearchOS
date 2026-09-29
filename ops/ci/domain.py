@@ -13,9 +13,10 @@ GROUPS = {
     "W03-G01": ["TestW03SchemaMigrationDefaults", "TestW03OperationCoverage", "TestW03PrivateOwnerBootstrap"],
     "W03-G02": ["TestW03PreconditionReplayAuthorization", "TestW03ConcurrentWriteOutboxRollback",
                 "TestW03ReferenceIsolationAndHistoricalHash", "TestW03DeferredContractAndScope",
-                "TestW03GoalTaskDraftAndRefusals", "TestW03CursorSnapshotAndReceipt"],
+                "TestW03GoalTaskDraftAndRefusals", "TestW03CursorSnapshotAndReceipt",
+                "TestW03CursorQueryBinding", "TestW03SlowBodyDoesNotBlockDatabase"],
     "W03-G03": ["TestW03ContentSealAccessAndImmutability", "TestW03RestrictedMetadataPositiveAndNegative",
-                "TestJSON", "TestUTF16AndFieldOrder"],
+                "TestJSON", "TestUTF16AndFieldOrder", "TestW03ExactIntegerOverflow"],
 }
 
 
