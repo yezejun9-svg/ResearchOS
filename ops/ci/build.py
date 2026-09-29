@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the pinned W02 skeleton and run real Go/HTTP/SQLite checks."""
+"""Build pinned sources and run real Go/HTTP/SQLite checks."""
 import json
 import os
 import subprocess
@@ -22,7 +22,8 @@ def run(name, argv, cwd=ROOT):
 
 
 def main():
-    if os.getenv("RESEARCHOS_TASK_ID", "W02") != "W02" or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", "W02-G01", "W02-G02", "W02-G03") or os.getenv("RESEARCHOS_CASE_ID"):
+    task = os.getenv("RESEARCHOS_TASK_ID", "W02")
+    if task not in ("W02", "W03") or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", *(f"{task}-G0{n}" for n in (1, 2, 3))) or os.getenv("RESEARCHOS_CASE_ID"):
         raise NotImplementedError("unbound task/check/case selection")
     go = os.environ["RESEARCHOS_GO"]
     node = os.environ["RESEARCHOS_NODE"]
