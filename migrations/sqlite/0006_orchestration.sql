@@ -16,3 +16,10 @@ CREATE TABLE orchestration_failures (
  project TEXT NOT NULL, key_hash TEXT NOT NULL, reason_hash TEXT NOT NULL, count INTEGER NOT NULL,
  PRIMARY KEY(project,key_hash,reason_hash)
 );
+
+CREATE TABLE orchestration_run_dependencies (
+ project TEXT NOT NULL, run TEXT NOT NULL, snapshot TEXT NOT NULL CHECK(json_valid(snapshot)),
+ PRIMARY KEY(project,run)
+);
+CREATE TRIGGER orchestration_run_dependencies_immutable BEFORE UPDATE ON orchestration_run_dependencies BEGIN SELECT RAISE(ABORT,'frozen run dependencies'); END;
+CREATE TRIGGER orchestration_run_dependencies_durable BEFORE DELETE ON orchestration_run_dependencies BEGIN SELECT RAISE(ABORT,'durable run dependencies'); END;
