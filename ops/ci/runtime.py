@@ -10,6 +10,17 @@ import sys
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
+FIXTURE_IDS = {
+    'W05-G01-SETTLED', 'W05-G01-FAKE-SUCCESS', 'W05-G01-DUPLICATE',
+    'W05-G01-TOOL-FAILED', 'W05-G01-REDACTION', 'W05-G01-NESTED-JOB-TREE',
+    'W05-G01-STALE-CANCEL', 'W05-G01-CANCELLED', 'W05-G01-QUEUE',
+    'W05-G01-NO-LATE-LAUNCH', 'W05-G01-RECONCILE-CANCEL', 'W05-G01-TIMEOUT',
+    'W05-G01-CRASH-UNKNOWN', 'W05-G01-NO-BLIND-RETRY', 'W05-G01-FAILED-QUEUE',
+    'W05-G01-CANCEL-WRITE-FAIL', 'W05-G01-SERVICE-REPORTED', 'W05-G01-NO-SELF-ACCEPT',
+    'W05-G01-CONTEXT-SCOPE', 'W05-G01-SCOPED-DENIALS', 'W05-G01-REVOKED', 'W05-G01-UNKNOWN-FENCE',
+    'W05-G01-MISSING-OUTPUT', 'W05-G01-LOG-NOT-OUTPUT',
+}
+LIVE_IDS = {'A04-01-SUCCESS', 'A04-01-TOOL-FAILED', 'A04-03-TIMEOUT', 'A04-02-CANCEL', 'A04-03-CRASH', 'A04-03-CONTEXT-REBUILD'}
 
 def digest(path):
     return 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()
@@ -54,10 +65,12 @@ def main():
             row = json.loads(line[len('W05_ASSERTION '):])
             row['raw'] = 'stdout.txt'
             rows.append(row)
-    passed = run.returncode == 0 and bool(rows) and all(x['status'] == 'PASS' for x in rows)
-    report = {'task': task, 'check': check, 'case': case, 'exit': run.returncode, 'assertions': rows, 'passed': passed, 'independent_acceptance': 'NOT_REQUESTED', 'stdout_hash': digest(out/'stdout.txt'), 'stderr_hash': digest(out/'stderr.txt')}
+    ids = [x['assertion_id'] for x in rows]
+    expected = LIVE_IDS if live else FIXTURE_IDS
+    passed = run.returncode == 0 and len(ids) == len(expected) and set(ids) == expected and all(x['status'] == 'PASS' for x in rows)
+    report = {'task': task, 'check': check, 'case': case, 'status': 'PASS' if passed else 'FAIL', 'exit': run.returncode, 'assertion_ids': ids, 'expected_assertion_ids': sorted(expected), 'assertions': rows, 'passed': passed, 'independent_acceptance': 'NOT_REQUESTED', 'stdout_hash': digest(out/'stdout.txt'), 'stderr_hash': digest(out/'stderr.txt')}
     (out/'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(json.dumps({'passed': passed, 'assertions': len(rows), 'receipt': str(out/'report.json')}))
+    print(json.dumps({'status': report['status'], 'passed': passed, 'assertions': len(rows), 'assertion_ids': ids, 'receipt': str(out/'report.json')}))
     return 0 if passed else 1
 
 if __name__ == '__main__':

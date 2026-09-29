@@ -86,12 +86,6 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		return
 	}
 	project, id := r.PathValue("project_id"), r.PathValue("object_id")
-	if project != "" && !p.Allowed(project, "", "", false) {
-		if !(op.ID == "getTask" && p.Allowed(project, id, "", false)) {
-			s.writeError(w, cid, Fail(404, "NOT_FOUND", "project or object unavailable"))
-			return
-		}
-	}
 	if !op.Implemented {
 		s.writeError(w, cid, Fail(503, "RESOURCE_UNAVAILABLE", "operation requires "+op.Owner))
 		return
@@ -112,6 +106,10 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		}
 	} else if op.Method == "GET" && len(raw) != 0 {
 		s.writeError(w, cid, Fail(400, "INVALID_REQUEST", "GET body unsupported"))
+		return
+	}
+	if project != "" && !p.Allowed(project, "", "", false) && !s.runtimeScope(tx, p, project, id, op.ID, b) {
+		s.writeError(w, cid, Fail(404, "NOT_FOUND", "project or object unavailable"))
 		return
 	}
 	if !s.visible(tx, p, project, b) {
@@ -228,10 +226,18 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		result, e = s.actTask(tx, project, id, b)
 		kind = "Task"
 	case "uploadContent":
-		result, e = s.upload(tx, p, project, raw)
+		if p.Allowed(project, "", "", false) {
+			result, e = s.upload(tx, p, project, raw)
+		} else {
+			result, e = s.runtimeUpload(tx, p, project, raw)
+		}
 		status = 201
 	case "sealArtifact":
-		result, e = s.seal(tx, p, project, b)
+		if p.Allowed(project, "", "", false) {
+			result, e = s.seal(tx, p, project, b)
+		} else {
+			result, e = s.runtimeSeal(tx, p, project, b)
+		}
 		kind = "Artifact"
 		status = 201
 	case "getArtifactContent":
@@ -267,6 +273,8 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 			result, e = s.readObject(tx, p, project, kind, id)
 		} else if strings.HasPrefix(op.ID, "list") {
 			result, e = s.page(tx, p, project, op, r)
+		} else if runtimeOperations[op.ID] {
+			result, kind, status, e = s.runtimeOperation(tx, p, project, id, b, op.ID)
 		} else if contextOperations[op.ID] {
 			result, kind, status, e = s.contextOperation(tx, p, project, id, b, op.ID)
 		} else {
@@ -295,6 +303,9 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		}
 		if op.ID == "recordDecision" {
 			eventType = "DECISION_RECORDED"
+		}
+		if kind == "Run" {
+			eventType = "RUN_CHANGED"
 		}
 		if kind == "Task" {
 			eventType = "TASK_CHANGED"
@@ -356,7 +367,7 @@ func (s *Service) replayAllowed(tx *sql.Tx, p Principal, op Operation, raw []byt
 	if e != nil {
 		return false
 	}
-	if project := Str(o, "project_id"); project != "" && !p.Allowed(project, "", "", false) {
+	if project := Str(o, "project_id"); project != "" && !p.Allowed(project, "", "", false) && !s.runtimeScope(tx, p, project, Str(o, "id"), op.ID, o) {
 		return false
 	}
 	return s.visible(tx, p, Str(o, "project_id"), o)

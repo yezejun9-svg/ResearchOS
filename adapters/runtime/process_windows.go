@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"strings"
 	"syscall"
 	"unicode/utf16"
@@ -13,6 +14,35 @@ import (
 
 	"golang.org/x/sys/windows"
 )
+
+// PrivateDirectory applies an inheritable, protected DACL, and reads the actual descriptor back.
+// os.Chmod alone does not restrict Windows access.
+func PrivateDirectory(path string) (string, error) {
+	u, e := user.Current()
+	if e != nil {
+		return "", e
+	}
+	sd, e := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;" + u.Uid + ")")
+	if e != nil {
+		return "", e
+	}
+	acl, _, e := sd.DACL()
+	if e != nil {
+		return "", e
+	}
+	if e = windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); e != nil {
+		return "", e
+	}
+	actual, e := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if e != nil {
+		return "", e
+	}
+	text := actual.String()
+	if !strings.Contains(text, u.Uid) || !strings.Contains(text, "D:P") {
+		return "", errors.New("private DACL verification failed")
+	}
+	return text, nil
+}
 
 type process struct {
 	job, handle windows.Handle
