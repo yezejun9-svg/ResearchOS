@@ -62,7 +62,7 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 		return p, e
 	}
 	defer a.Runner.Run(context.Background(), "session", "close", session)
-	search, e := a.eval(ctx, session, xSearchScript)
+	search, raw, e := a.eval(ctx, session, xSearchScript)
 	if e != nil {
 		p.Failure = "UNAVAILABLE"
 		return p, e
@@ -71,9 +71,12 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 		p.Failure = "AUTH_OR_NAVIGATION"
 		return p, nil
 	}
+	// This is a deliberately narrow public-article extraction, never page HTML.
+	p.RawResponse, p.RawMediaType = raw, "application/json"
 	if len(search.Items) == 0 {
 		if search.Empty {
-			p.Complete = true
+			// A visible empty UI state is not exhaustive search coverage.
+			p.Failure = "VISIBLE_EMPTY_UNVERIFIED"
 		} else {
 			p.Failure = "UNAVAILABLE"
 		}
@@ -92,7 +95,7 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 			p.Failure = "DETAIL_UNAVAILABLE"
 			return p, e
 		}
-		post, e := a.eval(ctx, session, xPostScript)
+		post, _, e := a.eval(ctx, session, xPostScript)
 		if e != nil {
 			p.Failure = "DETAIL_UNAVAILABLE"
 			return p, e
@@ -120,17 +123,17 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 	return p, nil
 }
 
-func (a XBrowser) eval(ctx context.Context, session, script string) (xPublicResult, error) {
+func (a XBrowser) eval(ctx context.Context, session, script string) (xPublicResult, []byte, error) {
 	var result xPublicResult
 	raw, e := a.Runner.Run(ctx, "--session", session, "eval", script)
 	if e != nil {
-		return result, e
+		return result, nil, e
 	}
 	if len(raw) > 1<<20 {
-		return result, fmt.Errorf("public article extraction too large")
+		return result, nil, fmt.Errorf("public article extraction too large")
 	}
 	if e = json.Unmarshal(raw, &result); e != nil {
-		return result, e
+		return result, nil, e
 	}
-	return result, nil
+	return result, raw, nil
 }

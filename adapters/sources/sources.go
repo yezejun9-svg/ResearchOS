@@ -41,6 +41,8 @@ type Page struct {
 	Failure       string
 	RetryAfter    *time.Time
 	HTTPStatus    int
+	RawResponse   []byte
+	RawMediaType  string
 }
 
 type Adapter interface {

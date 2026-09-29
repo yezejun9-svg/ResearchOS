@@ -103,6 +103,8 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 		p.Failure = "TRUNCATED"
 		return p, nil
 	}
+	p.RawResponse = raw
+	p.RawMediaType = "application/atom+xml"
 	var feed atomFeed
 	if e = xml.Unmarshal(raw, &feed); e != nil {
 		p.Failure = "INVALID_RESPONSE"

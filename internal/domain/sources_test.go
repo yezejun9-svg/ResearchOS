@@ -3,9 +3,19 @@ package domain
 import (
 	"context"
 	"database/sql"
+	"researchos.local/research-os/adapters/sources"
 	"testing"
 	"time"
 )
+
+type sourceFixtureAdapter struct{ page sources.Page }
+
+func (a sourceFixtureAdapter) Fetch(_ context.Context, q sources.Query) (sources.Page, error) {
+	p := a.page
+	p.RequestedFrom = q.From
+	p.RequestedTo = q.To
+	return p, nil
+}
 
 func sourceProject(t *testing.T) (*fixture, Object, Object) {
 	t.Helper()
@@ -130,6 +140,63 @@ func TestW07CursorDoesNotAdvanceFailedOrUnpersistedWindow(t *testing.T) {
 	}
 	if after["covered_until"] != nil || after["opaque_cursor"] != nil {
 		t.Fatalf("failed cursor changed: %v", after)
+	}
+}
+
+func TestW07HTTPSourceEvidenceAndDurableEmptyWindow(t *testing.T) {
+	f, _, cursor := sourceProject(t)
+	actor := Principal{ID: "fixture-source-http", Roles: []string{"SOURCE_ADAPTER"}, Grants: []Grant{{ProjectID: f.project}}}
+	if e := f.s.ProvisionPrincipal(context.Background(), actor); e != nil {
+		t.Fatal(e)
+	}
+	token, e := f.s.IssueCredential(context.Background(), actor.ID, time.Minute)
+	if e != nil {
+		t.Fatal(e)
+	}
+	f.token = token
+	// The source actor's HTTP path checks role, grant, body schema, seal,
+	// references, and response schema; invalid canonical origins are rejected.
+	content := []byte("Full public release body")
+	u := f.expect(201, "POST", f.path("/content"), ID(), "", content)
+	a := f.expect(201, "POST", f.path("/artifacts"), ID(), f.stateTag(), Object{"run_id": nil, "kind": "SOURCE_SNAPSHOT", "evidence_kind": "OBSERVED", "measurement_mode": "LIVE", "content_hash": u["content_hash"], "storage_key": u["storage_key"], "media_type": "text/plain", "byte_size": len(content), "input_refs": []any{Ref(cursor, "SourceCursor")}, "source_refs": Empty(), "produced_by": actor.ID, "access_class": "PROJECT"})
+	base := Object{"claim": "release content observed", "stance": "CONTEXT", "evidence_kind": "OBSERVED", "source_kind": "GITHUB", "canonical_url": "https://github.com/paperclipai/paperclip/releases/tag/v1", "publisher": nil, "upstream_revision": nil, "published_at": nil, "modified_at": nil, "retrieved_at": Now(), "time_status": "UNKNOWN", "snapshot_artifact_ref": Ref(a, "Artifact"), "locator": "release.body", "independence_key": Hash("release-1"), "origin_evidence_id": nil, "discovery_urls": Empty(), "license_status": "UNKNOWN", "license_expression": nil}
+	bad := MergeCopy(base, Object{"canonical_url": "https://other.example/release"})
+	f.expect(403, "POST", f.path("/evidence"), ID(), f.stateTag(), bad)
+	ev := f.expect(201, "POST", f.path("/evidence"), ID(), f.stateTag(), base)
+	if ev["publisher"] != nil || ev["upstream_revision"] != nil {
+		t.Fatal("unknown metadata was invented")
+	}
+	f.expect(200, "GET", f.path("/evidence/"+Str(ev, "id")), "", "", nil)
+	f.expect(200, "GET", f.path("/evidence"), "", "", nil)
+	f.expect(200, "GET", f.path("/source-cursors"), "", "", nil)
+	f.expect(200, "GET", f.path("/source-cursors/"+Str(cursor, "id")), "", "", nil)
+	// A different Evidence does not authorize arbitrary coverage.
+	for i := range f.s.Contracts.Operations {
+		if f.s.Contracts.Operations[i].ID == "advanceSourceCursor" {
+			f.s.Contracts.Operations[i].Implemented = true
+		}
+	}
+	f.h = f.s.Handler()
+	from := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	to := from.Add(time.Hour)
+	advance := Object{"opaque_cursor": nil, "covered_until": to.Format(time.RFC3339Nano), "last_success_at": Now(), "retry_after": nil, "pending_window_from": nil, "pending_window_to": nil, "last_cycle_id": nil}
+	f.expect(422, "PUT", f.path("/source-cursors/"+Str(cursor, "id")), ID(), testTag(cursor), advance)
+	config, current, e := f.s.sourceConfig(context.Background(), token, f.project, Str(cursor, "id"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	page := sources.Page{RawResponse: []byte("[]"), RawMediaType: "application/json", Complete: true, HTTPStatus: 200}
+	got, e := f.s.captureSourcePage(context.Background(), token, f.project, current, config, from, to, 20, sourceFixtureAdapter{page})
+	if e != nil || !got.Page.Complete || len(got.Evidence) != 0 || got.RawArtifact == nil {
+		t.Fatalf("empty page checkpoint: %+v %v", got, e)
+	}
+	advance["last_success_at"] = Now()
+	advanced := f.expect(200, "PUT", f.path("/source-cursors/"+Str(cursor, "id")), ID(), testTag(cursor), advance)
+	if advanced["covered_until"] != advance["covered_until"] {
+		t.Fatal("window not covered", advanced)
+	}
+	if n := countKind(t, f.db, "Evidence"); n != 1 {
+		t.Fatal("fixture evidence count", n)
 	}
 }
 
