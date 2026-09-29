@@ -84,6 +84,8 @@ func (a GitHubReleases) Fetch(ctx context.Context, q Query) (Page, error) {
 		p.Failure = "TRUNCATED"
 		return p, nil
 	}
+	p.RawResponse = raw
+	p.RawMediaType = "application/vnd.github+json"
 	var releases []githubRelease
 	if err = json.Unmarshal(raw, &releases); err != nil {
 		p.Failure = "INVALID_RESPONSE"
