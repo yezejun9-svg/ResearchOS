@@ -38,6 +38,13 @@ func (s *Service) BeginRuntimeQualification(ctx context.Context, token, project,
 	if task["task_type"] != "runtime_qualification" || task["status"] != "DRAFT" || len(Arr(task, "dependency_task_ids")) != 0 {
 		return nil, "", Fail(409, "STATE_CONFLICT", "only dependency-free DRAFT runtime_qualification tasks are admitted here")
 	}
+	var unresolved int
+	if e = tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='Run' AND json_extract(body,'$.task_id')=? AND json_extract(body,'$.status') NOT IN ('SETTLED','FAILED','CANCELLED')", project, taskID).Scan(&unresolved); e != nil {
+		return nil, "", e
+	}
+	if unresolved != 0 {
+		return nil, "", Fail(409, "STATE_CONFLICT", "prior run outcome unresolved; execution ownership retained")
+	}
 	if e = s.taskContext(tx, project, task); e != nil {
 		return nil, "", e
 	}
@@ -129,12 +136,16 @@ func currentRun(tx *sql.Tx, p Principal, project, id string) (Object, error) {
 func runTerminal(r Object) bool {
 	return r["status"] == "SETTLED" || r["status"] == "FAILED" || r["status"] == "CANCELLED"
 }
-func runtimeLease(p Principal, r, b Object) error {
+func runtimeLease(tx *sql.Tx, p Principal, project string, r, b Object) error {
 	epoch, e := Num(b, "lease_epoch")
 	current, _ := Num(r, "lease_epoch")
 	expires, te := time.Parse(time.RFC3339Nano, Str(r, "lease_expires_at"))
 	if p.ID != r["executor_principal_id"] || e != nil || epoch != current || Digest([]byte(Str(b, "lease_token"))) != r["lease_token_hash"] || te != nil || !time.Now().Before(expires) {
 		return Fail(409, "LEASE_EXPIRED", "run lease no longer current")
+	}
+	task, e := load(tx, project, "Task", Str(r, "task_id"))
+	if e != nil || task["active_run_id"] != r["id"] {
+		return Fail(409, "LEASE_EXPIRED", "run no longer owns task")
 	}
 	return nil
 }
@@ -149,7 +160,7 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 		return nil, "", 0, e
 	}
 	if op != "cancelRun" && op != "reconcileRun" {
-		if e = runtimeLease(p, r, b); e != nil {
+		if e = runtimeLease(tx, p, project, r, b); e != nil {
 			return nil, "", 0, e
 		}
 	}
