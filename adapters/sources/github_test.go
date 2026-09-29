@@ -12,7 +12,10 @@ import (
 )
 
 type blockedTransport struct{}
-func (blockedTransport) RoundTrip(*http.Request) (*http.Response,error) {return nil,context.DeadlineExceeded}
+
+func (blockedTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, context.DeadlineExceeded
+}
 
 func TestW07GitHubReleaseBodyAndCommit(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
@@ -138,14 +141,32 @@ func TestW07GitHubRejectsForeignRedirectBeforeRequest(t *testing.T) {
 }
 
 func TestW07GitHubEmptyAuthAndTimeoutAreDistinct(t *testing.T) {
-	from,_:=time.Parse(time.RFC3339,"2026-09-28T00:00:00Z"); to,_:=time.Parse(time.RFC3339,"2026-09-30T00:00:00Z")
-	q:=Query{SourceID:"g",Text:"repo:owner/repo",From:from,To:to,Limit:1}
-	server:=httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request) {if r.URL.Query().Get("page")=="1" {fmt.Fprint(w,"[]")}})); defer server.Close()
-	a:=GitHubReleases{BaseURL:server.URL,Client:server.Client(),AllowedOrigins:[]string{server.URL}}
-	p,e:=a.Fetch(context.Background(),q); if e!=nil || !p.Complete || len(p.Items)!=0 || p.Failure!="" {t.Fatalf("valid empty page classified as failure: %+v %v",p,e)}
-	a.Client=&http.Client{Transport:blockedTransport{}}
-	p,e=a.Fetch(context.Background(),q); if !errors.Is(e,context.DeadlineExceeded) || p.Failure!="TIMEOUT_OR_NETWORK" || p.Complete {t.Fatalf("timeout lost: %+v %v",p,e)}
-	unauthorized:=httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request) {w.WriteHeader(401)})); defer unauthorized.Close()
-	a.BaseURL=unauthorized.URL; a.Client=unauthorized.Client(); a.AllowedOrigins=[]string{unauthorized.URL}
-	p,e=a.Fetch(context.Background(),q); if e!=nil || p.Failure!="AUTH_REVOKED" || p.Complete {t.Fatalf("revoked key lost: %+v %v",p,e)}
+	from, _ := time.Parse(time.RFC3339, "2026-09-28T00:00:00Z")
+	to, _ := time.Parse(time.RFC3339, "2026-09-30T00:00:00Z")
+	q := Query{SourceID: "g", Text: "repo:owner/repo", From: from, To: to, Limit: 1}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "1" {
+			fmt.Fprint(w, "[]")
+		}
+	}))
+	defer server.Close()
+	a := GitHubReleases{BaseURL: server.URL, Client: server.Client(), AllowedOrigins: []string{server.URL}}
+	p, e := a.Fetch(context.Background(), q)
+	if e != nil || !p.Complete || len(p.Items) != 0 || p.Failure != "" {
+		t.Fatalf("valid empty page classified as failure: %+v %v", p, e)
+	}
+	a.Client = &http.Client{Transport: blockedTransport{}}
+	p, e = a.Fetch(context.Background(), q)
+	if !errors.Is(e, context.DeadlineExceeded) || p.Failure != "TIMEOUT_OR_NETWORK" || p.Complete {
+		t.Fatalf("timeout lost: %+v %v", p, e)
+	}
+	unauthorized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401) }))
+	defer unauthorized.Close()
+	a.BaseURL = unauthorized.URL
+	a.Client = unauthorized.Client()
+	a.AllowedOrigins = []string{unauthorized.URL}
+	p, e = a.Fetch(context.Background(), q)
+	if e != nil || p.Failure != "AUTH_REVOKED" || p.Complete {
+		t.Fatalf("revoked key lost: %+v %v", p, e)
+	}
 }

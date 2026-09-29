@@ -64,6 +64,8 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 		return p, e
 	}
 	defer a.Runner.Run(context.Background(), "session", "close", session)
+	// The browser-open acknowledgement can precede X's client-rendered results.
+	_, _ = a.Runner.Run(ctx, "--session", session, "wait", "stable", "--timeout", "15000")
 	search, raw, e := a.eval(ctx, session, xSearchScript)
 	if e != nil {
 		p.Failure = "UNAVAILABLE"
@@ -72,6 +74,18 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 	if search.URL != searchURL {
 		p.Failure = "AUTH_OR_NAVIGATION"
 		return p, nil
+	}
+	if len(search.Items) == 0 && !search.Empty {
+		_, _ = a.Runner.Run(ctx, "--session", session, "wait", "selector", "--selector", "main article", "--timeout", "15000")
+		search, raw, e = a.eval(ctx, session, xSearchScript)
+		if e != nil {
+			p.Failure = "UNAVAILABLE"
+			return p, e
+		}
+		if search.URL != searchURL {
+			p.Failure = "AUTH_OR_NAVIGATION"
+			return p, nil
+		}
 	}
 	p.FinalURLs = append(p.FinalURLs, search.URL)
 	p.FetchedAt = time.Now().UTC()
@@ -100,6 +114,7 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 			return p, e
 		}
 		p.RequestURLs = append(p.RequestURLs, candidate.URL)
+		_, _ = a.Runner.Run(ctx, "--session", session, "wait", "stable", "--timeout", "15000")
 		post, _, e := a.eval(ctx, session, xPostScript)
 		if e != nil {
 			p.Failure = "DETAIL_UNAVAILABLE"
