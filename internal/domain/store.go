@@ -160,7 +160,7 @@ func (s *Service) put(tx *sql.Tx, kind string, o Object) error {
 		if oldRevision == 1<<63-1 || rev != oldRevision+1 {
 			return Fail(409, "STATE_CONFLICT", "revision must advance once")
 		}
-		if kind == "Task" && o["status"] != old["status"] && !(o["task_type"] == "runtime_qualification" && old["status"] == "DRAFT" && o["status"] == "EXECUTION_REPORTED") && !(old["status"] == "NEEDS_REVALIDATION" && o["status"] == "DRAFT") && !(o["status"] == "NEEDS_REVALIDATION" && old["status"] != "CANCELLED") && !(old["status"] == "DRAFT" && (o["status"] == "CANCELLED" || o["status"] == "BLOCKED")) {
+		if kind == "Task" && !taskTransition(old, o) {
 			return Fail(409, "STATE_CONFLICT", "transition requires lifecycle owner")
 		}
 	} else if f, ok := e.(*Fault); !ok || f.Status != 404 {

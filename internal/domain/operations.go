@@ -223,6 +223,9 @@ func (s *Service) actTask(tx *sql.Tx, project, id string, b Object) (Object, err
 	if b["action"] == "REVALIDATE" {
 		return s.revalidateTask(tx, project, o)
 	}
+	if b["action"] == "SUBMIT" || b["action"] == "RESUME" {
+		return s.orchestrateTask(tx, project, o, b)
+	}
 	if o["status"] != "DRAFT" {
 		return nil, Fail(409, "STATE_CONFLICT", "task transition requires W06")
 	}
