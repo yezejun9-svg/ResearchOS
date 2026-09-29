@@ -157,10 +157,17 @@ def main():
     task, check, case = (os.getenv("RESEARCHOS_TASK_ID", "W07"),
                          os.getenv("RESEARCHOS_CHECK_ID", ""),
                          os.getenv("RESEARCHOS_CASE_ID", ""))
+    mode = os.getenv("RESEARCHOS_SOURCE_MODE", "")
     if task != "W07" or check not in {"W07-G01", "W07-G02", ""} or case not in {"", "A05"}:
         raise NotImplementedError("unbound W07 selection")
-    if (case == "A05" and check == "W07-G01") or (not check and not case):
-        raise NotImplementedError("ambiguous W07 selection")
+    if mode == "fixture":
+        if check != "W07-G01" or case:
+            raise NotImplementedError("fixture command requires W07-G01")
+    elif mode == "live":
+        if check not in {"", "W07-G02"} or (not check and case != "A05"):
+            raise NotImplementedError("live command requires W07-G02 or A05")
+    else:
+        raise NotImplementedError("registered W07 source mode required")
     go = os.getenv("RESEARCHOS_GO") or json.loads(
         (ROOT / "execution/toolchains/locked.json").read_text(encoding="utf-8")
     )["tools"]["go"]["path"]
@@ -172,7 +179,7 @@ def main():
     evidence.mkdir(parents=True, exist_ok=False)
     started = datetime.now(timezone.utc).isoformat()
     fr = fixture(go, evidence)
-    selected_live = check == "W07-G02" or case == "A05"
+    selected_live = mode == "live"
     result = live(go, evidence, fr) if selected_live and not fr["missing"] and fr["exit_code"] == 0 else None
     if selected_live:
         ids = [k for k, value in (result or {}).get("assertions", {}).items() if value]
