@@ -16,6 +16,7 @@ func TestW07GitHubReleaseBodyAndCommit(t *testing.T) {
 		switch {
 		case r.URL.Path == "/repos/paperclipai/paperclip/releases":
 			if r.URL.Query().Get("page") == "1" {
+				w.Header().Set("Link", `<https://api.github.com/repos/paperclipai/paperclip/releases?page=2>; rel="next"`)
 				fmt.Fprint(w, `[ {"id":22,"html_url":"https://github.com/paperclipai/paperclip/releases/tag/v2","body":"full release body","tag_name":"v2","published_at":"2026-09-29T12:00:00Z","author":{"login":"maintainer"}} ]`)
 			} else {
 				fmt.Fprint(w, `[]`)
