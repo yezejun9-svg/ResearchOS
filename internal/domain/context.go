@@ -248,6 +248,26 @@ func (s *Service) createContext(tx *sql.Tx, p Principal, project string, b Objec
 			decisions = append(decisions, r)
 		}
 	}
+	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+	if e != nil {
+		return nil, e
+	}
+	historical := Empty()
+	for _, v := range decisions {
+		d, e := version(tx, project, v.(map[string]any))
+		if e != nil {
+			return nil, e
+		}
+		if prior := Str(d, "supersedes_id"); prior != "" {
+			old, e := load(tx, project, "DecisionReceipt", prior)
+			if e != nil {
+				return nil, e
+			}
+			historical = append(historical, Ref(old, "DecisionReceipt"))
+		}
+	}
+	continuation := Object{"goal_id": goal["id"], "goal_title": goal["title"], "goal_intent": goal["original_intent"], "goal_status_at_construction": goal["status"], "next_task_id": task["id"], "next_task_title": task["title"], "historical_decision_refs": historical, "current_decision_refs": decisions, "acceptance_contract": task["acceptance_contract"]}
+	summary += "\nContinuation: " + string(Bytes(continuation))
 	manifestHash := Hash(profile["source_document_refs"])
 	var importedHash string
 	if err := tx.QueryRow("SELECT manifest_hash FROM context_imports WHERE project=?", project).Scan(&importedHash); err == nil {

@@ -160,7 +160,7 @@ func runtimeLease(tx *sql.Tx, p Principal, project string, r, b Object) error {
 	}
 	return nil
 }
-func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, b Object, op string) (Object, string, int, error) {
+func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, b Object, op, cid string) (Object, string, int, error) {
 	if op == "registerRuntime" {
 		r := Merge(Base(project), b)
 		Merge(r, Object{"status": "REGISTERED", "qualification_ids": Empty(), "health_checked_at": nil, "supports_resume": false, "resume_evidence_ref": nil})
@@ -266,6 +266,9 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 			if e = s.put(tx, "Task", task); e != nil {
 				return nil, "", 0, e
 			}
+			if e = s.event(tx, project, "Task", task, p.ID, cid, "TASK_CHANGED"); e != nil {
+				return nil, "", 0, e
+			}
 		}
 	case "acknowledgeRunCancellation":
 		o, err := runtimeObservation(tx, project, r)
@@ -297,7 +300,7 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 	if e = bump(r); e != nil {
 		return nil, "", 0, e
 	}
-	if e = s.runtimeTaskTerminal(tx, p, project, r); e != nil {
+	if e = s.runtimeTaskTerminal(tx, p, project, r, cid); e != nil {
 		return nil, "", 0, e
 	}
 	return r, "Run", 200, s.put(tx, "Run", r)

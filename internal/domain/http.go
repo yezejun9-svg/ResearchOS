@@ -17,7 +17,13 @@ import (
 func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	for _, op := range s.Contracts.Operations {
-		mux.HandleFunc(op.Method+" "+op.Path, func(w http.ResponseWriter, r *http.Request) { s.handle(w, r, op) })
+		mux.HandleFunc(op.Method+" "+op.Path, func(w http.ResponseWriter, r *http.Request) {
+			if op.ID == "recordAcceptance" || op.ID == "claimTask" {
+				s.handleAuditedOrchestration(w, r, op)
+				return
+			}
+			s.handle(w, r, op)
+		})
 	}
 	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, ID(), Fail(404, "NOT_FOUND", "operation unavailable"))
@@ -68,7 +74,7 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 	var preparationError error
 	if op.ID == "recordAcceptance" {
 		if input, err := Decode(raw); err == nil && s.Contracts.Validate(op.Request, input) == nil {
-			if ref, ok := input["subject_ref"].(map[string]any); ok && ref["entity_type"] == "Task" {
+			if ref, ok := input["subject_ref"].(map[string]any); ok && (ref["entity_type"] == "Task" || ref["entity_type"] == "Goal") {
 				prepared, preparationError = s.prepareTaskAcceptance(r.Context(), strings.TrimPrefix(auth, "Bearer "), r.PathValue("project_id"), input)
 			}
 		}
@@ -260,11 +266,11 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		kind = "Task"
 		status = 201
 	case "recordAcceptance":
-		if b["subject_ref"].(map[string]any)["entity_type"] == "Task" {
+		if b["subject_ref"].(map[string]any)["entity_type"] == "Task" || b["subject_ref"].(map[string]any)["entity_type"] == "Goal" {
 			if preparationError != nil {
 				e = preparationError
 			} else {
-				result, e = s.acceptTask(tx, p, project, b, prepared)
+				result, e = s.acceptTask(tx, p, project, b, prepared, cid)
 			}
 		} else {
 			result, e = s.acceptChange(tx, p, project, b)
@@ -275,10 +281,10 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		result, e = s.actGoal(tx, project, id, b)
 		kind = "Goal"
 	case "claimTask":
-		result, e = s.claimTask(tx, p, project, id, b)
+		result, e = s.claimTask(tx, p, project, id, b, cid)
 		status = 201
 	case "actOnTask":
-		result, e = s.actTask(tx, project, id, b)
+		result, e = s.actTask(tx, p, project, id, b, cid)
 		kind = "Task"
 	case "uploadContent":
 		if p.Allowed(project, "", "", false) {
@@ -329,7 +335,7 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		} else if strings.HasPrefix(op.ID, "list") {
 			result, e = s.page(tx, p, project, op, r)
 		} else if runtimeOperations[op.ID] {
-			result, kind, status, e = s.runtimeOperation(tx, p, project, id, b, op.ID)
+			result, kind, status, e = s.runtimeOperation(tx, p, project, id, b, op.ID, cid)
 		} else if contextOperations[op.ID] {
 			result, kind, status, e = s.contextOperation(tx, p, project, id, b, op.ID)
 		} else {

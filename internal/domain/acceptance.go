@@ -11,7 +11,13 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 	if !p.HasRole("VERIFIER") || !p.Allowed(project, "", "", false) {
 		return nil, Fail(403, "FORBIDDEN", "current independent verifier grant required")
 	}
+	if !s.visible(tx, p, project, b) {
+		return nil, Fail(403, "FORBIDDEN", "acceptance references are not visible to current verifier")
+	}
 	ref := b["subject_ref"].(map[string]any)
+	if ref["entity_type"] == "Goal" {
+		return s.goalAcceptanceSnapshot(tx, p, project, b)
+	}
 	t, e := load(tx, project, "Task", Str(ref, "id"))
 	if e != nil {
 		return nil, e
@@ -205,9 +211,12 @@ func (s *Service) prepareTaskAcceptance(ctx context.Context, token, project stri
 	return a, nil
 }
 
-func (s *Service) acceptTask(tx *sql.Tx, p Principal, project string, b Object, a *preparedAcceptance) (Object, error) {
+func (s *Service) acceptTask(tx *sql.Tx, p Principal, project string, b Object, a *preparedAcceptance, cid string) (Object, error) {
 	if a == nil {
 		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "independent verification was not performed")
+	}
+	if b["subject_ref"].(map[string]any)["entity_type"] == "Goal" {
+		return s.acceptGoal(tx, p, project, b, a, cid)
 	}
 	current, e := s.acceptanceSnapshot(tx, p, project, b)
 	if e != nil {
@@ -250,11 +259,11 @@ func (s *Service) acceptTask(tx *sql.Tx, p Principal, project string, b Object, 
 	if e = s.put(tx, "Task", t); e != nil {
 		return nil, e
 	}
-	if e = s.event(tx, project, "Task", t, p.ID, ID(), "TASK_CHANGED"); e != nil {
+	if e = s.event(tx, project, "Task", t, p.ID, cid, "TASK_CHANGED"); e != nil {
 		return nil, e
 	}
 	if a.verdict == "PASS" {
-		if e = s.releaseSuccessors(tx, p, project, t); e != nil {
+		if e = s.releaseSuccessors(tx, p, project, t, cid); e != nil {
 			return nil, e
 		}
 	}
@@ -292,7 +301,7 @@ func (s *Service) acceptedTaskBinding(tx *sql.Tx, project string, t Object) erro
 	return nil
 }
 
-func (s *Service) releaseSuccessors(tx *sql.Tx, p Principal, project string, accepted Object) error {
+func (s *Service) releaseSuccessors(tx *sql.Tx, p Principal, project string, accepted Object, cid string) error {
 	rows, e := tx.Query("SELECT body FROM domain_objects WHERE project=? AND kind='Task' AND json_extract(body,'$.status')='BLOCKED'", project)
 	if e != nil {
 		return e
@@ -326,6 +335,13 @@ func (s *Service) releaseSuccessors(tx *sql.Tx, p Principal, project string, acc
 		if !depends || len(Arr(t, "blocking_conflict_ids")) != 0 {
 			continue
 		}
+		var held int
+		if e = tx.QueryRow("SELECT count(*) FROM orchestration_task_controls WHERE project=? AND task=?", project, t["id"]).Scan(&held); e != nil {
+			return e
+		}
+		if held != 0 {
+			continue
+		}
 		var submitted int
 		if e = tx.QueryRow("SELECT count(*) FROM orchestration_contracts WHERE project=? AND task=?", project, t["id"]).Scan(&submitted); e != nil {
 			return e
@@ -354,7 +370,7 @@ func (s *Service) releaseSuccessors(tx *sql.Tx, p Principal, project string, acc
 		if e = s.put(tx, "Task", t); e != nil {
 			return e
 		}
-		if e = s.event(tx, project, "Task", t, p.ID, ID(), "TASK_CHANGED"); e != nil {
+		if e = s.event(tx, project, "Task", t, p.ID, cid, "TASK_CHANGED"); e != nil {
 			return e
 		}
 	}
