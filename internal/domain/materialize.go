@@ -61,6 +61,10 @@ func (s *Service) MaterializeTaskContext(ctx context.Context, token, project, ta
 	if e != nil {
 		return nil, e
 	}
+	task, e := load(tx, project, "Task", taskID)
+	if e != nil {
+		return nil, e
+	}
 	files := map[string][]byte{}
 	entries := Empty()
 	seen := map[string]bool{}
@@ -82,6 +86,27 @@ func (s *Service) MaterializeTaskContext(ctx context.Context, token, project, ta
 					return Fail(403, "FORBIDDEN", "input unavailable")
 				}
 				if kind == "Artifact" {
+					if obj["validity"] == "STALE" && obj["kind"] == "REPORT" {
+						use, proof, e := s.dependencyArtifactUse(tx, project, task, o)
+						if e != nil {
+							return e
+						}
+						var raw []byte
+						if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, use["storage_key"]).Scan(&raw); e != nil {
+							return e
+						}
+						if Digest(raw) != obj["content_hash"] {
+							return Fail(422, "CONTENT_HASH_MISMATCH", "re-proven result bytes changed")
+						}
+						name := Str(obj, "id") + ".content"
+						files[name] = raw
+						entries = append(entries, Object{"path": "inputs/" + name, "ref": o, "content_hash": obj["content_hash"], "access_class": obj["access_class"], "use_receipt_hash": use["receipt_hash"], "proof_ref": proof, "canonical_validity": "STALE"})
+						if e = visit(proof); e != nil {
+							return e
+						}
+						return nil // Historical primary inputs are not this contribution inputs.
+					}
+
 					if e = s.requireCurrentArtifactBody(tx, project, obj); e != nil {
 						return e
 					}

@@ -11,6 +11,11 @@ func (s *Service) reusableArtifact(tx *sql.Tx, p Principal, project string, exis
 			return Fail(409, "STATE_CONFLICT", "canonical artifact evidence and access metadata cannot change on reuse")
 		}
 	}
+	if existing["validity"] == "STALE" && run != nil && existing["kind"] == "REPORT" && existing["access_class"] == "PROJECT" {
+		// A fresh contribution may prove identical result bytes under new inputs.
+		// recordArtifactUse seals a separate manifest; canonical history stays STALE.
+		return nil
+	}
 	if existing["validity"] != "CURRENT" {
 		return Fail(409, "STATE_CONFLICT", "canonical historical or revoked content requires separate revalidation proof")
 	}
@@ -73,6 +78,9 @@ func (s *Service) recordArtifactUse(tx *sql.Tx, p Principal, project string, run
 	use := Object{"project_id": project, "artifact_ref": Ref(a, "Artifact"), "run_id": run["id"], "lease_epoch": run["lease_epoch"], "principal_id": p.ID, "storage_key": b["storage_key"], "content_hash": a["content_hash"], "byte_size": a["byte_size"], "input_refs": b["input_refs"], "source_refs": b["source_refs"], "run_input_refs": run["input_refs"], "context_bundle_id": run["context_bundle_id"], "measurement_mode": b["measurement_mode"], "evidence_kind": b["evidence_kind"], "access_class": b["access_class"], "created_at": Now()}
 	use["receipt_hash"] = Receipt(use)
 	_, e = tx.Exec("INSERT INTO artifact_uses(project,artifact,run,epoch,principal,storage_key,receipt_hash,body) VALUES(?,?,?,?,?,?,?,?)", project, a["id"], run["id"], epoch, p.ID, b["storage_key"], use["receipt_hash"], string(Bytes(use)))
+	if e == nil && a["validity"] == "STALE" {
+		e = s.recordArtifactUseProof(tx, project, p.ID, run, a, use)
+	}
 	return e
 }
 
@@ -122,7 +130,11 @@ func (s *Service) artifactUse(tx *sql.Tx, project string, r Object, id string, e
 		}
 	}
 	if effective {
-		if e = s.effective(tx, project, Ref(a, "Artifact")); e != nil {
+		if a["validity"] == "STALE" {
+			if _, e = s.artifactUseProof(tx, project, r, a, use); e != nil {
+				return nil, nil, e
+			}
+		} else if e = s.effective(tx, project, Ref(a, "Artifact")); e != nil {
 			return nil, nil, e
 		}
 		for _, field := range []string{"input_refs", "source_refs", "run_input_refs"} {

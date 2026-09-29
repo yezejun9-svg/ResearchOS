@@ -138,7 +138,7 @@ func (s *Service) taskContext(tx *sql.Tx, project string, task Object) error {
 		return e
 	}
 	for _, v := range Arr(bundle, "version_vector") {
-		if e = s.effective(tx, project, v.(map[string]any)); e != nil {
+		if e = s.contextReferenceEffective(tx, project, task, v.(map[string]any)); e != nil {
 			return e
 		}
 	}
@@ -227,7 +227,12 @@ func (s *Service) createContext(tx *sql.Tx, p Principal, project string, b Objec
 			if e != nil {
 				return nil, e
 			}
-			for _, ref := range append([]any{Ref(dep, "Task"), Ref(receipt, "AcceptanceReceipt")}, Arr(receipt, "artifact_refs")...) {
+			proofs, e := s.dependencyProofRefs(tx, project, receipt)
+			if e != nil {
+				return nil, e
+			}
+			dependencyRefs := append(append([]any{Ref(dep, "Task"), Ref(receipt, "AcceptanceReceipt")}, Arr(receipt, "artifact_refs")...), proofs...)
+			for _, ref := range dependencyRefs {
 				if !seen[Hash(ref)] {
 					refs = append(refs, ref)
 					seen[Hash(ref)] = true

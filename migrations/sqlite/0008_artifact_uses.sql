@@ -9,3 +9,12 @@ CREATE TABLE artifact_uses (
 );
 CREATE TRIGGER artifact_uses_immutable BEFORE UPDATE ON artifact_uses BEGIN SELECT RAISE(ABORT,'immutable artifact use'); END;
 CREATE TRIGGER artifact_uses_durable BEFORE DELETE ON artifact_uses BEGIN SELECT RAISE(ABORT,'durable artifact use'); END;
+
+-- Separate proof of a new contribution never mutates canonical historical validity.
+CREATE TABLE artifact_use_proofs (
+ project TEXT NOT NULL, artifact TEXT NOT NULL, run TEXT NOT NULL, epoch INTEGER NOT NULL,
+ use_hash TEXT NOT NULL, manifest_ref TEXT NOT NULL CHECK(json_valid(manifest_ref)),
+ PRIMARY KEY(project,artifact,run,epoch)
+);
+CREATE TRIGGER artifact_use_proofs_immutable BEFORE UPDATE ON artifact_use_proofs BEGIN SELECT RAISE(ABORT,'immutable artifact use proof'); END;
+CREATE TRIGGER artifact_use_proofs_durable BEFORE DELETE ON artifact_use_proofs BEGIN SELECT RAISE(ABORT,'durable artifact use proof'); END;
