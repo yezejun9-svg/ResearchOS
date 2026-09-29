@@ -129,9 +129,6 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 		if use["measurement_mode"] != "FIXTURE" || a["access_class"] == "VERIFIER_ONLY" {
 			return nil, Fail(422, "GATE_FAILED", "output provenance or isolation mismatch")
 		}
-		if e = s.effective(tx, project, Ref(a, "Artifact")); e != nil {
-			return nil, e
-		}
 		var raw []byte
 		if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, use["storage_key"]).Scan(&raw); e != nil {
 			return nil, e
@@ -273,11 +270,19 @@ func (s *Service) acceptedTaskBinding(tx *sql.Tx, project string, t Object) erro
 	if receipt["verdict"] != "PASS" || receipt["receipt_hash"] != Receipt(receipt) || receipt["contract_hash"] != c["contract_hash"] || c["contract_hash"] != contractDigest(c) || Hash(receipt["input_refs"]) != Hash(t["input_refs"]) || receipt["run_id"] != t["active_run_id"] {
 		return Fail(422, "GATE_FAILED", "dependency acceptance binding changed")
 	}
+	r, e := load(tx, project, "Run", Str(receipt, "run_id"))
+	if e != nil {
+		return e
+	}
 	ids := Empty()
 	for _, v := range Arr(receipt, "artifact_refs") {
 		ref := v.(map[string]any)
-		if e = s.effective(tx, project, ref); e != nil {
+		a, _, e := s.artifactUse(tx, project, r, Str(ref, "id"), true)
+		if e != nil {
 			return e
+		}
+		if Hash(Ref(a, "Artifact")) != Hash(ref) {
+			return Fail(412, "STALE_INPUT", "accepted result version changed")
 		}
 		ids = append(ids, ref["id"])
 	}

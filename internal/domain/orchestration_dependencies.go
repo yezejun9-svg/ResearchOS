@@ -24,6 +24,11 @@ func (s *Service) dependencyVector(tx *sql.Tx, project string, t Object) ([]any,
 		}
 		refs = append(refs, Ref(dep, "Task"), Ref(receipt, "AcceptanceReceipt"))
 		refs = append(refs, Arr(receipt, "artifact_refs")...)
+		proofs, e := s.dependencyProofRefs(tx, project, receipt)
+		if e != nil {
+			return nil, e
+		}
+		refs = append(refs, proofs...)
 	}
 	return refs, nil
 }
