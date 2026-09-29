@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -23,11 +24,13 @@ EXPECTED = {
     "TestW07ArxivRejectsForeignRedirectBeforeRequest",
     "TestW07XOnlyPublicPostAndNoFalseComplete",
     "TestW07XExpandedBodyRequired",
+    "TestW07XVisibleEmptyDiffersFromUnrendered",
     "TestW07EvidenceNeedsSealedLiveSnapshotAndAllowedOrigin",
     "TestW07CursorDoesNotAdvanceFailedOrUnpersistedWindow",
     "TestW07HTTPSourceEvidenceAndDurableEmptyWindow",
     "TestW07RetryAfterPreventsPrematureSourceRequest",
     "TestW07MissingAuthorizedXChannelDoesNotFetch",
+    "TestW07XVisibleEmptySealsObservationWithoutCoverage",
 }
 SOURCE_FILES = [
     "adapters/sources/sources.go", "adapters/sources/github.go",
@@ -45,16 +48,48 @@ def sha256(path):
 
 
 def run_process(command, evidence, stem, *, env=None, timeout=180):
-    result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, timeout=timeout)
     stdout, stderr = evidence / (stem + ".stdout"), evidence / (stem + ".stderr")
-    stdout.write_bytes(result.stdout)
-    stderr.write_bytes(result.stderr)
-    return result.returncode, stdout, stderr
+    opts = {"cwd": ROOT, "env": env, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+    if os.name == "nt":
+        opts["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        opts["start_new_session"] = True
+    try:
+        process = subprocess.Popen(command, **opts)
+    except OSError as exc:
+        stdout.write_bytes(b"")
+        stderr.write_text(str(exc) + "\n", encoding="utf-8")
+        return -2, stdout, stderr, False
+    timed_out = False
+    try:
+        out, err = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as timeout_error:
+        timed_out = True
+        # Kill only this command's process tree (including a child BrowserAct
+        # CLI), then retain whatever output was produced before timeout.
+        if os.name == "nt":
+            try:
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                               capture_output=True, timeout=10, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                process.kill()
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+        try:
+            out, err = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            out, err = process.communicate()
+        out = out or timeout_error.stdout or b""
+        err = err or timeout_error.stderr or b""
+    stdout.write_bytes(out)
+    stderr.write_bytes(err)
+    return (-1 if timed_out else process.returncode), stdout, stderr, timed_out
 
 
 def fixture(go, evidence):
     command = [go, "test", "-count=1", "-json", "-run", "^TestW07", "./adapters/sources", "./internal/domain"]
-    code, out, err = run_process(command, evidence, "fixture")
+    code, out, err, timed_out = run_process(command, evidence, "fixture")
     passed = set()
     for line in out.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
@@ -64,7 +99,7 @@ def fixture(go, evidence):
         if event.get("Action") == "pass" and event.get("Test") in EXPECTED:
             passed.add(event["Test"])
     return {
-        "command": command, "exit_code": code, "passed": sorted(passed),
+        "command": command, "exit_code": code, "timed_out": timed_out, "passed": sorted(passed),
         "missing": sorted(EXPECTED - passed),
         "raw": [str(out.relative_to(ROOT)), str(err.relative_to(ROOT))],
     }
@@ -106,22 +141,36 @@ def live(go, evidence, fixture_result):
     if not browser_act or not Path(browser_act).is_file() or not browser_id:
         return {"status": "BLOCKED", "reason": "authorized BrowserAct tool/browser ID unavailable",
                 "reports": reports, "raw": raw_refs, "commands": commands}
-    for kind in ("GITHUB", "PAPER", "X"):
-        env = os.environ.copy()
-        env.update({"RESEARCHOS_SOURCE_KIND": kind,
-                    "RESEARCHOS_SOURCE_OUTPUT_DIR": str(evidence)})
-        command = [go, "run", "./tests/sources/live"]
-        code, out, err = run_process(command, evidence, kind.lower(), env=env, timeout=180)
-        commands[kind] = {"argv": command, "exit_code": code}
-        raw_refs.extend([str(out.relative_to(ROOT)), str(err.relative_to(ROOT))])
-        report_path = evidence / ("report-" + kind + ".json")
-        if report_path.is_file():
-            report = json.loads(report_path.read_text(encoding="utf-8"))
-            reports[kind] = report
-            raw_refs.append(str(report_path.relative_to(ROOT)))
-        if code != 0 or kind not in reports or reports[kind].get("status") != "PASS":
-            return {"status": "FAIL", "reason": kind + " live product capture failed",
-                    "reports": reports, "raw": raw_refs, "commands": commands}
+    binary = evidence / ("w07-live.exe" if os.name == "nt" else "w07-live")
+    build_command = [go, "build", "-o", str(binary), "./tests/sources/live"]
+    code, out, err, timed_out = run_process(build_command, evidence, "build", timeout=180)
+    commands["BUILD"] = {"argv": build_command, "exit_code": code, "timed_out": timed_out}
+    raw_refs.extend([str(out.relative_to(ROOT)), str(err.relative_to(ROOT))])
+    if code != 0 or not binary.is_file():
+        binary.unlink(missing_ok=True)
+        return {"status": "FAIL", "reason": "live probe binary build failed",
+                "reports": reports, "raw": raw_refs, "commands": commands}
+    binary_hash = sha256(binary)
+    try:
+        for kind in ("GITHUB", "PAPER", "X"):
+            env = os.environ.copy()
+            env.update({"RESEARCHOS_SOURCE_KIND": kind,
+                        "RESEARCHOS_SOURCE_OUTPUT_DIR": str(evidence)})
+            command = [str(binary)]
+            code, out, err, timed_out = run_process(command, evidence, kind.lower(), env=env, timeout=180)
+            commands[kind] = {"argv": command, "exit_code": code, "timed_out": timed_out}
+            raw_refs.extend([str(out.relative_to(ROOT)), str(err.relative_to(ROOT))])
+            report_path = evidence / ("report-" + kind + ".json")
+            if report_path.is_file():
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                reports[kind] = report
+                raw_refs.append(str(report_path.relative_to(ROOT)))
+            if code != 0 or kind not in reports or reports[kind].get("status") != "PASS":
+                return {"status": "FAIL", "reason": kind + " live product capture failed",
+                        "reports": reports, "raw": raw_refs, "commands": commands,
+                        "live_binary_sha256": binary_hash}
+    finally:
+        binary.unlink(missing_ok=True)
     required = ("url", "author", "published_at", "retrieved_at", "upstream_revision",
                 "body_sha256", "artifact_ref", "evidence_id")
     real_items = all(
@@ -132,7 +181,12 @@ def live(go, evidence, fixture_result):
         all(item.get(field) for field in required for item in r["items"])
         for r in reports.values()
     )
-    x_public, x_unverified = x_public_only(reports["X"])
+    try:
+        x_public, x_unverified = x_public_only(reports["X"])
+    except (OSError, sqlite3.Error, ValueError, KeyError) as exc:
+        return {"status": "FAIL", "reason": "sealed X receipt inspection failed: " + str(exc),
+                "reports": reports, "raw": raw_refs, "commands": commands,
+                "live_binary_sha256": binary_hash}
     faults = fixture_result["exit_code"] == 0 and not fixture_result["missing"]
     assertions = {
         "A05-01": bool(real_items),
@@ -148,7 +202,7 @@ def live(go, evidence, fixture_result):
         r["items"] = r["items"][:1]
     return {"status": "PASS" if all(assertions.values()) else "FAIL",
             "assertions": assertions, "reports": reports, "raw": raw_refs,
-            "commands": commands,
+            "commands": commands, "live_binary_sha256": binary_hash,
             "x_primary_context_url": reports["GITHUB"]["items"][0]["url"],
             "x_claim_confirmed_by_primary": False, "x_adoption_authority": False}
 

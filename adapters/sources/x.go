@@ -63,7 +63,11 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 		p.Failure = "UNAVAILABLE"
 		return p, e
 	}
-	defer a.Runner.Run(context.Background(), "session", "close", session)
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = a.Runner.Run(cleanup, "session", "close", session)
+	}()
 	// The browser-open acknowledgement can precede X's client-rendered results.
 	_, _ = a.Runner.Run(ctx, "--session", session, "wait", "stable", "--timeout", "15000")
 	search, raw, e := a.eval(ctx, session, xSearchScript)
@@ -93,8 +97,8 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 	p.RawResponse, p.RawMediaType = raw, "application/json"
 	if len(search.Items) == 0 {
 		if search.Empty {
-			// A visible empty UI state is not exhaustive search coverage.
-			p.Failure = "VISIBLE_EMPTY_UNVERIFIED"
+			// A visible empty result is a valid observation, never exhaustive coverage.
+			p.VisibleEmpty = true
 		} else {
 			p.Failure = "UNAVAILABLE"
 		}

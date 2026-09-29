@@ -44,6 +44,7 @@ type Page struct {
 	ObservedFrom  *time.Time
 	ObservedTo    *time.Time
 	Complete      bool
+	VisibleEmpty  bool // provider UI explicitly rendered an empty result, not full-window coverage
 	Failure       string
 	RetryAfter    *time.Time
 	HTTPStatus    int
