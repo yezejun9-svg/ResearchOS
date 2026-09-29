@@ -17,8 +17,12 @@ func (a sourceFixtureAdapter) Fetch(_ context.Context, q sources.Query) (sources
 	return p, nil
 }
 
-type neverFetchSource struct {calls int}
-func (a *neverFetchSource) Fetch(context.Context,sources.Query)(sources.Page,error) {a.calls++; return sources.Page{},nil}
+type neverFetchSource struct{ calls int }
+
+func (a *neverFetchSource) Fetch(context.Context, sources.Query) (sources.Page, error) {
+	a.calls++
+	return sources.Page{}, nil
+}
 
 func sourceProject(t *testing.T) (*fixture, Object, Object) {
 	t.Helper()
@@ -246,33 +250,117 @@ func countKind(t *testing.T, db *sql.DB, kind string) int {
 }
 
 func TestW07RetryAfterPreventsPrematureSourceRequest(t *testing.T) {
-	f,_,cursor:=sourceProject(t)
-	actor:=Principal{ID:"fixture-source-retry",Roles:[]string{"SOURCE_ADAPTER"},Grants:[]Grant{{ProjectID:f.project}}}
-	if e:=f.s.ProvisionPrincipal(context.Background(),actor); e!=nil {t.Fatal(e)}
-	token,e:=f.s.IssueCredential(context.Background(),actor.ID,time.Minute); if e!=nil {t.Fatal(e)}
-	from:=time.Now().UTC().Add(-time.Hour); to:=time.Now().UTC().Add(-time.Minute)
-	retry:=time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano)
-	body:=Object{"opaque_cursor":nil,"covered_until":nil,"last_success_at":nil,"retry_after":retry,"pending_window_from":from.Format(time.RFC3339Nano),"pending_window_to":to.Format(time.RFC3339Nano),"last_cycle_id":nil}
-	f.token=token
-	updated:=f.expect(200,"PUT",f.path("/source-cursors/"+Str(cursor,"id")),ID(),testTag(cursor),body)
-	config,current,e:=f.s.sourceConfig(context.Background(),token,f.project,Str(cursor,"id")); if e!=nil {t.Fatal(e)}
-	adapter:=&neverFetchSource{}
-	result,e:=f.s.captureSourcePage(context.Background(),token,f.project,current,config,from,to,1,adapter)
-	if e!=nil || result.Page.Failure!="RATE_LIMITED" || result.Page.RetryAfter==nil || adapter.calls!=0 || updated["covered_until"]!=nil {t.Fatalf("retry guard failed: %+v %v calls=%d",result,e,adapter.calls)}
-	var n int; if e=f.db.QueryRow("SELECT count(*) FROM source_pages WHERE project=?",f.project).Scan(&n); e!=nil || n!=0 {t.Fatal("failed source page persisted",n,e)}
+	f, _, cursor := sourceProject(t)
+	actor := Principal{ID: "fixture-source-retry", Roles: []string{"SOURCE_ADAPTER"}, Grants: []Grant{{ProjectID: f.project}}}
+	if e := f.s.ProvisionPrincipal(context.Background(), actor); e != nil {
+		t.Fatal(e)
+	}
+	token, e := f.s.IssueCredential(context.Background(), actor.ID, time.Minute)
+	if e != nil {
+		t.Fatal(e)
+	}
+	from := time.Now().UTC().Add(-time.Hour)
+	to := time.Now().UTC().Add(-time.Minute)
+	retry := time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano)
+	body := Object{"opaque_cursor": nil, "covered_until": nil, "last_success_at": nil, "retry_after": retry, "pending_window_from": from.Format(time.RFC3339Nano), "pending_window_to": to.Format(time.RFC3339Nano), "last_cycle_id": nil}
+	f.token = token
+	updated := f.expect(200, "PUT", f.path("/source-cursors/"+Str(cursor, "id")), ID(), testTag(cursor), body)
+	config, current, e := f.s.sourceConfig(context.Background(), token, f.project, Str(cursor, "id"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	adapter := &neverFetchSource{}
+	result, e := f.s.captureSourcePage(context.Background(), token, f.project, current, config, from, to, 1, adapter)
+	if e != nil || result.Page.Failure != "RATE_LIMITED" || result.Page.RetryAfter == nil || adapter.calls != 0 || updated["covered_until"] != nil {
+		t.Fatalf("retry guard failed: %+v %v calls=%d", result, e, adapter.calls)
+	}
+	var n int
+	if e = f.db.QueryRow("SELECT count(*) FROM source_pages WHERE project=?", f.project).Scan(&n); e != nil || n != 0 {
+		t.Fatal("failed source page persisted", n, e)
+	}
 }
 
 func TestW07MissingAuthorizedXChannelDoesNotFetch(t *testing.T) {
-	f:=setup(t)
-	sourceID:=ID()
-	b:=projectBody(); b["source_configs"]=[]any{Object{"source_id":sourceID,"kind":"X","required":true,"enabled":true,"query":"paperclip agents","allowed_origins":[]any{"https://x.com"},"credential_ref":nil}}
-	p:=f.expect(201,"POST","/v1/projects",ID(),"",b); f.project=Str(p,"project_id")
-	actor:=Principal{ID:"fixture-x-source",Roles:[]string{"SOURCE_ADAPTER"},Grants:[]Grant{{ProjectID:f.project}}}
-	if e:=f.s.ProvisionPrincipal(context.Background(),actor); e!=nil {t.Fatal(e)}
-	token,e:=f.s.IssueCredential(context.Background(),actor.ID,time.Minute); if e!=nil {t.Fatal(e)}
-	var cursorID string; e=f.db.QueryRow("SELECT id FROM domain_objects WHERE project=? AND kind='SourceCursor'",f.project).Scan(&cursorID); if e!=nil {t.Fatal(e)}
-	from:=time.Now().UTC().Add(-time.Hour); to:=time.Now().UTC().Add(-time.Minute)
-	_,e=f.s.CaptureSourcePage(context.Background(),token,f.project,cursorID,from,to,1,"","")
-	if fault,ok:=e.(*Fault); !ok || fault.Status!=503 {t.Fatalf("missing authorized browser not classified: %v",e)}
-	if n:=countKind(t,f.db,"Evidence"); n!=0 {t.Fatal("missing X channel left evidence",n)}
+	f := setup(t)
+	sourceID := ID()
+	b := projectBody()
+	b["source_configs"] = []any{Object{"source_id": sourceID, "kind": "X", "required": true, "enabled": true, "query": "paperclip agents", "allowed_origins": []any{"https://x.com"}, "credential_ref": nil}}
+	p := f.expect(201, "POST", "/v1/projects", ID(), "", b)
+	f.project = Str(p, "project_id")
+	actor := Principal{ID: "fixture-x-source", Roles: []string{"SOURCE_ADAPTER"}, Grants: []Grant{{ProjectID: f.project}}}
+	if e := f.s.ProvisionPrincipal(context.Background(), actor); e != nil {
+		t.Fatal(e)
+	}
+	token, e := f.s.IssueCredential(context.Background(), actor.ID, time.Minute)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var cursorID string
+	e = f.db.QueryRow("SELECT id FROM domain_objects WHERE project=? AND kind='SourceCursor'", f.project).Scan(&cursorID)
+	if e != nil {
+		t.Fatal(e)
+	}
+	from := time.Now().UTC().Add(-time.Hour)
+	to := time.Now().UTC().Add(-time.Minute)
+	_, e = f.s.CaptureSourcePage(context.Background(), token, f.project, cursorID, from, to, 1, "", "")
+	if fault, ok := e.(*Fault); !ok || fault.Status != 503 {
+		t.Fatalf("missing authorized browser not classified: %v", e)
+	}
+	if n := countKind(t, f.db, "Evidence"); n != 0 {
+		t.Fatal("missing X channel left evidence", n)
+	}
+}
+
+func TestW07XVisibleEmptySealsObservationWithoutCoverage(t *testing.T) {
+	f := setup(t)
+	sourceID := ID()
+	b := projectBody()
+	b["source_configs"] = []any{Object{"source_id": sourceID, "kind": "X", "required": true, "enabled": true, "query": "paperclip agents", "allowed_origins": []any{"https://x.com"}, "credential_ref": nil}}
+	p := f.expect(201, "POST", "/v1/projects", ID(), "", b)
+	f.project = Str(p, "project_id")
+	actor := Principal{ID: "fixture-x-empty", Roles: []string{"SOURCE_ADAPTER"}, Grants: []Grant{{ProjectID: f.project}}}
+	if e := f.s.ProvisionPrincipal(context.Background(), actor); e != nil {
+		t.Fatal(e)
+	}
+	token, e := f.s.IssueCredential(context.Background(), actor.ID, time.Minute)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var cursorID string
+	if e = f.db.QueryRow("SELECT id FROM domain_objects WHERE project=? AND kind='SourceCursor'", f.project).Scan(&cursorID); e != nil {
+		t.Fatal(e)
+	}
+	config, cursor, e := f.s.sourceConfig(context.Background(), token, f.project, cursorID)
+	if e != nil {
+		t.Fatal(e)
+	}
+	from := time.Now().UTC().Add(-time.Hour)
+	to := time.Now().UTC().Add(-time.Minute)
+	searchURL := "https://x.com/search?q=paperclip"
+	raw := []byte(`{"url":"https://x.com/search?q=paperclip","items":[],"empty":true}`)
+	page := sources.Page{RawResponse: raw, RawMediaType: "application/json", VisibleEmpty: true, Complete: false, FetchedAt: time.Now().UTC(), RequestURLs: []string{searchURL}, FinalURLs: []string{searchURL}}
+	beforeEvents := countKind(t, f.db, "EventEnvelope")
+	got, e := f.s.captureSourcePage(context.Background(), token, f.project, cursor, config, from, to, 1, sourceFixtureAdapter{page})
+	if e != nil || got.Manifest == nil || got.RawArtifact == nil || len(got.Evidence) != 0 {
+		t.Fatalf("valid empty observation rejected: %+v %v", got, e)
+	}
+	if countKind(t, f.db, "EventEnvelope") != beforeEvents+1 {
+		t.Fatal("empty observation event missing")
+	}
+	var pages int
+	if e = f.db.QueryRow("SELECT count(*) FROM source_pages WHERE project=?", f.project).Scan(&pages); e != nil || pages != 0 {
+		t.Fatal("visible empty wrongly completed window", pages, e)
+	}
+	updated := f.expect(200, "GET", f.path("/source-cursors/"+cursorID), "", "", nil)
+	if updated["covered_until"] != nil {
+		t.Fatal("visible empty advanced coverage")
+	}
+	bad := page
+	bad.RawResponse = []byte(`{"url":"https://x.com/search?q=paperclip","items":[],"empty":false}`)
+	if _, e = f.s.captureSourcePage(context.Background(), token, f.project, cursor, config, from, to, 1, sourceFixtureAdapter{bad}); e == nil {
+		t.Fatal("unrendered empty accepted")
+	}
+	if countKind(t, f.db, "EventEnvelope") != beforeEvents+1 {
+		t.Fatal("failed empty wrote event")
+	}
 }

@@ -9,8 +9,9 @@ import (
 )
 
 type fakeXRunner struct {
-	calls     [][]string
-	truncated bool
+	calls      [][]string
+	truncated  bool
+	searchMode string
 }
 
 func (f *fakeXRunner) Run(_ context.Context, args ...string) ([]byte, error) {
@@ -26,9 +27,29 @@ func (f *fakeXRunner) Run(_ context.Context, args ...string) ([]byte, error) {
 				searchURL = call[len(call)-1]
 			}
 		}
+		if f.searchMode == "empty" {
+			return []byte(fmt.Sprintf(`{"url":%q,"items":[],"empty":true}`, searchURL)), nil
+		}
+		if f.searchMode == "unrendered" {
+			return []byte(fmt.Sprintf(`{"url":%q,"items":[],"empty":false}`, searchURL)), nil
+		}
 		return []byte(fmt.Sprintf(`{"url":%q,"items":[{"url":"https://x.com/public_author/status/2105011808327401690","published_at":"2026-09-29T19:08:18.000Z","text":"search snippet","author":"/public_author"}]}`, searchURL)), nil
 	}
 	return []byte(fmt.Sprintf(`{"url":"https://x.com/public_author/status/2105011808327401690","items":[{"url":"https://x.com/public_author/status/2105011808327401690","published_at":"2026-09-29T19:08:18.000Z","text":"Complete public post body","author":"/public_author","truncated":%v}]}`, f.truncated)), nil
+}
+
+func TestW07XVisibleEmptyDiffersFromUnrendered(t *testing.T) {
+	from, _ := time.Parse(time.RFC3339, "2026-09-29T00:00:00Z")
+	to, _ := time.Parse(time.RFC3339, "2026-09-30T00:00:00Z")
+	q := Query{SourceID: "x", Text: "paperclip agents", From: from, To: to, Limit: 1}
+	empty, e := (XBrowser{Runner: &fakeXRunner{searchMode: "empty"}, BrowserID: "existing-authorized-browser"}).Fetch(context.Background(), q)
+	if e != nil || empty.Failure != "" || !empty.VisibleEmpty || empty.Complete || len(empty.Items) != 0 || len(empty.RawResponse) == 0 {
+		t.Fatalf("valid visible empty misclassified: %+v %v", empty, e)
+	}
+	unrendered, e := (XBrowser{Runner: &fakeXRunner{searchMode: "unrendered"}, BrowserID: "existing-authorized-browser"}).Fetch(context.Background(), q)
+	if e != nil || unrendered.Failure != "UNAVAILABLE" || unrendered.VisibleEmpty || unrendered.Complete {
+		t.Fatalf("unrendered page misclassified: %+v %v", unrendered, e)
+	}
 }
 
 func TestW07XExpandedBodyRequired(t *testing.T) {
