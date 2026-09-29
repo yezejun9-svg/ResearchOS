@@ -280,7 +280,11 @@ func (s *Service) CaptureSourcePage(ctx context.Context, token, project, cursorI
 	}
 	switch config["kind"] {
 	case "GITHUB":
-		adapter = sources.GitHubReleases{AllowedOrigins: allowed}
+		if strings.HasPrefix(Str(config, "query"), "readme:") {
+			adapter = sources.GitHubReadme{AllowedOrigins: allowed}
+		} else {
+			adapter = sources.GitHubReleases{AllowedOrigins: allowed}
+		}
 	case "PAPER":
 		adapter = &sources.Arxiv{AllowedOrigins: allowed}
 	case "X":
@@ -344,6 +348,17 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 	page, e := adapter.Fetch(ctx, q)
 	result.Page = page
 	if e != nil || page.Failure != "" {
+		if e == nil && page.Failure == "RATE_LIMITED" {
+			wait := page.RetryAfter
+			if wait == nil || !wait.After(time.Now()) {
+				fallback := time.Now().UTC().Add(time.Minute)
+				wait = &fallback
+				result.Page.RetryAfter = wait
+			}
+			if err := s.persistSourceRetry(ctx, token, project, cursor, config, *wait); err != nil {
+				return result, err
+			}
+		}
 		return result, e
 	}
 	if !page.Complete && page.NextCursor == "" && len(page.Items) == 0 && !page.VisibleEmpty {
@@ -496,6 +511,54 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 		return SourceCapture{}, e
 	}
 	return result, tx.Commit()
+}
+
+// persistSourceRetry records provider backoff without changing page position or
+// coverage. It rechecks the credential, source configuration and cursor after
+// the network request, so a stale or revoked fetch cannot alter project state.
+func (s *Service) persistSourceRetry(ctx context.Context, token, project string, cursor, config Object, wait time.Time) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	p, err := authenticate(tx, token)
+	if err != nil {
+		return err
+	}
+	if !p.HasRole("SOURCE_ADAPTER") || !p.Allowed(project, "", "", false) {
+		return Fail(403, "FORBIDDEN", "source adapter project grant required")
+	}
+	current, err := load(tx, project, "SourceCursor", Str(cursor, "id"))
+	if err != nil {
+		return err
+	}
+	if current["revision"] != cursor["revision"] || current["opaque_cursor"] != cursor["opaque_cursor"] || current["covered_until"] != cursor["covered_until"] || current["source_id"] != config["source_id"] || current["query_hash"] != Hash(config["query"]) {
+		return Fail(409, "STATE_CONFLICT", "source cursor changed during fetch")
+	}
+	profile, err := singleton(tx, project, "ProjectProfile")
+	if err != nil {
+		return err
+	}
+	enabled := false
+	for _, v := range Arr(profile, "source_configs") {
+		c := v.(map[string]any)
+		if c["source_id"] == config["source_id"] && c["enabled"] == true && Hash(c) == Hash(config) {
+			enabled = true
+		}
+	}
+	if !enabled {
+		return Fail(409, "STATE_CONFLICT", "source configuration changed during fetch")
+	}
+	b := Object{"opaque_cursor": current["opaque_cursor"], "covered_until": current["covered_until"], "last_success_at": current["last_success_at"], "retry_after": wait.UTC().Format(time.RFC3339Nano), "pending_window_from": current["pending_window_from"], "pending_window_to": current["pending_window_to"], "last_cycle_id": current["last_cycle_id"]}
+	updated, err := s.advanceSourceCursor(tx, project, Str(current, "id"), b)
+	if err != nil {
+		return err
+	}
+	if err = s.event(tx, project, "SourceCursor", updated, p.ID, ID(), "PROJECT_UPDATED"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Service) sealSourceBytes(tx *sql.Tx, p Principal, project string, cursor Object, body []byte, media string, raw Object) (Object, error) {
