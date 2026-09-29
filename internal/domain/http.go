@@ -125,9 +125,35 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		s.writeError(w, cid, Fail(403, "FORBIDDEN", "restricted reference unavailable"))
 		return
 	}
-	write := op.Method != "GET"
+	search := op.ID == "searchEvidence"
+	write := op.Method != "GET" && !search
 	key := r.Header.Get("Idempotency-Key")
 	var requestHash string
+	searchSeen := false
+	if search {
+		values, present := r.Header[http.CanonicalHeaderKey("Idempotency-Key")]
+		if !present {
+			s.writeError(w, cid, Fail(428, "PRECONDITION_REQUIRED", "Idempotency-Key required"))
+			return
+		}
+		if len(values) != 1 || s.Contracts.Validate("Idempotency-Key", key) != nil {
+			s.writeError(w, cid, Fail(400, "INVALID_REQUEST", "Idempotency-Key violates header schema"))
+			return
+		}
+		requestHash = Hash([]any{op.ID, r.URL.EscapedPath(), r.URL.Query().Encode(), b})
+		var oldHash string
+		e = tx.QueryRow("SELECT request_hash FROM retrieval_dedupe WHERE principal=? AND project=? AND key=?", p.ID, project, key).Scan(&oldHash)
+		if e == nil {
+			searchSeen = true
+			if oldHash != requestHash {
+				s.writeError(w, cid, Fail(409, "IDEMPOTENCY_CONFLICT", "key already used with different request"))
+				return
+			}
+		} else if !errors.Is(e, sql.ErrNoRows) {
+			s.writeError(w, cid, e)
+			return
+		}
+	}
 	if write {
 		values, present := r.Header[http.CanonicalHeaderKey("Idempotency-Key")]
 		if !present {
@@ -217,6 +243,8 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		result, e = s.createEvidence(tx, project, b)
 		kind = "Evidence"
 		status = 201
+	case "searchEvidence":
+		result, e = s.searchEvidence(tx, p, project, b)
 	case "advanceSourceCursor":
 		result, e = s.advanceSourceCursor(tx, project, id, b)
 		kind = "SourceCursor"
@@ -357,6 +385,12 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		headers["ETag"] = tag
 	}
 	response := Bytes(result)
+	if search && !searchSeen {
+		if _, e = tx.Exec("INSERT INTO retrieval_dedupe(principal,project,key,request_hash) VALUES(?,?,?,?)", p.ID, project, key, requestHash); e != nil {
+			s.writeError(w, cid, e)
+			return
+		}
+	}
 	if write {
 		if _, e = tx.Exec("INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,?,?,?,?,?,?,?)", p.ID, project, op.ID, key, requestHash, status, response, string(Bytes(headers)), Now()); e != nil {
 			s.writeError(w, cid, e)

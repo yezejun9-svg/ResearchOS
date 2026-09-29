@@ -30,6 +30,9 @@ func (s *Service) authorizedContext(tx *sql.Tx, token, project, taskID string) (
 	if !s.visible(tx, p, project, bundle) {
 		return p, nil, Fail(403, "FORBIDDEN", "context visibility changed")
 	}
+	if e = s.validateBundleSnapshots(tx, p, project, bundle); e != nil {
+		return p, nil, e
+	}
 	if bundle["receipt_hash"] != Receipt(bundle) || bundle["summary_hash"] != Digest([]byte(Str(bundle, "summary"))) {
 		return p, nil, Fail(422, "CONTENT_HASH_MISMATCH", "context integrity failed")
 	}
