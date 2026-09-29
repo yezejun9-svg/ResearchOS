@@ -329,6 +329,11 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 	if from.IsZero() || !from.Before(to) || to.After(time.Now().Add(time.Minute)) || limit < 1 || limit > 100 {
 		return result, Fail(400, "INVALID_REQUEST", "invalid bounded source window")
 	}
+	if raw:=Str(cursor,"retry_after"); raw!="" {
+		wait,e:=time.Parse(time.RFC3339Nano,raw)
+		if e!=nil {return result,Fail(409,"STATE_CONFLICT","invalid persisted source retry time")}
+		if time.Now().Before(wait) {result.Page=sources.Page{RequestedFrom:from.UTC(),RequestedTo:to.UTC(),Failure:"RATE_LIMITED",RetryAfter:&wait}; return result,nil}
+	}
 	pageCursor := Str(cursor, "opaque_cursor")
 	q := sources.Query{SourceID: Str(config, "source_id"), Text: Str(config, "query"), From: from.UTC(), To: to.UTC(), Cursor: pageCursor, Limit: limit}
 	page, e := adapter.Fetch(ctx, q)
@@ -341,6 +346,25 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 	}
 	if len(page.RawResponse) == 0 || page.RawMediaType == "" {
 		return result, Fail(422, "GATE_FAILED", "raw provider page missing")
+	}
+	if page.FetchedAt.IsZero() || len(page.RequestURLs) == 0 || len(page.FinalURLs) == 0 {
+		return result, Fail(422, "GATE_FAILED", "actual request and final URL trace required")
+	}
+	for _, rawURL := range append(append([]string{}, page.RequestURLs...), page.FinalURLs...) {
+		u, e := url.Parse(rawURL)
+		if e != nil || u.Scheme != "https" || u.User != nil || u.Host == "" {
+			return result, Fail(422, "GATE_FAILED", "source request URL is not public HTTPS")
+		}
+		allowed := false
+		for _, v := range Arr(config, "allowed_origins") {
+			origin, e := url.Parse(v.(string))
+			if e == nil && strings.EqualFold(origin.Scheme+"://"+origin.Host, u.Scheme+"://"+u.Host) {
+				allowed = true
+			}
+		}
+		if !allowed {
+			return result, Fail(422, "GATE_FAILED", "source request escaped configured origin")
+		}
 	}
 	if !page.RequestedFrom.Equal(q.From) || !page.RequestedTo.Equal(q.To) {
 		return result, Fail(422, "GATE_FAILED", "provider window mismatch")
@@ -432,7 +456,14 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 	for _, ev := range result.Evidence {
 		manifestRefs = append(manifestRefs, Ref(ev, "Evidence"))
 	}
-	manifestBytes := Bytes(Object{"source_id": config["source_id"], "query_hash": cursor["query_hash"], "window_from": q.From.Format(time.RFC3339Nano), "window_to": q.To.Format(time.RFC3339Nano), "page_cursor_in": pageCursor, "page_cursor_out": page.NextCursor, "complete": page.Complete && config["kind"] != "X", "raw_artifact_ref": Ref(raw, "Artifact"), "evidence_refs": manifestRefs[1:]})
+	var observedFrom, observedTo any
+	if page.ObservedFrom != nil {
+		observedFrom = page.ObservedFrom.UTC().Format(time.RFC3339Nano)
+	}
+	if page.ObservedTo != nil {
+		observedTo = page.ObservedTo.UTC().Format(time.RFC3339Nano)
+	}
+	manifestBytes := Bytes(Object{"source_id": config["source_id"], "query_hash": cursor["query_hash"], "window_from": q.From.Format(time.RFC3339Nano), "window_to": q.To.Format(time.RFC3339Nano), "observed_from": observedFrom, "observed_to": observedTo, "fetched_at": page.FetchedAt.UTC().Format(time.RFC3339Nano), "request_urls": page.RequestURLs, "final_urls": page.FinalURLs, "page_cursor_in": pageCursor, "page_cursor_out": page.NextCursor, "complete": page.Complete && config["kind"] != "X", "raw_artifact_ref": Ref(raw, "Artifact"), "evidence_refs": manifestRefs[1:]})
 	u, e := s.upload(tx, p, project, manifestBytes)
 	if e != nil {
 		return SourceCapture{}, e

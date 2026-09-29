@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-type fakeXRunner struct{ calls [][]string }
+type fakeXRunner struct {
+	calls     [][]string
+	truncated bool
+}
 
 func (f *fakeXRunner) Run(_ context.Context, args ...string) ([]byte, error) {
 	f.calls = append(f.calls, append([]string(nil), args...))
@@ -25,7 +28,16 @@ func (f *fakeXRunner) Run(_ context.Context, args ...string) ([]byte, error) {
 		}
 		return []byte(fmt.Sprintf(`{"url":%q,"items":[{"url":"https://x.com/public_author/status/2105011808327401690","published_at":"2026-09-29T19:08:18.000Z","text":"search snippet","author":"/public_author"}]}`, searchURL)), nil
 	}
-	return []byte(`{"url":"https://x.com/public_author/status/2105011808327401690","items":[{"url":"https://x.com/public_author/status/2105011808327401690","published_at":"2026-09-29T19:08:18.000Z","text":"Complete public post body","author":"/public_author"}]}`), nil
+	return []byte(fmt.Sprintf(`{"url":"https://x.com/public_author/status/2105011808327401690","items":[{"url":"https://x.com/public_author/status/2105011808327401690","published_at":"2026-09-29T19:08:18.000Z","text":"Complete public post body","author":"/public_author","truncated":%v}]}`, f.truncated)), nil
+}
+
+func TestW07XExpandedBodyRequired(t *testing.T) {
+	from, _ := time.Parse(time.RFC3339, "2026-09-29T00:00:00Z")
+	to, _ := time.Parse(time.RFC3339, "2026-09-30T00:00:00Z")
+	p, e := (XBrowser{Runner: &fakeXRunner{truncated: true}, BrowserID: "existing-authorized-browser"}).Fetch(context.Background(), Query{SourceID: "x", Text: "paperclip agents", From: from, To: to, Limit: 1})
+	if e != nil || p.Failure != "INCOMPLETE_ITEM" || p.Complete {
+		t.Fatalf("collapsed post promoted: %+v %v", p, e)
+	}
 }
 
 func TestW07XOnlyPublicPostAndNoFalseComplete(t *testing.T) {

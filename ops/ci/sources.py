@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""W07 fixture and real public-source construction probes; no acceptance self-signing."""
+import hashlib
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+EXPECTED = {
+    "TestW07GitHubReleaseBodyAndCommit",
+    "TestW07GitHubRateLimitAndUnsafeQuery",
+    "TestW07GitHubFaultsDoNotCompleteWindow",
+    "TestW07GitHubRejectsForeignRedirectBeforeRequest",
+    "TestW07GitHubEmptyAuthAndTimeoutAreDistinct",
+    "TestW07ArxivFullPDFAndVersion",
+    "TestW07ArxivMetadataCannotPassForFullText",
+    "TestW07ArxivChunkedPDFPrefixCannotPass",
+    "TestW07ArxivRejectsForeignRedirectBeforeRequest",
+    "TestW07XOnlyPublicPostAndNoFalseComplete",
+    "TestW07XExpandedBodyRequired",
+    "TestW07EvidenceNeedsSealedLiveSnapshotAndAllowedOrigin",
+    "TestW07CursorDoesNotAdvanceFailedOrUnpersistedWindow",
+    "TestW07HTTPSourceEvidenceAndDurableEmptyWindow",
+    "TestW07RetryAfterPreventsPrematureSourceRequest",
+    "TestW07MissingAuthorizedXChannelDoesNotFetch",
+}
+SOURCE_FILES = [
+    "adapters/sources/sources.go", "adapters/sources/github.go",
+    "adapters/sources/arxiv.go", "adapters/sources/x.go",
+    "internal/domain/sources.go", "tests/sources/live/main.go",
+]
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def run_process(command, evidence, stem, *, env=None, timeout=180):
+    result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, timeout=timeout)
+    stdout, stderr = evidence / (stem + ".stdout"), evidence / (stem + ".stderr")
+    stdout.write_bytes(result.stdout)
+    stderr.write_bytes(result.stderr)
+    return result.returncode, stdout, stderr
+
+
+def fixture(go, evidence):
+    command = [go, "test", "-count=1", "-json", "-run", "^TestW07", "./adapters/sources", "./internal/domain"]
+    code, out, err = run_process(command, evidence, "fixture")
+    passed = set()
+    for line in out.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("Action") == "pass" and event.get("Test") in EXPECTED:
+            passed.add(event["Test"])
+    return {
+        "command": command, "exit_code": code, "passed": sorted(passed),
+        "missing": sorted(EXPECTED - passed),
+        "raw": [str(out.relative_to(ROOT)), str(err.relative_to(ROOT))],
+    }
+
+
+def x_public_only(report):
+    db = sqlite3.connect(ROOT / report["db_path"])
+    try:
+        artifact_id = report["raw_page"]["artifact_id"]
+        raw = db.execute(
+            "SELECT u.bytes FROM domain_objects d JOIN uploaded_content u "
+            "ON u.storage_key=json_extract(d.body,'$.storage_key') "
+            "WHERE d.kind='Artifact' AND d.id=?", (artifact_id,)
+        ).fetchone()
+        if not raw:
+            return False, False
+        page = json.loads(raw[0])
+        public_keys = set(page) <= {"url", "items", "empty"} and all(
+            set(item) <= {"url", "published_at", "text", "author"}
+            for item in page.get("items", [])
+        )
+        item_id = report["items"][0]["evidence_id"]
+        evidence = db.execute("SELECT body FROM domain_objects WHERE kind='Evidence' AND id=?", (item_id,)).fetchone()
+        if not evidence:
+            return public_keys, False
+        evidence = json.loads(evidence[0])
+        unverified = (evidence.get("stance") == "CONTEXT" and
+                      evidence.get("verification_status") == "UNVERIFIED" and
+                      evidence.get("origin_evidence_id") is None)
+        return public_keys, unverified
+    finally:
+        db.close()
+
+
+def live(go, evidence, fixture_result):
+    reports, raw_refs, commands = {}, [], {}
+    browser_act = os.getenv("RESEARCHOS_BROWSER_ACT", "")
+    browser_id = os.getenv("RESEARCHOS_BROWSER_ID", "")
+    if not browser_act or not Path(browser_act).is_file() or not browser_id:
+        return {"status": "BLOCKED", "reason": "authorized BrowserAct tool/browser ID unavailable",
+                "reports": reports, "raw": raw_refs, "commands": commands}
+    for kind in ("GITHUB", "PAPER", "X"):
+        env = os.environ.copy()
+        env.update({"RESEARCHOS_SOURCE_KIND": kind,
+                    "RESEARCHOS_SOURCE_OUTPUT_DIR": str(evidence)})
+        command = [go, "run", "./tests/sources/live"]
+        code, out, err = run_process(command, evidence, kind.lower(), env=env, timeout=180)
+        commands[kind] = {"argv": command, "exit_code": code}
+        raw_refs.extend([str(out.relative_to(ROOT)), str(err.relative_to(ROOT))])
+        report_path = evidence / ("report-" + kind + ".json")
+        if report_path.is_file():
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            reports[kind] = report
+            raw_refs.append(str(report_path.relative_to(ROOT)))
+        if code != 0 or kind not in reports or reports[kind].get("status") != "PASS":
+            return {"status": "FAIL", "reason": kind + " live product capture failed",
+                    "reports": reports, "raw": raw_refs, "commands": commands}
+    required = ("url", "author", "published_at", "retrieved_at", "upstream_revision",
+                "body_sha256", "artifact_ref", "evidence_id")
+    real_items = all(
+        r.get("scope") == "LIVE_SERVICE" and r.get("cursor_id") and
+        r.get("window_from") and r.get("window_to") and r.get("fetched_at") and
+        r.get("request_urls") and r.get("final_urls") and r.get("manifest") and
+        r.get("raw_page") and r.get("items") and
+        all(item.get(field) for field in required for item in r["items"])
+        for r in reports.values()
+    )
+    x_public, x_unverified = x_public_only(reports["X"])
+    faults = fixture_result["exit_code"] == 0 and not fixture_result["missing"]
+    assertions = {
+        "A05-01": bool(real_items),
+        "A05-02": bool(x_unverified and reports["GITHUB"]["items"]),
+        "A05-03": bool(faults),
+        "A05-04": bool(x_public and browser_act and browser_id),
+    }
+    for kind, r in reports.items():
+        db_path = ROOT / r["db_path"]
+        r["db_sha256"] = sha256(db_path) if db_path.is_file() else None
+        r["item_count"] = len(r["items"])
+        # Final summary is compact; full public metadata stays in report-KIND.json.
+        r["items"] = r["items"][:1]
+    return {"status": "PASS" if all(assertions.values()) else "FAIL",
+            "assertions": assertions, "reports": reports, "raw": raw_refs,
+            "commands": commands,
+            "x_primary_context_url": reports["GITHUB"]["items"][0]["url"],
+            "x_claim_confirmed_by_primary": False, "x_adoption_authority": False}
+
+
+def main():
+    task, check, case = (os.getenv("RESEARCHOS_TASK_ID", "W07"),
+                         os.getenv("RESEARCHOS_CHECK_ID", ""),
+                         os.getenv("RESEARCHOS_CASE_ID", ""))
+    if task != "W07" or check not in {"W07-G01", "W07-G02", ""} or case not in {"", "A05"}:
+        raise NotImplementedError("unbound W07 selection")
+    if (case == "A05" and check == "W07-G01") or (not check and not case):
+        raise NotImplementedError("ambiguous W07 selection")
+    go = os.getenv("RESEARCHOS_GO") or json.loads(
+        (ROOT / "execution/toolchains/locked.json").read_text(encoding="utf-8")
+    )["tools"]["go"]["path"]
+    if not Path(go).is_file():
+        raise FileNotFoundError("pinned Go executable unavailable")
+    before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.splitlines()
+    evidence = ROOT / "execution/receipts/W07" / ("run-" + uuid.uuid4().hex)
+    evidence.mkdir(parents=True, exist_ok=False)
+    started = datetime.now(timezone.utc).isoformat()
+    fr = fixture(go, evidence)
+    selected_live = check == "W07-G02" or case == "A05"
+    result = live(go, evidence, fr) if selected_live and not fr["missing"] and fr["exit_code"] == 0 else None
+    if selected_live:
+        ids = [k for k, value in (result or {}).get("assertions", {}).items() if value]
+        status = (result or {}).get("status", "FAIL")
+    else:
+        ids = fr["passed"]
+        status = "PASS" if fr["exit_code"] == 0 and not fr["missing"] else "FAIL"
+    report = {
+        "status": status, "scope": "LIVE_SERVICE" if selected_live else "FIXTURE",
+        "task_id": task, "check_id": check or None, "case_id": case or None,
+        "assertions": len(ids), "assertion_ids": sorted(ids), "expected_assertion_ids":
+            ["A05-01", "A05-02", "A05-03", "A05-04"] if selected_live else sorted(EXPECTED),
+        "started_at": started, "ended_at": datetime.now(timezone.utc).isoformat(),
+        "execution_head": before, "dirty_before": dirty,
+        "source_hashes": {name: sha256(ROOT / name) for name in SOURCE_FILES},
+        "browser_act_sha256": sha256(os.getenv("RESEARCHOS_BROWSER_ACT"))
+            if selected_live and os.getenv("RESEARCHOS_BROWSER_ACT") and Path(os.getenv("RESEARCHOS_BROWSER_ACT")).is_file() else None,
+        "fixture": fr, "live": result, "owned_acceptance_ids": ["A05"] if selected_live else [],
+        "formal_product_acceptance": "PENDING_INDEPENDENT_REVIEW" if selected_live else "NOT_RUN",
+        "raw_evidence_references": fr["raw"] + ((result or {}).get("raw", [])),
+    }
+    (evidence / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return report
+
+
+if __name__ == "__main__":
+    try:
+        outcome = main()
+    except Exception as exc:
+        outcome = {"status": "NOT_IMPLEMENTED" if isinstance(exc, NotImplementedError) else "FAIL",
+                   "assertions": 0, "assertion_ids": [], "error": str(exc)}
+    print(json.dumps(outcome, ensure_ascii=False))
+    sys.exit(0 if outcome["status"] == "PASS" and outcome["assertions"] > 0 else 1)
