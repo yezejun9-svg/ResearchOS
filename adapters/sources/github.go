@@ -3,6 +3,7 @@ package sources
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,8 +16,9 @@ import (
 // GitHubReleases reads public releases of one configured repository. It does
 // not claim to search every GitHub repository or all commits in a window.
 type GitHubReleases struct {
-	Client  *http.Client
-	BaseURL string
+	Client         *http.Client
+	BaseURL        string
+	AllowedOrigins []string
 }
 
 type githubRelease struct {
@@ -60,12 +62,21 @@ func (a GitHubReleases) Fetch(ctx context.Context, q Query) (Page, error) {
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "ResearchOS-source-adapter")
-	client := a.Client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
+	allowed := a.AllowedOrigins
+	if len(allowed) == 0 {
+		allowed = []string{"https://api.github.com", "https://github.com"}
+	}
+	client, err := sourceClient(a.Client, allowed, u)
+	if err != nil {
+		p.Failure = "ORIGIN_DENIED"
+		return p, nil
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		if errors.Is(err, ErrSourceOrigin) {
+			p.Failure = "ORIGIN_DENIED"
+			return p, nil
+		}
 		p.Failure = "TIMEOUT_OR_NETWORK"
 		return p, err
 	}
@@ -111,6 +122,10 @@ func (a GitHubReleases) Fetch(ctx context.Context, q Query) (Page, error) {
 		}
 		sha, status, headers, e := a.commitSHA(ctx, client, base, parts[0], parts[1], r.TagName)
 		if e != nil {
+			if errors.Is(e, ErrSourceOrigin) {
+				p.Failure = "ORIGIN_DENIED"
+				return p, nil
+			}
 			if status != 0 {
 				p.HTTPStatus = status
 				p.Failure = classifyHTTP(status, headers)
@@ -137,6 +152,13 @@ func (a GitHubReleases) Fetch(ctx context.Context, q Query) (Page, error) {
 
 func (a GitHubReleases) commitSHA(ctx context.Context, client *http.Client, base, owner, repo, tag string) (string, int, http.Header, error) {
 	u := fmt.Sprintf("%s/repos/%s/%s/commits/%s", strings.TrimRight(base, "/"), url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(tag))
+	allowed := a.AllowedOrigins
+	if len(allowed) == 0 {
+		allowed = []string{"https://api.github.com", "https://github.com"}
+	}
+	if !sourceAllowed(allowed, u) {
+		return "", 0, nil, ErrSourceOrigin
+	}
 	req, e := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if e != nil {
 		return "", 0, nil, e

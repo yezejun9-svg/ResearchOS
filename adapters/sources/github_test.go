@@ -30,7 +30,7 @@ func TestW07GitHubReleaseBodyAndCommit(t *testing.T) {
 	defer server.Close()
 	from, _ := time.Parse(time.RFC3339, "2026-09-28T00:00:00Z")
 	to, _ := time.Parse(time.RFC3339, "2026-09-30T00:00:00Z")
-	a := GitHubReleases{BaseURL: server.URL, Client: server.Client()}
+	a := GitHubReleases{BaseURL: server.URL, Client: server.Client(), AllowedOrigins: []string{server.URL}}
 	p, e := a.Fetch(context.Background(), Query{SourceID: "github-source", Text: "repo:paperclipai/paperclip", From: from, To: to, Limit: 1})
 	if e != nil || p.Failure != "" || len(p.Items) != 1 || p.Complete || p.NextCursor != "2" {
 		t.Fatalf("first page: %+v %v", p, e)
@@ -50,7 +50,7 @@ func TestW07GitHubRateLimitAndUnsafeQuery(t *testing.T) {
 	defer server.Close()
 	from := time.Now().UTC().Add(-time.Hour)
 	to := time.Now().UTC().Add(time.Hour)
-	a := GitHubReleases{BaseURL: server.URL, Client: server.Client()}
+	a := GitHubReleases{BaseURL: server.URL, Client: server.Client(), AllowedOrigins: []string{server.URL}}
 	p, e := a.Fetch(context.Background(), Query{SourceID: "g", Text: "repo:owner/repo", From: from, To: to, Limit: 1})
 	if e != nil || p.Failure != "RATE_LIMITED" || p.RetryAfter == nil || p.Complete || p.NextCursor != "" {
 		t.Fatalf("rate limit: %+v %v", p, e)
@@ -62,5 +62,70 @@ func TestW07GitHubRateLimitAndUnsafeQuery(t *testing.T) {
 	_, e = a.Fetch(context.Background(), Query{SourceID: "g", Text: "repo:" + strings.Repeat("a", 101) + "/repo", From: from, To: to, Limit: 1})
 	if e != ErrInvalidQuery {
 		t.Fatalf("oversized repository accepted: %v", e)
+	}
+}
+
+func TestW07GitHubFaultsDoNotCompleteWindow(t *testing.T) {
+	from, _ := time.Parse(time.RFC3339, "2026-09-28T00:00:00Z")
+	to, _ := time.Parse(time.RFC3339, "2026-09-30T00:00:00Z")
+	const release = `[{"id":22,"html_url":"https://github.com/owner/repo/releases/tag/v2","body":"full body","tag_name":"v2","published_at":"2026-09-29T12:00:00Z","author":{"login":"maintainer"}}]`
+	for _, tc := range []struct {
+		name, body, link string
+		commitStatus     int
+		retry            string
+		failure          string
+	}{
+		{"short_page_with_next", release, `<https://api.github.com/next>; rel="next"`, 200, "", ""},
+		{"missing_author", strings.Replace(release, `"login":"maintainer"`, `"login":""`, 1), "", 200, "", "INCOMPLETE_ITEM"},
+		{"missing_body", strings.Replace(release, `"body":"full body"`, `"body":""`, 1), "", 200, "", "INCOMPLETE_ITEM"},
+		{"detail_rate_limit", release, "", 429, "Wed, 30 Sep 2026 12:00:00 GMT", "RATE_LIMITED"},
+		{"detail_forbidden", release, "", 403, "", "FORBIDDEN"},
+		{"detail_not_found", release, "", 404, "", "NOT_FOUND"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/releases") {
+					if tc.link != "" {
+						w.Header().Set("Link", tc.link)
+					}
+					fmt.Fprint(w, tc.body)
+					return
+				}
+				if tc.retry != "" {
+					w.Header().Set("Retry-After", tc.retry)
+				}
+				w.WriteHeader(tc.commitStatus)
+				if tc.commitStatus == 200 {
+					fmt.Fprint(w, `{"sha":"0123456789abcdef0123456789abcdef01234567"}`)
+				}
+			}))
+			defer server.Close()
+			p, e := (GitHubReleases{BaseURL: server.URL, Client: server.Client(), AllowedOrigins: []string{server.URL}}).Fetch(context.Background(), Query{SourceID: "g", Text: "repo:owner/repo", From: from, To: to, Limit: 20})
+			if e != nil || p.Failure != tc.failure || p.Complete && (tc.link != "" || tc.failure != "") {
+				t.Fatalf("fault promoted: %+v %v", p, e)
+			}
+			if tc.link != "" && p.NextCursor != "2" {
+				t.Fatal("Link next ignored", p.NextCursor)
+			}
+			if tc.retry != "" && p.RetryAfter == nil {
+				t.Fatal("Retry-After HTTP-date lost")
+			}
+		})
+	}
+}
+
+func TestW07GitHubRejectsForeignRedirectBeforeRequest(t *testing.T) {
+	foreignHits := 0
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { foreignHits++; fmt.Fprint(w, `[]`) }))
+	defer foreign.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, foreign.URL+"/elsewhere", http.StatusFound)
+	}))
+	defer server.Close()
+	from, _ := time.Parse(time.RFC3339, "2026-09-28T00:00:00Z")
+	to, _ := time.Parse(time.RFC3339, "2026-09-30T00:00:00Z")
+	p, e := (GitHubReleases{BaseURL: server.URL, Client: server.Client(), AllowedOrigins: []string{server.URL}}).Fetch(context.Background(), Query{SourceID: "g", Text: "repo:owner/repo", From: from, To: to, Limit: 1})
+	if e != nil || p.Failure != "ORIGIN_DENIED" || p.Complete || foreignHits != 0 {
+		t.Fatalf("foreign redirect escaped: %+v %v hits=%d", p, e, foreignHits)
 	}
 }
