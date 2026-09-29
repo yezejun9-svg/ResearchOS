@@ -8,6 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 	_ "time/tzdata"
@@ -32,20 +35,41 @@ func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
 	if e != nil {
 		return nil, e
 	}
-	b, e := os.ReadFile(migrationFile)
-	if e != nil {
-		return nil, e
-	}
 	tx, e := db.Begin()
 	if e != nil {
 		return nil, e
 	}
 	defer tx.Rollback()
-	if _, e = tx.Exec(string(b)); e != nil {
+	files, e := filepath.Glob(filepath.Join(filepath.Dir(migrationFile), "[0-9][0-9][0-9][0-9]_*.sql"))
+	if e != nil {
 		return nil, e
 	}
-	if _, e = tx.Exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES(2)"); e != nil {
-		return nil, e
+	sort.Strings(files)
+	for _, file := range files {
+		n, e := strconv.Atoi(filepath.Base(file)[:4])
+		if e != nil {
+			return nil, e
+		}
+		if n < 2 {
+			continue
+		}
+		var applied int
+		if e = tx.QueryRow("SELECT count(*) FROM schema_migrations WHERE version=?", n).Scan(&applied); e != nil {
+			return nil, e
+		}
+		if applied != 0 {
+			continue
+		}
+		b, e := os.ReadFile(file)
+		if e != nil {
+			return nil, e
+		}
+		if _, e = tx.Exec(string(b)); e != nil {
+			return nil, fmt.Errorf("migration %d: %w", n, e)
+		}
+		if _, e = tx.Exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", n); e != nil {
+			return nil, e
+		}
 	}
 	if e = tx.Commit(); e != nil {
 		return nil, e
@@ -135,7 +159,7 @@ func (s *Service) put(tx *sql.Tx, kind string, o Object) error {
 		if oldRevision == 1<<63-1 || rev != oldRevision+1 {
 			return Fail(409, "STATE_CONFLICT", "revision must advance once")
 		}
-		if kind == "Task" && o["status"] != old["status"] && !(old["status"] == "DRAFT" && (o["status"] == "CANCELLED" || o["status"] == "BLOCKED")) {
+		if kind == "Task" && o["status"] != old["status"] && !(old["status"] == "NEEDS_REVALIDATION" && o["status"] == "DRAFT") && !(o["status"] == "NEEDS_REVALIDATION" && old["status"] != "CANCELLED") && !(old["status"] == "DRAFT" && (o["status"] == "CANCELLED" || o["status"] == "BLOCKED")) {
 			return Fail(409, "STATE_CONFLICT", "transition requires lifecycle owner")
 		}
 	} else if f, ok := e.(*Fault); !ok || f.Status != 404 {
@@ -237,6 +261,13 @@ func (s *Service) ref(tx *sql.Tx, project, kind, id string, rev int64, path, tp,
 	if e != nil {
 		return Fail(422, "GATE_FAILED", "reference unavailable")
 	}
+	history := kind == "Conflict" || kind == "Artifact" || kind == "ContextBundle" || kind == "DecisionReceipt" || kind == "AcceptanceReceipt" || kind == "AgentMessage" || kind == "ImpactLink" || kind == "ChangeProposal" || kind == "EventEnvelope" || ((kind == "Task" || kind == "Goal") && rev > 1)
+	if exact && history {
+		e = tx.QueryRow("SELECT revision,content_hash FROM domain_versions WHERE project=? AND kind=? AND id=? AND revision=?", tp, tk, tid, tr).Scan(&current, &h)
+		if e != nil {
+			return Fail(422, "GATE_FAILED", "historical reference unavailable")
+		}
+	}
 	if exact && current != tr {
 		return Fail(412, "STALE_INPUT", "reference revision changed")
 	}
@@ -299,6 +330,10 @@ func (s *Service) event(tx *sql.Tx, project, kind string, o Object, actor, corre
 		return e
 	}
 	_, e = tx.Exec("INSERT INTO outbox(project,sequence,id,body) VALUES(?,?,?,?)", project, seq, ev["id"], string(Bytes(ev)))
+	if e != nil {
+		return e
+	}
+	_, e = tx.Exec("INSERT INTO event_state_snapshots(project,event_id,revision,body) VALUES(?,?,?,?)", project, ev["id"], state["revision"], string(Bytes(state)))
 	return e
 }
 

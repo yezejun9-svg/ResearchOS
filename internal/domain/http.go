@@ -260,6 +260,8 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 			result, e = s.readObject(tx, p, project, kind, id)
 		} else if strings.HasPrefix(op.ID, "list") {
 			result, e = s.page(tx, p, project, op, r)
+		} else if contextOperations[op.ID] {
+			result, kind, status, e = s.contextOperation(tx, p, project, id, b, op.ID)
 		} else {
 			e = Fail(503, "RESOURCE_UNAVAILABLE", "operation unavailable")
 		}
@@ -268,12 +270,25 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		s.writeError(w, cid, e)
 		return
 	}
+	if !s.visible(tx, p, project, result) {
+		s.writeError(w, cid, Fail(403, "FORBIDDEN", "result references restricted content"))
+		return
+	}
 	if write && kind != "" {
 		ep := project
 		if op.ID == "createProject" {
 			ep = Str(result, "project_id")
 		}
 		eventType := "PROJECT_UPDATED"
+		if op.ID == "applyChangeProposal" {
+			eventType = "CHANGE_APPLIED"
+		}
+		if op.ID == "recordAcceptance" {
+			eventType = "ACCEPTANCE_RECORDED"
+		}
+		if op.ID == "recordDecision" {
+			eventType = "DECISION_RECORDED"
+		}
 		if kind == "Task" {
 			eventType = "TASK_CHANGED"
 		}
@@ -315,6 +330,9 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 }
 func (s *Service) precondition(tx *sql.Tx, project, id string, op Operation, b Object) (Object, error) {
 	switch op.Target {
+	case "subject_ref":
+		r := b["subject_ref"].(map[string]any)
+		return load(tx, project, Str(r, "entity_type"), Str(r, "id"))
 	case "ProjectState":
 		return singleton(tx, project, "ProjectState")
 	case "Goal":
@@ -338,6 +356,9 @@ func (s *Service) replayAllowed(tx *sql.Tx, p Principal, op Operation, raw []byt
 }
 
 func (s *Service) visible(tx *sql.Tx, p Principal, project string, value any) bool {
+	return s.visibleGraph(tx, p, project, value, map[string]bool{})
+}
+func (s *Service) visibleGraph(tx *sql.Tx, p Principal, project string, value any, seen map[string]bool) bool {
 	switch o := value.(type) {
 	case map[string]any:
 		if o["access_class"] == "VERIFIER_ONLY" && (!p.Allowed(project, "", "", true) || !(p.HasRole("OWNER") || p.HasRole("VERIFIER"))) {
@@ -349,14 +370,24 @@ func (s *Service) visible(tx *sql.Tx, p Principal, project string, value any) bo
 				return false
 			}
 		}
+		if kind := Str(o, "entity_type"); kind != "" {
+			key := Hash([]any{project, o})
+			if !seen[key] {
+				seen[key] = true
+				obj, e := version(tx, project, o)
+				if e == nil && !s.visibleGraph(tx, p, project, obj, seen) {
+					return false
+				}
+			}
+		}
 		for _, v := range o {
-			if !s.visible(tx, p, project, v) {
+			if !s.visibleGraph(tx, p, project, v, seen) {
 				return false
 			}
 		}
 	case []any:
 		for _, v := range o {
-			if !s.visible(tx, p, project, v) {
+			if !s.visibleGraph(tx, p, project, v, seen) {
 				return false
 			}
 		}
