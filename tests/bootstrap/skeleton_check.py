@@ -16,7 +16,7 @@ from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / ".local" / "bin" / ("researchos-control.exe" if os.name == "nt" else "researchos-control")
-IDS = ["W02-STARTUP-HTTP", "W02-STARTUP-DB", "W02-STARTUP-UNIMPLEMENTED"]
+IDS = ["W02-STARTUP-HTTP", "W02-STARTUP-DB", "W03-STARTUP-AUTH-REQUIRED"]
 
 
 def main():
@@ -58,14 +58,16 @@ def main():
             with closing(sqlite3.connect(db_path)) as db:
                 assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
                 assert db.execute("PRAGMA synchronous").fetchone()[0] == 2
-                assert db.execute("SELECT version FROM schema_migrations").fetchall() == [(1,)]
+                expected = sorted((int(path.name.split('_', 1)[0]),)
+                                  for path in (ROOT / 'migrations/sqlite').glob('*.sql'))
+                assert db.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() == expected
             try:
                 urlopen(base + "/v1/projects", timeout=2)
-                raise AssertionError("unimplemented business endpoint succeeded")
+                raise AssertionError("unauthenticated business endpoint succeeded")
             except HTTPError as exc:
-                if exc.code != 501:
+                if exc.code != 401:
                     raise
-                assert json.load(exc)["status"] == "NOT_IMPLEMENTED"
+                assert json.load(exc)["code"] == "UNAUTHENTICATED"
         finally:
             process.terminate()
             try:
