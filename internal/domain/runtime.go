@@ -198,32 +198,39 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 		if r["status"] == "CANCEL_REQUESTED" {
 			return nil, "", 0, Fail(409, "STATE_CONFLICT", "cancellation requires acknowledgement")
 		}
-		for _, v := range Arr(b, "result_artifact_ids") {
-			a, err := load(tx, project, "Artifact", v.(string))
-			if err != nil || a["run_id"] != id || a["produced_by"] != p.ID {
-				return nil, "", 0, Fail(422, "GATE_FAILED", "result must be sealed by this run")
-			}
-		}
-		status := "FAILED"
-		manifestOK := len(Arr(o, "artifacts")) > 0
+		manifest := map[string]int{}
 		for _, v := range Arr(o, "artifacts") {
 			item, ok := v.(map[string]any)
 			if !ok {
-				manifestOK = false
-				break
+				return nil, "", 0, Fail(422, "GATE_FAILED", "invalid trusted output manifest")
 			}
-			found := false
-			for _, id := range Arr(b, "result_artifact_ids") {
-				a, err := load(tx, project, "Artifact", id.(string))
-				if err == nil && a["content_hash"] == item["content_hash"] && Hash(a["byte_size"]) == Hash(item["byte_size"]) {
-					found = true
-				}
+			manifest[Hash([]any{item["content_hash"], item["byte_size"]})]++
+		}
+		if len(Arr(b, "result_artifact_ids")) != len(Arr(o, "artifacts")) {
+			return nil, "", 0, Fail(422, "GATE_FAILED", "results must exactly match trusted output manifest")
+		}
+		seen := map[string]bool{}
+		for _, v := range Arr(b, "result_artifact_ids") {
+			artifactID := v.(string)
+			a, err := load(tx, project, "Artifact", artifactID)
+			if err != nil || a["run_id"] != id || a["produced_by"] != p.ID || seen[artifactID] {
+				return nil, "", 0, Fail(422, "GATE_FAILED", "result must be a unique artifact sealed by this run")
 			}
-			if !found {
-				manifestOK = false
+			seen[artifactID] = true
+			key := Hash([]any{a["content_hash"], a["byte_size"]})
+			if manifest[key] == 0 {
+				return nil, "", 0, Fail(422, "GATE_FAILED", "result is absent from trusted output manifest")
+			}
+			manifest[key]--
+		}
+		if checkpoint := Str(b, "checkpoint_artifact_id"); checkpoint != "" {
+			a, err := load(tx, project, "Artifact", checkpoint)
+			if err != nil || a["run_id"] != id || a["produced_by"] != p.ID {
+				return nil, "", 0, Fail(422, "GATE_FAILED", "checkpoint must be sealed by this run")
 			}
 		}
-		if o["state"] == "SETTLED" && protocol["settled"] == true && manifestOK {
+		status := "FAILED"
+		if o["state"] == "SETTLED" && protocol["settled"] == true && len(Arr(o, "artifacts")) > 0 {
 			status = "SETTLED"
 		}
 		Merge(r, Object{"status": status, "execution_report": b["execution_report"], "exit_code": b["exit_code"], "result_artifact_ids": b["result_artifact_ids"], "checkpoint_artifact_id": b["checkpoint_artifact_id"], "runtime_settled_at": Now(), "children_stopped": true, "queue_empty": true, "ended_at": Now()})
