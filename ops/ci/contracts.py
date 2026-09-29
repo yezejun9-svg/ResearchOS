@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def main():
     task = os.getenv("RESEARCHOS_TASK_ID", "W02")
-    if task not in ("W02", "W03") or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", *(f"{task}-G0{n}" for n in (1, 2, 3))) or os.getenv("RESEARCHOS_CASE_ID"):
+    if task not in ("W02", "W03", "W04", "W07") or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", *(f"{task}-G0{n}" for n in (1, 2, 3))) or os.getenv("RESEARCHOS_CASE_ID"):
         raise NotImplementedError("unbound task/check/case selection")
     command = [sys.executable, str(ROOT / "spec" / "v2.0" / "tools" / "validate_package.py")]
     result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=120)
@@ -32,7 +32,7 @@ def main():
     if route["selected_route"] != "THIN_CORE" or any(root_lock[k] != pkg[k] for k in ("dependencies", "devDependencies")):
         raise RuntimeError("route or web lock declarations drifted")
     ids.append("W02-CONTRACT-ROUTE-LOCK")
-    if task == "W03":
+    if task != "W02":
         coverage = json.loads((ROOT / "contracts/operation_coverage.json").read_text(encoding="utf-8"))
         expected = {operation["operationId"]: (method.upper(), path)
                     for path, methods in api["paths"].items()

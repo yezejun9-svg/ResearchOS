@@ -23,13 +23,13 @@ GROUPS = {
 def main():
     task = os.getenv("RESEARCHOS_TASK_ID", "W03")
     check = os.getenv("RESEARCHOS_CHECK_ID", "")
-    if task != "W03" or (check and check not in GROUPS) or os.getenv("RESEARCHOS_CASE_ID"):
+    if task not in ("W03", "W04") or (check and check not in GROUPS) or os.getenv("RESEARCHOS_CASE_ID"):
         raise NotImplementedError("unbound task/check/case selection")
     expected = GROUPS[check] if check else [test for tests in GROUPS.values() for test in tests]
     go = json.loads((ROOT / "execution/toolchains/locked.json").read_text(encoding="utf-8"))["tools"]["go"]["path"]
     command = [go, "test", "-count=1", "-json", "-run", "^(" + "|".join(expected) + ")$",
                "./internal/domain", "./internal/canonical", "./apps/control"]
-    evidence = ROOT / "execution/receipts/W03/domain" / ("run-" + uuid.uuid4().hex)
+    evidence = ROOT / "execution/receipts" / task / "domain" / ("run-" + uuid.uuid4().hex)
     evidence.mkdir(parents=True)
     started = datetime.now(timezone.utc).isoformat()
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=120)
