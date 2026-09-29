@@ -31,15 +31,16 @@ type Command struct {
 	Input      string   `json:"-"`
 }
 type Spec struct {
-	RunID       string        `json:"run_id"`
-	TaskID      string        `json:"task_id"`
-	Epoch       int64         `json:"epoch"`
-	Commands    []Command     `json:"commands"`
-	Model       string        `json:"model"`
-	Environment []string      `json:"-"`
-	Lease       time.Duration `json:"-"`
-	Timeout     time.Duration `json:"-"`
-	Outputs     []string      `json:"expected_outputs"`
+	RunID             string        `json:"run_id"`
+	TaskID            string        `json:"task_id"`
+	Epoch             int64         `json:"epoch"`
+	Commands          []Command     `json:"commands"`
+	Model             string        `json:"model"`
+	Environment       []string      `json:"-"`
+	Lease             time.Duration `json:"-"`
+	Timeout           time.Duration `json:"-"`
+	Outputs           []string      `json:"expected_outputs"`
+	ArtifactTransport string        `json:"artifact_transport"`
 }
 type Artifact struct {
 	Path string `json:"path"`
@@ -136,6 +137,9 @@ func Start(directory string, s Spec) (*Worker, error) {
 		if !filepath.IsLocal(path) {
 			return nil, errors.New("output must be a local relative path")
 		}
+	}
+	if s.ArtifactTransport != "" && s.ArtifactTransport != "protocol-json" {
+		return nil, errors.New("unsupported artifact transport")
 	}
 	if e := os.Mkdir(directory, 0700); e != nil {
 		return nil, e
@@ -317,6 +321,10 @@ func (w *Worker) run(s Spec) {
 			}
 			exited, code, err := w.p.exited()
 			ids, treeErr := jobPIDs(w.job)
+			if exited && code != 0 && treeErr == nil && len(ids) > 0 {
+				w.snapshotTree()
+				killJob(w.job)
+			}
 			if err != nil || treeErr != nil {
 				w.journal.State = "UNKNOWN"
 				w.journal.Reason = "process inspection unavailable"
@@ -357,6 +365,16 @@ func (w *Worker) run(s Spec) {
 					}
 				}
 				w.journal.Streams = append(w.journal.Streams, stream)
+				outBytes, outError := os.ReadFile(stream.Out)
+				errBytes, errError := os.ReadFile(stream.Err)
+				if outError != nil || errError != nil {
+					w.journal.State = "UNKNOWN"
+					w.journal.Reason = "stream unavailable"
+					w.persist()
+					w.mu.Unlock()
+					return
+				}
+				w.journal.Protocol = ParseStreams(outBytes, errBytes, code)
 				if code != 0 || w.journal.Cancelled || (s.Model != "" && !w.journal.Protocol.Settled) {
 					if !w.journal.Cancelled {
 						w.journal.State = "FAILED"
@@ -392,6 +410,18 @@ func (w *Worker) finishLocked() {
 		w.journal.State = "SETTLED"
 	}
 	if w.journal.State == "SETTLED" {
+		if w.journal.Spec.ArtifactTransport == "protocol-json" {
+			b := w.journal.Protocol.Result
+			if len(b) == 0 || !json.Valid(b) {
+				w.journal.State = "FAILED"
+				w.journal.Reason = "structured_result_missing"
+			} else if e := os.WriteFile(filepath.Join(w.directory, "result.json"), b, 0600); e != nil {
+				w.journal.State = "FAILED"
+				w.journal.Reason = "structured_result_write_failed"
+			} else {
+				w.journal.Artifacts = append(w.journal.Artifacts, Artifact{"protocol:final-json", Hash(b), int64(len(b))})
+			}
+		}
 		for _, relative := range w.journal.Spec.Outputs {
 			root, e := filepath.EvalSymlinks(w.journal.Spec.Commands[0].Directory)
 			if e != nil {

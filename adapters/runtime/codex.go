@@ -5,23 +5,32 @@ import (
 	"bytes"
 	"encoding/json"
 	"regexp"
+	"strings"
 )
 
 type Protocol struct {
-	Settled       bool           `json:"settled"`
-	ToolFailed    bool           `json:"tool_failed"`
-	Failure       string         `json:"failure"`
-	ThreadID      string         `json:"thread_id"`
-	Usage         map[string]any `json:"usage"`
-	ModelRevision *string        `json:"model_revision"`
-	Cost          any            `json:"cost"`
+	Settled        bool            `json:"settled"`
+	ToolFailed     bool            `json:"tool_failed"`
+	Failure        string          `json:"failure"`
+	ThreadID       string          `json:"thread_id"`
+	Usage          map[string]any  `json:"usage"`
+	ModelRevision  *string         `json:"model_revision"`
+	Cost           any             `json:"cost"`
+	Result         json.RawMessage `json:"result"`
+	ToolsCompleted int             `json:"tools_completed"`
 }
 
 func Parse(raw []byte, exit int) Protocol {
 	p := Protocol{}
+	seen := map[string]bool{}
 	s := bufio.NewScanner(bytes.NewReader(raw))
 	s.Buffer(make([]byte, 4096), 8*1024*1024)
 	for s.Scan() {
+		line := string(s.Bytes())
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
 		var o map[string]any
 		if json.Unmarshal(s.Bytes(), &o) != nil {
 			p.Failure = "invalid_protocol"
@@ -37,6 +46,14 @@ func Parse(raw []byte, exit int) Protocol {
 			p.Failure = "request_failed"
 		case "item.completed":
 			if item, ok := o["item"].(map[string]any); ok {
+				if item["type"] == "agent_message" {
+					if text, ok := item["text"].(string); ok && json.Valid([]byte(text)) {
+						p.Result = json.RawMessage(text)
+					}
+				}
+				if item["type"] == "command_execution" && item["status"] == "completed" {
+					p.ToolsCompleted++
+				}
 				if code, ok := item["exit_code"].(float64); ok && code != 0 {
 					p.ToolFailed = true
 				}
@@ -60,6 +77,22 @@ func Parse(raw []byte, exit int) Protocol {
 	}
 	if p.Failure != "" {
 		p.Settled = false
+	}
+	return p
+}
+
+// Codex may emit turn.completed/exit 0 after a tool router rejection. That is a failure.
+func ParseStreams(stdout, stderr []byte, exit int) Protocol {
+	p := Parse(stdout, exit)
+	text := strings.ToLower(string(stderr))
+	if strings.Contains(text, "rejected: blocked by policy") {
+		p.ToolFailed = true
+		p.Settled = false
+		p.Failure = "tool_permission_denied"
+	} else if strings.Contains(text, "error=exec_command failed") {
+		p.ToolFailed = true
+		p.Settled = false
+		p.Failure = "tool_failed"
 	}
 	return p
 }
