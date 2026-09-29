@@ -39,7 +39,7 @@ func TestW07GitHubReleaseBodyAndCommit(t *testing.T) {
 	to, _ := time.Parse(time.RFC3339, "2026-09-30T00:00:00Z")
 	a := GitHubReleases{BaseURL: server.URL, Client: server.Client(), AllowedOrigins: []string{server.URL}}
 	p, e := a.Fetch(context.Background(), Query{SourceID: "github-source", Text: "repo:paperclipai/paperclip", From: from, To: to, Limit: 1})
-	if e != nil || p.Failure != "" || len(p.Items) != 1 || p.Complete || p.NextCursor != "2" {
+	if e != nil || p.Failure != "" || len(p.Items) != 1 || p.Complete || p.NextCursor != "github-releases:v1:1:2" {
 		t.Fatalf("first page: %+v %v", p, e)
 	}
 	if len(p.RequestURLs) != 2 || len(p.FinalURLs) != 2 || p.FetchedAt.IsZero() {
@@ -114,7 +114,7 @@ func TestW07GitHubFaultsDoNotCompleteWindow(t *testing.T) {
 			if e != nil || p.Failure != tc.failure || p.Complete && (tc.link != "" || tc.failure != "") {
 				t.Fatalf("fault promoted: %+v %v", p, e)
 			}
-			if tc.link != "" && p.NextCursor != "2" {
+			if tc.link != "" && p.NextCursor != "github-releases:v1:20:2" {
 				t.Fatal("Link next ignored", p.NextCursor)
 			}
 			if tc.retry != "" && p.RetryAfter == nil {
@@ -168,5 +168,37 @@ func TestW07GitHubEmptyAuthAndTimeoutAreDistinct(t *testing.T) {
 	p, e = a.Fetch(context.Background(), q)
 	if e != nil || p.Failure != "AUTH_REVOKED" || p.Complete {
 		t.Fatalf("revoked key lost: %+v %v", p, e)
+	}
+}
+
+func TestW07GitHubCursorKeepsPageSizeAndRejectsNull(t *testing.T) {
+	from, _ := time.Parse(time.RFC3339, "2026-09-28T00:00:00Z")
+	to, _ := time.Parse(time.RFC3339, "2026-09-30T00:00:00Z")
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if r.URL.Query().Get("page") == "1" {
+			w.Header().Set("Link", `<https://api.github.com/next>; rel="next"`)
+			fmt.Fprint(w, `[]`)
+			return
+		}
+		fmt.Fprint(w, `null`)
+	}))
+	defer server.Close()
+	a := GitHubReleases{BaseURL: server.URL, Client: server.Client(), AllowedOrigins: []string{server.URL}}
+	q := Query{SourceID: "g", Text: "repo:owner/repo", From: from, To: to, Limit: 1}
+	first, err := a.Fetch(context.Background(), q)
+	if err != nil || first.NextCursor != "github-releases:v1:1:2" || first.Complete {
+		t.Fatalf("first page cursor lost: %+v %v", first, err)
+	}
+	q.Cursor = first.NextCursor
+	q.Limit = 100
+	if _, err = a.Fetch(context.Background(), q); !errors.Is(err, ErrInvalidQuery) || requestCount != 1 {
+		t.Fatalf("page-size change reached provider: %v requests=%d", err, requestCount)
+	}
+	q.Limit = 1
+	second, err := a.Fetch(context.Background(), q)
+	if err != nil || second.Failure != "INVALID_RESPONSE" || second.Complete || requestCount != 2 {
+		t.Fatalf("null body promoted to complete: %+v %v", second, err)
 	}
 }

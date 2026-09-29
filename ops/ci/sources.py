@@ -18,10 +18,13 @@ EXPECTED = {
     "TestW07GitHubFaultsDoNotCompleteWindow",
     "TestW07GitHubRejectsForeignRedirectBeforeRequest",
     "TestW07GitHubEmptyAuthAndTimeoutAreDistinct",
+    "TestW07GitHubCursorKeepsPageSizeAndRejectsNull",
+    "TestW07GitHubReadmePinnedPrimaryBody",
     "TestW07ArxivFullPDFAndVersion",
     "TestW07ArxivMetadataCannotPassForFullText",
     "TestW07ArxivChunkedPDFPrefixCannotPass",
     "TestW07ArxivRejectsForeignRedirectBeforeRequest",
+    "TestW07ArxivErrorPageIsNotValidEmptyFeed",
     "TestW07XOnlyPublicPostAndNoFalseComplete",
     "TestW07XExpandedBodyRequired",
     "TestW07XVisibleEmptyDiffersFromUnrendered",
@@ -29,12 +32,13 @@ EXPECTED = {
     "TestW07CursorDoesNotAdvanceFailedOrUnpersistedWindow",
     "TestW07HTTPSourceEvidenceAndDurableEmptyWindow",
     "TestW07RetryAfterPreventsPrematureSourceRequest",
+    "TestW07Provider429PersistsRetryBeforeAnotherFetch",
     "TestW07MissingAuthorizedXChannelDoesNotFetch",
     "TestW07XVisibleEmptySealsObservationWithoutCoverage",
 }
 SOURCE_FILES = [
     "adapters/sources/sources.go", "adapters/sources/github.go",
-    "adapters/sources/arxiv.go", "adapters/sources/x.go",
+    "adapters/sources/github_readme.go", "adapters/sources/arxiv.go", "adapters/sources/x.go",
     "internal/domain/sources.go", "tests/sources/live/main.go",
 ]
 
@@ -134,6 +138,76 @@ def x_public_only(report):
         db.close()
 
 
+def x_claim_has_primary_lineage(report):
+    """Check the sealed product graph and both bodies, not another source's item count."""
+    linked = report.get("claim_check") or {}
+    if not linked or linked.get("conclusion") != "SUPPORTED_NARROW_SCOPE" or linked.get("adoption_authority") is not False:
+        return False
+    db = sqlite3.connect(ROOT / report["db_path"])
+    try:
+        project = report["project_id"]
+
+        def object_ref(ref, kind):
+            if not isinstance(ref, dict) or ref.get("entity_type") != kind:
+                raise ValueError("typed reference missing")
+            row = db.execute("SELECT body FROM domain_objects WHERE project=? AND kind=? AND id=?",
+                             (project, kind, ref.get("id"))).fetchone()
+            if row is None:
+                raise ValueError("referenced object missing")
+            body = json.loads(row[0])
+            if body["revision"] != ref.get("revision") or body.get("content_hash") != ref.get("content_hash"):
+                raise ValueError("reference revision or hash mismatch")
+            return body
+
+        def artifact_bytes(ref):
+            artifact = object_ref(ref, "Artifact")
+            row = db.execute("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=?",
+                             (project, artifact["storage_key"])).fetchone()
+            if row is None or "sha256:" + hashlib.sha256(row[0]).hexdigest() != ref["content_hash"]:
+                raise ValueError("sealed content mismatch")
+            return artifact, row[0]
+
+        manifest_artifact, raw = artifact_bytes(linked["artifact_ref"])
+        manifest = json.loads(raw)
+        x_ref, primary_ref = manifest["x_evidence_ref"], manifest["primary_evidence_ref"]
+        x = object_ref(x_ref, "Evidence")
+        primary = object_ref(primary_ref, "Evidence")
+        if {ref.get("id") for ref in manifest_artifact["source_refs"]} != {x_ref["id"], primary_ref["id"]}:
+            return False
+        if {ref.get("id") for ref in manifest_artifact["input_refs"]} != {x_ref["id"], primary_ref["id"]}:
+            return False
+        if x_ref["id"] != report["items"][0]["evidence_id"] or x["source_kind"] != "X" or primary["source_kind"] != "GITHUB":
+            return False
+        if x["origin_evidence_id"] is not None or primary["origin_evidence_id"] is not None:
+            return False
+        if x["stance"] != "CONTEXT" or x["verification_status"] != "UNVERIFIED":
+            return False
+        _, x_body = artifact_bytes(x["snapshot_artifact_ref"])
+        _, primary_body = artifact_bytes(primary["snapshot_artifact_ref"])
+        if b"paperclipai/paperclip" not in x_body.lower() or b"agent management" not in x_body.lower():
+            return False
+        excerpt = manifest["primary_excerpt"]
+        if excerpt != "manage AI agents for work" or excerpt.casefold() not in primary_body.decode("utf-8").casefold():
+            return False
+        commit = manifest["primary_commit"]
+        if len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
+            return False
+        if manifest["primary_url"] != primary["canonical_url"] or not manifest["primary_url"].endswith("/blob/" + commit + "/README.md") or primary["upstream_revision"] != commit:
+            return False
+        if manifest["primary_snapshot_ref"] != primary["snapshot_artifact_ref"]:
+            return False
+        if manifest["adoption_authority"] is not False or not any("stars" in claim for claim in manifest["unverified_claims"]):
+            return False
+        return linked.get("artifact_ref") == manifest_artifact_ref(manifest_artifact)
+    finally:
+        db.close()
+
+
+def manifest_artifact_ref(artifact):
+    return {"entity_type": "Artifact", "id": artifact["id"],
+            "revision": artifact["revision"], "content_hash": artifact["content_hash"]}
+
+
 def live(go, evidence, fixture_result):
     reports, raw_refs, commands = {}, [], {}
     browser_act = os.getenv("RESEARCHOS_BROWSER_ACT", "")
@@ -183,6 +257,7 @@ def live(go, evidence, fixture_result):
     )
     try:
         x_public, x_unverified = x_public_only(reports["X"])
+        x_linked = x_claim_has_primary_lineage(reports["X"])
     except (OSError, sqlite3.Error, ValueError, KeyError) as exc:
         return {"status": "FAIL", "reason": "sealed X receipt inspection failed: " + str(exc),
                 "reports": reports, "raw": raw_refs, "commands": commands,
@@ -190,7 +265,7 @@ def live(go, evidence, fixture_result):
     faults = fixture_result["exit_code"] == 0 and not fixture_result["missing"]
     assertions = {
         "A05-01": bool(real_items),
-        "A05-02": bool(x_unverified and reports["GITHUB"]["items"]),
+        "A05-02": bool(x_unverified and x_linked),
         "A05-03": bool(faults),
         "A05-04": bool(x_public and browser_act and browser_id),
     }
@@ -203,8 +278,8 @@ def live(go, evidence, fixture_result):
     return {"status": "PASS" if all(assertions.values()) else "FAIL",
             "assertions": assertions, "reports": reports, "raw": raw_refs,
             "commands": commands, "live_binary_sha256": binary_hash,
-            "x_primary_context_url": reports["GITHUB"]["items"][0]["url"],
-            "x_claim_confirmed_by_primary": False, "x_adoption_authority": False}
+            "x_primary_context_url": reports["X"].get("claim_check", {}).get("primary_url"),
+            "x_claim_narrowly_supported": bool(x_linked), "x_adoption_authority": False}
 
 
 def main():

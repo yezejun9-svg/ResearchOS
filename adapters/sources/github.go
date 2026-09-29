@@ -45,8 +45,13 @@ func (a GitHubReleases) Fetch(ctx context.Context, q Query) (Page, error) {
 	}
 	page := 1
 	if q.Cursor != "" {
-		n, e := strconv.Atoi(q.Cursor)
-		if e != nil || n < 1 || n > 1000 {
+		parts := strings.Split(q.Cursor, ":")
+		if len(parts) != 4 || parts[0] != "github-releases" || parts[1] != "v1" {
+			return p, ErrInvalidQuery
+		}
+		perPage, perPageError := strconv.Atoi(parts[2])
+		n, pageError := strconv.Atoi(parts[3])
+		if perPageError != nil || perPage != q.Limit || pageError != nil || n < 2 || n > 1000 {
 			return p, ErrInvalidQuery
 		}
 		page = n
@@ -101,7 +106,7 @@ func (a GitHubReleases) Fetch(ctx context.Context, q Query) (Page, error) {
 	p.RawResponse = raw
 	p.RawMediaType = "application/vnd.github+json"
 	var releases []githubRelease
-	if err = json.Unmarshal(raw, &releases); err != nil {
+	if len(strings.TrimSpace(string(raw))) == 0 || strings.TrimSpace(string(raw))[0] != '[' || json.Unmarshal(raw, &releases) != nil || releases == nil {
 		p.Failure = "INVALID_RESPONSE"
 		return p, nil
 	}
@@ -144,7 +149,7 @@ func (a GitHubReleases) Fetch(ctx context.Context, q Query) (Page, error) {
 	// The Link relation is authoritative even when the server returns fewer
 	// than requested entries. A full page without Link is not proof of closure.
 	if hasNextLink(resp.Header.Get("Link")) {
-		p.NextCursor = strconv.Itoa(page + 1)
+		p.NextCursor = fmt.Sprintf("github-releases:v1:%d:%d", q.Limit, page+1)
 	} else if len(releases) == q.Limit {
 		p.Failure = "PAGINATION_UNKNOWN"
 	} else {

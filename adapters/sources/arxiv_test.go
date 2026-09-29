@@ -71,7 +71,7 @@ func TestW07ArxivFullPDFAndVersion(t *testing.T) {
 func TestW07ArxivMetadataCannotPassForFullText(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/query" {
-			fmt.Fprint(w, `<feed><entry><id>http://arxiv.org/abs/2304.03442v2</id><published>2023-04-07T00:00:00Z</published><updated>2023-07-01T00:00:00Z</updated><author><name>Author</name></author></entry></feed>`)
+			fmt.Fprint(w, `<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/2304.03442v2</id><published>2023-04-07T00:00:00Z</published><updated>2023-07-01T00:00:00Z</updated><author><name>Author</name></author></entry></feed>`)
 			return
 		}
 		w.Header().Set("Content-Type", "application/pdf")
@@ -90,7 +90,7 @@ func TestW07ArxivMetadataCannotPassForFullText(t *testing.T) {
 func TestW07ArxivChunkedPDFPrefixCannotPass(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/query" {
-			fmt.Fprint(w, `<feed><entry><id>http://arxiv.org/abs/2304.03442v2</id><published>2023-04-07T00:00:00Z</published><updated>2023-07-01T00:00:00Z</updated><author><name>Author</name></author></entry></feed>`)
+			fmt.Fprint(w, `<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/2304.03442v2</id><published>2023-04-07T00:00:00Z</published><updated>2023-07-01T00:00:00Z</updated><author><name>Author</name></author></entry></feed>`)
 			return
 		}
 		w.Header().Set("Content-Type", "application/pdf")
@@ -112,7 +112,7 @@ func TestW07ArxivRejectsForeignRedirectBeforeRequest(t *testing.T) {
 	defer foreign.Close()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/query" {
-			fmt.Fprint(w, `<feed><entry><id>http://arxiv.org/abs/2304.03442v2</id><published>2023-04-07T00:00:00Z</published><updated>2023-07-01T00:00:00Z</updated><author><name>Author</name></author></entry></feed>`)
+			fmt.Fprint(w, `<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/2304.03442v2</id><published>2023-04-07T00:00:00Z</published><updated>2023-07-01T00:00:00Z</updated><author><name>Author</name></author></entry></feed>`)
 			return
 		}
 		http.Redirect(w, r, foreign.URL+"/pdf", http.StatusFound)
@@ -124,5 +124,36 @@ func TestW07ArxivRejectsForeignRedirectBeforeRequest(t *testing.T) {
 	p, e := a.Fetch(context.Background(), Query{SourceID: "paper", Text: "id:2304.03442v2", From: from, To: to, Limit: 1})
 	if e != nil || p.Failure != "ORIGIN_DENIED" || p.Complete || foreignHits != 0 {
 		t.Fatalf("foreign redirect escaped: %+v %v hits=%d", p, e, foreignHits)
+	}
+}
+
+func TestW07ArxivErrorPageIsNotValidEmptyFeed(t *testing.T) {
+	from, _ := time.Parse(time.RFC3339, "2023-01-01T00:00:00Z")
+	to, _ := time.Parse(time.RFC3339, "2026-09-30T00:00:00Z")
+	q := Query{SourceID: "paper", Text: "id:2304.03442v2", From: from, To: to, Limit: 1}
+	for _, tc := range []struct {
+		name, body, failure string
+		complete            bool
+	}{
+		{"html_200", `<html><body>temporary error</body></html>`, "INVALID_RESPONSE", false},
+		{"unrelated_xml", `<error>temporary error</error>`, "INVALID_RESPONSE", false},
+		{"atom_without_total", `<feed xmlns="http://www.w3.org/2005/Atom"></feed>`, "INVALID_RESPONSE", false},
+		{"atom_nonzero_without_entry", `<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"><opensearch:totalResults>1</opensearch:totalResults></feed>`, "INVALID_RESPONSE", false},
+		{"valid_empty", `<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"><opensearch:totalResults>0</opensearch:totalResults></feed>`, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/query" {
+					t.Fatal("unexpected PDF request for empty/error feed")
+				}
+				fmt.Fprint(w, tc.body)
+			}))
+			defer server.Close()
+			a := &Arxiv{Client: server.Client(), APIURL: server.URL + "/api/query", PDFBaseURL: server.URL + "/pdf", AllowedOrigins: []string{server.URL}, MinInterval: time.Nanosecond}
+			p, e := a.Fetch(context.Background(), q)
+			if e != nil || p.Failure != tc.failure || p.Complete != tc.complete || len(p.Items) != 0 {
+				t.Fatalf("feed classified incorrectly: %+v %v", p, e)
+			}
+		})
 	}
 }

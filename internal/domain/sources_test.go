@@ -3,6 +3,8 @@ package domain
 import (
 	"context"
 	"database/sql"
+	"net/http"
+	"net/http/httptest"
 	"researchos.local/research-os/adapters/sources"
 	"testing"
 	"time"
@@ -277,6 +279,48 @@ func TestW07RetryAfterPreventsPrematureSourceRequest(t *testing.T) {
 	var n int
 	if e = f.db.QueryRow("SELECT count(*) FROM source_pages WHERE project=?", f.project).Scan(&n); e != nil || n != 0 {
 		t.Fatal("failed source page persisted", n, e)
+	}
+}
+
+func TestW07Provider429PersistsRetryBeforeAnotherFetch(t *testing.T) {
+	f, _, cursor := sourceProject(t)
+	actor := Principal{ID: "fixture-source-live-retry", Roles: []string{"SOURCE_ADAPTER"}, Grants: []Grant{{ProjectID: f.project}}}
+	if e := f.s.ProvisionPrincipal(context.Background(), actor); e != nil {
+		t.Fatal(e)
+	}
+	token, e := f.s.IssueCredential(context.Background(), actor.ID, time.Minute)
+	if e != nil {
+		t.Fatal(e)
+	}
+	count := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count++
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	adapter := sources.GitHubReleases{BaseURL: server.URL, Client: server.Client(), AllowedOrigins: []string{server.URL}}
+	from := time.Now().UTC().Add(-time.Hour)
+	to := time.Now().UTC().Add(-time.Minute)
+	config, current, e := f.s.sourceConfig(context.Background(), token, f.project, Str(cursor, "id"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	beforeEvents := countKind(t, f.db, "EventEnvelope")
+	first, e := f.s.captureSourcePage(context.Background(), token, f.project, current, config, from, to, 1, adapter)
+	if e != nil || first.Page.Failure != "RATE_LIMITED" || first.Page.RetryAfter == nil || count != 1 {
+		t.Fatalf("429 not retained: %+v %v count=%d", first, e, count)
+	}
+	config, current, e = f.s.sourceConfig(context.Background(), token, f.project, Str(cursor, "id"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	second, e := f.s.captureSourcePage(context.Background(), token, f.project, current, config, from, to, 1, adapter)
+	if e != nil || second.Page.Failure != "RATE_LIMITED" || count != 1 || current["retry_after"] == nil || current["covered_until"] != nil || current["opaque_cursor"] != nil {
+		t.Fatalf("retry guard failed: %+v %v count=%d cursor=%+v", second, e, count, current)
+	}
+	if countKind(t, f.db, "EventEnvelope") != beforeEvents+1 || countKind(t, f.db, "Evidence") != 0 {
+		t.Fatal("429 left evidence or missing durable event")
 	}
 }
 

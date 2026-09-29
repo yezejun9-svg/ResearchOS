@@ -30,6 +30,7 @@ type Arxiv struct {
 }
 
 type atomFeed struct {
+	XMLName xml.Name `xml:"http://www.w3.org/2005/Atom feed"`
 	Entries []struct {
 		ID        string `xml:"id"`
 		Published string `xml:"published"`
@@ -38,7 +39,7 @@ type atomFeed struct {
 			Name string `xml:"name"`
 		} `xml:"author"`
 	} `xml:"entry"`
-	Total int `xml:"totalResults"`
+	Total *int `xml:"http://a9.com/-/spec/opensearch/1.1/ totalResults"`
 }
 
 // Fetch downloads the complete PDF bytes of an arXiv version. The Atom entry
@@ -132,6 +133,10 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 		return p, nil
 	}
 	if len(feed.Entries) == 0 {
+		if feed.Total == nil || *feed.Total != 0 {
+			p.Failure = "INVALID_RESPONSE"
+			return p, nil
+		}
 		p.Complete = true
 		return p, nil
 	}
