@@ -35,11 +35,12 @@ EXPECTED = {
     "TestW07Provider429PersistsRetryBeforeAnotherFetch",
     "TestW07MissingAuthorizedXChannelDoesNotFetch",
     "TestW07XVisibleEmptySealsObservationWithoutCoverage",
+    "TestW07OfflineXPrimaryClaimSealsProductLineage",
 }
 SOURCE_FILES = [
     "adapters/sources/sources.go", "adapters/sources/github.go",
     "adapters/sources/github_readme.go", "adapters/sources/arxiv.go", "adapters/sources/x.go",
-    "internal/domain/sources.go", "tests/sources/live/main.go",
+    "internal/domain/sources.go", "tests/sources/live/main.go", "tests/sources/live/main_test.go",
 ]
 
 
@@ -92,7 +93,7 @@ def run_process(command, evidence, stem, *, env=None, timeout=180):
 
 
 def fixture(go, evidence):
-    command = [go, "test", "-count=1", "-json", "-run", "^TestW07", "./adapters/sources", "./internal/domain"]
+    command = [go, "test", "-count=1", "-json", "-run", "^TestW07", "./adapters/sources", "./internal/domain", "./tests/sources/live"]
     code, out, err, timed_out = run_process(command, evidence, "fixture")
     passed = set()
     for line in out.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -196,7 +197,11 @@ def x_claim_has_primary_lineage(report):
             return False
         if manifest["primary_snapshot_ref"] != primary["snapshot_artifact_ref"]:
             return False
-        if manifest["adoption_authority"] is not False or not any("stars" in claim for claim in manifest["unverified_claims"]):
+        claims = manifest["unverified_claims"]
+        fallback = "Any X growth, usage or effectiveness claim is unverified without its own primary source."
+        if manifest["adoption_authority"] is not False or not isinstance(claims, list) or not claims or not all(
+            isinstance(claim, str) and (claim in x_body.decode("utf-8") or claim == fallback) for claim in claims
+        ):
             return False
         return linked.get("artifact_ref") == manifest_artifact_ref(manifest_artifact)
     finally:
