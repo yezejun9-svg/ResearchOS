@@ -253,6 +253,9 @@ func init() {
 	}
 }
 func operationOwner(id string) string {
+	if id == "claimTask" || id == "actOnGoal" {
+		return "W06"
+	}
 	if runtimeOperations[id] {
 		return "W05"
 	}
