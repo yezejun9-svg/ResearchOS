@@ -1,4 +1,4 @@
-// Trusted offline fixture provisioning. Never linked into the control HTTP surface.
+// Trusted local fixture provisioning. Never linked into the control HTTP surface.
 package main
 
 import (
