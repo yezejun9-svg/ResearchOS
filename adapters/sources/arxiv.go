@@ -1,8 +1,12 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
+	pdfapi "github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	"io"
 	"net/http"
 	"net/url"
@@ -16,12 +20,13 @@ import (
 var arxivID = regexp.MustCompile(`^[0-9]{4}\.[0-9]{4,5}v[1-9][0-9]*$`)
 
 type Arxiv struct {
-	Client      *http.Client
-	APIURL      string
-	PDFBaseURL  string
-	MinInterval time.Duration
-	mu          sync.Mutex
-	lastRequest time.Time
+	Client         *http.Client
+	APIURL         string
+	PDFBaseURL     string
+	AllowedOrigins []string
+	MinInterval    time.Duration
+	mu             sync.Mutex
+	lastRequest    time.Time
 }
 
 type atomFeed struct {
@@ -74,9 +79,18 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 	}
 	a.lastRequest = time.Now()
 	a.mu.Unlock()
-	client := a.Client
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+	allowed := a.AllowedOrigins
+	if len(allowed) == 0 {
+		allowed = []string{"https://export.arxiv.org", "https://arxiv.org"}
+	}
+	pdfBase := a.PDFBaseURL
+	if pdfBase == "" {
+		pdfBase = "https://arxiv.org/pdf"
+	}
+	client, e := sourceClient(a.Client, allowed, u.String(), pdfBase)
+	if e != nil {
+		p.Failure = "ORIGIN_DENIED"
+		return p, nil
 	}
 	req, e := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if e != nil {
@@ -85,6 +99,10 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 	req.Header.Set("User-Agent", "ResearchOS-source-adapter/1.0 (research use)")
 	resp, e := client.Do(req)
 	if e != nil {
+		if errors.Is(e, ErrSourceOrigin) {
+			p.Failure = "ORIGIN_DENIED"
+			return p, nil
+		}
 		p.Failure = "TIMEOUT_OR_NETWORK"
 		return p, e
 	}
@@ -143,10 +161,6 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 		p.Failure = "INVALID_RESPONSE"
 		return p, nil
 	}
-	pdfBase := a.PDFBaseURL
-	if pdfBase == "" {
-		pdfBase = "https://arxiv.org/pdf"
-	}
 	pdfURL := strings.TrimRight(pdfBase, "/") + "/" + url.PathEscape(id)
 	pdfReq, e := http.NewRequestWithContext(ctx, http.MethodGet, pdfURL, nil)
 	if e != nil {
@@ -155,6 +169,10 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 	pdfReq.Header.Set("User-Agent", "ResearchOS-source-adapter/1.0 (research use)")
 	pdfResp, e := client.Do(pdfReq)
 	if e != nil {
+		if errors.Is(e, ErrSourceOrigin) {
+			p.Failure = "ORIGIN_DENIED"
+			return p, nil
+		}
 		p.Failure = "DETAIL_UNAVAILABLE"
 		return p, e
 	}
@@ -172,7 +190,7 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 		p.Failure = "TRUNCATED"
 		return p, nil
 	}
-	if len(body) < 1024 || !strings.HasPrefix(string(body[:5]), "%PDF-") {
+	if len(body) < 1024 || !bytes.HasPrefix(body, []byte("%PDF-")) {
 		p.Failure = "INVALID_FULLTEXT"
 		return p, nil
 	}
@@ -182,6 +200,20 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 			p.Failure = "TRUNCATED"
 			return p, nil
 		}
+	}
+	// A successful transfer can still be an incomplete PDF. Parse its xref,
+	// trailer, page tree and object graph before declaring a full snapshot.
+	conf := model.NewStatelessConfiguration()
+	conf.Optimize = false
+	conf.Limits.MaxInputBytes = 32 << 20
+	conf.Limits.MaxObjectBytes = 8 << 20
+	conf.Limits.MaxStreamBytes = 32 << 20
+	conf.Limits.MaxDecodeBytes = 64 << 20
+	conf.Limits.MaxObjectCount = 1_000_000
+	conf.Limits.MaxXRefEntries = 1_000_000
+	if e = pdfapi.Validate(ctx, bytes.NewReader(body), conf, nil); e != nil {
+		p.Failure = "INVALID_FULLTEXT"
+		return p, nil
 	}
 	canonical := "https://arxiv.org/abs/" + id
 	p.Items = []Item{{SourceID: q.SourceID, CanonicalURL: canonical, UpstreamID: id, Author: strings.Join(names, ", "), PublishedAt: published, ModifiedAt: &modified, UpstreamRevision: id, Body: body, MediaType: "application/pdf", Locator: "pdf:all"}}

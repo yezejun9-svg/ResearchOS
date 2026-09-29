@@ -171,27 +171,60 @@ func TestW07HTTPSourceEvidenceAndDurableEmptyWindow(t *testing.T) {
 	f.expect(200, "GET", f.path("/source-cursors"), "", "", nil)
 	f.expect(200, "GET", f.path("/source-cursors/"+Str(cursor, "id")), "", "", nil)
 	// A different Evidence does not authorize arbitrary coverage.
-	for i := range f.s.Contracts.Operations {
-		if f.s.Contracts.Operations[i].ID == "advanceSourceCursor" {
-			f.s.Contracts.Operations[i].Implemented = true
+	advanceEnabled := false
+	for _, op := range f.s.Contracts.Operations {
+		if op.ID == "advanceSourceCursor" {
+			advanceEnabled = op.Implemented
 		}
 	}
-	f.h = f.s.Handler()
 	from := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
 	to := from.Add(time.Hour)
 	advance := Object{"opaque_cursor": nil, "covered_until": to.Format(time.RFC3339Nano), "last_success_at": Now(), "retry_after": nil, "pending_window_from": nil, "pending_window_to": nil, "last_cycle_id": nil}
-	f.expect(422, "PUT", f.path("/source-cursors/"+Str(cursor, "id")), ID(), testTag(cursor), advance)
+	if advanceEnabled {
+		f.expect(422, "PUT", f.path("/source-cursors/"+Str(cursor, "id")), ID(), testTag(cursor), advance)
+	} else {
+		sourceTx(t, f.db, func(tx *sql.Tx) error {
+			if _, e := f.s.advanceSourceCursor(tx, f.project, Str(cursor, "id"), advance); e == nil {
+				t.Fatal("unpersisted window accepted")
+			}
+			return nil
+		})
+	}
 	config, current, e := f.s.sourceConfig(context.Background(), token, f.project, Str(cursor, "id"))
 	if e != nil {
 		t.Fatal(e)
 	}
 	page := sources.Page{RawResponse: []byte("[]"), RawMediaType: "application/json", Complete: true, HTTPStatus: 200}
+	eventsBefore := countKind(t, f.db, "EventEnvelope")
+	artifactsBefore := countKind(t, f.db, "Artifact")
 	got, e := f.s.captureSourcePage(context.Background(), token, f.project, current, config, from, to, 20, sourceFixtureAdapter{page})
 	if e != nil || !got.Page.Complete || len(got.Evidence) != 0 || got.RawArtifact == nil {
 		t.Fatalf("empty page checkpoint: %+v %v", got, e)
 	}
+	if got.Manifest == nil || countKind(t, f.db, "EventEnvelope") != eventsBefore+1 {
+		t.Fatal("capture event/outbox missing")
+	}
+	pending, e := f.s.PendingEvents(context.Background(), f.project)
+	if e != nil || len(pending) != eventsBefore+1 {
+		t.Fatal("capture outbox missing", len(pending), e)
+	}
+	if _, e = f.s.captureSourcePage(context.Background(), token, f.project, current, config, from, to, 20, sourceFixtureAdapter{page}); e == nil {
+		t.Fatal("duplicate page checkpoint accepted")
+	}
+	if countKind(t, f.db, "EventEnvelope") != eventsBefore+1 || countKind(t, f.db, "Artifact") != artifactsBefore+2 {
+		t.Fatal("failed capture left artifacts or events")
+	}
 	advance["last_success_at"] = Now()
-	advanced := f.expect(200, "PUT", f.path("/source-cursors/"+Str(cursor, "id")), ID(), testTag(cursor), advance)
+	var advanced Object
+	if advanceEnabled {
+		advanced = f.expect(200, "PUT", f.path("/source-cursors/"+Str(cursor, "id")), ID(), testTag(cursor), advance)
+	} else {
+		sourceTx(t, f.db, func(tx *sql.Tx) error {
+			var e error
+			advanced, e = f.s.advanceSourceCursor(tx, f.project, Str(cursor, "id"), advance)
+			return e
+		})
+	}
 	if advanced["covered_until"] != advance["covered_until"] {
 		t.Fatal("window not covered", advanced)
 	}

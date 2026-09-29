@@ -192,11 +192,16 @@ func (s *Service) advanceSourceCursor(tx *sql.Tx, project, id string, b Object) 
 func (s *Service) verifySourcePageChain(tx *sql.Tx, project string, cursor Object, from, to string, success time.Time, wantNext string) (bool, error) {
 	next := ""
 	seen := map[string]bool{}
+	oldNext := Str(cursor, "opaque_cursor")
+	passedOld := oldNext == ""
 	for i := 0; i < 1000; i++ {
 		if seen[next] {
 			return false, Fail(422, "GATE_FAILED", "source page cursor loop")
 		}
 		seen[next] = true
+		if next == oldNext {
+			passedOld = true
+		}
 		var source, query, out, rawID, refsRaw, fetched string
 		var complete int
 		e := tx.QueryRow("SELECT source_id,query_hash,page_cursor_out,raw_artifact_id,item_refs_json,complete,fetched_at FROM source_pages WHERE project=? AND cursor_id=? AND window_from=? AND window_to=? AND page_cursor_in=?", project, cursor["id"], from, to, next).Scan(&source, &query, &out, &rawID, &refsRaw, &complete, &fetched)
@@ -236,12 +241,15 @@ func (s *Service) verifySourcePageChain(tx *sql.Tx, project string, cursor Objec
 			}
 		}
 		if complete == 1 {
-			if wantNext != "" {
+			if wantNext != "" || !passedOld {
 				return false, Fail(422, "GATE_FAILED", "completed page has no next cursor")
 			}
 			return true, nil
 		}
 		if out == wantNext {
+			if !passedOld || out == oldNext {
+				return false, Fail(422, "GATE_FAILED", "source page cursor cannot move backwards")
+			}
 			return false, nil
 		}
 		next = out
@@ -255,6 +263,7 @@ type SourceCapture struct {
 	Page        sources.Page
 	RawArtifact Object
 	Evidence    []Object
+	Manifest    Object
 }
 
 // CaptureSourcePage chooses the configured public provider, authenticates the
@@ -265,11 +274,15 @@ func (s *Service) CaptureSourcePage(ctx context.Context, token, project, cursorI
 		return SourceCapture{}, e
 	}
 	var adapter sources.Adapter
+	allowed := []string{}
+	for _, v := range Arr(config, "allowed_origins") {
+		allowed = append(allowed, v.(string))
+	}
 	switch config["kind"] {
 	case "GITHUB":
-		adapter = sources.GitHubReleases{}
+		adapter = sources.GitHubReleases{AllowedOrigins: allowed}
 	case "PAPER":
-		adapter = &sources.Arxiv{}
+		adapter = &sources.Arxiv{AllowedOrigins: allowed}
 	case "X":
 		if browserActPath == "" || browserID == "" {
 			return SourceCapture{}, Fail(503, "RESOURCE_UNAVAILABLE", "authorized X browser unavailable")
@@ -359,7 +372,7 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 	enabled := false
 	for _, v := range Arr(profile, "source_configs") {
 		c := v.(map[string]any)
-		if c["source_id"] == config["source_id"] && c["enabled"] == true && Hash(c["query"]) == current["query_hash"] {
+		if c["source_id"] == config["source_id"] && c["enabled"] == true && Hash(c) == Hash(config) {
 			enabled = true
 		}
 	}
@@ -414,6 +427,27 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 		if e != nil {
 			return SourceCapture{}, e
 		}
+	}
+	manifestRefs := []any{Ref(raw, "Artifact")}
+	for _, ev := range result.Evidence {
+		manifestRefs = append(manifestRefs, Ref(ev, "Evidence"))
+	}
+	manifestBytes := Bytes(Object{"source_id": config["source_id"], "query_hash": cursor["query_hash"], "window_from": q.From.Format(time.RFC3339Nano), "window_to": q.To.Format(time.RFC3339Nano), "page_cursor_in": pageCursor, "page_cursor_out": page.NextCursor, "complete": page.Complete && config["kind"] != "X", "raw_artifact_ref": Ref(raw, "Artifact"), "evidence_refs": manifestRefs[1:]})
+	u, e := s.upload(tx, p, project, manifestBytes)
+	if e != nil {
+		return SourceCapture{}, e
+	}
+	manifest, e := s.seal(tx, p, project, Object{"run_id": nil, "kind": "MANIFEST", "evidence_kind": "GENERATED", "measurement_mode": "LIVE", "content_hash": u["content_hash"], "storage_key": u["storage_key"], "media_type": "application/json", "byte_size": len(manifestBytes), "input_refs": []any{Ref(cursor, "SourceCursor")}, "source_refs": manifestRefs, "produced_by": p.ID, "access_class": "PROJECT"})
+	if e != nil {
+		return SourceCapture{}, e
+	}
+	result.Manifest = manifest
+	eventType := "PROJECT_UPDATED"
+	if len(result.Evidence) > 0 {
+		eventType = "EVIDENCE_ADDED"
+	}
+	if e = s.event(tx, project, "Artifact", manifest, p.ID, ID(), eventType); e != nil {
+		return SourceCapture{}, e
 	}
 	return result, tx.Commit()
 }
