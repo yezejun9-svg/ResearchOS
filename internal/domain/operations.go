@@ -220,6 +220,9 @@ func (s *Service) actTask(tx *sql.Tx, project, id string, b Object) (Object, err
 	if e != nil {
 		return nil, e
 	}
+	if b["action"] == "REVALIDATE" {
+		return s.revalidateTask(tx, project, o)
+	}
 	if o["status"] != "DRAFT" {
 		return nil, Fail(409, "STATE_CONFLICT", "task transition requires W06")
 	}
@@ -260,6 +263,9 @@ func (s *Service) seal(tx *sql.Tx, p Principal, project string, b Object) (Objec
 		if !p.Allowed(project, Str(r, "task_id"), Str(r, "id"), false) {
 			return nil, Fail(403, "FORBIDDEN", "run scope denied")
 		}
+	}
+	if !s.visible(tx, Principal{ID: p.ID, Roles: []string{"READER"}, Grants: []Grant{{ProjectID: project}}}, project, b) {
+		return nil, Fail(403, "FORBIDDEN", "restricted lineage cannot be declassified")
 	}
 	for _, key := range []string{"input_refs", "source_refs"} {
 		for _, v := range Arr(b, key) {
@@ -311,12 +317,34 @@ func (s *Service) seal(tx *sql.Tx, p Principal, project string, b Object) (Objec
 		}
 	}
 	o := Merge(Base(project), b)
-	Merge(o, Object{"validity": "CURRENT", "sealed_at": Now()})
+	validity := "CURRENT"
+	for _, field := range []string{"input_refs", "source_refs"} {
+		for _, v := range Arr(b, field) {
+			r := v.(map[string]any)
+			if _, e = version(tx, project, r); e != nil {
+				return nil, e
+			}
+			if e = s.effective(tx, project, r); e != nil {
+				validity = "STALE"
+			}
+		}
+	}
+	Merge(o, Object{"validity": validity, "sealed_at": Now()})
 	if e = s.put(tx, "Artifact", o); e != nil {
 		return nil, e
 	}
 	_, e = tx.Exec("UPDATE uploaded_content SET sealed=1 WHERE storage_key=?", b["storage_key"])
-	return o, e
+	if e != nil {
+		return nil, e
+	}
+	for _, field := range []string{"input_refs", "source_refs"} {
+		for _, r := range Arr(b, field) {
+			if _, e = s.impactLink(tx, project, Object{"from_ref": Ref(o, "Artifact"), "to_ref": r, "relation": "DERIVED_FROM", "basis": "DETERMINISTIC", "evidence_refs": Empty()}); e != nil {
+				return nil, e
+			}
+		}
+	}
+	return o, nil
 }
 func ETag(o Object) (string, error) {
 	n, e := Num(o, "revision")

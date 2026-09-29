@@ -28,10 +28,12 @@ func setting(name, fallback string) string {
 func main() {
 	bootstrapOwner := flag.Bool("bootstrap-owner", false, "initialize the local Owner and write a private credential file")
 	credentialFile := flag.String("credential-file", "", "private local output path")
+	importSpec := flag.String("import-spec", "", "import a pinned specification directory as the initial ResearchOS goal")
+	manifestHash := flag.String("manifest-sha256", "", "trusted sha256 digest of the complete package manifest")
 	flag.Parse()
 	dataDir := setting("RESEARCHOS_DATA_DIR", filepath.Join(".local", "data"))
 	webDir := setting("RESEARCHOS_WEB_DIR", filepath.Join("apps", "web", "dist"))
-	if _, err := os.Stat(filepath.Join(webDir, "index.html")); err != nil && !*bootstrapOwner {
+	if _, err := os.Stat(filepath.Join(webDir, "index.html")); err != nil && !*bootstrapOwner && *importSpec == "" {
 		log.Fatalf("web build unavailable: %v", err)
 	}
 	db, err := store.Open(filepath.Join(dataDir, "researchos.sqlite"))
@@ -53,6 +55,25 @@ func main() {
 		if err = bootstrap(service, *credentialFile); err != nil {
 			log.Fatalf("Owner bootstrap failed: %v", err)
 		}
+		return
+	}
+	if *importSpec != "" {
+		if *credentialFile == "" || *manifestHash == "" {
+			log.Fatal("credential-file and manifest-sha256 required")
+		}
+		raw, e := os.ReadFile(*credentialFile)
+		if e != nil {
+			log.Fatal("private credential file unavailable")
+		}
+		credential, e := domain.Decode(raw)
+		if e != nil {
+			log.Fatal("invalid credential file")
+		}
+		result, e := service.ImportSpecification(context.Background(), domain.Str(credential, "token"), *importSpec, *manifestHash, domain.Object{})
+		if e != nil {
+			log.Fatalf("specification import failed: %v", e)
+		}
+		json.NewEncoder(os.Stdout).Encode(result)
 		return
 	}
 	listen := setting("RESEARCHOS_LISTEN", "127.0.0.1:8787")

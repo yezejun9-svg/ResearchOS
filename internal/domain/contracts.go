@@ -33,7 +33,7 @@ func (localOnly) Load(url string) (any, error) {
 	return nil, fmt.Errorf("unregistered schema resource: %s", url)
 }
 func Decode(raw []byte) (Object, error) {
-	_, e := canonical.JSON(raw)
+	encoded, e := canonical.JSON(raw)
 	if e != nil {
 		return nil, e
 	}
@@ -44,7 +44,48 @@ func Decode(raw []byte) (Object, error) {
 	if o == nil && e == nil {
 		e = fmt.Errorf("object required")
 	}
+	if e == nil {
+		var c any
+		d = json.NewDecoder(bytes.NewReader(encoded))
+		d.UseNumber()
+		if e = d.Decode(&c); e == nil && !sameNumbers(o, c) {
+			e = fmt.Errorf("JSON number is not losslessly representable by canonical JSON")
+		}
+	}
 	return o, e
+}
+func sameNumbers(a, b any) bool {
+	switch x := a.(type) {
+	case json.Number:
+		y, ok := b.(json.Number)
+		if !ok {
+			return false
+		}
+		r, ok := new(big.Rat).SetString(x.String())
+		s, ok2 := new(big.Rat).SetString(y.String())
+		return ok && ok2 && r.Cmp(s) == 0
+	case map[string]any:
+		y, ok := b.(map[string]any)
+		if !ok {
+			return false
+		}
+		for k, v := range x {
+			if !sameNumbers(v, y[k]) {
+				return false
+			}
+		}
+	case []any:
+		y, ok := b.([]any)
+		if !ok || len(x) != len(y) {
+			return false
+		}
+		for i, v := range x {
+			if !sameNumbers(v, y[i]) {
+				return false
+			}
+		}
+	}
+	return true
 }
 func Bytes(v any) []byte {
 	b, e := json.Marshal(v)
@@ -212,6 +253,9 @@ func init() {
 	}
 }
 func operationOwner(id string) string {
+	if contextOperations[id] {
+		return "W04"
+	}
 	if id == "searchEvidence" {
 		return "W09"
 	}
