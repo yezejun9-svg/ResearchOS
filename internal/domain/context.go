@@ -57,6 +57,11 @@ func (s *Service) effectiveGraph(tx *sql.Tx, project string, r Object, seen map[
 	if current["validity"] == "STALE" || current["validity"] == "REVOKED" {
 		return Fail(409, "STATE_CONFLICT", "input is no longer effective")
 	}
+	if r["entity_type"] == "Artifact" {
+		if e = s.requireCurrentArtifactBody(tx, project, current); e != nil {
+			return e
+		}
+	}
 	if r["entity_type"] == "DecisionReceipt" {
 		state, e := singleton(tx, project, "ProjectState")
 		if e != nil {
@@ -167,10 +172,14 @@ func (s *Service) createContext(tx *sql.Tx, p Principal, project string, b Objec
 	}
 	refs := []any{Ref(profile, "ProjectProfile")}
 	snapshotIDs, e := s.currentAuthorizedSnapshots(tx, p, project)
-	if e != nil { return nil, e }
+	if e != nil {
+		return nil, e
+	}
 	for _, rawID := range snapshotIDs {
 		a, loadErr := s.readObject(tx, p, project, "Artifact", rawID.(string))
-		if loadErr != nil { return nil, loadErr }
+		if loadErr != nil {
+			return nil, loadErr
+		}
 		refs = append(refs, Ref(a, "Artifact"))
 	}
 	seen := map[string]bool{}
@@ -227,7 +236,9 @@ func (s *Service) createContext(tx *sql.Tx, p Principal, project string, b Objec
 	} else if err != sql.ErrNoRows {
 		return nil, err
 	}
-	if len(snapshotIDs) > 0 { manifestHash = Hash([]any{manifestHash, snapshotIDs}) }
+	if len(snapshotIDs) > 0 {
+		manifestHash = Hash([]any{manifestHash, snapshotIDs})
+	}
 	bundle := Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now(), "task_id": task["id"], "project_state_revision": state["revision"], "version_vector": refs, "facts": profile["facts"], "unresolved_items": unresolved, "latest_decision_refs": decisions, "unfinished_commitments": commitments, "summary": summary, "summary_hash": Digest([]byte(summary)), "source_manifest_hash": manifestHash, "authorized_snapshot_ids": snapshotIDs, "policy_revision": state["policy_revision"]}
 	bundle["receipt_hash"] = Receipt(bundle)
 	if e = s.put(tx, "ContextBundle", bundle); e != nil {
