@@ -206,6 +206,13 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		result, e = s.createRequirement(tx, project, b)
 		kind = "Requirement"
 		status = 201
+	case "createEvidence":
+		result, e = s.createEvidence(tx, project, b)
+		kind = "Evidence"
+		status = 201
+	case "advanceSourceCursor":
+		result, e = s.advanceSourceCursor(tx, project, id, b)
+		kind = "SourceCursor"
 	case "actOnRequirement":
 		result, e = s.actRequirement(tx, project, id, b)
 		kind = "Requirement"
