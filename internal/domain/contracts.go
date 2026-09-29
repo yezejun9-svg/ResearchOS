@@ -253,6 +253,9 @@ func init() {
 	}
 }
 func operationOwner(id string) string {
+	if runtimeOperations[id] {
+		return "W05"
+	}
 	if contextOperations[id] {
 		return "W04"
 	}

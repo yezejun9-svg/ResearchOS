@@ -39,6 +39,12 @@ type Spec struct {
 	Environment []string      `json:"-"`
 	Lease       time.Duration `json:"-"`
 	Timeout     time.Duration `json:"-"`
+	Outputs     []string      `json:"expected_outputs"`
+}
+type Artifact struct {
+	Path string `json:"path"`
+	Hash string `json:"content_hash"`
+	Size int64  `json:"byte_size"`
 }
 type Tree struct {
 	At    string   `json:"at"`
@@ -46,26 +52,27 @@ type Tree struct {
 	Error string   `json:"error,omitempty"`
 }
 type Journal struct {
-	Spec             Spec     `json:"spec"`
-	Revision         string   `json:"adapter_revision"`
-	Job              string   `json:"job"`
-	State            string   `json:"state"`
-	Reason           string   `json:"reason"`
-	Worker           string   `json:"worker"`
-	PID              uint32   `json:"pid"`
-	Created          int64    `json:"process_created_ns"`
-	Launched         int      `json:"launched"`
-	Pending          int      `json:"pending"`
-	Exit             *int     `json:"exit_code"`
-	Cancelled        bool     `json:"cancelled"`
-	QueueEmpty       bool     `json:"queue_empty"`
-	ChildrenStopped  bool     `json:"children_stopped"`
-	Started          string   `json:"started"`
-	Ended            string   `json:"ended"`
-	EnvironmentNames []string `json:"environment_names"`
-	Trees            []Tree   `json:"trees"`
-	Streams          []Stream `json:"streams"`
-	Protocol         Protocol `json:"protocol"`
+	Spec             Spec       `json:"spec"`
+	Revision         string     `json:"adapter_revision"`
+	Job              string     `json:"job"`
+	State            string     `json:"state"`
+	Reason           string     `json:"reason"`
+	Worker           string     `json:"worker"`
+	PID              uint32     `json:"pid"`
+	Created          int64      `json:"process_created_ns"`
+	Launched         int        `json:"launched"`
+	Pending          int        `json:"pending"`
+	Exit             *int       `json:"exit_code"`
+	Cancelled        bool       `json:"cancelled"`
+	QueueEmpty       bool       `json:"queue_empty"`
+	ChildrenStopped  bool       `json:"children_stopped"`
+	Started          string     `json:"started"`
+	Ended            string     `json:"ended"`
+	EnvironmentNames []string   `json:"environment_names"`
+	Trees            []Tree     `json:"trees"`
+	Streams          []Stream   `json:"streams"`
+	Protocol         Protocol   `json:"protocol"`
+	Artifacts        []Artifact `json:"artifacts"`
 }
 type Stream struct {
 	Out     string `json:"stdout"`
@@ -123,6 +130,11 @@ func Start(directory string, s Spec) (*Worker, error) {
 		}
 		if strings.ContainsRune(c.Input, 0) {
 			return nil, errors.New("invalid stdin")
+		}
+	}
+	for _, path := range s.Outputs {
+		if !filepath.IsLocal(path) {
+			return nil, errors.New("output must be a local relative path")
 		}
 	}
 	if e := os.Mkdir(directory, 0700); e != nil {
@@ -194,10 +206,13 @@ func (w *Worker) Cancel(epoch int64, reason string) error {
 	w.journal.State = "CANCEL_REQUESTED"
 	w.journal.Reason = reason
 	w.snapshotTree()
-	if e := w.persist(); e != nil {
-		return e
+	journalError := w.persist()
+	killError := killJob(w.job)
+	if journalError != nil {
+		w.journal.State = "UNKNOWN"
+		w.journal.Reason = "cancel journal failed: " + journalError.Error()
 	}
-	return killJob(w.job)
+	return errors.Join(journalError, killError)
 }
 func (w *Worker) Read() Journal {
 	w.mu.Lock()
@@ -342,10 +357,10 @@ func (w *Worker) run(s Spec) {
 					}
 				}
 				w.journal.Streams = append(w.journal.Streams, stream)
-				if code != 0 || w.journal.Cancelled {
+				if code != 0 || w.journal.Cancelled || (s.Model != "" && !w.journal.Protocol.Settled) {
 					if !w.journal.Cancelled {
 						w.journal.State = "FAILED"
-						w.journal.Reason = "executor_exit"
+						w.journal.Reason = w.journal.Protocol.Failure
 					}
 					w.finishLocked()
 					w.mu.Unlock()
@@ -375,6 +390,41 @@ func (w *Worker) finishLocked() {
 		w.journal.State = "CANCELLED"
 	} else if w.journal.State != "FAILED" {
 		w.journal.State = "SETTLED"
+	}
+	if w.journal.State == "SETTLED" {
+		for _, relative := range w.journal.Spec.Outputs {
+			root, e := filepath.EvalSymlinks(w.journal.Spec.Commands[0].Directory)
+			if e != nil {
+				w.journal.State = "FAILED"
+				w.journal.Reason = "output_workspace_unavailable"
+				break
+			}
+			path, e := filepath.EvalSymlinks(filepath.Join(root, relative))
+			if e != nil {
+				w.journal.State = "FAILED"
+				w.journal.Reason = "output_missing"
+				break
+			}
+			rel, e := filepath.Rel(root, path)
+			if e != nil || !filepath.IsLocal(rel) {
+				w.journal.State = "FAILED"
+				w.journal.Reason = "output_escapes_workspace"
+				break
+			}
+			stat, e := os.Stat(path)
+			if e != nil || !stat.Mode().IsRegular() || stat.Size() > 64*1024*1024 {
+				w.journal.State = "FAILED"
+				w.journal.Reason = "output_invalid"
+				break
+			}
+			b, e := os.ReadFile(path)
+			if e != nil {
+				w.journal.State = "FAILED"
+				w.journal.Reason = "output_unreadable"
+				break
+			}
+			w.journal.Artifacts = append(w.journal.Artifacts, Artifact{relative, Hash(b), int64(len(b))})
+		}
 	}
 	w.journal.Ended = now()
 	if e = w.persist(); e != nil {
@@ -425,7 +475,7 @@ func Reconcile(directory string) (Journal, error) {
 		alive, ie := inspectIdentity(j.PID, j.Created)
 		if ie != nil || alive {
 			j.ChildrenStopped = false
-		} else if je != nil {
+		} else if errors.Is(je, windows.ERROR_FILE_NOT_FOUND) {
 			j.ChildrenStopped = true
 		}
 	}

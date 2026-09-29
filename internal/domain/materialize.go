@@ -13,7 +13,7 @@ func (s *Service) authorizedContext(tx *sql.Tx, token, project, taskID string) (
 	if e != nil {
 		return p, nil, e
 	}
-	if !p.Allowed(project, taskID, "", false) {
+	if !p.Allowed(project, taskID, "", false) && !s.runtimeScope(tx, p, project, taskID, "getTask", nil) {
 		return p, nil, Fail(404, "NOT_FOUND", "task unavailable")
 	}
 	task, e := load(tx, project, "Task", taskID)
