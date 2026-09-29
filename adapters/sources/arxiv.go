@@ -87,7 +87,7 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 	if pdfBase == "" {
 		pdfBase = "https://arxiv.org/pdf"
 	}
-	client, e := sourceClient(a.Client, allowed, u.String(), pdfBase)
+	client, e := sourceClient(a.Client, allowed, func(v string) { p.RequestURLs = append(p.RequestURLs, v) }, u.String(), pdfBase)
 	if e != nil {
 		p.Failure = "ORIGIN_DENIED"
 		return p, nil
@@ -97,6 +97,7 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 		return p, e
 	}
 	req.Header.Set("User-Agent", "ResearchOS-source-adapter/1.0 (research use)")
+	p.RequestURLs = append(p.RequestURLs, u.String())
 	resp, e := client.Do(req)
 	if e != nil {
 		if errors.Is(e, ErrSourceOrigin) {
@@ -107,6 +108,8 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 		return p, e
 	}
 	defer resp.Body.Close()
+	p.FinalURLs = append(p.FinalURLs, resp.Request.URL.String())
+	p.FetchedAt = time.Now().UTC()
 	p.HTTPStatus = resp.StatusCode
 	if resp.StatusCode != 200 {
 		p.Failure = classifyHTTP(resp.StatusCode, resp.Header)
@@ -167,6 +170,7 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 		return p, e
 	}
 	pdfReq.Header.Set("User-Agent", "ResearchOS-source-adapter/1.0 (research use)")
+	p.RequestURLs = append(p.RequestURLs, pdfURL)
 	pdfResp, e := client.Do(pdfReq)
 	if e != nil {
 		if errors.Is(e, ErrSourceOrigin) {
@@ -177,6 +181,8 @@ func (a *Arxiv) Fetch(ctx context.Context, q Query) (Page, error) {
 		return p, e
 	}
 	defer pdfResp.Body.Close()
+	p.FinalURLs = append(p.FinalURLs, pdfResp.Request.URL.String())
+	p.FetchedAt = time.Now().UTC()
 	if pdfResp.StatusCode != 200 {
 		p.Failure = classifyHTTP(pdfResp.StatusCode, pdfResp.Header)
 		p.RetryAfter = retryTime(pdfResp.Header, time.Now())

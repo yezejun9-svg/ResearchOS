@@ -34,6 +34,7 @@ type xPublicPost struct {
 	PublishedAt string `json:"published_at"`
 	Text        string `json:"text"`
 	Author      string `json:"author"`
+	Truncated   bool   `json:"truncated"`
 }
 type xPublicResult struct {
 	URL   string        `json:"url"`
@@ -44,7 +45,7 @@ type xPublicResult struct {
 var xStatusURL = regexp.MustCompile(`^https://x\.com/([A-Za-z0-9_]{1,15})/status/([0-9]{1,25})$`)
 
 const xSearchScript = `JSON.stringify({url:location.href,items:Array.from(document.querySelectorAll('article')).slice(0,20).map(a=>({url:a.querySelector('a[href*="/status/"]')?.href||"",published_at:a.querySelector('time')?.dateTime||"",text:a.querySelector('[data-testid="tweetText"]')?.innerText||"",author:a.querySelector('[data-testid="User-Name"] a[href^="/"]')?.getAttribute('href')||""})),empty:!!document.querySelector('[data-testid="emptyState"]')})`
-const xPostScript = `JSON.stringify({url:location.href,items:Array.from(document.querySelectorAll('article')).filter(a=>a.querySelector('a[href*="/status/"]')?.href===location.href).slice(0,1).map(a=>({url:location.href,published_at:a.querySelector('time')?.dateTime||"",text:a.querySelector('[data-testid="tweetText"]')?.innerText||"",author:a.querySelector('[data-testid="User-Name"] a[href^="/"]')?.getAttribute('href')||""}))})`
+const xPostScript = `JSON.stringify({url:location.href,items:Array.from(document.querySelectorAll('article')).filter(a=>a.querySelector('a[href*="/status/"]')?.href===location.href).slice(0,1).map(a=>({url:location.href,published_at:a.querySelector('time')?.dateTime||"",text:a.querySelector('[data-testid="tweetText"]')?.innerText||"",author:a.querySelector('[data-testid="User-Name"] a[href^="/"]')?.getAttribute('href')||"",truncated:!!a.querySelector('[data-testid="tweet-text-show-more-link"]')||Array.from(a.querySelectorAll('a,button')).some(x=>/^(show more|显示更多)$/i.test(x.innerText?.trim()||""))}))})`
 
 // Fetch reads X's authorized public search page, then the canonical post page
 // for a complete visible post body. It never inspects account sidebars or XHR
@@ -56,6 +57,7 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 	}
 	query := q.Text + " since:" + q.From.UTC().Format("2006-01-02") + " until:" + q.To.UTC().Add(24*time.Hour).Format("2006-01-02")
 	searchURL := "https://x.com/search?q=" + url.QueryEscape(query) + "&src=typed_query&f=live"
+	p.RequestURLs = append(p.RequestURLs, searchURL)
 	session := fmt.Sprintf("researchos-w07-%d", time.Now().UnixNano())
 	if _, e := a.Runner.Run(ctx, "--session", session, "browser", "open", a.BrowserID, searchURL); e != nil {
 		p.Failure = "UNAVAILABLE"
@@ -71,6 +73,8 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 		p.Failure = "AUTH_OR_NAVIGATION"
 		return p, nil
 	}
+	p.FinalURLs = append(p.FinalURLs, search.URL)
+	p.FetchedAt = time.Now().UTC()
 	// This is a deliberately narrow public-article extraction, never page HTML.
 	p.RawResponse, p.RawMediaType = raw, "application/json"
 	if len(search.Items) == 0 {
@@ -95,6 +99,7 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 			p.Failure = "DETAIL_UNAVAILABLE"
 			return p, e
 		}
+		p.RequestURLs = append(p.RequestURLs, candidate.URL)
 		post, _, e := a.eval(ctx, session, xPostScript)
 		if e != nil {
 			p.Failure = "DETAIL_UNAVAILABLE"
@@ -104,8 +109,10 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 			p.Failure = "INCOMPLETE_ITEM"
 			return p, nil
 		}
+		p.FinalURLs = append(p.FinalURLs, post.URL)
+		p.FetchedAt = time.Now().UTC()
 		full := post.Items[0]
-		if full.URL != candidate.URL || full.Author != "/"+match[1] || strings.TrimSpace(full.Text) == "" || full.PublishedAt != candidate.PublishedAt {
+		if full.URL != candidate.URL || full.Author != "/"+match[1] || strings.TrimSpace(full.Text) == "" || full.PublishedAt != candidate.PublishedAt || full.Truncated {
 			p.Failure = "INCOMPLETE_ITEM"
 			return p, nil
 		}

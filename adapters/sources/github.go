@@ -66,11 +66,12 @@ func (a GitHubReleases) Fetch(ctx context.Context, q Query) (Page, error) {
 	if len(allowed) == 0 {
 		allowed = []string{"https://api.github.com", "https://github.com"}
 	}
-	client, err := sourceClient(a.Client, allowed, u)
+	client, err := sourceClient(a.Client, allowed, func(v string) { p.RequestURLs = append(p.RequestURLs, v) }, u)
 	if err != nil {
 		p.Failure = "ORIGIN_DENIED"
 		return p, nil
 	}
+	p.RequestURLs = append(p.RequestURLs, u)
 	resp, err := client.Do(req)
 	if err != nil {
 		if errors.Is(err, ErrSourceOrigin) {
@@ -81,6 +82,8 @@ func (a GitHubReleases) Fetch(ctx context.Context, q Query) (Page, error) {
 		return p, err
 	}
 	defer resp.Body.Close()
+	p.FinalURLs = append(p.FinalURLs, resp.Request.URL.String())
+	p.FetchedAt = time.Now().UTC()
 	p.HTTPStatus = resp.StatusCode
 	if resp.StatusCode != 200 {
 		p.Failure = classifyHTTP(resp.StatusCode, resp.Header)
@@ -120,7 +123,7 @@ func (a GitHubReleases) Fetch(ctx context.Context, q Query) (Page, error) {
 			p.Failure = "INVALID_RESPONSE"
 			return p, nil
 		}
-		sha, status, headers, e := a.commitSHA(ctx, client, base, parts[0], parts[1], r.TagName)
+		sha, status, headers, e := a.commitSHA(ctx, client, base, parts[0], parts[1], r.TagName, &p)
 		if e != nil {
 			if errors.Is(e, ErrSourceOrigin) {
 				p.Failure = "ORIGIN_DENIED"
@@ -150,8 +153,9 @@ func (a GitHubReleases) Fetch(ctx context.Context, q Query) (Page, error) {
 	return p, nil
 }
 
-func (a GitHubReleases) commitSHA(ctx context.Context, client *http.Client, base, owner, repo, tag string) (string, int, http.Header, error) {
+func (a GitHubReleases) commitSHA(ctx context.Context, client *http.Client, base, owner, repo, tag string, p *Page) (string, int, http.Header, error) {
 	u := fmt.Sprintf("%s/repos/%s/%s/commits/%s", strings.TrimRight(base, "/"), url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(tag))
+	p.RequestURLs = append(p.RequestURLs, u)
 	allowed := a.AllowedOrigins
 	if len(allowed) == 0 {
 		allowed = []string{"https://api.github.com", "https://github.com"}
@@ -170,6 +174,7 @@ func (a GitHubReleases) commitSHA(ctx context.Context, client *http.Client, base
 		return "", 0, nil, e
 	}
 	defer resp.Body.Close()
+	p.FinalURLs = append(p.FinalURLs, resp.Request.URL.String())
 	if resp.StatusCode != 200 {
 		return "", resp.StatusCode, resp.Header, fmt.Errorf("commit lookup returned %d", resp.StatusCode)
 	}

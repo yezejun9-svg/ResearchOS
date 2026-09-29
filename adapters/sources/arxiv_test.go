@@ -59,6 +59,9 @@ func TestW07ArxivFullPDFAndVersion(t *testing.T) {
 	if e != nil || p.Failure != "" || !p.Complete || len(p.Items) != 1 {
 		t.Fatalf("fetch: %+v %v", p, e)
 	}
+	if len(p.RequestURLs) != 2 || len(p.FinalURLs) != 2 || p.FetchedAt.IsZero() {
+		t.Fatal("actual metadata/PDF URL trace missing")
+	}
 	item := p.Items[0]
 	if item.UpstreamRevision != "2304.03442v2" || item.Author != "First Author, Second Author" || !bytes.Equal(item.Body, pdf) || item.MediaType != "application/pdf" {
 		t.Fatalf("item: %+v", item)

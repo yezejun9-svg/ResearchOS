@@ -35,6 +35,9 @@ type Item struct {
 
 type Page struct {
 	Items         []Item
+	RequestURLs   []string
+	FinalURLs     []string
+	FetchedAt     time.Time
 	NextCursor    string
 	RequestedFrom time.Time
 	RequestedTo   time.Time
@@ -79,7 +82,7 @@ func sourceOrigin(raw string) string {
 	return strings.ToLower(u.Scheme + "://" + u.Host)
 }
 
-func sourceClient(base *http.Client, allowed []string, initial ...string) (*http.Client, error) {
+func sourceClient(base *http.Client, allowed []string, trace func(string), initial ...string) (*http.Client, error) {
 	approved := map[string]bool{}
 	fixture := len(initial) > 0
 	for _, v := range initial {
@@ -112,7 +115,12 @@ func sourceClient(base *http.Client, allowed []string, initial ...string) (*http
 			return errors.New("too many source redirects")
 		}
 		if prior != nil {
-			return prior(req, via)
+			if e := prior(req, via); e != nil {
+				return e
+			}
+		}
+		if trace != nil {
+			trace(req.URL.String())
 		}
 		return nil
 	}
