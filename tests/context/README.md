@@ -23,3 +23,5 @@ MaterializeTaskContext(ctx context.Context, token, project, taskID, newDirectory
 材料化重新检查当前授权、最新任务 bundle 指针、版本向量和内容 hash；目录必须尚不存在。bundle.json、manifest.json、inputs/* 为只读，candidates/ 可写。ContextBundle 的 ProjectState revision 是观察水位，实际有效性由 Profile/Task 输入/策略版本决定；无关全局事件不会让有效输入失效。只携带该任务真正引用的当前决定；历史决定仍通过不可变 receipt 和 supersedes_id 追溯。
 
 边界：模型决策信号/BOUNDED_AUTO 仍为 W11，Run 消息/语义审查等待 W05，Task/Goal 正式接受仍为 W06。recordAcceptance 这里只支持服务器重算冻结检查的 ChangeProposal 接受，不信任客户端 PASS/checks/executor 列表。受限内容材料化保持 W17 未绑定 503。事件消费者为持久顺序应用基础，不代表 W12 全生命周期完成。
+
+预审回归：DecisionReceipt 的 subject_ref、rubric_ref、evidence_refs 和检查证据统一进入语义依赖遍历与影响链接，supersedes_id 只保留历史追溯。新增候选作者从持久 DecisionReceipt.recorded_by 与实际候选 Artifact 作者解析；客户端 executor 列表不构成独立性证明，未被本次晋升的历史作者不排除。A01 另注入真实未列入 manifest 的文件，验证整包拒绝且数据库不变。运行报告的 version_manifest 在执行前采样真实 HEAD、dirty 状态、环境及源码/规格/工具锁 hash。

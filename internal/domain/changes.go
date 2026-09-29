@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 )
 
 var changeChecks = []string{"context.inputs-frozen", "context.impact-exact", "context.authority-independent"}
@@ -66,7 +67,7 @@ func (s *Service) recordDecision(tx *sql.Tx, p Principal, project string, b Obje
 	if e != nil {
 		return nil, e
 	}
-	for _, r := range Arr(b, "input_refs") {
+	for _, r := range semanticReferences("DecisionReceipt", o) {
 		if _, e = s.impactLink(tx, project, Object{"from_ref": Ref(o, "DecisionReceipt"), "to_ref": r, "relation": "DEPENDS_ON", "basis": "DETERMINISTIC", "evidence_refs": Empty()}); e != nil {
 			return nil, e
 		}
@@ -95,10 +96,8 @@ func (s *Service) validateDecisions(tx *sql.Tx, project string, old, newValue an
 		if e != nil {
 			return e
 		}
-		for _, input := range Arr(d, "input_refs") {
-			if e = s.effective(tx, project, input.(map[string]any)); e != nil {
-				return e
-			}
+		if e = s.effectiveInputs(tx, project, "DecisionReceipt", d, map[string]bool{}); e != nil {
+			return e
 		}
 		if d["status"] != "DECIDED" {
 			return Fail(422, "GATE_FAILED", "abstained or failed decision cannot be adopted")
@@ -338,13 +337,9 @@ func (s *Service) acceptChange(tx *sql.Tx, p Principal, project string, b Object
 	if e = tx.QueryRow("SELECT author FROM context_changes WHERE project=? AND proposal_id=?", project, proposal["id"]).Scan(&author); e != nil {
 		return nil, e
 	}
-	authors := []any{author}
-	for _, v := range Arr(proposal, "edits") {
-		a, e := version(tx, project, v.(map[string]any)["proposed_value_artifact_ref"].(map[string]any))
-		if e != nil {
-			return nil, e
-		}
-		authors = append(authors, a["produced_by"])
+	authors, e := s.candidateAuthors(tx, project, proposal, author)
+	if e != nil {
+		return nil, e
 	}
 	for _, id := range authors {
 		if id == p.ID {
@@ -576,4 +571,88 @@ func artifactMedia(data []byte) string {
 		return "application/json"
 	}
 	return "text/plain; charset=utf-8"
+}
+
+// candidateAuthors follows the material being promoted, not the superseded lineage.
+// Source snapshots and unrelated/current decisions are not candidate authorship.
+func (s *Service) candidateAuthors(tx *sql.Tx, project string, proposal Object, author string) ([]any, error) {
+	authors := map[string]bool{author: true}
+	visited := map[string]bool{}
+	var artifact func(Object, bool) error
+	artifact = func(ref Object, direct bool) error {
+		key := Hash(ref)
+		if visited[key] {
+			return nil
+		}
+		visited[key] = true
+		a, e := version(tx, project, ref)
+		if e != nil {
+			return e
+		}
+		if !direct && a["kind"] == "SOURCE_SNAPSHOT" {
+			return nil
+		}
+		authors[Str(a, "produced_by")] = true
+		for _, r := range Arr(a, "input_refs") {
+			v := r.(map[string]any)
+			if v["entity_type"] == "Artifact" {
+				if e = artifact(v, false); e != nil {
+					return e
+				}
+			}
+		}
+		return nil
+	}
+	state, e := singleton(tx, project, "ProjectState")
+	if e != nil {
+		return nil, e
+	}
+	current := map[string]bool{}
+	for _, r := range Arr(state, "current_decision_refs") {
+		current[Str(r.(map[string]any), "id")] = true
+	}
+	for _, v := range Arr(proposal, "edits") {
+		edit := v.(map[string]any)
+		ref := edit["proposed_value_artifact_ref"].(map[string]any)
+		if e = artifact(ref, true); e != nil {
+			return nil, e
+		}
+		target := edit["target_ref"].(map[string]any)
+		if target["entity_type"] != "ProjectState" || edit["field"] != "current_decision_refs" {
+			continue
+		}
+		value, e := s.artifactJSON(tx, project, ref)
+		if e != nil {
+			return nil, e
+		}
+		for _, v := range value.([]any) {
+			r := v.(map[string]any)
+			if current[Str(r, "id")] {
+				continue
+			}
+			d, e := version(tx, project, r)
+			if e != nil {
+				return nil, e
+			}
+			authors[Str(d, "recorded_by")] = true
+			for _, r := range Arr(d, "evidence_refs") {
+				evidence := r.(map[string]any)
+				if evidence["entity_type"] == "Artifact" {
+					if e = artifact(evidence, false); e != nil {
+						return nil, e
+					}
+				}
+			}
+		}
+	}
+	ids := []string{}
+	for id := range authors {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	result := Empty()
+	for _, id := range ids {
+		result = append(result, id)
+	}
+	return result, nil
 }
