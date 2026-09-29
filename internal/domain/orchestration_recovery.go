@@ -103,7 +103,7 @@ func (s *Service) taskFailed(tx *sql.Tx, project string, t Object, reason string
 	return s.put(tx, "NoProgressRecord", n)
 }
 
-func (s *Service) runtimeTaskTerminal(tx *sql.Tx, p Principal, project string, r Object) error {
+func (s *Service) runtimeTaskTerminal(tx *sql.Tx, p Principal, project string, r Object, cid string) error {
 	if r["status"] != "FAILED" && r["status"] != "CANCELLED" {
 		return nil
 	}
@@ -111,7 +111,7 @@ func (s *Service) runtimeTaskTerminal(tx *sql.Tx, p Principal, project string, r
 	if e != nil {
 		return e
 	}
-	if t["task_type"] == "runtime_qualification" || t["status"] != "RUNNING" {
+	if t["task_type"] == "runtime_qualification" || (t["status"] != "RUNNING" && t["status"] != "BLOCKED") {
 		return nil
 	}
 	if t["active_run_id"] != r["id"] {
@@ -123,6 +123,14 @@ func (s *Service) runtimeTaskTerminal(tx *sql.Tx, p Principal, project string, r
 		}
 	} else {
 		t["status"] = "CANCELLED"
+		var action string
+		e = tx.QueryRow("SELECT action FROM orchestration_task_controls WHERE project=? AND task=?", project, t["id"]).Scan(&action)
+		if e != nil && e != sql.ErrNoRows {
+			return e
+		}
+		if action == "PAUSE" {
+			t["status"] = "BLOCKED"
+		}
 	}
 	if e = bump(t); e != nil {
 		return e
@@ -130,5 +138,5 @@ func (s *Service) runtimeTaskTerminal(tx *sql.Tx, p Principal, project string, r
 	if e = s.put(tx, "Task", t); e != nil {
 		return e
 	}
-	return s.event(tx, project, "Task", t, p.ID, ID(), "TASK_CHANGED")
+	return s.event(tx, project, "Task", t, p.ID, cid, "TASK_CHANGED")
 }
