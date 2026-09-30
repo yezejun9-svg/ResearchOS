@@ -23,7 +23,7 @@ func main() {
 }
 func run() error {
 	if len(os.Args) < 2 {
-		return fmt.Errorf("usage: backup keygen|create|export|restore [flags]")
+		return fmt.Errorf("usage: backup keygen|create|export|restore|upgrade-local [flags]")
 	}
 	command := os.Args[1]
 	f := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -32,6 +32,10 @@ func run() error {
 	out := f.String("out", "", "new destination (must not exist)")
 	keyfile := f.String("key-file", "", "separate recovery key file; never command-line key bytes")
 	root := f.String("root", ".", "matching application repository root")
+	sourceRoot := f.String("source-root", "", "upgrade: exact schema13 release root")
+	sourceProgram := f.String("source-program", "", "upgrade: preserved matching old program")
+	targetProgram := f.String("target-program", "", "upgrade: reviewed target program")
+	plan := f.String("plan", "", "upgrade: schema13-to14-remote-access-v1 only")
 	if e := f.Parse(os.Args[2:]); e != nil {
 		return e
 	}
@@ -60,11 +64,22 @@ func run() error {
 		fmt.Println(`{"status":"KEY_CREATED_SEPARATELY","key_bytes_printed":false}`)
 		return nil
 	}
-	if command != "create" && command != "export" && command != "restore" {
+	if command != "create" && command != "export" && command != "restore" && command != "upgrade-local" {
 		return fmt.Errorf("unknown command")
 	}
 	if *out == "" {
 		return fmt.Errorf("--out required")
+	}
+	if command == "upgrade-local" {
+		r, e := domain.UpgradeLocal(context.Background(), domain.LocalUpgradeOptions{
+			Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
+			SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
+			TargetProgram: *targetProgram, Plan: *plan,
+		})
+		if e != nil {
+			return e
+		}
+		return json.NewEncoder(os.Stdout).Encode(r)
 	}
 	keyPath, e := filepath.Abs(*keyfile)
 	if e != nil {
