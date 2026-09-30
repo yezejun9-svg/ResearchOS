@@ -136,3 +136,37 @@ func (s *Service) reserveFixtureDispatch(tx *sql.Tx, project string, run Object)
 	_, e = s.appendBudget(tx, project, Object{"policy_id": goal["budget_policy_id"], "run_id": run["id"], "operation": "RESERVE", "money": Object{"amount": "0", "currency": currency}, "provider_request_id": "fixture-dispatch/" + Str(run, "id"), "provider_event_id": "fixture-dispatch/" + Str(run, "id"), "reservation_id": nil, "cost_basis": "UPPER_BOUND", "occurred_at": Now()})
 	return e
 }
+
+// AppContainer creation is a local operation with no provider request. Its
+// zero charge is explicit and separate from every typed broker reservation.
+func (s *Service) reserveRuntimeLocalLaunch(tx *sql.Tx, project string, run, admission Object) error {
+	profile, ok := admission["profile"].(map[string]any)
+	if !ok {
+		return Fail(422, "GATE_FAILED", "dispatch cost admission requires frozen profile")
+	}
+	if e := validateRuntimeDispatchProfile(profile); e != nil {
+		return e
+	}
+	scopes, _, e := runBudgetScopes(tx, project, Str(run, "id"))
+	if e != nil {
+		return e
+	}
+	currency := "USD"
+	for _, p := range scopes {
+		if p["cap"] != nil {
+			currency = Str(p["cap"].(map[string]any), "currency")
+			break
+		}
+	}
+	task, e := load(tx, project, "Task", Str(run, "task_id"))
+	if e != nil {
+		return e
+	}
+	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+	if e != nil {
+		return e
+	}
+	request := "runtime-local-launch/" + Str(run, "id") + "/" + string(Bytes(run["lease_epoch"]))
+	_, e = s.appendBudget(tx, project, Object{"policy_id": goal["budget_policy_id"], "run_id": run["id"], "operation": "RESERVE", "money": Object{"amount": "0", "currency": currency}, "provider_request_id": request, "provider_event_id": request, "reservation_id": nil, "cost_basis": "UPPER_BOUND", "occurred_at": Now()})
+	return e
+}

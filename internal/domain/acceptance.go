@@ -157,8 +157,25 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 	if e = tx.QueryRow("SELECT count(*) FROM orchestration_fixtures WHERE project=? AND runtime=?", project, rt["id"]).Scan(&fixture); e != nil {
 		return nil, e
 	}
-	if (!qualification && fixture != 1) || rt["measurement_mode"] != "FIXTURE" || b["measurement_mode"] != "FIXTURE" {
-		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "LIVE acceptance requires qualified runtime and verification resources")
+	mode := Str(rt, "measurement_mode")
+	dispatch, de := runtimeDispatch(tx, project, Str(r, "id"), r["lease_epoch"])
+	if de != nil && de != sql.ErrNoRows {
+		return nil, de
+	}
+	if de == nil {
+		if _, e = nativeDispatchProof(tx, project, r, observation); e != nil {
+			return nil, e
+		}
+		admission, e := s.currentDispatchAdmission(tx, project, t, r, dispatch, "accept")
+		if e != nil {
+			return nil, e
+		}
+		mode = Str(admission, "mode")
+	} else if (!qualification && fixture != 1) || mode != "FIXTURE" || b["measurement_mode"] != "FIXTURE" {
+		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "acceptance requires qualified native dispatch")
+	}
+	if b["measurement_mode"] != mode {
+		return nil, Fail(422, "GATE_FAILED", "acceptance mode differs from host provenance")
 	}
 	if b["independence_basis"] != "DETERMINISTIC_SERVICE" || len(Arr(b, "qualification_ids")) != 0 {
 		return nil, Fail(422, "GATE_FAILED", "only deterministic service verification is implemented")
@@ -188,7 +205,7 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 		if e != nil {
 			return nil, e
 		}
-		if use["measurement_mode"] != "FIXTURE" || a["access_class"] == "VERIFIER_ONLY" {
+		if use["measurement_mode"] != mode || a["access_class"] == "VERIFIER_ONLY" {
 			return nil, Fail(422, "GATE_FAILED", "output provenance or isolation mismatch")
 		}
 		var raw []byte

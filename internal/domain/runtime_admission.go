@@ -166,7 +166,14 @@ func (s *Service) qualificationEvidence(tx *sql.Tx, project string, receipt Obje
 		return nil, nil, nil, Fail(422, "GATE_FAILED", "evidence mode differs from runtime")
 	}
 	if rt["measurement_mode"] == "LIVE" {
-		return nil, nil, nil, Fail(503, "RESOURCE_UNAVAILABLE", "S1 has no production dispatch identity for LIVE evidence")
+		dispatch, err := nativeDispatchProof(tx, project, r, obs)
+		if err != nil {
+			return nil, nil, nil, Fail(503, "RESOURCE_UNAVAILABLE", "LIVE qualification requires bound native dispatch evidence")
+		}
+		admission := dispatch["manifest"].(map[string]any)["admission"].(map[string]any)
+		if admission["qualification_bootstrap"] != true || admission["mode"] != "LIVE" {
+			return nil, nil, nil, Fail(422, "GATE_FAILED", "LIVE qualification bootstrap identity missing")
+		}
 	}
 	return plan, rt, r, nil
 }
@@ -246,8 +253,12 @@ func mustRuntimeObservation(tx *sql.Tx, project string, run Object) Object {
 	return o
 }
 
-// S1 validates current authority. Normal LIVE claim remains closed until S2.
+// currentRuntimeAdmission returns only current, verified authority facts.
+// Legacy fixture registrations retain their old local-only path, never dispatch authority.
 func (s *Service) currentRuntimeAdmission(tx *sql.Tx, project string, task, runtime Object, requestedCapabilities []any, operation string) (Object, error) {
+	if runtime["measurement_mode"] == "LIVE" && len(Arr(runtime, "qualification_ids")) == 0 {
+		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "LIVE runtime has no current qualification")
+	}
 	if runtime["status"] != "AVAILABLE" {
 		return nil, Fail(409, "STATE_CONFLICT", "runtime not available")
 	}
@@ -286,7 +297,7 @@ func (s *Service) currentRuntimeAdmission(tx *sql.Tx, project string, task, runt
 			return nil, e
 		}
 		if count == 1 && len(Arr(runtime, "qualification_ids")) == 0 {
-			return Object{"mode": "FIXTURE", "runtime_id": runtime["id"]}, nil
+			return Object{"mode": "FIXTURE", "runtime_id": runtime["id"], "legacy_fixture": true}, nil
 		}
 	}
 	if len(Arr(runtime, "qualification_ids")) != 1 {
@@ -300,6 +311,16 @@ func (s *Service) currentRuntimeAdmission(tx *sql.Tx, project string, task, runt
 	if e != nil {
 		return nil, Fail(422, "GATE_FAILED", "runtime approval receipt invalid")
 	}
+	profileRef, profileArtifact, e := s.currentRuntimeBinding(tx, project, runtime)
+	if e != nil {
+		return nil, e
+	}
+	profileBody, e := runtimeProfileBody(tx, project, profileArtifact)
+	if e != nil {
+		return nil, e
+	}
+	var expires time.Time
+	evidence := Empty()
 	for _, v := range Arr(runtime, "qualification_ids") {
 		receipt, e := load(tx, project, "AcceptanceReceipt", v.(string))
 		if e != nil {
@@ -335,9 +356,27 @@ func (s *Service) currentRuntimeAdmission(tx *sql.Tx, project string, task, runt
 		if err = s.runtimeReceipt(tx, project, run, ref, observation); err != nil {
 			return nil, err
 		}
+		created, err := time.Parse(time.RFC3339Nano, Str(receipt, "created_at"))
+		valid, ve := Num(plan, "max_validity_seconds")
+		if err != nil || ve != nil || valid <= 0 {
+			return nil, Fail(422, "GATE_FAILED", "qualification lifetime invalid")
+		}
+		end := created.Add(time.Duration(valid) * time.Second)
+		if expires.IsZero() || end.Before(expires) {
+			expires = end
+		}
+		evidence = append(evidence, Object{"acceptance_ref": Ref(receipt, "AcceptanceReceipt"), "observation_hash": Hash(observation), "receipt_ref": ref, "plan_hash": Hash(plan), "required_capabilities": plan["required_capabilities"]})
 	}
-	if runtime["measurement_mode"] == "FIXTURE" {
-		return Object{"mode": "FIXTURE", "runtime_id": runtime["id"], "qualification_ids": runtime["qualification_ids"]}, nil
+	var permission Object
+	if task != nil {
+		permission, e = s.currentRuntimePurpose(tx, project, task, runtime, profileRef)
+		if e != nil {
+			return nil, e
+		}
+		end, _ := time.Parse(time.RFC3339Nano, Str(permission, "expires_at"))
+		if end.Before(expires) {
+			expires = end
+		}
 	}
-	return nil, Fail(503, "RESOURCE_UNAVAILABLE", "normal LIVE admission awaits S2")
+	return Object{"mode": runtime["measurement_mode"], "runtime_id": runtime["id"], "runtime_ref": Ref(runtime, "RuntimeRegistration"), "profile_ref": profileRef, "profile_hash": Hash(profileRef), "profile": profileBody, "technical_hash": runtimeTechnicalHash(runtime), "qualification_ids": runtime["qualification_ids"], "qualification_evidence": evidence, "permission": permission, "credential_revision": profileBody["credential_revision"], "expires_at": expires.UTC().Format(time.RFC3339Nano), "requested_capabilities": requestedCapabilities}, nil
 }
