@@ -53,9 +53,8 @@ func resourceHTTP(f *fixture) {
 	evidenceName := "http-" + ID() + ".json"
 	var mu sync.Mutex
 	events := Empty()
-	readiness := Empty()
 	handler := f.s.Handler()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server, readiness := fixtureHTTPServer(f.t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, e := io.ReadAll(r.Body)
 		if e != nil {
 			http.Error(w, e.Error(), 500)
@@ -82,7 +81,6 @@ func resourceHTTP(f *fixture) {
 		defer mu.Unlock()
 		resourceEvidence(f.t, evidenceName, Object{"transport": "REAL_LOOPBACK_HTTP", "base_url": server.URL, "readiness": readiness, "exchanges": events})
 	})
-	readiness = fixtureHTTPReady(f.t, server.Client(), server.URL+"/__researchos_fixture_readiness__")
 	f.h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req, e := http.NewRequest(r.Method, server.URL+r.URL.RequestURI(), r.Body)
 		if e != nil {
