@@ -34,20 +34,20 @@ export function useQueries(api, projectId, requests, revision = 0) {
 }
 
 export function useProjectEvents(api, projectId) {
-  const [status, setStatus] = useState({ projectId: null, online: false, lastSync: null, sequence: null, refresh: 0, message: null })
+  const [status, setStatus] = useState({ api: null, projectId: null, online: false, lastSync: null, sequence: null, refresh: 0, message: null })
   useEffect(() => {
     if (!api || !projectId) return
     const controller = new AbortController()
     let sequence = null
     let transport = null
     const seen = new Set()
-    setStatus({ projectId, online: false, lastSync: null, sequence: null, refresh: 0, message: '正在同步快照' })
+    setStatus({ api, projectId, online: false, lastSync: null, sequence: null, refresh: 0, message: '正在同步快照' })
     const reset = async () => {
       const progress = await api.call('getProgressProjection', { params: { projectId }, signal: controller.signal })
       if (controller.signal.aborted) return
       sequence = Number(progress.as_of_event_sequence)
       seen.clear()
-      setStatus(old => ({ ...old, projectId, online: true, lastSync: new Date(), sequence, refresh: old.refresh + 1, message: null }))
+      setStatus(old => ({ ...old, api, projectId, online: true, authExpired: false, lastSync: new Date(), sequence, refresh: old.refresh + 1, message: null }))
     }
     const loop = async () => {
       while (!controller.signal.aborted) {
@@ -67,9 +67,9 @@ export function useProjectEvents(api, projectId) {
             seen.add(event.id)
             if (seen.size > 512) seen.clear()
             sequence = next
-            setStatus(old => ({ ...old, online: true, lastSync: new Date(), sequence, refresh: old.refresh + 1 }))
+            setStatus(old => ({ ...old, online: true, authExpired: false, lastSync: new Date(), sequence, refresh: old.refresh + 1 }))
           }, transport.signal, () => gap, () => {
-            if (!controller.signal.aborted) setStatus(old => ({ ...old, online: true, lastSync: new Date(), message: null, refresh: old.refresh + 1 }))
+            if (!controller.signal.aborted) setStatus(old => ({ ...old, online: true, authExpired: false, lastSync: new Date(), message: null, refresh: old.refresh + 1 }))
           })
           if (gap) sequence = null
         } catch (error) {
@@ -86,5 +86,5 @@ export function useProjectEvents(api, projectId) {
     addEventListener('offline', off); addEventListener('online', on)
     return () => { controller.abort(); removeEventListener('offline', off); removeEventListener('online', on) }
   }, [api, projectId])
-  return status.projectId === projectId ? status : { projectId, online: false, lastSync: null, sequence: null, refresh: 0, message: '正在同步快照' }
+  return status.api === api && status.projectId === projectId ? status : { api, projectId, online: false, lastSync: null, sequence: null, refresh: 0, message: '正在同步快照' }
 }
