@@ -29,10 +29,6 @@ func Parse(raw []byte, exit int) Protocol {
 	s.Buffer(make([]byte, 4096), 8*1024*1024)
 	for s.Scan() {
 		line := string(s.Bytes())
-		if seen[line] {
-			continue
-		}
-		seen[line] = true
 		var o map[string]any
 		if json.Unmarshal(s.Bytes(), &o) != nil {
 			p.Failure = "invalid_protocol"
@@ -55,6 +51,10 @@ func Parse(raw []byte, exit int) Protocol {
 				p.Failure = "request_failed"
 			}
 		case "item.completed":
+			if seen[line] {
+				continue
+			}
+			seen[line] = true
 			if item, ok := o["item"].(map[string]any); ok {
 				if item["type"] == "agent_message" {
 					if text, ok := item["text"].(string); ok && json.Valid([]byte(text)) {
