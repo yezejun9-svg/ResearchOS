@@ -205,6 +205,17 @@ func (s *Service) prepareTaskAcceptance(ctx context.Context, token, project stri
 				exit = 0
 			}
 		}
+		if check["kind"] == "DETERMINISTIC" && (check["command_key"] == "evolution.regression-v1" || check["command_key"] == "evolution.canary-v1") && check["rubric_ref"] == nil && check["qualification_id"] == nil {
+			phase := "REGRESSION"
+			if check["command_key"] == "evolution.canary-v1" {
+				phase = "CANARY"
+			}
+			status, actual = s.verifyEvolutionObservation(snap, phase)
+			exit = 1
+			if status == "PASS" {
+				exit = 0
+			}
+		}
 		if check["required"] == true {
 			if status == "FAIL" {
 				a.verdict = "FAIL"
