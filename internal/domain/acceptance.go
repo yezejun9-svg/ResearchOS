@@ -198,6 +198,13 @@ func (s *Service) prepareTaskAcceptance(ctx context.Context, token, project stri
 				}
 			}
 		}
+		if check["kind"] == "DETERMINISTIC" && check["command_key"] == "experiments.paired-mean-v1" && check["rubric_ref"] == nil && check["qualification_id"] == nil {
+			status, actual = s.verifyExperimentObservation(snap)
+			exit = 1
+			if status == "PASS" {
+				exit = 0
+			}
+		}
 		if check["required"] == true {
 			if status == "FAIL" {
 				a.verdict = "FAIL"
