@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = {
+    "TestW09C19ChainInvalidation": ("./internal/domain", ["C19-05"]),
     "TestW09C19ExplicitOriginAndUnknown": ("./internal/domain", ["C19-01", "C19-02", "C19-03", "C19-04"]),
     "TestW09A06HTTPInvalidationAndContext": ("./internal/domain", ["A06-01", "A06-02"]),
     "TestW09A06FTSFallbackAndDuplicatePath": ("./internal/domain", ["A06-03"]),
@@ -25,13 +26,13 @@ TESTS = {
     "TestW09LegacyRootMigrationRevokesUnidentifiedRoot": ("./internal/domain", ["W09-G02-LEGACY-ROOT"]),
 }
 GROUPS = {
-    "W09-G01": ["TestW09C19ExplicitOriginAndUnknown", "TestW09A06HTTPInvalidationAndContext",
+    "W09-G01": ["TestW09C19ExplicitOriginAndUnknown", "TestW09C19ChainInvalidation", "TestW09A06HTTPInvalidationAndContext",
                 "TestW09A06FTSFallbackAndDuplicatePath", "TestW09RootReadRejectsEscape"],
-    "W09-G02": [name for name in TESTS if name != "TestW09C19ExplicitOriginAndUnknown"],
+    "W09-G02": [name for name in TESTS if not name.startswith("TestW09C19")],
 }
 CASES = {
-    "C19": ["TestW09C19ExplicitOriginAndUnknown"],
-    "A06": [name for name in TESTS if name != "TestW09C19ExplicitOriginAndUnknown"],
+    "C19": ["TestW09C19ExplicitOriginAndUnknown", "TestW09C19ChainInvalidation"],
+    "A06": [name for name in TESTS if not name.startswith("TestW09C19")],
 }
 SOURCES = [
     "adapters/retrieval/local.go", "adapters/retrieval/local_test.go",

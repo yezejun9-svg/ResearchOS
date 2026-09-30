@@ -116,6 +116,64 @@ func TestW09C19ExplicitOriginAndUnknown(t *testing.T) {
 	w09Assertion(t, "C19-04", Object{"primary_changed": true, "remaining_independent_roots": 1, "retained_records": 27})
 }
 
+func TestW09C19ChainInvalidation(t *testing.T) {
+	f := contextFixture(t)
+	rootPath := t.TempDir()
+	rootID, err := f.s.RegisterLocalRoot(context.Background(), f.token, f.project, rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := func(name, parent string) (Object, Object) {
+		t.Helper()
+		body := name
+		if parent != "" {
+			body += " cites https://fixture.example/" + parent
+		}
+		if e := os.WriteFile(filepath.Join(rootPath, name), []byte(body), 0600); e != nil {
+			t.Fatal(e)
+		}
+		return w09LocalEvidence(t, f, rootID, name, "reviewed source chain")
+	}
+	annotate := func(a, ev Object, parent, name string) error {
+		return f.s.RecordEvidenceOrigin(context.Background(), f.token, f.project, Str(ev, "id"), parent, Str(a, "id"), rootID, name)
+	}
+	a, primary := add("primary.txt", "")
+	if err = annotate(a, primary, "", "primary.txt"); err != nil {
+		t.Fatal(err)
+	}
+	a, middle := add("middle.txt", "primary.txt")
+	if err = annotate(a, middle, Str(primary, "id"), "middle.txt"); err != nil {
+		t.Fatal(err)
+	}
+	a, leaf := add("leaf.txt", "middle.txt")
+	if err = annotate(a, leaf, Str(middle, "id"), "leaf.txt"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := f.s.EvidenceSupportSummary(context.Background(), f.token, f.project, []string{Str(leaf, "id")})
+	if err != nil || before["independent_observed_count"] != 1 {
+		t.Fatal("valid chain unavailable", err, before)
+	}
+	if err = os.Remove(filepath.Join(rootPath, "middle.txt")); err != nil {
+		t.Fatal(err)
+	}
+	after, err := f.s.EvidenceSupportSummary(context.Background(), f.token, f.project, []string{Str(leaf, "id")})
+	if err != nil || after["independent_observed_count"] != 0 || after["unknown_count"] != 1 {
+		t.Fatal("unavailable intermediate still counted before refresh", err, after)
+	}
+	a, later := add("later.txt", "leaf.txt")
+	if err = annotate(a, later, Str(leaf, "id"), "later.txt"); err == nil {
+		t.Fatal("new annotation traversed invalid intermediate")
+	}
+	if _, err = f.s.RefreshLocalSnapshots(context.Background(), f.token, f.project); err != nil {
+		t.Fatal(err)
+	}
+	after, err = f.s.EvidenceSupportSummary(context.Background(), f.token, f.project, []string{Str(leaf, "id")})
+	if err != nil || after["independent_observed_count"] != 0 || after["unknown_count"] != 1 {
+		t.Fatal("stale intermediate still counted after refresh", err, after)
+	}
+	w09Assertion(t, "C19-05", Object{"before": before, "after": after, "new_relation_rejected": true, "intermediate_validity": f.read("evidence", Str(middle, "id"))["validity"]})
+}
+
 func TestW09A06HTTPInvalidationAndContext(t *testing.T) {
 	f := contextFixture(t)
 	base := t.TempDir()

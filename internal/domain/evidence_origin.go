@@ -111,7 +111,7 @@ func (s *Service) RecordEvidenceOrigin(ctx context.Context, token, project, evid
 		}
 	} else {
 		ev["origin_evidence_id"] = originID
-		rootID, err := originRoot(tx, project, originID)
+		rootID, err := s.originRoot(tx, p, project, originID)
 		if err != nil {
 			return err
 		}
@@ -156,15 +156,22 @@ func reviewedBasisCurrent(tx *sql.Tx, project string, basis Object, rootID, rela
 	return err == nil && Digest(data) == hash
 }
 
-func originRoot(tx *sql.Tx, project, evidenceID string) (string, error) {
+func (s *Service) originRoot(tx *sql.Tx, p Principal, project, evidenceID string) (string, error) {
 	seen := map[string]bool{}
 	for evidenceID != "" {
 		if seen[evidenceID] {
 			return "", Fail(422, "GATE_FAILED", "origin cycle")
 		}
 		seen[evidenceID] = true
+		evidence, err := s.readObject(tx, p, project, "Evidence", evidenceID)
+		if err != nil {
+			return "", err
+		}
+		if evidence["evidence_kind"] != "OBSERVED" || evidence["validity"] != "CURRENT" || !s.evidenceBodyCurrent(tx, p, project, evidence) {
+			return "", Fail(422, "GATE_FAILED", "origin chain contains unavailable reviewed evidence")
+		}
 		var next, kind string
-		err := tx.QueryRow("SELECT origin_id,relation FROM evidence_origins WHERE project=? AND evidence_id=?", project, evidenceID).Scan(&next, &kind)
+		err = tx.QueryRow("SELECT origin_id,relation FROM evidence_origins WHERE project=? AND evidence_id=?", project, evidenceID).Scan(&next, &kind)
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", Fail(422, "GATE_FAILED", "origin unknown")
 		}
@@ -225,7 +232,7 @@ func (s *Service) EvidenceSupportSummary(ctx context.Context, token, project str
 		if kind == "SIMULATED" {
 			simulated++
 		} else if kind == "OBSERVED" && ev["validity"] == "CURRENT" && ev["stance"] == "SUPPORT" && s.evidenceBodyCurrent(tx, p, project, ev) {
-			rootID, readErr = originRoot(tx, project, id)
+			rootID, readErr = s.originRoot(tx, p, project, id)
 			if readErr == nil {
 				root, rootErr := s.readObject(tx, p, project, "Evidence", rootID)
 				if rootErr == nil && root["validity"] == "CURRENT" && s.evidenceBodyCurrent(tx, p, project, root) {
