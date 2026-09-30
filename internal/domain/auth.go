@@ -11,6 +11,7 @@ import (
 
 type Principal struct {
 	ID               string
+	DeviceID         string
 	Roles            []string
 	CanCreateProject bool
 	Grants           []Grant
@@ -89,7 +90,12 @@ func authenticate(tx *sql.Tx, token string) (Principal, error) {
 		}
 		p.Grants = append(p.Grants, g)
 	}
-	return p, rows.Err()
+	if e = rows.Err(); e != nil {
+		return p, e
+	}
+	rows.Close()
+	e = constrainRemotePrincipal(tx, &p)
+	return p, e
 }
 func (p Principal) HasRole(want string) bool {
 	for _, r := range p.Roles {

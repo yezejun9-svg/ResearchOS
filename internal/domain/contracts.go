@@ -253,6 +253,9 @@ func init() {
 	}
 }
 func operationOwner(id string) string {
+	if remoteOperations[id] {
+		return "W17"
+	}
 	if workbenchOperations[id] {
 		return "W13"
 	}
