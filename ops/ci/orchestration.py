@@ -26,6 +26,11 @@ def digest(path):
 
 
 def main():
+    if os.getenv('RESEARCHOS_TASK_ID') == 'W16':
+        if os.getenv('RESEARCHOS_CASE_ID') != 'C10' or os.getenv('RESEARCHOS_CHECK_ID'):
+            raise SystemExit('test.orchestration only binds W16 C10')
+        from evolution import main as evolution_main
+        return evolution_main('test.orchestration')
     if os.getenv('RESEARCHOS_TASK_ID') == 'W11':
         from jev import main as jev_main
         return jev_main('test.orchestration')
