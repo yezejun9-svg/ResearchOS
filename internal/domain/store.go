@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"researchos.local/research-os/adapters/protectedstore"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 type Service struct {
 	DB        *sql.DB
 	Contracts *Contracts
+	Protected protectedstore.Provider
 }
 type Fault struct {
 	Status        int
@@ -78,7 +80,7 @@ func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
 	if e = tx.Commit(); e != nil {
 		return nil, e
 	}
-	return &Service{db, c}, nil
+	return &Service{DB: db, Contracts: c}, nil
 }
 func ID() string {
 	var b [16]byte
