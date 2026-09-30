@@ -69,7 +69,7 @@ export function useProjectEvents(api, projectId) {
             sequence = next
             setStatus(old => ({ ...old, online: true, lastSync: new Date(), sequence, refresh: old.refresh + 1 }))
           }, transport.signal, () => gap, () => {
-            if (!controller.signal.aborted) setStatus(old => ({ ...old, online: true, message: null, refresh: old.refresh + 1 }))
+            if (!controller.signal.aborted) setStatus(old => ({ ...old, online: true, lastSync: new Date(), message: null, refresh: old.refresh + 1 }))
           })
           if (gap) sequence = null
         } catch (error) {

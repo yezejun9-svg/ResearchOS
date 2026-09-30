@@ -1,5 +1,7 @@
 // Paths and methods from spec/v2.0/contracts/openapi.json.
 export const operations = {
+  "redeemDevicePairing": { "method": "POST", "path": "/v1/device-pairings/redeem" },
+  "refreshDeviceSession": { "method": "POST", "path": "/v1/device-sessions/refresh" },
   "sealArtifact": { "method": "POST", "path": "/v1/projects/{project_id}/artifacts" },
   "listProjects": {
     "method": "GET",

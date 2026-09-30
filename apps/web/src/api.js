@@ -1,5 +1,11 @@
 import { operations } from './operations.js'
 
+let remoteTransport
+async function transportMode() {
+  remoteTransport ||= fetch('/remote-info', { cache: 'no-store', signal: AbortSignal.timeout(5000) }).then(response => response.ok && response.headers.get('Content-Type')?.includes('application/json') ? response.json() : null).then(info => info?.events === 'poll' ? 'poll' : 'sse').catch(() => { remoteTransport = null; return location.hostname.endsWith('.trycloudflare.com') ? 'poll' : 'sse' })
+  return remoteTransport
+}
+
 export class ApiError extends Error {
   constructor(status, detail, operation) {
     super(detail?.message || `HTTP ${status}`)
@@ -54,6 +60,24 @@ export function createApi(getToken) {
     }
   }
   async function stream(projectId, afterSequence, onEvent, signal, shouldStop = () => false, onOpen = () => {}) {
+    if (await transportMode() === 'poll') {
+      let position = afterSequence ?? 0
+      while (!signal.aborted) {
+        let cursor = null
+        do {
+          const page = await call('listEvents', { params: { projectId }, query: { after_sequence: position, limit: 100, cursor }, signal })
+          for (const event of page.items || []) {
+            onEvent(event)
+            if (shouldStop()) throw new ApiError(409, { code: 'EVENT_GAP', message: '事件序号出现缺口' }, 'listEvents')
+          }
+          cursor = page.next_cursor
+          if (!cursor) position = Math.max(position, Number(page.snapshot_event_sequence) || position)
+        } while (cursor && !signal.aborted)
+        onOpen()
+        await new Promise(resolve => { if (signal.aborted) { resolve(); return }; const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve() }; const timer = setTimeout(done, 2000); signal.addEventListener('abort', done, { once: true }) })
+      }
+      return
+    }
     const url = new URL(pathFor(operations.streamEvents.path, { projectId }), window.location.origin)
     const headers = { Authorization: `Bearer ${getToken()}`, Accept: 'text/event-stream' }
     if (afterSequence != null) headers['Last-Event-ID'] = String(afterSequence)
