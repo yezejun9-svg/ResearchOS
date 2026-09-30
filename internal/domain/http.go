@@ -18,6 +18,10 @@ func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	for _, op := range s.Contracts.Operations {
 		mux.HandleFunc(op.Method+" "+op.Path, func(w http.ResponseWriter, r *http.Request) {
+			if op.ID == "streamEvents" {
+				s.streamWorkbenchEvents(w, r, op)
+				return
+			}
 			if op.ID == "recordAcceptance" || op.ID == "claimTask" {
 				s.handleAuditedOrchestration(w, r, op)
 				return
@@ -136,6 +140,12 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 	if !s.visible(tx, p, project, b) {
 		s.writeError(w, cid, Fail(403, "FORBIDDEN", "restricted reference unavailable"))
 		return
+	}
+	if op.ID == "markNotificationRead" {
+		if _, e = s.readObject(tx, p, project, "Notification", id); e != nil {
+			s.writeError(w, cid, e)
+			return
+		}
 	}
 	search := op.ID == "searchEvidence"
 	write := op.Method != "GET" && !search
@@ -324,6 +334,13 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		result, e = singleton(tx, project, "ProjectProfile")
 	case "getProjectState":
 		result, e = singleton(tx, project, "ProjectState")
+	case "getProgressProjection":
+		result, e = s.workbenchProgress(tx, p, project)
+	case "createMilestoneRelease":
+		result, e = s.createMilestone(tx, p, project, b, cid)
+		status = 201
+	case "markNotificationRead":
+		result, e = s.readNotification(tx, p, project, id, cid)
 	case "getGlobalBudgetPolicy", "getGlobalRunPolicy":
 		k := strings.TrimPrefix(op.ID, "getGlobal")
 		result, e = singleton(tx, "", k)
@@ -471,6 +488,12 @@ func (s *Service) visible(tx *sql.Tx, p Principal, project string, value any) bo
 func (s *Service) visibleGraph(tx *sql.Tx, p Principal, project string, value any, seen map[string]bool) bool {
 	switch o := value.(type) {
 	case map[string]any:
+		if project == "" {
+			project = Str(o, "project_id")
+		}
+		if !s.workbenchVisible(tx, p, project, o, seen) {
+			return false
+		}
 		if o["access_class"] == "VERIFIER_ONLY" && (!p.Allowed(project, "", "", true) || !(p.HasRole("OWNER") || p.HasRole("VERIFIER"))) {
 			return false
 		}
