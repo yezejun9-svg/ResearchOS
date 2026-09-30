@@ -71,6 +71,10 @@ func (s *Service) RegisterEvolutionReleaseFixture(ctx context.Context, project, 
 }
 
 func (s *Service) registerEvolutionFixture(ctx context.Context, project, supervisorID, releasePrincipal, root string, stable, suite, rollback Object, releaseMechanism bool) error {
+	return s.registerEvolutionFixtureProfile(ctx, project, supervisorID, releasePrincipal, root, stable, suite, rollback, releaseMechanism, nil)
+}
+
+func (s *Service) registerEvolutionFixtureProfile(ctx context.Context, project, supervisorID, releasePrincipal, root string, stable, suite, rollback Object, releaseMechanism bool, control *controlHostRegistration) error {
 	abs, e := filepath.Abs(root)
 	if e != nil {
 		return e
@@ -104,7 +108,7 @@ func (s *Service) registerEvolutionFixture(ctx context.Context, project, supervi
 	if e != nil {
 		return e
 	}
-	if string(b) != string(evolution.Bytes(evolution.Suite())) {
+	if control == nil && string(b) != string(evolution.Bytes(evolution.Suite())) {
 		return fmt.Errorf("suite must equal trusted built-in suite including negative labels")
 	}
 	if _, _, e = s.evolutionBytes(tx, project, rollback); e != nil {
@@ -115,6 +119,38 @@ func (s *Service) registerEvolutionFixture(ctx context.Context, project, supervi
 		return e
 	}
 	h := Object{"supervisor_id": supervisorID, "release_principal": releasePrincipal, "root": abs, "stable_ref": stable, "suite_ref": suite, "rollback_ref": rollback, "policy_hash": Digest(evolution.Bytes(evolution.Policy())), "scope": evolution.Scope, "os_service_qualified": false}
+	if control != nil {
+		if releaseMechanism {
+			return fmt.Errorf("control proof profile requires a new separate release admission")
+		}
+		if err := validateControlBuild(stableBytes); err != nil {
+			return err
+		}
+		_, snapshotRaw, err := s.evolutionBytes(tx, project, control.SnapshotRef)
+		if err != nil {
+			return err
+		}
+		var bundle evolution.ControlBundle
+		if err = evolution.StrictControlJSON(snapshotRaw, &bundle); err != nil {
+			return err
+		}
+		if err = validateEvolutionControlBundle(ctx, bundle); err != nil {
+			return err
+		}
+		var public evolution.ControlSuite
+		if err = evolution.StrictControlJSON(b, &public); err != nil {
+			return err
+		}
+		if err = evolution.ValidateControlDataset(public.Inputs, public.Labels); err != nil {
+			return err
+		}
+		if public.Inputs.Revision != evolution.ControlPublicRevision || public.Inputs.Binding != bundle.Binding || Digest(b) != Digest(evolution.Bytes(public)) {
+			return fmt.Errorf("CONTROL_PUBLIC_SUITE_BINDING")
+		}
+		h["evaluation_profile"], h["protocol"], h["snapshot_ref"], h["stable_source_hash"] = evolution.ControlProfile, evolution.ControlProtocol, control.SnapshotRef, control.StableSourceHash
+		h["control_binding"], h["public_suite_hash"] = bundle.Binding, Digest(b)
+		h["policy_hash"] = Digest(evolution.Bytes(evolution.ControlPolicy(bundle.Binding, Digest(b))))
+	}
 	if releaseMechanism {
 		h["release_mechanism"] = "R2_NATIVE_FIXTURE"
 		if e = os.WriteFile(filepath.Join(abs, "stable.exe"), stableBytes, 0600); e != nil {
@@ -147,7 +183,7 @@ func (s *Service) RegisterEvolutionBuild(ctx context.Context, project string, ar
 		return e
 	}
 	defer tx.Rollback()
-	a, _, e := s.evolutionBytes(tx, project, artifact)
+	a, binary, e := s.evolutionBytes(tx, project, artifact)
 	if e != nil {
 		return e
 	}
@@ -162,10 +198,27 @@ func (s *Service) RegisterEvolutionBuild(ctx context.Context, project string, ar
 	if e != nil {
 		return e
 	}
-	if Hash(m) != Hash(Object{"paths": []any{"ops/canary/fixture/main.go"}}) {
+	h, e := evolutionHost(tx, project)
+	if e != nil {
+		return e
+	}
+	if controlHost(h) {
+		if !controlBuildManifest(m) {
+			return Fail(422, "GATE_FAILED", "control candidate may change only reviewed business paths")
+		}
+		if e = validateControlBuild(binary); e != nil {
+			return e
+		}
+		if _, _, e = s.controlHostInputs(tx, project, h); e != nil {
+			return e
+		}
+	} else if Hash(m) != Hash(Object{"paths": []any{"ops/canary/fixture/main.go"}}) {
 		return Fail(422, "GATE_FAILED", "development build may not modify tests labels supervisor or release permissions")
 	}
 	body := Object{"artifact_ref": artifact, "manifest_ref": manifest, "source_hash": sourceHash, "build_hash": a["content_hash"], "registered_at": Now(), "scope": evolution.Scope}
+	if controlHost(h) {
+		body["evaluation_profile"], body["protocol"], body["control_binding"] = evolution.ControlProfile, evolution.ControlProtocol, h["control_binding"]
+	}
 	_, e = tx.Exec("INSERT INTO evolution_builds(project,artifact,body) VALUES(?,?,?)", project, a["id"], string(Bytes(body)))
 	if e != nil {
 		return e
@@ -177,8 +230,13 @@ func (s *Service) evolutionCurrent(tx *sql.Tx, project string, x Object) (Object
 	if e != nil {
 		return nil, e
 	}
-	if x["independent_supervisor_id"] != h["supervisor_id"] || x["baseline_policy_hash"] != h["policy_hash"] || h["policy_hash"] != Digest(evolution.Bytes(evolution.Policy())) || Hash(x["stable_artifact_ref"]) != Hash(h["stable_ref"]) || Hash(x["baseline_suite_ref"]) != Hash(h["suite_ref"]) || Hash(x["rollback_plan_ref"]) != Hash(h["rollback_ref"]) || x["migration_plan_ref"] != nil {
+	if x["independent_supervisor_id"] != h["supervisor_id"] || x["baseline_policy_hash"] != h["policy_hash"] || h["policy_hash"] != evolutionPolicyHash(h) || Hash(x["stable_artifact_ref"]) != Hash(h["stable_ref"]) || Hash(x["baseline_suite_ref"]) != Hash(h["suite_ref"]) || Hash(x["rollback_plan_ref"]) != Hash(h["rollback_ref"]) || x["migration_plan_ref"] != nil {
 		return nil, Fail(422, "GATE_FAILED", "candidate may not select host baseline policy suite rollback or migration")
+	}
+	if controlHost(h) {
+		if _, _, err := s.controlHostInputs(tx, project, h); err != nil {
+			return nil, err
+		}
 	}
 	for _, k := range []string{"candidate_artifact_ref", "stable_artifact_ref", "baseline_suite_ref", "changed_paths_manifest_ref", "rollback_plan_ref"} {
 		if _, _, e = s.evolutionBytes(tx, project, x[k].(map[string]any)); e != nil {
@@ -195,6 +253,11 @@ func (s *Service) evolutionCurrent(tx *sql.Tx, project string, x Object) (Object
 	}
 	if Hash(build["artifact_ref"]) != Hash(x["candidate_artifact_ref"]) || Hash(build["manifest_ref"]) != Hash(x["changed_paths_manifest_ref"]) {
 		return nil, Fail(422, "GATE_FAILED", "candidate differs from host reviewed build")
+	}
+	if controlHost(h) {
+		if _, _, err := s.controlBuildSources(tx, project, x, h); err != nil {
+			return nil, err
+		}
 	}
 	experiment, e := load(tx, project, "Experiment", Str(x, "experiment_id"))
 	if e != nil {
@@ -282,6 +345,8 @@ func (s *Service) actSystemCandidate(tx *sql.Tx, p Principal, project, id string
 		if record["improved"] != true || record["required_passed"] != true {
 			x["status"] = "REJECTED"
 			x["freeze_reason"] = "frozen required regression or no independently measured gain"
+		} else if controlHost(h) {
+			return nil, Fail(503, "RESOURCE_UNAVAILABLE", "control proof does not qualify release; separate exact-generation admission required")
 		} else if h["release_mechanism"] == releaseFixtureMechanism {
 			if e = s.evolutionReleaseIntent(tx, project, x, h, b, record); e != nil {
 				return nil, e

@@ -26,11 +26,15 @@ func evolutionRecord(tx *sql.Tx, project, id, phase string) (Object, error) {
 	return r, nil
 }
 func (s *Service) evolutionRecordValid(tx *sql.Tx, project string, x, r Object) error {
-	if r["project_id"] != project || r["candidate_id"] != x["id"] || r["plan_hash"] != Hash(evolutionPlan(x)) || r["baseline_hash"] != x["stable_artifact_ref"].(map[string]any)["content_hash"] || r["candidate_hash"] != x["candidate_artifact_ref"].(map[string]any)["content_hash"] || r["suite_hash"] != Digest(evolution.Bytes(evolution.Suite())) || r["policy_hash"] != Digest(evolution.Bytes(evolution.Policy())) || r["scope"] != evolution.Scope {
+	h, err := s.evolutionCurrent(tx, project, x)
+	if err != nil {
+		return err
+	}
+	if r["project_id"] != project || r["candidate_id"] != x["id"] || r["plan_hash"] != Hash(evolutionPlan(x)) || r["baseline_hash"] != x["stable_artifact_ref"].(map[string]any)["content_hash"] || r["candidate_hash"] != x["candidate_artifact_ref"].(map[string]any)["content_hash"] || r["suite_hash"] != evolutionSuiteHash(h) || r["policy_hash"] != evolutionPolicyHash(h) || r["scope"] != evolution.Scope {
 		return Fail(422, "GATE_FAILED", "frozen host/build/suite binding mismatch")
 	}
-	if _, e := s.evolutionCurrent(tx, project, x); e != nil {
-		return e
+	if controlHost(h) {
+		return s.controlRecordValid(tx, project, x, h, r)
 	}
 	if r["phase"] == "REGRESSION" {
 		p, e := decodePair(r["pair"])
@@ -132,7 +136,11 @@ func (s *Service) verifyEvolutionObservation(snap Object, phase string) (string,
 	if record["run_id"] != run["id"] || Hash(record["lease_epoch"]) != Hash(run["lease_epoch"]) || record["executor_id"] != run["executor_principal_id"] || Hash(task["input_refs"]) != Hash(evolutionInputs(x)) {
 		return "FAIL", "native execution run/epoch/input binding changed"
 	}
-	if e = evolutionCheckContract(task["acceptance_contract"].(map[string]any), phase); e != nil {
+	h, e := s.evolutionCurrent(tx, project, x)
+	if e != nil {
+		return "FAIL", e.Error()
+	}
+	if e = s.evolutionHostContract(tx, project, h, task["acceptance_contract"].(map[string]any), phase); e != nil {
 		return "FAIL", e.Error()
 	}
 	artifacts := Arr(snap, "artifacts")
