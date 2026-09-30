@@ -30,6 +30,7 @@ type ReleaseState struct {
 	LastGoodPath    string            `json:"last_known_good_path"`
 	Data            string            `json:"data"`
 	Backup          string            `json:"backup,omitempty"`
+	Cutover         *ReleaseCutover   `json:"cutover,omitempty"`
 	Admission       string            `json:"admission,omitempty"`
 	AdmissionBundle *ReleaseAdmission `json:"admission_bundle,omitempty"`
 	DrainReceipt    string            `json:"drain_receipt,omitempty"`
@@ -71,6 +72,11 @@ func validDigest(v string) bool {
 }
 
 func validReleaseState(s ReleaseState) error {
+	if b := s.Cutover; b != nil {
+		if s.AdmissionBundle == nil || b.Operation != s.Operation || b.Epoch != s.Epoch || !validDigest(b.ManifestSHA256) || !filepath.IsAbs(b.Root) || b.Database != filepath.Join(b.Root, "researchos.sqlite") || len(b.Migrations) == 0 || len(b.Purpose) == 0 {
+			return errors.New("cutover snapshot binding invalid")
+		}
+	}
 	if s.Epoch == 0 || !validDigest(s.Active) || !validDigest(s.LastGood) || s.Data == "" || !filepath.IsAbs(s.Data) || !filepath.IsAbs(s.ActivePath) || !filepath.IsAbs(s.LastGoodPath) {
 		return errors.New("incomplete release slot")
 	}
@@ -104,7 +110,7 @@ func validReleaseState(s ReleaseState) error {
 		}
 	}
 	switch s.Phase {
-	case "STARTING", "STABLE", "PREPARED", "DRAIN_UNKNOWN", "DRAINED", "EXIT_UNKNOWN", "SWITCHED", "CANARY", "ROLLBACK_PREPARED", "RECOVERING", "ROLLED_BACK":
+	case "STARTING", "STABLE", "PREPARED", "DRAIN_UNKNOWN", "DRAINED", "EXIT_UNKNOWN", "SWITCHED", "CANARY", "ROLLBACK_PREPARED", "RECOVERING", "ROLLED_BACK", "STOPPED":
 	default:
 		return errors.New("unknown release phase")
 	}

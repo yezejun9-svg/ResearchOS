@@ -175,6 +175,7 @@ func (e *ReleaseEngine) SwitchFixture(ctx context.Context, operation string) (Re
 		return e.journal.State(), errors.New("stable drain receipt absent")
 	}
 	s.DrainNonce = e.journal.State().DrainNonce
+	s.Cutover = e.journal.State().Cutover
 	s.DrainReceipt = proof
 	s.Phase = "DRAINED"
 	if err = e.journal.Append(s); err != nil {
@@ -226,6 +227,18 @@ func (e *ReleaseEngine) RollbackFixture(ctx context.Context, operation string) (
 		}
 	}
 	if s.PID != 0 {
+		if _, actual := e.driver.(*ControlFixtureDriver); actual {
+			proof, err := e.barrier.Drain(ctx, processIn(s), operation)
+			if err != nil || !validDigest(proof) {
+				return e.journal.State(), errors.New("rollback drain receipt absent")
+			}
+			s.DrainNonce = e.journal.State().DrainNonce
+			s.DrainReceipt = proof
+			s.Phase = "DRAINED"
+			if err = e.journal.Append(s); err != nil {
+				return s, err
+			}
+		}
 		if err := e.driver.Stop(processIn(s)); err != nil {
 			return s, err
 		}
@@ -239,6 +252,9 @@ func (e *ReleaseEngine) RollbackFixture(ctx context.Context, operation string) (
 		s.Phase = "RECOVERING"
 		_ = e.journal.Append(s)
 		return s, err
+	}
+	if _, actual := e.driver.(*ControlFixtureDriver); actual {
+		s.Data = e.journal.State().Data
 	}
 	_, digest, err := exactImage(s.LastGoodPath)
 	if err != nil || digest != s.LastGood {
