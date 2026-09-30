@@ -38,7 +38,15 @@ func (s *Service) researchStageSnapshot(tx *sql.Tx, project string, task Object)
 		if w.SourceReceipt["run_id"] != task["active_run_id"] {
 			return nil, Fail(422, "GATE_FAILED", "source receipt belongs to a different run")
 		}
+		intent, e := latestEffect(tx, project, Str(w.SourceReceipt, "run_id"), Str(w.SourceReceipt, "effect_key"))
+		if e != nil || intent["state"] != "CONFIRMED" {
+			return nil, Fail(422, "GATE_FAILED", "source effect has not been durably confirmed")
+		}
 		expected, err = s.researchSourceFacts(tx, project, w)
+	case "verification":
+		expected, err = s.researchSupportFacts(tx, project, w)
+	case "review":
+		expected, err = s.researchReviewFacts(tx, project, w)
 	default:
 		return Object{"work": w.publicParameters(), "unavailable": "typed stage verifier unavailable"}, nil
 	}
@@ -162,13 +170,12 @@ func (s *Service) researchCycleFacts(tx *sql.Tx, project string, cycle Object) (
 			return nil, err
 		}
 		candidate := Object{"evidence_ref": Ref(ev, "Evidence"), "review": nil}
-		var body string
-		err = tx.QueryRow("SELECT origin_summary_json FROM research_candidate_reviews WHERE project=? AND cycle_id=? AND evidence_id=? AND reviewer_id IS NOT NULL AND review_task_ref IS NOT NULL AND acceptance_ref IS NOT NULL", project, cycle["id"], id).Scan(&body)
-		if err == sql.ErrNoRows {
+		review, gate := s.currentResearchReview(tx, project, Str(cycle, "id"), id.(string))
+		if gate != nil {
 			complete = false
 			gaps = append(gaps, Object{"code": "CANDIDATE_REVIEW_REQUIRED", "evidence_id": id, "reason": "Current independent source review and disposition required"})
-		} else if err != nil {
-			return nil, err
+		} else {
+			candidate["review"] = review
 		}
 		// The typed review binding is revalidated before it can populate this field.
 		candidates = append(candidates, candidate)
@@ -226,6 +233,28 @@ func (s *Service) researchSourceFacts(tx *sql.Tx, project string, w *researchWor
 	if r == nil || r["project_id"] != project || r["task_id"] != w.Task {
 		return nil, Fail(422, "GATE_FAILED", "bound source receipt unavailable")
 	}
+	run, err := load(tx, project, "Run", Str(r, "run_id"))
+	if err != nil || run["task_id"] != w.Task {
+		return nil, Fail(422, "GATE_FAILED", "source run binding unavailable")
+	}
+	intent, err := latestEffect(tx, project, Str(r, "run_id"), Str(r, "effect_key"))
+	if err != nil || intent["request_hash"] != r["request_hash"] || intent["reservation_id"] != r["reservation_id"] || Hash(intent["epoch"]) != Hash(r["epoch"]) {
+		return nil, Fail(422, "GATE_FAILED", "source receipt effect identity differs")
+	}
+	reservation, err := load(tx, project, "BudgetLedgerEntry", Str(r, "reservation_id"))
+	if err != nil || reservation["run_id"] != r["run_id"] || reservation["provider_request_id"] != r["effect_key"] {
+		return nil, Fail(422, "GATE_FAILED", "source receipt reservation differs")
+	}
+	for _, key := range []string{"cursor_before_ref", "cursor_after_ref"} {
+		ref, ok := r[key].(map[string]any)
+		if !ok || ref["entity_type"] != "SourceCursor" || ref["id"] != w.Parameters["cursor_id"] {
+			return nil, Fail(422, "GATE_FAILED", "source receipt cursor binding differs")
+		}
+		cursor, e := version(tx, project, ref)
+		if e != nil || cursor["source_id"] != w.SourceID || cursor["query_hash"] != w.Parameters["query_hash"] {
+			return nil, Fail(422, "GATE_FAILED", "historical source cursor invalid")
+		}
+	}
 	manifestRef, ok := r["manifest_ref"].(map[string]any)
 	if !ok {
 		return nil, Fail(422, "GATE_FAILED", "source manifest required")
@@ -246,5 +275,5 @@ func (s *Service) researchSourceFacts(tx *sql.Tx, project string, w *researchWor
 			return nil, Fail(422, "GATE_FAILED", "source manifest differs from exact page work")
 		}
 	}
-	return Object{"type": "research.source-page.v1", "cycle_id": w.Cycle, "logical_key": w.Key, "manifest_ref": manifestRef, "cursor_before_ref": r["cursor_before_ref"], "cursor_after_ref": r["cursor_after_ref"], "effect_key": r["effect_key"], "page_complete": manifest["complete"], "actual_cost": r["actual_cost"], "cost_basis": r["cost_basis"]}, nil
+	return Object{"type": "research.source-page.v1", "cycle_id": w.Cycle, "logical_key": w.Key, "manifest_ref": manifestRef, "cursor_before_ref": r["cursor_before_ref"], "cursor_after_ref": r["cursor_after_ref"], "effect_key": r["effect_key"], "page_complete": manifest["complete"], "actual_cost": r["actual_cost"], "cost_basis": r["cost_basis"], "capture_environment": r["capture_environment"]}, nil
 }

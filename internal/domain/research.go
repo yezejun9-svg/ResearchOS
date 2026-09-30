@@ -365,77 +365,17 @@ func (s *Service) closeResearchCycle(tx *sql.Tx, project, id string, b Object) (
 	if state["active_cycle_id"] != id {
 		return nil, Fail(409, "STATE_CONFLICT", "cycle is not active")
 	}
-	profile, err := version(tx, project, o["profile_ref"].(map[string]any))
-	if err != nil {
+	if err = researchCycleSettled(tx, project, id); err != nil {
 		return nil, err
 	}
-	current, err := singleton(tx, project, "ProjectProfile")
-	if err != nil {
-		return nil, err
-	}
-	if current["revision"] != profile["revision"] {
-		return nil, Fail(412, "STALE_INPUT", "project profile changed")
-	}
-	from, to, err := parseCycleWindow(Str(o, "window_from"), Str(o, "window_to"))
-	if err != nil {
-		return nil, err
-	}
-	coverage, err := s.researchCoverage(tx, project, profile, from, to)
-	if err != nil {
-		return nil, err
-	}
-	complete, progress := true, false
-	for _, raw := range coverage {
-		c := raw.(map[string]any)
-		if c["status"] == "COMPLETE" {
-			progress = true
+	coverage := Arr(o, "source_coverage")
+	actual := "CANCELLED"
+	if b["requested_status"] != "CANCELLED" {
+		facts, e := s.researchCycleFacts(tx, project, o)
+		if e != nil {
+			return nil, e
 		}
-		if c["required"] == true && c["status"] != "COMPLETE" {
-			complete = false
-		}
-	}
-	for _, raw := range Arr(o, "required_experiment_ids") {
-		x, err := load(tx, project, "Experiment", raw.(string))
-		if err != nil {
-			return nil, err
-		}
-		if x["cycle_id"] != id || x["status"] != "COMPLETED" || x["acceptance_id"] == nil {
-			complete = false
-			continue
-		}
-		if _, err = s.experimentAcceptance(tx, project, x, Str(x, "acceptance_id")); err != nil {
-			var fault *Fault
-			if !errors.As(err, &fault) || fault.Status >= 500 {
-				return nil, err
-			}
-			complete = false
-			continue
-		}
-		progress = true
-	}
-	for _, raw := range Arr(o, "candidate_evidence_ids") {
-		var count int
-		if err := tx.QueryRow("SELECT count(*) FROM research_candidate_reviews WHERE project=? AND cycle_id=? AND evidence_id=?", project, id, raw).Scan(&count); err != nil {
-			return nil, err
-		}
-		if count != 1 {
-			complete = false
-		} else {
-			progress = true
-		}
-	}
-	if len(Arr(o, "decision_ids")) > 0 || o["checkpoint_artifact_id"] != nil {
-		progress = true
-	}
-	actual := "COMPLETE"
-	if !complete {
-		actual = "PARTIAL"
-		if !progress {
-			actual = "BLOCKED"
-		}
-	}
-	if b["requested_status"] == "CANCELLED" {
-		actual = "CANCELLED"
+		coverage, actual = Arr(facts, "source_coverage"), Str(facts, "cycle_outcome")
 	}
 	if b["requested_status"] != actual {
 		return nil, Fail(422, "GATE_FAILED", "requested cycle status differs from verified coverage and experiments: "+actual)

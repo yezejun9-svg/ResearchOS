@@ -90,3 +90,19 @@ ALTER TABLE research_candidate_reviews ADD COLUMN acceptance_ref TEXT;
 CREATE TRIGGER research_review_no_replace BEFORE INSERT ON research_candidate_reviews
 WHEN EXISTS(SELECT 1 FROM research_candidate_reviews WHERE project=NEW.project AND cycle_id=NEW.cycle_id AND evidence_id=NEW.evidence_id)
 BEGIN SELECT RAISE(ABORT,'candidate review cannot be replaced'); END;
+CREATE TRIGGER research_review_bound_insert BEFORE INSERT ON research_candidate_reviews
+WHEN NEW.reviewer_id IS NOT NULL OR NEW.review_task_ref IS NOT NULL OR NEW.acceptance_ref IS NOT NULL BEGIN
+ SELECT CASE WHEN NEW.reviewer_id IS NULL OR NEW.review_task_ref IS NULL OR NEW.acceptance_ref IS NULL
+ OR NOT json_valid(NEW.review_task_ref) OR NOT json_valid(NEW.acceptance_ref)
+ OR json_type(NEW.review_task_ref,'$.revision') IS NOT 'integer'
+ OR json_type(NEW.acceptance_ref,'$.revision') IS NOT 'integer'
+ OR json_extract(NEW.review_task_ref,'$.entity_type') IS NOT 'Task'
+ OR json_extract(NEW.acceptance_ref,'$.entity_type') IS NOT 'AcceptanceReceipt'
+ OR NOT EXISTS(SELECT 1 FROM research_cycle_work w WHERE w.project=NEW.project AND w.cycle=NEW.cycle_id AND w.stage='review' AND w.evidence_id=NEW.evidence_id AND w.task=json_extract(NEW.review_task_ref,'$.id'))
+ OR NOT EXISTS(SELECT 1 FROM domain_objects WHERE project=NEW.project AND kind='AcceptanceReceipt' AND id=json_extract(NEW.acceptance_ref,'$.id') AND json_extract(body,'$.verifier_principal_id')=NEW.reviewer_id)
+ THEN RAISE(ABORT,'bound current review required') END;
+END;
+CREATE TRIGGER research_review_immutable BEFORE UPDATE ON research_candidate_reviews
+BEGIN SELECT RAISE(ABORT,'immutable candidate review'); END;
+CREATE TRIGGER research_review_no_delete BEFORE DELETE ON research_candidate_reviews
+BEGIN SELECT RAISE(ABORT,'durable candidate review'); END;
