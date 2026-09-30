@@ -254,6 +254,9 @@ func (s *Service) skillCurrent(tx *sql.Tx, project string, o Object) error {
 			return e
 		}
 	}
+	if e := skillOpenSourceConflict(tx, project, Arr(o, "source_refs")); e != nil {
+		return e
+	}
 	for _, v := range Arr(o, "conflict_ids") {
 		c, e := load(tx, project, "Conflict", v.(string))
 		if e != nil {
@@ -264,6 +267,41 @@ func (s *Service) skillCurrent(tx *sql.Tx, project string, o Object) error {
 		}
 	}
 	return nil
+}
+
+// A candidate's conflict_ids are only a disclosure ledger. Current conflicts
+// concerning its source manifest are server state, including conflicts opened
+// after its Experiment or acceptance.
+func skillOpenSourceConflict(tx *sql.Tx, project string, sources []any) error {
+	ids := map[string]bool{}
+	for _, v := range sources {
+		r := v.(map[string]any)
+		ids[Str(r, "entity_type")+":"+Str(r, "id")] = true
+	}
+	rows, e := tx.Query("SELECT body FROM domain_objects WHERE project=? AND kind='Conflict' AND json_extract(body,'$.status')='OPEN'", project)
+	if e != nil {
+		return e
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		if e = rows.Scan(&raw); e != nil {
+			return e
+		}
+		c, e := Decode([]byte(raw))
+		if e != nil {
+			return e
+		}
+		for _, field := range []string{"subject_refs", "blocks_refs"} {
+			for _, v := range Arr(c, field) {
+				r, ok := v.(map[string]any)
+				if ok && ids[Str(r, "entity_type")+":"+Str(r, "id")] {
+					return Fail(409, "STATE_CONFLICT", "source conflict unresolved")
+				}
+			}
+		}
+	}
+	return rows.Err()
 }
 
 func (s *Service) skillExperiment(tx *sql.Tx, project string, o, doc Object) (Object, Object, error) {
@@ -277,6 +315,7 @@ func (s *Service) skillExperiment(tx *sql.Tx, project string, o, doc Object) (Ob
 	if x["status"] != "COMPLETED" || x["outcome"] != "IMPROVED" || x["measurement_mode"] != "FIXTURE" || Hash(x["candidate_ref"]) != Hash(o["content_artifact_ref"]) {
 		return nil, nil, Fail(422, "GATE_FAILED", "completed paired candidate experiment required")
 	}
+	previousCases, previousNegative := []string{}, []string{}
 	if o["baseline_skill_id"] != nil {
 		old, e := load(tx, project, "SkillVersion", Str(o, "baseline_skill_id"))
 		if e != nil {
@@ -284,6 +323,16 @@ func (s *Service) skillExperiment(tx *sql.Tx, project string, o, doc Object) (Ob
 		}
 		if Hash(x["baseline_refs"]) != Hash([]any{old["content_artifact_ref"]}) {
 			return nil, nil, Fail(422, "GATE_FAILED", "old skill baseline mismatch")
+		}
+		oldDoc, e := s.skillDocument(tx, project, old["content_artifact_ref"].(map[string]any))
+		if e != nil {
+			return nil, nil, e
+		}
+		for _, v := range Arr(oldDoc, "suite_case_ids") {
+			previousCases = append(previousCases, v.(string))
+		}
+		for _, v := range Arr(oldDoc, "negative_case_ids") {
+			previousNegative = append(previousNegative, v.(string))
 		}
 	}
 	receipt, e := s.experimentAcceptance(tx, project, x, Str(x, "acceptance_id"))
@@ -346,13 +395,13 @@ func (s *Service) skillExperiment(tx *sql.Tx, project string, o, doc Object) (Ob
 		}
 		after = append(after, text)
 	}
-	negative := map[string]bool{}
+	declaredNegative := []string{}
 	for _, v := range Arr(doc, "negative_case_ids") {
-		id := v.(string)
-		if negative[id] {
-			return nil, nil, Fail(422, "GATE_FAILED", "duplicate negative case")
-		}
-		negative[id] = true
+		declaredNegative = append(declaredNegative, v.(string))
+	}
+	negative, e := skillseval.TrustedSuite(ids, declaredNegative, previousCases, previousNegative)
+	if e != nil {
+		return nil, nil, Fail(422, "GATE_FAILED", e.Error())
 	}
 	if e = skillseval.Compare(ids, before, after, negative); e != nil {
 		return nil, nil, Fail(422, "GATE_FAILED", e.Error())
