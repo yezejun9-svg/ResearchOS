@@ -336,6 +336,8 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 			result, e = s.page(tx, p, project, op, r)
 		} else if runtimeOperations[op.ID] {
 			result, kind, status, e = s.runtimeOperation(tx, p, project, id, b, op.ID, cid)
+		} else if resourceOperations[op.ID] {
+			result, kind, status, e = s.resourceOperation(tx, p, project, id, b, op.ID)
 		} else if contextOperations[op.ID] {
 			result, kind, status, e = s.contextOperation(tx, p, project, id, b, op.ID)
 		} else {
@@ -350,7 +352,7 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		s.writeError(w, cid, Fail(403, "FORBIDDEN", "result references restricted content"))
 		return
 	}
-	if write && kind != "" {
+	if write && kind != "" && project != "" || op.ID == "createProject" {
 		ep := project
 		if op.ID == "createProject" {
 			ep = Str(result, "project_id")
@@ -414,6 +416,9 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 	w.Write(response)
 }
 func (s *Service) precondition(tx *sql.Tx, project, id string, op Operation, b Object) (Object, error) {
+	if op.Target == "BudgetPolicy" || op.Target == "RunPolicy" {
+		return s.resourcePolicyTarget(tx, project, id, op.ID, b)
+	}
 	switch op.Target {
 	case "subject_ref":
 		r := b["subject_ref"].(map[string]any)
