@@ -36,3 +36,7 @@ One workflow rerun `6a07c389c24c43fba968110c381310a9` failed with `Remote end cl
 From repository root with `RESEARCHOS_TASK_ID=W13`, run `python ops/ci/ui.py`. Optional `RESEARCHOS_UI_PHASE` is `core` (default), `native`, or `workflow`; `RESEARCHOS_GO` overrides the recorded pinned Go path. Python Playwright and installed Chromium are required. Reports record actual browser version, HEAD, project identity, source hashes and screenshot hashes. No fixture bearer credentials are included in evidence.
 
 Earlier receipt directories remain development history. PASS labels apply only to each run's listed checks and exact source hashes; they are not complete C23-C26 acceptance. Counts are named scenarios and matrix cases, not fabricated contract assertion totals.
+
+## C18 follow-up
+
+`ca989432a86244e1b134f10937304062/report.json` passes the exact 4 accepted / 6 planned / 2 VERIFYING -> 4 accepted / 9 planned / 3 READY scenario. Four independent server acceptance receipts are recorded; only the transient EXECUTION_REPORTED -> VERIFYING status is seeded by a schema-validated temporary-fixture helper, matching the existing domain test approach. Plan revisions are server generated per task creation rather than relabelled 1/2. Desktop/mobile screenshots and complete projections are retained. `a41671f9372e46eaad806db27f02a461` reproduced stale-projection rollback; the passing run verifies monotonic entity revision, plan revision and event watermark protection in useQueries.

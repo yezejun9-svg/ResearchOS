@@ -16,7 +16,17 @@ export function useQueries(api, projectId, requests, revision = 0) {
         if (value.status === 'fulfilled') data[name] = value.value
         else errors[name] = value.reason
       })
-      setResult({ api, scope, loading: false, data, errors })
+      setResult(old => {
+        if (old.api === api && old.scope === scope) {
+          for (const [name, value] of Object.entries(data)) {
+            const previous = old.data[name]
+            if (value?.id && previous?.id === value.id && previous.project_id === value.project_id &&
+              ['revision', 'plan_revision', 'as_of_event_sequence'].some(field =>
+                Number.isSafeInteger(value[field]) && Number.isSafeInteger(previous[field]) && value[field] < previous[field])) data[name] = previous
+          }
+        }
+        return { api, scope, loading: false, data, errors }
+      })
     })
     return () => controller.abort()
   }, [api, projectId, key, revision])
