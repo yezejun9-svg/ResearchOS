@@ -360,3 +360,82 @@ func TestW16RecoveryContextNonIdleRejected(t *testing.T) {
 		})
 	}
 }
+
+func TestW16RecoveryContextCorrectionManifestRawBinding(t *testing.T) {
+	for _, kind := range []string{"reencoded", "invalid", "missing", "same-bytes-new-identity"} {
+		t.Run(kind, func(t *testing.T) {
+			f := recoveryStorageSetup(t)
+			r := f.restore(t)
+			path := filepath.Join(f.state.Cutover.Directory, "manifest.json")
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			j, err := supervisor.OpenReleaseJournal(filepath.Join(filepath.Dir(f.state.Data), "release-state"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer j.Close()
+			if err = j.Append(f.state); err != nil {
+				t.Fatal(err)
+			}
+			if err = j.BindRestoreContext(r); err != nil {
+				t.Fatal(err)
+			}
+			switch kind {
+			case "reencoded":
+				err = os.WriteFile(path, append([]byte(" \n"), raw...), 0600)
+			case "invalid":
+				err = os.WriteFile(path, []byte(`{}`), 0600)
+			case "missing":
+				err = os.Remove(path)
+			case "same-bytes-new-identity":
+				if err = os.Rename(path, path+".old"); err == nil {
+					err = os.WriteFile(path, raw, 0600)
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = supervisor.ValidateReleaseRestoreResult(f.state, r); err == nil {
+				t.Fatal("changed actual manifest accepted")
+			}
+			if err = j.BindRestoreContext(r); err == nil {
+				t.Fatal("changed actual manifest rebound")
+			}
+			if _, err = restoreEvolutionCutoverContext(context.Background(), j.State(), f.lease, f.contracts, f.policy); err == nil {
+				t.Fatal("bound context revisit ignored changed manifest")
+			}
+		})
+	}
+}
+
+func TestW16RecoveryContextCorrectionManifestDuringRestore(t *testing.T) {
+	for _, stage := range []string{"before", "after"} {
+		t.Run(stage, func(t *testing.T) {
+			f := recoveryStorageSetup(t)
+			poison := func(*sql.DB) error {
+				path := filepath.Join(f.state.Cutover.Directory, "manifest.json")
+				raw, err := os.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				return os.WriteFile(path, append(raw, '\n'), 0600)
+			}
+			if stage == "before" {
+				f.policy.beforeRecovery = poison
+			} else {
+				f.policy.afterRecovery = poison
+			}
+			if _, err := restoreEvolutionCutoverContext(context.Background(), f.state, f.lease, f.contracts, f.policy); err == nil || !strings.Contains(err.Error(), "manifest bytes or identity changed") {
+				t.Fatal("manifest mutation during restore accepted", err)
+			}
+			directory, destination, _ := supervisor.RestoreContextPaths(f.state)
+			for _, path := range []string{destination, filepath.Join(directory, "context.json")} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatal("mutated-manifest restore published", path, err)
+				}
+			}
+		})
+	}
+}

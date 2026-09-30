@@ -40,8 +40,31 @@ func restoreEvolutionCutoverContext(ctx context.Context, state supervisor.Releas
 	if err != nil {
 		return result, err
 	}
+	manifestFile, err := supervisor.ObserveRestorePath(filepath.Join(b.Directory, "manifest.json"), false)
+	if err != nil {
+		return result, err
+	}
+	manifestRaw, err := supervisor.ReadRestoreFile(manifestFile)
+	if err != nil {
+		return result, err
+	}
+	manifestRawHash := supervisor.ReleaseBytesDigest(manifestRaw)
+	manifestUnchanged := func() error {
+		hash, err := supervisor.RestoreFileDigest(manifestFile)
+		if err != nil || hash != manifestRawHash {
+			return errors.New("recovery source manifest bytes or identity changed")
+		}
+		return nil
+	}
 	manifest, _, err := readBackupPolicy(b.Directory, key, policy)
 	if err != nil {
+		return result, err
+	}
+	var captured BackupManifest
+	if json.Unmarshal(manifestRaw, &captured) != nil || Hash(captured) != Hash(manifest) {
+		return result, errors.New("recovery captured manifest differs from authenticated manifest")
+	}
+	if err = manifestUnchanged(); err != nil {
 		return result, err
 	}
 	if releaseArtifactDigest(Digest(Bytes(manifest))) != b.ManifestSHA256 || Hash(manifest.Migrations) != Hash(b.Migrations) || policy.databaseName != "researchos.sqlite" || releasePlainDigest(policy.purpose) != releasePlainDigest(json.RawMessage(b.Purpose)) {
@@ -59,7 +82,7 @@ func restoreEvolutionCutoverContext(ctx context.Context, state supervisor.Releas
 	if err != nil {
 		return result, err
 	}
-	if err = os.MkdirAll(directory, 0700); err != nil {
+	if err = supervisor.EnsureRestoreDirectory(directory); err != nil {
 		return result, err
 	}
 	if _, err = supervisor.ObserveRestorePath(directory, true); err != nil {
@@ -84,6 +107,9 @@ func restoreEvolutionCutoverContext(ctx context.Context, state supervisor.Releas
 				return err
 			}
 		}
+		if err := manifestUnchanged(); err != nil {
+			return err
+		}
 		return guard.beforeRecovery(db)
 	}
 	bounded.afterRecovery = func(db *sql.DB) error {
@@ -92,10 +118,16 @@ func restoreEvolutionCutoverContext(ctx context.Context, state supervisor.Releas
 				return err
 			}
 		}
+		if err := manifestUnchanged(); err != nil {
+			return err
+		}
 		return guard.afterRecovery(db)
 	}
 	report, err := restoreBackupPolicy(ctx, b.Directory, destination, RestoreOptions{Key: key, Contracts: contracts, SupportedMigrations: b.Migrations}, &bounded)
 	if err != nil {
+		return result, err
+	}
+	if err = manifestUnchanged(); err != nil {
 		return result, err
 	}
 	if report.Status != "RESTORED_RECONCILIATION_REQUIRED" || guard.after == nil || Hash(report.Before) != Hash(manifest.Inventory) {
@@ -135,6 +167,7 @@ func restoreEvolutionCutoverContext(ctx context.Context, state supervisor.Releas
 		Format: supervisor.ReleaseRestoreContextFormat, Status: supervisor.RecoveryAuthorizationBlocked,
 		Operation: state.Operation, Project: a.Project, Candidate: a.CandidateID, AdmissionSHA256: state.Admission,
 		ManifestSHA256: b.ManifestSHA256, PurposeSHA256: supervisor.ReleaseBytesDigest(b.Purpose), SnapshotEpoch: a.ExpectedEpoch, HostEpoch: state.Epoch,
+		Manifest: manifestFile, ManifestRawSHA256: manifestRawHash,
 		SourceRoot: sourceRoot, SourceDatabase: sourceDatabase, DestinationRoot: root, DestinationDatabase: database,
 		SourceDatabaseSHA256: sourceHash, DestinationDatabaseSHA256: databaseHash, Report: reportFile, ReportSHA256: reportHash,
 		BeforeInventory: Bytes(stored.Before), AfterInventory: Bytes(stored.After), BeforeRowsSHA256: releasePlainDigest(guard.before), AfterRowsSHA256: releasePlainDigest(guard.after), AllowedDelta: releaseRecoveryDeltaSummary(guard.before, guard.after),

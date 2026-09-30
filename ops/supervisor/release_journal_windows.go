@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 
 	"golang.org/x/sys/windows"
@@ -140,7 +141,7 @@ func OpenReleaseJournal(root string) (*ReleaseJournal, error) {
 	if e != nil {
 		return nil, e
 	}
-	if e = os.MkdirAll(abs, 0700); e != nil {
+	if e = EnsureRestoreDirectory(abs); e != nil {
 		return nil, e
 	}
 	actual, e := filepath.EvalSymlinks(abs)
@@ -164,8 +165,30 @@ func OpenReleaseJournal(root string) (*ReleaseJournal, error) {
 }
 
 func (j *ReleaseJournal) Close() error        { return j.lock.Close() }
-func (j *ReleaseJournal) State() ReleaseState { return j.last.State }
+func (j *ReleaseJournal) State() ReleaseState { return cloneReleaseState(j.last.State) }
 func (j *ReleaseJournal) Sequence() uint64    { return j.last.Sequence }
+
+// Keep journal ownership at both API boundaries. Explicit cloning preserves
+// RawMessage bytes and nil slices, unlike a JSON round trip. New mutable fields
+// on ReleaseState or its nested values must be copied here as well.
+func cloneReleaseState(s ReleaseState) ReleaseState {
+	s.Frozen = slices.Clone(s.Frozen)
+	if s.Cutover != nil {
+		b := *s.Cutover
+		b.Purpose = slices.Clone(b.Purpose)
+		b.Migrations = slices.Clone(b.Migrations)
+		s.Cutover = &b
+	}
+	if s.AdmissionBundle != nil {
+		a := *s.AdmissionBundle
+		s.AdmissionBundle = &a
+	}
+	if s.RestoreContext != nil {
+		r := *s.RestoreContext
+		s.RestoreContext = &r
+	}
+	return s
+}
 
 func (j *ReleaseJournal) load() error {
 	b, e := os.ReadFile(filepath.Join(j.root, "release.journal"))
@@ -216,6 +239,7 @@ func (j *ReleaseJournal) load() error {
 }
 
 func (j *ReleaseJournal) Append(s ReleaseState) error {
+	s = cloneReleaseState(s)
 	if e := validReleaseState(s); e != nil {
 		return e
 	}
@@ -288,6 +312,11 @@ func ObserveRestorePath(path string, directory bool) (RestorePathIdentity, error
 	if err != nil {
 		return result, err
 	}
+	// Check the opened component itself before following it, including junctions.
+	attributes, err := windows.GetFileAttributes(name)
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return result, errors.New("recovery reparse point rejected")
+	}
 	h, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
 	if err != nil {
 		return result, err
@@ -317,6 +346,49 @@ func ObserveRestorePath(path string, directory bool) (RestorePathIdentity, error
 	return RestorePathIdentity{Path: path, FileID: fmt.Sprintf("%08x:%08x:%08x", info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow), Directory: directory}, nil
 }
 
+// EnsureRestoreDirectory validates the existing ancestor before any write,
+// then creates and checks one component at a time. It grants no protection
+// against a hostile process concurrently replacing directories for this user.
+func EnsureRestoreDirectory(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return errors.New("plain absolute recovery directory required")
+	}
+	missing := []string{}
+	ancestor := path
+	for {
+		_, err := os.Lstat(ancestor)
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return errors.New("recovery ancestor unavailable")
+		}
+		missing = append(missing, ancestor)
+		ancestor = parent
+	}
+	identity, err := ObserveRestorePath(ancestor, true)
+	if err != nil {
+		return err
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err = restorePathUnchanged(identity); err != nil {
+			return err
+		}
+		if err = os.Mkdir(missing[i], 0700); err != nil {
+			return err
+		}
+		identity, err = ObserveRestorePath(missing[i], true)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func restorePathUnchanged(want RestorePathIdentity) error {
 	got, err := ObserveRestorePath(want.Path, want.Directory)
 	if err != nil || got != want {
@@ -328,29 +400,40 @@ func restorePathUnchanged(want RestorePathIdentity) error {
 // RestoreFileDigest verifies the identity around a read-only file hash. It is
 // used while the source root is leased and before the restored writer starts.
 func RestoreFileDigest(want RestorePathIdentity) (string, error) {
+	h := sha256.New()
+	if err := readRestoreFile(want, func(r io.Reader) error { _, err := io.Copy(h, r); return err }); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// ReadRestoreFile returns actual bytes from the handle whose identity is checked.
+func ReadRestoreFile(want RestorePathIdentity) ([]byte, error) {
+	var raw []byte
+	err := readRestoreFile(want, func(r io.Reader) error { var err error; raw, err = io.ReadAll(r); return err })
+	return raw, err
+}
+
+func readRestoreFile(want RestorePathIdentity, consume func(io.Reader) error) error {
 	if want.Directory {
-		return "", errors.New("recovery file required")
+		return errors.New("recovery file required")
 	}
 	if err := restorePathUnchanged(want); err != nil {
-		return "", err
+		return err
 	}
 	f, err := os.Open(want.Path)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer f.Close()
 	var info windows.ByHandleFileInformation
 	if err = windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil || fmt.Sprintf("%08x:%08x:%08x", info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow) != want.FileID {
-		return "", errors.New("recovery hash handle identity changed")
+		return errors.New("recovery hash handle identity changed")
 	}
-	h := sha256.New()
-	if _, err = io.Copy(h, f); err != nil {
-		return "", err
+	if err = consume(f); err != nil {
+		return err
 	}
-	if err = restorePathUnchanged(want); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return restorePathUnchanged(want)
 }
 
 // ValidateReleaseRestoreResult verifies immutable bytes and native identities,
@@ -370,6 +453,20 @@ func ValidateReleaseRestoreResult(s ReleaseState, result ReleaseRestoreResult) (
 	a, b := s.AdmissionBundle, s.Cutover
 	if c.Format != ReleaseRestoreContextFormat || c.Status != RecoveryAuthorizationBlocked || c.Operation != s.Operation || c.Project != a.Project || c.Candidate != a.CandidateID || c.AdmissionSHA256 != s.Admission || releaseHash(*a) != s.Admission || c.ManifestSHA256 != b.ManifestSHA256 || c.PurposeSHA256 != ReleaseBytesDigest(b.Purpose) || c.SnapshotEpoch != a.ExpectedEpoch || c.HostEpoch != s.Epoch || c.SnapshotEpoch+1 != c.HostEpoch {
 		return c, errors.New("restore context lineage changed")
+	}
+	if c.Manifest.Path != filepath.Join(b.Directory, "manifest.json") || b.Directory != filepath.Join(filepath.Dir(b.Root), "release-state", "cutovers", s.Operation) || c.Manifest.Directory || !validDigest(c.ManifestRawSHA256) {
+		return c, errors.New("restore manifest location changed")
+	}
+	manifestRaw, err := ReadRestoreFile(c.Manifest)
+	if err != nil || ReleaseBytesDigest(manifestRaw) != c.ManifestRawSHA256 {
+		return c, errors.New("restore manifest bytes or identity changed")
+	}
+	var manifest struct {
+		Purpose    json.RawMessage `json:"purpose"`
+		Migrations []int           `json:"migrations"`
+	}
+	if json.Unmarshal(manifestRaw, &manifest) != nil || releaseHash(manifest.Purpose) != releaseHash(b.Purpose) || !reflect.DeepEqual(manifest.Migrations, b.Migrations) {
+		return c, errors.New("restore manifest purpose or migrations changed")
 	}
 	if c.SourceRoot.Path != b.Root || !c.SourceRoot.Directory || c.SourceDatabase.Path != b.Database || c.DestinationRoot.Path != result.Destination || !c.DestinationRoot.Directory || c.DestinationDatabase.Path != filepath.Join(result.Destination, "researchos.sqlite") || c.Report.Path != filepath.Join(result.Destination, "restore-report.json") {
 		return c, errors.New("restore context location changed")

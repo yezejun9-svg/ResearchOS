@@ -85,6 +85,8 @@ type ReleaseRestoreContext struct {
 	Candidate                 string              `json:"candidate"`
 	AdmissionSHA256           string              `json:"admission_sha256"`
 	ManifestSHA256            string              `json:"manifest_sha256"`
+	Manifest                  RestorePathIdentity `json:"manifest"`
+	ManifestRawSHA256         string              `json:"manifest_raw_sha256"`
 	PurposeSHA256             string              `json:"purpose_sha256"`
 	SnapshotEpoch             uint64              `json:"snapshot_epoch"`
 	HostEpoch                 uint64              `json:"host_epoch"`
