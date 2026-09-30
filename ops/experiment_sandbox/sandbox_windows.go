@@ -26,20 +26,25 @@ type Command struct {
 	Timeout                         time.Duration
 }
 type Receipt struct {
-	Executable   string   `json:"executable"`
-	Args         []string `json:"argv"`
-	Directory    string   `json:"cwd"`
-	Profile      string   `json:"profile"`
-	PID          uint32   `json:"pid"`
-	SID          string   `json:"appcontainer_sid"`
-	Capabilities []string `json:"capabilities"`
-	ExitCode     int      `json:"exit_code"`
-	Stopped      bool     `json:"children_stopped"`
-	TimedOut     bool     `json:"timed_out"`
-	Started      string   `json:"started_at"`
-	Finished     string   `json:"finished_at"`
-	Stdout       []byte   `json:"stdout"`
-	Stderr       []byte   `json:"stderr"`
+	Executable      string   `json:"executable"`
+	Args            []string `json:"argv"`
+	Directory       string   `json:"cwd"`
+	Profile         string   `json:"profile"`
+	PID             uint32   `json:"pid"`
+	Created         int64    `json:"process_created_ns"`
+	Job             string   `json:"job"`
+	StreamsDrained  bool     `json:"streams_drained"`
+	CleanupComplete bool     `json:"cleanup_complete"`
+	OutputCopied    bool     `json:"output_copied"`
+	SID             string   `json:"appcontainer_sid"`
+	Capabilities    []string `json:"capabilities"`
+	ExitCode        int      `json:"exit_code"`
+	Stopped         bool     `json:"children_stopped"`
+	TimedOut        bool     `json:"timed_out"`
+	Started         string   `json:"started_at"`
+	Finished        string   `json:"finished_at"`
+	Stdout          []byte   `json:"stdout"`
+	Stderr          []byte   `json:"stderr"`
 }
 
 var userenv = windows.NewLazySystemDLL("userenv.dll")
@@ -70,7 +75,15 @@ func acl(path, sid, rights string) error {
 
 // Fresh container SIDs receive access only to these caller-owned staging roots.
 // Windows platform files and the OS-created private AppContainer storage are OS grants.
-func Run(ctx context.Context, c Command) (r Receipt, err error) {
+func Run(ctx context.Context, c Command) (Receipt, error) {
+	p, err := Start(ctx, c, StartOptions{})
+	if err != nil {
+		return Receipt{}, err
+	}
+	return p.Wait(context.Background())
+}
+
+func runSandbox(ctx context.Context, c Command, options StartOptions, process *Process) (r Receipt, err error) {
 	if c.Timeout <= 0 || c.Timeout > 5*time.Minute {
 		return r, errors.New("bounded timeout 0..5m required")
 	}
@@ -115,7 +128,11 @@ func Run(ctx context.Context, c Command) (r Receipt, err error) {
 	if e != nil {
 		return r, e
 	}
-	defer os.RemoveAll(staging)
+	defer func() {
+		cleanupErr := os.RemoveAll(staging)
+		r.CleanupComplete = cleanupErr == nil
+		err = errors.Join(err, cleanupErr)
+	}()
 	originalInput, originalOutput := c.InputDirectory, c.OutputDirectory
 	c.InputDirectory = filepath.Join(staging, "input")
 	c.OutputDirectory = filepath.Join(staging, "output")
@@ -151,12 +168,15 @@ func Run(ctx context.Context, c Command) (r Receipt, err error) {
 	r.Executable, r.Args, r.Directory = c.Executable, c.Args, c.OutputDirectory
 	defer func() {
 		if r.Stopped {
-			if x := copyTree(context.Background(), c.OutputDirectory, originalOutput); x != nil && err == nil {
-				err = x
-			}
+			copyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			x := copyTree(copyCtx, c.OutputDirectory, originalOutput)
+			r.OutputCopied = x == nil
+			err = errors.Join(err, x)
 		}
 	}()
-	job, e := windows.CreateJobObject(nil, nil)
+	r.Job = "Local\\" + name
+	job, e := windows.CreateJobObject(nil, utf(r.Job))
 	if e != nil {
 		return r, e
 	}
@@ -168,23 +188,33 @@ func Run(ctx context.Context, c Command) (r Receipt, err error) {
 	if _, e = windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limit)), uint32(unsafe.Sizeof(limit))); e != nil {
 		return r, e
 	}
-	stdin, e := os.Open(os.DevNull)
+	stdin, input, e := os.Pipe()
 	if e != nil {
 		return r, e
 	}
 	defer stdin.Close()
-	stdout, e := os.CreateTemp("", "researchos-w10-out-")
+	process.mu.Lock()
+	process.stdin = input
+	process.mu.Unlock()
+	defer process.CloseInput()
+	if !options.Interactive {
+		process.CloseInput()
+	}
+	stdoutReader, stdout, e := os.Pipe()
 	if e != nil {
 		return r, e
 	}
-	defer os.Remove(stdout.Name())
 	defer stdout.Close()
-	stderr, e := os.CreateTemp("", "researchos-w10-err-")
+	defer stdoutReader.Close()
+	stderrReader, stderr, e := os.Pipe()
 	if e != nil {
 		return r, e
 	}
-	defer os.Remove(stderr.Name())
 	defer stderr.Close()
+	defer stderrReader.Close()
+	outDone, errDone := make(chan streamResult, 1), make(chan streamResult, 1)
+	go collectStream(stdoutReader, "stdout", options.OnStream, process.cancel, outDone)
+	go collectStream(stderrReader, "stderr", options.OnStream, process.cancel, errDone)
 	handles := []windows.Handle{windows.Handle(stdin.Fd()), windows.Handle(stdout.Fd()), windows.Handle(stderr.Fd())}
 	for _, h := range handles {
 		if e = windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); e != nil {
@@ -226,12 +256,42 @@ func Run(ctx context.Context, c Command) (r Receipt, err error) {
 	env := utf16.Encode([]rune("SystemRoot=" + os.Getenv("SystemRoot") + "\x00TEMP=" + c.OutputDirectory + "\x00TMP=" + c.OutputDirectory + "\x00USERPROFILE=" + c.OutputDirectory + "\x00LOCALAPPDATA=" + c.OutputDirectory + "\x00APPDATA=" + c.OutputDirectory + "\x00\x00"))
 	var pi windows.ProcessInformation
 	r.Started = time.Now().UTC().Format(time.RFC3339Nano)
-	if e = windows.CreateProcess(utf(c.Executable), line, nil, nil, true, windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_NO_WINDOW|windows.CREATE_UNICODE_ENVIRONMENT, &env[0], utf(c.OutputDirectory), &si.StartupInfo, &pi); e != nil {
+	if e = windows.CreateProcess(utf(c.Executable), line, nil, nil, true, windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_NO_WINDOW|windows.CREATE_UNICODE_ENVIRONMENT|windows.CREATE_SUSPENDED, &env[0], utf(c.OutputDirectory), &si.StartupInfo, &pi); e != nil {
 		return r, fmt.Errorf("CreateProcess: %w", e)
 	}
 	defer windows.CloseHandle(pi.Process)
-	windows.CloseHandle(pi.Thread)
+	defer windows.CloseHandle(pi.Thread)
+	// The parent must release its copies of the child write ends for true EOF.
+	stdout.Close()
+	stderr.Close()
+	stdin.Close()
 	r.PID = pi.ProcessId
+	var created, exited, kernel, user windows.Filetime
+	if e = windows.GetProcessTimes(pi.Process, &created, &exited, &kernel, &user); e != nil {
+		windows.TerminateJobObject(job, 125)
+		windows.WaitForSingleObject(pi.Process, 5000)
+		return r, e
+	}
+	r.Created = created.Nanoseconds()
+	identity := Identity{PID: r.PID, Created: r.Created, Job: r.Job, SID: r.SID, Profile: r.Profile}
+	if options.BeforeResume != nil {
+		if e = options.BeforeResume(identity); e != nil {
+			windows.TerminateJobObject(job, 125)
+			windows.WaitForSingleObject(pi.Process, 5000)
+			return r, fmt.Errorf("beforeResume: %w", e)
+		}
+	}
+	if ctx.Err() != nil {
+		windows.TerminateJobObject(job, 125)
+		windows.WaitForSingleObject(pi.Process, 5000)
+		return r, ctx.Err()
+	}
+	if _, e = windows.ResumeThread(pi.Thread); e != nil {
+		windows.TerminateJobObject(job, 125)
+		windows.WaitForSingleObject(pi.Process, 5000)
+		return r, e
+	}
+	process.ready <- nil
 	deadline := time.Now().Add(c.Timeout)
 	for {
 		state, x := windows.WaitForSingleObject(pi.Process, 20)
@@ -270,12 +330,10 @@ func Run(ctx context.Context, c Command) (r Receipt, err error) {
 		}
 	}
 	r.Stopped = accounting.ActiveProcesses == 0
-	r.Stdout, e = os.ReadFile(stdout.Name())
-	if e != nil {
-		return r, e
-	}
-	r.Stderr, e = os.ReadFile(stderr.Name())
-	return r, e
+	outResult, errResult := <-outDone, <-errDone
+	r.Stdout, r.Stderr = outResult.bytes, errResult.bytes
+	r.StreamsDrained = outResult.err == nil && errResult.err == nil
+	return r, errors.Join(outResult.err, errResult.err)
 }
 
 func copyTree(ctx context.Context, source, target string) error {
