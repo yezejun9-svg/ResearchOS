@@ -16,6 +16,8 @@ def run(name, argv, cwd=ROOT):
     COMMANDS.append({"name": name, "argv": argv, "cwd": str(cwd),
                      "exit_code": result.returncode, "stdout_tail": result.stdout[-2500:],
                      "stderr_tail": result.stderr[-2500:]})
+    if name == "go-test":
+        COMMANDS[-1].update(stdout=result.stdout, stderr=result.stderr)
     if result.returncode:
         raise RuntimeError(f"{name} exited {result.returncode}: {result.stderr[-500:]}")
     return result.stdout
