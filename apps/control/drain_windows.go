@@ -89,6 +89,7 @@ type controlDrain struct {
 	mu                        sync.Mutex
 	operation, nonce, receipt string
 	epoch                     uint64
+	currentConfigured         bool
 }
 
 func (d *controlDrain) observe(ctx context.Context) (domain.RuntimeDrainSnapshot, error) {
@@ -158,6 +159,7 @@ func (d *controlDrain) response(kind string, frame supervisor.DrainFrame, receip
 }
 
 func (d *controlDrain) handle(ctx context.Context) error {
+	hostContext := ctx
 	conn, e := supervisor.AcceptDrainPipe(ctx, d.pipe, d.peer)
 	if e != nil {
 		return e
@@ -178,6 +180,23 @@ func (d *controlDrain) handle(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	switch frame.Kind {
+	case "CURRENT_CONTROL":
+		currentContext, currentCancel := context.WithTimeout(hostContext, 30*time.Second)
+		defer currentCancel()
+		if e = conn.SetDeadline(time.Now().Add(30 * time.Second)); e != nil {
+			return e
+		}
+		result, err := d.currentControl(currentContext, frame)
+		if err != nil {
+			result.Error = err.Error()
+		}
+		reply := d.response(frame.Kind, frame, "", "FIXTURE")
+		reply.Release = &result
+		reply, err = supervisor.DrainFrameSign(d.key, reply)
+		if err != nil {
+			return err
+		}
+		return supervisor.WriteDrainFrame(conn, reply)
 	case "FIXTURE_SEAL", "FIXTURE_CURRENT", "FIXTURE_DISPATCH", "FIXTURE_CUTOVER", "FIXTURE_PROJECT":
 		if d.startup == nil || d.startup.FixtureStore == "" || frame.Release == nil {
 			return errors.New("inherited fixture release capability required")
