@@ -16,8 +16,16 @@ import (
 
 func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
+	remote := s.newRemoteHandler()
 	for _, op := range s.Contracts.Operations {
 		mux.HandleFunc(op.Method+" "+op.Path, func(w http.ResponseWriter, r *http.Request) {
+			if !s.remoteOperationBoundary(w, r, op) {
+				return
+			}
+			if remoteOperations[op.ID] {
+				remote.handle(w, r, op)
+				return
+			}
 			if op.ID == "streamEvents" {
 				s.streamWorkbenchEvents(w, r, op)
 				return
