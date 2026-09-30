@@ -124,7 +124,7 @@ func (s *Service) closeReportedResearchCycle(tx *sql.Tx, owner Principal, projec
 	if err != nil {
 		return err
 	}
-	facts, err := s.researchCycleFacts(tx, project, cycle)
+	facts, err := s.researchCycleFacts(tx, project, cycle, &owner)
 	if err != nil {
 		return err
 	}
@@ -148,7 +148,7 @@ func (s *Service) closeReportedResearchCycle(tx *sql.Tx, owner Principal, projec
 	if err != nil {
 		return err
 	}
-	cycle, err = s.closeResearchCycle(tx, project, Str(cycle, "id"), Object{"requested_status": facts["cycle_outcome"], "outcome_summary": "Current independently accepted cycle report " + Str(artifact, "id") + "; gaps and unknown cost retained."})
+	cycle, err = s.closeResearchCycle(tx, owner, project, Str(cycle, "id"), Object{"requested_status": facts["cycle_outcome"], "outcome_summary": "Current independently accepted cycle report " + Str(artifact, "id") + "; gaps and unknown cost retained."})
 	if err != nil {
 		return err
 	}

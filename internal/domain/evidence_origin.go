@@ -214,6 +214,11 @@ func (s *Service) EvidenceSupportSummary(ctx context.Context, token, project str
 	if err != nil {
 		return nil, err
 	}
+	return s.evidenceSupportSummary(tx, p, project, ids)
+}
+
+// Keep source reads in the caller's transaction when revalidating a disposition.
+func (s *Service) evidenceSupportSummary(tx *sql.Tx, p Principal, project string, ids []string) (Object, error) {
 	if !p.Allowed(project, "", "", false) {
 		return nil, Fail(404, "NOT_FOUND", "project unavailable")
 	}
