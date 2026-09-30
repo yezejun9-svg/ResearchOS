@@ -555,7 +555,7 @@ func (s *Service) content(w http.ResponseWriter, r *http.Request, tx *sql.Tx, p 
 		return
 	}
 	if o["access_class"] == "VERIFIER_ONLY" {
-		s.writeError(w, cid, Fail(503, "RESOURCE_UNAVAILABLE", "protected content store requires W17 qualification"))
+		s.protectedContent(w, r, tx, project, id, cid)
 		return
 	}
 	var b []byte
