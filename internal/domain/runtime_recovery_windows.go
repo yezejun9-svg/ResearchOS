@@ -8,11 +8,89 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	rt "researchos.local/research-os/adapters/runtime"
 )
+
+// recoverCheckpoints imports host-persisted checkpoint bytes as an old-epoch
+// contribution. Attaching its recovery pointer does not renew execution rights.
+func (c *RuntimeCoordinator) recoverCheckpoints(ctx context.Context, project, runID, directory string, epoch int64) error {
+	paths, e := filepath.Glob(filepath.Join(directory, "checkpoint-*.json"))
+	if e != nil || len(paths) == 0 {
+		return e
+	}
+	tx, e := c.service.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	if e = resourceWriteLock(tx); e != nil {
+		return e
+	}
+	dispatch, e := runtimeDispatch(tx, project, runID, epoch)
+	if e != nil {
+		return e
+	}
+	var latest Object
+	var latestSequence int64
+	for _, path := range paths {
+		actual, err := filepath.EvalSymlinks(path)
+		if err != nil || !strings.EqualFold(actual, path) {
+			return errors.New("host checkpoint reparse rejected")
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > 128*1024 {
+			return errors.New("host checkpoint exceeds bound")
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		fact, err := Decode(raw)
+		if err != nil {
+			return err
+		}
+		sequence, err := Num(fact, "sequence")
+		payload, ok := fact["payload"].(map[string]any)
+		if err != nil || sequence <= 0 || !ok || filepath.Base(path) != "checkpoint-"+strconv.FormatInt(sequence, 10)+".json" || fact["project_id"] != project || fact["run_id"] != runID || Hash(fact["epoch"]) != Hash(epoch) || fact["manifest_hash"] != dispatch["manifest_hash"] || fact["dispatch_key"] != dispatch["dispatch_key"] || fact["content_hash"] != Digest(Bytes(payload)) {
+			return errors.New("host checkpoint binding mismatch")
+		}
+		artifact, err := c.recoverArtifact(tx, project, dispatch, Bytes(payload), "CHECKPOINT")
+		if err != nil {
+			return err
+		}
+		if sequence > latestSequence {
+			latestSequence, latest = sequence, artifact
+		}
+	}
+	run, e := load(tx, project, "Run", runID)
+	if e != nil {
+		return e
+	}
+	if latest != nil && Hash(run["lease_epoch"]) == Hash(epoch) && !runTerminal(run) && run["checkpoint_artifact_id"] != latest["id"] {
+		task, err := load(tx, project, "Task", Str(run, "task_id"))
+		if err != nil {
+			return err
+		}
+		if task["active_run_id"] == runID {
+			run["checkpoint_artifact_id"] = latest["id"]
+			if e = bump(run); e != nil {
+				return e
+			}
+			if e = c.service.put(tx, "Run", run); e != nil {
+				return e
+			}
+			manifest := dispatch["manifest"].(map[string]any)
+			if e = c.service.event(tx, project, "Run", run, Str(manifest, "executor_principal_id"), Str(dispatch, "dispatch_key"), "RUN_CHANGED"); e != nil {
+				return e
+			}
+		}
+	}
+	return tx.Commit()
+}
 
 // recoverArtifact writes an immutable historical contribution from validated
 // host bytes. It neither impersonates a live lease nor exposes an HTTP bypass.

@@ -273,7 +273,7 @@ func runSandbox(ctx context.Context, c Command, options StartOptions, process *P
 		return r, e
 	}
 	r.Created = created.Nanoseconds()
-	identity := Identity{PID: r.PID, Created: r.Created, Job: r.Job, SID: r.SID, Profile: r.Profile}
+	identity := Identity{PID: r.PID, Created: r.Created, Job: r.Job, SID: r.SID, Profile: r.Profile, StagingDirectory: staging}
 	if options.BeforeResume != nil {
 		if e = options.BeforeResume(identity); e != nil {
 			windows.TerminateJobObject(job, 125)
