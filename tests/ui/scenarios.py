@@ -215,7 +215,7 @@ def event_recovery(page, base, project_path, token, api, report, out, other_proj
         'requirement_key': 'event-' + uuid.uuid4().hex, 'text': 'Actual event for replay transport fixture',
         'basis': 'USER_STATED', 'source_refs': [], 'rationale': 'W13 recovery', 'supersedes_id': None,
         'acceptance_check_ids': []}, f'"r{state["revision"]}"')
-    events = api(base, token, 'GET', project_api + '/events')['items']
+    events = api(base, token, 'GET', project_api + '/events?after_sequence=' + str(initial['as_of_event_sequence']) + '&limit=100')['items']
     new_events = [event for event in events if int(event['sequence']) > int(initial['as_of_event_sequence'])]
     assert new_events, 'real replay event missing'
     event = new_events[0]
