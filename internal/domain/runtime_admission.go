@@ -7,7 +7,7 @@ import (
 
 // qualificationEvidence validates the private bootstrap marker against current authority.
 // It cannot turn a fixture observation into a LIVE qualification.
-func (s *Service) qualificationEvidence(tx *sql.Tx, project string, receipt Object) (Object, Object, Object, error) {
+func (s *Service) qualificationEvidence(tx *sql.Tx, project string, receipt Object, caller string) (Object, Object, Object, error) {
 	ref, ok := receipt["subject_ref"].(map[string]any)
 	if !ok || ref["entity_type"] != "Task" || receipt["verdict"] != "PASS" || receipt["receipt_hash"] != Receipt(receipt) || receipt["project_id"] != project {
 		return nil, nil, nil, Fail(422, "GATE_FAILED", "PASS task acceptance receipt required")
@@ -118,7 +118,23 @@ func (s *Service) qualificationEvidence(tx *sql.Tx, project string, receipt Obje
 	if e != nil {
 		return nil, nil, nil, e
 	}
-	if verifierRoot == executorRoot || verifierRoot == ownerRoot || Hash(receipt["executor_principal_ids"]) != Hash([]any{r["executor_principal_id"]}) {
+	authorRoot, e := authorityRoot(tx, author)
+	if e != nil {
+		return nil, nil, nil, e
+	}
+	if authorRoot != ownerRoot {
+		return nil, nil, nil, Fail(403, "FORBIDDEN", "qualification author authority changed")
+	}
+	if caller != "" {
+		callerRoot, err := authorityRoot(tx, caller)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if callerRoot == authorRoot || callerRoot == executorRoot {
+			return nil, nil, nil, Fail(403, "FORBIDDEN", "qualification caller is not independent")
+		}
+	}
+	if verifierRoot == executorRoot || verifierRoot == authorRoot || Hash(receipt["executor_principal_ids"]) != Hash([]any{r["executor_principal_id"]}) {
 		return nil, nil, nil, Fail(403, "FORBIDDEN", "qualification verifier is not independent")
 	}
 	created, e := time.Parse(time.RFC3339Nano, Str(receipt, "created_at"))
@@ -186,7 +202,7 @@ func (s *Service) qualifyRuntime(tx *sql.Tx, p Principal, project, runtimeID str
 		if err != nil {
 			return nil, Fail(422, "GATE_FAILED", "same-project acceptance receipt required")
 		}
-		currentPlan, currentRuntime, currentRun, err := s.qualificationEvidence(tx, project, receipt)
+		currentPlan, currentRuntime, currentRun, err := s.qualificationEvidence(tx, project, receipt, p.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -235,6 +251,17 @@ func (s *Service) currentRuntimeAdmission(tx *sql.Tx, project string, task, runt
 	if runtime["status"] != "AVAILABLE" {
 		return nil, Fail(409, "STATE_CONFLICT", "runtime not available")
 	}
+	current, e := load(tx, project, "RuntimeRegistration", Str(runtime, "id"))
+	if e != nil {
+		return nil, e
+	}
+	if Hash(current["revision"]) != Hash(runtime["revision"]) {
+		return nil, Fail(412, "STALE_INPUT", "runtime snapshot changed")
+	}
+	runtime = current
+	if runtime["status"] != "AVAILABLE" {
+		return nil, Fail(409, "STATE_CONFLICT", "runtime not available")
+	}
 	if task != nil && task["project_id"] != project {
 		return nil, Fail(403, "FORBIDDEN", "task belongs to another project")
 	}
@@ -258,7 +285,7 @@ func (s *Service) currentRuntimeAdmission(tx *sql.Tx, project string, task, runt
 		if e := tx.QueryRow("SELECT count(*) FROM orchestration_fixtures WHERE project=? AND runtime=?", project, runtime["id"]).Scan(&count); e != nil {
 			return nil, e
 		}
-		if count == 1 {
+		if count == 1 && len(Arr(runtime, "qualification_ids")) == 0 {
 			return Object{"mode": "FIXTURE", "runtime_id": runtime["id"]}, nil
 		}
 	}
@@ -278,13 +305,32 @@ func (s *Service) currentRuntimeAdmission(tx *sql.Tx, project string, task, runt
 		if e != nil {
 			return nil, e
 		}
-		_, rt, run, err := s.qualificationEvidence(tx, project, receipt)
+		plan, rt, run, err := s.qualificationEvidence(tx, project, receipt, "")
 		if err != nil || rt["id"] != runtime["id"] || run["id"] != runID {
 			return nil, Fail(422, "GATE_FAILED", "current runtime qualification invalid")
 		}
 		observation, err := runtimeObservation(tx, project, run)
 		if err != nil {
 			return nil, err
+		}
+		planned := map[string]bool{}
+		observed := map[string]bool{}
+		for _, v := range Arr(plan, "required_capabilities") {
+			if cap, ok := v.(string); ok {
+				planned[cap] = true
+			}
+		}
+		spec, _ := observation["spec"].(map[string]any)
+		for _, v := range Arr(spec, "capabilities") {
+			if cap, ok := v.(string); ok {
+				observed[cap] = true
+			}
+		}
+		for _, v := range requestedCapabilities {
+			cap, _ := v.(string)
+			if !planned[cap] || !observed[cap] {
+				return nil, Fail(422, "GATE_FAILED", "runtime capability lacks qualified host evidence")
+			}
 		}
 		if err = s.runtimeReceipt(tx, project, run, ref, observation); err != nil {
 			return nil, err
