@@ -101,7 +101,8 @@ def main() -> int:
         report['files'] = {p.name: digest(p) for p in sorted(out.iterdir()) if p.is_file() and p.name != 'report.json'}
         (out / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     print(json.dumps({'status': report['status'], 'scope': report['scope'], 'assertions': report.get('assertion_count', 0),
-                      'report': str(out / 'report.json')}, ensure_ascii=False))
+                      'assertion_ids': [row['assertion_id'] for row in assertions],
+                      'receipt': str(out / 'report.json')}, ensure_ascii=False))
     return 0 if report['status'] == 'PASS' else 1
 
 

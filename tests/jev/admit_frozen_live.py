@@ -6,6 +6,7 @@ an executor report, not an independent acceptance or a new LIVE measurement.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import sys
@@ -221,6 +222,11 @@ def main():
     admission = Admission(args.evidence_root.resolve())
     error = None
     try:
+        task = os.getenv("RESEARCHOS_TASK_ID", "W11")
+        check = os.getenv("RESEARCHOS_CHECK_ID", "")
+        case = os.getenv("RESEARCHOS_CASE_ID", "")
+        if task != "W11" or check not in ("", "W11-G02", "W11-G03", "W11-G04") or case not in ("", "A08") or check and case:
+            raise ValueError("unbound W11 selection")
         admission.run()
     except (ValueError, OSError, KeyError, StopIteration, subprocess.CalledProcessError) as exc:
         error = str(exc)
@@ -234,8 +240,9 @@ def main():
         service_operations=[], automatic_authority="NONE", whole_W11_accepted=False,
         independent_acceptance="PENDING", error=error)
     (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(dict(status=report["status"], assertion_count=report["assertion_count"],
-                         report=str(output / "report.json"), error=error), ensure_ascii=False))
+    print(json.dumps(dict(status=report["status"], assertions=report["assertion_count"],
+                         assertion_ids=[row["assertion_id"] for row in admission.checks],
+                         receipt=str(output / "report.json"), error=error), ensure_ascii=False))
     return 1 if error else 0
 
 
