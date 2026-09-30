@@ -35,8 +35,8 @@ func runControlHost(control, root, work, web, listen, private, contracts string)
 	}
 	defer j.Close()
 	d := &supervisor.ControlFixtureDriver{Journal: j, WorkDir: work, WebDir: web, Listen: listen, FixtureStore: private, Output: os.Stderr}
-	d.Restore = func(ctx context.Context, s supervisor.ReleaseState, lease *rt.DataRootLease) (string, error) {
-		return domain.RestoreEvolutionCutover(ctx, s, lease, contracts, private)
+	d.RestoreWithContext = func(ctx context.Context, s supervisor.ReleaseState, lease *rt.DataRootLease) (supervisor.ReleaseRestoreResult, error) {
+		return domain.RestoreEvolutionCutoverContext(ctx, s, lease, contracts, private)
 	}
 	verify := func(a supervisor.ReleaseAdmission) error {
 		state := j.State()

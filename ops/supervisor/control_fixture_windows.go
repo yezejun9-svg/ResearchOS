@@ -80,6 +80,7 @@ type ControlFixtureDriver struct {
 	Output                                     io.Writer
 	FixtureStore                               string
 	Restore                                    func(context.Context, ReleaseState, *rt.DataRootLease) (string, error)
+	RestoreWithContext                         func(context.Context, ReleaseState, *rt.DataRootLease) (ReleaseRestoreResult, error)
 	boot                                       *DrainBootstrap
 	process                                    ProcessIdentity
 	frame                                      DrainFrame
@@ -90,6 +91,9 @@ func (d *ControlFixtureDriver) Start(image, token, data string) (ProcessIdentity
 		return ProcessIdentity{}, errors.New("supervisor journal required")
 	}
 	s := d.Journal.State()
+	if s.RestoreContext != nil {
+		return ProcessIdentity{}, errors.New(RecoveryAuthorizationBlocked)
+	}
 	if (s.Phase != "STARTING" && s.Phase != "SWITCHED") || s.PID != 0 || s.Data != data || token == "" {
 		return ProcessIdentity{}, errors.New("durable unstarted slot required")
 	}
@@ -382,14 +386,37 @@ func (d *ControlFixtureDriver) Ready(ctx context.Context, p ProcessIdentity, tok
 }
 
 func (d *ControlFixtureDriver) Compatible(ctx context.Context, s ReleaseState) error {
-	if d.Restore == nil || s.Cutover == nil {
+	if (d.RestoreWithContext == nil && d.Restore == nil) || s.Cutover == nil {
 		return errors.New("actual control rollback requires a separately qualified restore")
+	}
+	if d.Journal == nil || d.Journal.State().Operation != s.Operation || d.Journal.State().Epoch != s.Epoch {
+		return errors.New("restore journal operation changed")
+	}
+	if bound := d.Journal.State().RestoreContext; bound != nil {
+		if _, err := ValidateReleaseRestoreResult(d.Journal.State(), *bound); err != nil {
+			return err
+		}
+		return errors.New(RecoveryAuthorizationBlocked)
 	}
 	lease, err := rt.AcquireDataRootLease(s.Data)
 	if err != nil {
 		return err
 	}
 	defer lease.Close()
+	if d.RestoreWithContext != nil {
+		result, err := d.RestoreWithContext(ctx, s, lease)
+		if err != nil {
+			return err // Never fall back to an untyped restore after uncertainty.
+		}
+		if err = d.Journal.BindRestoreContext(result); err != nil {
+			return err
+		}
+		// The real restored copy is fenced, but no current recovery actor/proof
+		// exists in this bounded slice. Do not select its Data or start control.
+		return errors.New(RecoveryAuthorizationBlocked)
+	}
+	// Legacy synthetic fixture callback remains compatible; it cannot consume
+	// a typed context and is not selected by the actual-control host.
 	dest, err := d.Restore(ctx, s, lease)
 	if err != nil {
 		return err
