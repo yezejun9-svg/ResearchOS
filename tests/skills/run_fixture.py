@@ -67,7 +67,7 @@ def main() -> int:
     }
     save(out / 'before.json', before)
     try:
-        result = subprocess.run(command, cwd=ROOT, capture_output=True, timeout=190)
+        result = subprocess.run(command, cwd=ROOT, capture_output=True, timeout=190, env=dict(os.environ, W15_EVIDENCE_DIR=str(out)))
         stdout, stderr, code = result.stdout, result.stderr, result.returncode
     except subprocess.TimeoutExpired as exc:
         stdout, stderr, code = exc.stdout or b'', exc.stderr or b'', 124
@@ -99,7 +99,7 @@ def main() -> int:
               'assertion_ids': ids, 'expected_assertion_ids': expected,
               'missing_assertion_ids': sorted(set(expected) - set(ids)), 'malformed': malformed,
               'source_drift': drift, 'assertions': rows, 'test_passed': test_passed,
-              'raw_evidence_hashes': {name: digest(out / name) for name in ('before.json', 'stdout.jsonl', 'stderr.txt')},
+              'raw_evidence_hashes': {p.name: digest(p) for p in out.iterdir() if p.is_file()},
               'construction_acceptance': 'PENDING_INDEPENDENT_VERIFIER',
               'product_live_qualification': 'BLOCKED_W15_G02_W14_REAL_INPUT_W05_POLICY',
               'ended_at': dt.datetime.now(dt.timezone.utc).isoformat()}
