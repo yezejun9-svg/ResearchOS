@@ -13,9 +13,10 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED = json.loads((ROOT / 'tests/jev/expected.json').read_text(encoding='utf-8'))
 GROUPS = {
-    'W11-G01': list(EXPECTED),
+    'W11-G01': [name for name in EXPECTED if name != 'TestW11C20RubricOnly'],
     'C07': ['TestW11HardGates', 'TestW11ManualDecisionHardGate'],
     'C08': ['TestW11HostAndFallback', 'TestW11QualificationClosed', 'TestW11ImportedProvenance'],
+    'C20': ['TestW11C20RubricOnly'],
 }
 
 
@@ -32,8 +33,10 @@ def main(command_key='test.jev.fixture'):
     parser.add_argument('--mode', choices=['fixture'], default='fixture')
     args = parser.parse_args()
     task, check, case = (os.getenv(k, '') for k in ['RESEARCHOS_TASK_ID', 'RESEARCHOS_CHECK_ID', 'RESEARCHOS_CASE_ID'])
-    if task != 'W11' or bool(check) == bool(case) or (check and check != 'W11-G01') or (case and case not in ['C07', 'C08']):
-        parser.error('exactly one owned W11-G01 / C07 / C08 selector required; live/protected gates are separate')
+    w11 = task == 'W11' and ((check == 'W11-G01' and not case) or (not check and case in ('C07', 'C08')))
+    w16_c20 = task == 'W16' and not check and case == 'C20'
+    if not (w11 or w16_c20):
+        parser.error('exact W11-G01 / C07 / C08 or W16/C20 selector required; live/protected gates are separate')
     selector = check or case
     go = os.getenv('RESEARCHOS_GO') or str(ROOT / '.local/tools/go1.27.1/go/bin/go.exe')
     if not Path(go).is_file():
@@ -43,7 +46,7 @@ def main(command_key='test.jev.fixture'):
     if not expected or len(expected) != len(set(expected)):
         raise RuntimeError('nonzero, unique frozen assertion inventory required')
     run_id = str(uuid.uuid4())
-    out = ROOT / 'execution/receipts/W11/fixture' / run_id
+    out = ROOT / ('execution/receipts/W16/c20-private/jev' if w16_c20 else 'execution/receipts/W11/fixture') / run_id
     out.mkdir(parents=True)
     env = dict(os.environ)
     # Credentials are neither needed nor propagated to fixture subprocesses.
@@ -59,15 +62,15 @@ def main(command_key='test.jev.fixture'):
         'schema': 'GLOBAL_EVIDENCE_V1_CANDIDATE', 'task_id': task, 'check_id': check, 'case_id': case, 'run_id': run_id,
         'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'environment_mode': 'FIXTURE',
         'os': platform.platform(), 'architecture': platform.machine(), 'executor_identity': os.getenv('RESEARCHOS_EXECUTOR_ID', 'codex:/root/resources'),
-        'verifier_identity': None, 'code_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
-        'dirty': subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True),
+        'verifier_identity': None, 'code_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True, encoding='utf-8').strip(),
+        'dirty': subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True, encoding='utf-8'),
         'command_key': command_key, 'registered_command_revision': digest(ROOT / 'execution/commands.json'),
         'argv': command, 'cwd': str(ROOT), 'environment_names': sorted(env), 'version_manifest': manifest,
         'go_version': subprocess.check_output([go, 'version'], cwd=ROOT, text=True).strip(),
         'expected_assertion_ids': sorted(expected), 'implementation_model': 'gpt-6-astra', 'reasoning_effort': 'high',
         'runtime_model': {'provider': 'LOOPBACK_FIXTURE', 'model': 'jev-1.13.0', 'real_provider_called': False},
-        'scope': 'W11 typed adapter, authenticated host invocation, C07 hard gates, C08 fallback and W11 interface portion of C20',
-        'excluded': ['A08 LIVE_SERVICE', 'W11-G02', 'W11-G03', 'W11-G04 protected identity isolation', 'W16 full C20'],
+        'scope': 'W16 C20 Jev rubric-only fixture interface' if w16_c20 else 'W11 typed adapter, authenticated host invocation, C07 hard gates, C08 fallback and W11 interface portion of C20',
+        'excluded': ['real provider', 'LIVE qualification', 'automatic authority', 'full C20 acceptance'] if w16_c20 else ['A08 LIVE_SERVICE', 'W11-G02', 'W11-G03', 'W11-G04 protected identity isolation', 'W16 full C20'],
         'rubric': 'spec/v2.0/contracts/acceptance.json C07/C08; tests/jev/expected.json exact assertion inventory',
         'automatic_authority': 'NONE', 'qualification_maximum_mode': 'ADVISORY',
     }
