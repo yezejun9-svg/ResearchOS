@@ -294,6 +294,13 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		result, e = s.createExperiment(tx, project, b)
 		kind = "Experiment"
 		status = 201
+	case "createSkillCandidate":
+		result, e = s.createSkillCandidate(tx, p, project, b)
+		kind = "SkillVersion"
+		status = 201
+	case "promoteSkill":
+		result, e = s.promoteSkill(tx, project, id, b)
+		kind = "SkillVersion"
 	case "registerExperiment":
 		result, e = s.registerExperiment(tx, project, id, b)
 		kind = "Experiment"
@@ -315,6 +322,8 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 			} else {
 				result, e = s.acceptTask(tx, p, project, b, prepared, cid)
 			}
+		} else if b["subject_ref"].(map[string]any)["entity_type"] == "SkillVersion" {
+			result, e = s.acceptSkill(tx, p, project, b)
 		} else if b["subject_ref"].(map[string]any)["entity_type"] == "Qualification" {
 			if preparationError != nil {
 				e = preparationError

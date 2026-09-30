@@ -416,6 +416,11 @@ func (s *Service) applyChange(tx *sql.Tx, p Principal, project, id string, b Obj
 		if e = s.put(tx, kind, o); e != nil {
 			return nil, e
 		}
+		if kind == "Artifact" {
+			if e = s.freezeSkillsForSource(tx, project, Str(o, "id")); e != nil {
+				return nil, e
+			}
+		}
 		changed = append(changed, struct {
 			kind   string
 			object Object
@@ -459,6 +464,11 @@ func (s *Service) applyChange(tx *sql.Tx, p Principal, project, id string, b Obj
 		}
 		if e = s.put(tx, kind, o); e != nil {
 			return nil, e
+		}
+		if kind == "Artifact" {
+			if e = s.freezeSkillsForSource(tx, project, Str(o, "id")); e != nil {
+				return nil, e
+			}
 		}
 		changed = append(changed, struct {
 			kind   string

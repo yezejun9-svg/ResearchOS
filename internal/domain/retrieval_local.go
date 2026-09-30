@@ -226,6 +226,9 @@ func (s *Service) retireLocalPath(tx *sql.Tx, project, rootID, relative, artifac
 	if live > 0 {
 		return nil
 	}
+	if err := s.freezeSkillsForSource(tx, project, artifactID); err != nil {
+		return err
+	}
 	rows, err := tx.Query("SELECT id,body FROM domain_objects WHERE project=? AND kind='Evidence' AND json_extract(body,'$.snapshot_artifact_ref.id')=?", project, artifactID)
 	if err != nil {
 		return err
