@@ -118,7 +118,7 @@ func ConfigureServiceCredential(raw []byte) error {
 	}
 }
 func configureServiceCredential(raw []byte, deadline time.Time) error {
-	file, service, pid, e := connectServicePipe(configPipe)
+	file, service, pid, e := connectServicePipe(configPipe, deadline)
 	if e != nil {
 		return e
 	}

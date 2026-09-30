@@ -289,7 +289,18 @@ func queryServiceSummary(command string) (SafeSummary, error) {
 	}
 }
 
-func connectServicePipe(pipeName string) (*os.File, *mgr.Service, uint32, error) {
+func openClientPipe(pipeName string, deadline time.Time) (windows.Handle, error) {
+	for {
+		pipe, e := windows.CreateFile(windows.StringToUTF16Ptr(pipeName), pipeClientRights, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED|windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
+		if !errors.Is(e, windows.ERROR_PIPE_BUSY) || !time.Now().Before(deadline) {
+			return pipe, e
+		}
+		// Wait only before connection; a sent operation is never retried.
+		time.Sleep(min(10*time.Millisecond, time.Until(deadline)))
+	}
+}
+
+func connectServicePipe(pipeName string, deadline time.Time) (*os.File, *mgr.Service, uint32, error) {
 	scm, e := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
 	if e != nil {
 		return nil, nil, 0, ErrUnavailable
@@ -319,7 +330,7 @@ func connectServicePipe(pipeName string) (*os.File, *mgr.Service, uint32, error)
 	if e != nil || status.State != svc.Running || status.ProcessId == 0 {
 		return nil, nil, 0, ErrUnavailable
 	}
-	pipe, e := windows.CreateFile(windows.StringToUTF16Ptr(pipeName), pipeClientRights, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED|windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
+	pipe, e := openClientPipe(pipeName, deadline)
 	if e != nil {
 		return nil, nil, 0, ErrUnavailable
 	}
@@ -333,7 +344,7 @@ func connectServicePipe(pipeName string) (*os.File, *mgr.Service, uint32, error)
 	return file, s, pid, nil
 }
 func probeServiceSummary(deadline time.Time, command string) (SafeSummary, error) {
-	file, s, pid, e := connectServicePipe(canaryPipe)
+	file, s, pid, e := connectServicePipe(canaryPipe, deadline)
 	if e != nil {
 		return SafeSummary{}, e
 	}
