@@ -143,6 +143,14 @@ func toAnyStrings(values []string) []any {
 }
 
 func (s *Service) compiledPlanningSnapshot(tx *sql.Tx, project string, goal Object) (Object, error) {
+	var kind string
+	if err := tx.QueryRow("SELECT plan_kind FROM intent_plan_bindings WHERE project=? AND compiled_goal=?", project, goal["id"]).Scan(&kind); err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if kind == "MONITOR" {
+		meta, _, err := s.monitorSnapshot(tx, project, Str(goal, "id"), true)
+		return meta, err
+	}
 	var planningGoal, briefRaw, receiptRaw, mappingRaw string
 	e := tx.QueryRow("SELECT planning_goal,brief_ref,acceptance_ref,node_mapping FROM intent_plan_bindings WHERE project=? AND compiled_goal=?", project, goal["id"]).Scan(&planningGoal, &briefRaw, &receiptRaw, &mappingRaw)
 	if e == sql.ErrNoRows {

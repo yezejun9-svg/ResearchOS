@@ -38,6 +38,7 @@ CREATE TABLE research_cycle_work (
  evidence_id TEXT,
  input_refs TEXT NOT NULL CHECK(json_valid(input_refs) AND json_type(input_refs)='array'),
  input_hash TEXT NOT NULL CHECK(length(input_hash)>0),
+	parameters TEXT NOT NULL CHECK(json_valid(parameters) AND json_type(parameters)='object'),
  window_from TEXT,
  window_to TEXT,
  progress_record_id TEXT,
@@ -60,7 +61,7 @@ CREATE TRIGGER research_work_insert BEFORE INSERT ON research_cycle_work BEGIN
  THEN RAISE(ABORT,'research work needs existing domain objects') END;
 END;
 CREATE TRIGGER research_work_update BEFORE UPDATE ON research_cycle_work BEGIN
- SELECT CASE WHEN NEW.project IS NOT OLD.project OR NEW.cycle IS NOT OLD.cycle OR NEW.logical_key IS NOT OLD.logical_key OR NEW.plan_ref IS NOT OLD.plan_ref OR NEW.stage IS NOT OLD.stage OR NEW.task IS NOT OLD.task OR NEW.experiment IS NOT OLD.experiment OR NEW.source_id IS NOT OLD.source_id OR NEW.evidence_id IS NOT OLD.evidence_id OR NEW.input_refs IS NOT OLD.input_refs OR NEW.input_hash IS NOT OLD.input_hash OR NEW.window_from IS NOT OLD.window_from OR NEW.window_to IS NOT OLD.window_to OR NEW.progress_record_id IS NOT OLD.progress_record_id OR NEW.created_at IS NOT OLD.created_at
+ SELECT CASE WHEN NEW.project IS NOT OLD.project OR NEW.cycle IS NOT OLD.cycle OR NEW.logical_key IS NOT OLD.logical_key OR NEW.plan_ref IS NOT OLD.plan_ref OR NEW.stage IS NOT OLD.stage OR NEW.task IS NOT OLD.task OR NEW.experiment IS NOT OLD.experiment OR NEW.source_id IS NOT OLD.source_id OR NEW.evidence_id IS NOT OLD.evidence_id OR NEW.input_refs IS NOT OLD.input_refs OR NEW.input_hash IS NOT OLD.input_hash OR NEW.parameters IS NOT OLD.parameters OR NEW.window_from IS NOT OLD.window_from OR NEW.window_to IS NOT OLD.window_to OR NEW.progress_record_id IS NOT OLD.progress_record_id OR NEW.created_at IS NOT OLD.created_at
  THEN RAISE(ABORT,'immutable research work mapping') END;
  SELECT CASE WHEN OLD.source_receipt IS NOT NULL AND NEW.source_receipt IS NOT OLD.source_receipt
  THEN RAISE(ABORT,'immutable source receipt') END;

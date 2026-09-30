@@ -147,6 +147,22 @@ func (s *Service) taskContext(tx *sql.Tx, project string, task Object) error {
 	if task["status"] == "NEEDS_REVALIDATION" || task["status"] == "CANCELLED" {
 		return Fail(409, "STATE_CONFLICT", "task needs new validated inputs")
 	}
+	if strings.HasPrefix(Str(task, "task_type"), "research_") && task["status"] != "ACCEPTED" {
+		work, err := loadResearchWork(tx, project, Str(task, "id"))
+		if err != nil {
+			return Fail(422, "GATE_FAILED", "private research work required")
+		}
+		cycle, err := load(tx, project, "ResearchCycle", work.Cycle)
+		if err != nil {
+			return err
+		}
+		if cycle["status"] != "RUNNING" {
+			return Fail(409, "STATE_CONFLICT", "closed research cycle permits no execution")
+		}
+		if _, _, err = s.monitorSnapshot(tx, project, Str(task, "goal_id"), true); err != nil {
+			return err
+		}
+	}
 	id := Str(task, "context_bundle_id")
 	if id == "" {
 		return Fail(422, "GATE_FAILED", "task context required")
@@ -259,6 +275,13 @@ func (s *Service) createContext(tx *sql.Tx, p Principal, project string, b Objec
 		}
 	}
 	summary := Str(profile, "intent") + "\nTask: " + Str(task, "title") + "\nNext: follow the frozen acceptance contract; execution is not acceptance."
+	if strings.HasPrefix(Str(task, "task_type"), "research_") {
+		work, err := loadResearchWork(tx, project, Str(task, "id"))
+		if err != nil {
+			return nil, err
+		}
+		summary += "\nBounded research work: " + string(Bytes(work.publicParameters())) + ". Only host effects may capture sources; produce the current structured stage evidence, preserve missing sources and UNKNOWN costs."
+	}
 	if task["task_type"] == "intent_planning" {
 		var requirement, rawHash string
 		var revision int64
