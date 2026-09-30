@@ -47,7 +47,11 @@ def run(archive: Path, fixture: bool):
         listed = {entry["path"]: entry for entry in manifest["files"]}
         checks.append(require(set(names) == set(listed) | {"release-manifest.json"}, "exact-allowlist"))
         checks.append(require(all(len(package.read(name)) == listed[name]["size"] and sha(package.read(name)) == listed[name]["sha256"] for name in listed), "every-file-hash"))
-        checks.append(require(manifest["database"]["schema13_to_final_plan"] == "NOT_IMPLEMENTED", "final-upgrade-unbound"))
+        checks.append(require(manifest["database"]["schema13_to_final_plan"] == "schema13-to20-research-runtime-v1"
+                              and manifest["database"]["final_release_schema"] == 20
+                              and manifest["database"]["fresh_fixture_schema"] == 20, "exact-final-upgrade-mechanism-declared"))
+        checks.append(require(manifest["database"]["schema13_to_final_qualification"] == "BOUNDED_FIXTURE_MECHANISM_ONLY; ACTUAL_ACTIVATION_BLOCKED", "actual-activation-not-qualified"))
+        checks.append(require("bin/release_host.exe" in listed, "existing-release-host-packaged"))
         checks.append(require("release.reproduce" in manifest["commands"]["unbound_not_implemented"], "release-command-unbound"))
         with tempfile.TemporaryDirectory(prefix="researchos-r1-check-") as temporary:
             root = Path(temporary) / "release"
