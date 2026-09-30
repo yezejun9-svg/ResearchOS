@@ -2,6 +2,8 @@
 
 This ZIP is a reproducible **development fixture**. It does not install an SCM service, enable normal LIVE runtime execution, qualify a provider, activate a populated database, or satisfy clean Windows A15.
 
+The [Chinese workbench guide](user-guide.md) explains all eleven implemented screens, permissions, result states, and the existing screenshot index. Those screenshots are external historical evidence in the source checkout; they are not bundled. Using the UI requires an already authorized service and credentials; the fixture launcher does not issue login credentials or remove activation restrictions.
+
 Build from a frozen source commit on a Windows x64 build host with the exact locally provisioned Go 1.27.1, Node 24.9.0, npm 11.6.0, and Python 3.14.3 recorded in `execution/toolchains/locked.json`. The builder rejects dirty, missing, and untracked files across the package and Go/web build input trees, checks the source against HEAD before and after building, verifies tool hashes, uses `GOTOOLCHAIN=local`, runs `npm ci --offline`, and never invokes the repository's full-test CI script. Unrelated execution evidence can remain untracked. Its external JSON output records the archive SHA-256. Use two separate invocations and compare both archive hashes and every manifest file hash before distributing a candidate.
 
 ```powershell
