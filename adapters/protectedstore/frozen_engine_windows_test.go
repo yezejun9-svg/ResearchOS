@@ -315,5 +315,6 @@ func TestFrozenProviderNeverReads(t *testing.T) {
 	frozenAssert(t, "FROZEN-PROVIDER-READ-ALWAYS-DENIED", []bool{true, true}, []bool{len(raw) == 0, err == ErrIsolation})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	frozenAssert(t, "FROZEN-PROVIDER-CANCELLED-READY-DENIED", true, p.Ready(ctx, "public-product-project") != nil)
+	frozenAssert(t, "FROZEN-PROVIDER-NONLIVE-READY-DENIED", true, p.Ready(context.Background(), "FIXTURE") == ErrBoundary)
+	frozenAssert(t, "FROZEN-PROVIDER-CANCELLED-READY-DENIED", true, p.Ready(ctx, "LIVE") != nil)
 }
