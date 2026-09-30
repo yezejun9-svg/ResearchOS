@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -20,6 +21,19 @@ func loopbackAddress(address string) bool {
 	h, _, e := net.SplitHostPort(address)
 	ip := net.ParseIP(h)
 	return e == nil && ip != nil && ip.IsLoopback()
+}
+
+// Security-sensitive request fields must never silently select the first of
+// several values. Absent optional headers remain distinguishable from blanks.
+func oneHeader(header http.Header, name string) (string, bool) {
+	values := header.Values(name)
+	if len(values) == 0 {
+		return "", true
+	}
+	if len(values) != 1 || values[0] == "" {
+		return "", false
+	}
+	return values[0], true
 }
 func gateway(upstream, publicOrigin string) (http.Handler, error) {
 	target, e := url.Parse(upstream)
@@ -52,15 +66,24 @@ func gateway(upstream, publicOrigin string) (http.Handler, error) {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		remote, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil || net.ParseIP(remote) == nil || !net.ParseIP(remote).IsLoopback() || r.Host != origin.Host || r.Header.Get("X-Forwarded-Proto") != "https" {
+		proto, protoOK := oneHeader(r.Header, "X-Forwarded-Proto")
+		requestOrigin, originOK := oneHeader(r.Header, "Origin")
+		fetchSite, siteOK := oneHeader(r.Header, "Sec-Fetch-Site")
+		contentType, typeOK := oneHeader(r.Header, "Content-Type")
+		authorization, authOK := oneHeader(r.Header, "Authorization")
+		if !protoOK || !originOK || !siteOK || !typeOK || !authOK {
+			http.Error(w, "ambiguous request headers rejected", 403)
+			return
+		}
+		if err != nil || net.ParseIP(remote) == nil || !net.ParseIP(remote).IsLoopback() || r.Host != origin.Host || proto != "https" {
 			http.Error(w, "HTTPS tunnel origin required", 403)
 			return
 		}
-		if v := r.Header.Get("Origin"); v != "" && v != publicOrigin {
+		if requestOrigin != "" && requestOrigin != publicOrigin {
 			http.Error(w, "same origin required", 403)
 			return
 		}
-		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		if fetchSite != "" && fetchSite != "same-origin" && fetchSite != "same-site" && fetchSite != "none" {
 			http.Error(w, "cross-site request rejected", 403)
 			return
 		}
@@ -69,7 +92,8 @@ func gateway(upstream, publicOrigin string) (http.Handler, error) {
 			return
 		}
 		if r.Method != "GET" && r.Method != "HEAD" {
-			if r.Header.Get("Origin") != publicOrigin || !strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+			media, _, parseError := mime.ParseMediaType(contentType)
+			if requestOrigin != publicOrigin || parseError != nil || media != "application/json" {
 				http.Error(w, "same-origin JSON required", 403)
 				return
 			}
@@ -86,7 +110,7 @@ func gateway(upstream, publicOrigin string) (http.Handler, error) {
 				http.NotFound(w, r)
 				return
 			}
-			if !proof && !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			if !proof && !strings.HasPrefix(authorization, "Bearer ") {
 				http.Error(w, "device credential required", 401)
 				return
 			}
