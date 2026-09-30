@@ -118,6 +118,15 @@ func semanticReferences(kind string, o Object) []Object {
 }
 func (s *Service) effectiveInputs(tx *sql.Tx, project, kind string, o Object, seen map[string]bool) error {
 	for _, ref := range semanticReferences(kind, o) {
+		if kind == "DecisionReceipt" && ref["entity_type"] == "Conflict" && Hash(ref) == Hash(o["subject_ref"]) {
+			resolved, e := s.resolvedSourceDecision(tx, project, o, ref)
+			if e != nil {
+				return e
+			}
+			if resolved {
+				continue
+			}
+		}
 		if kind == "Artifact" && ref["entity_type"] == "SourceCursor" {
 			captured, e := capturedSourceArtifact(tx, project, o)
 			if e != nil {

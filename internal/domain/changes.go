@@ -346,6 +346,13 @@ func (s *Service) acceptChange(tx *sql.Tx, p Principal, project string, b Object
 	if e != nil {
 		return nil, e
 	}
+	if sourceResolution, e := sourceConflictInProposal(tx, project, proposal); e != nil {
+		return nil, e
+	} else if sourceResolution {
+		if e := sourceConflictVerifier(tx, project, p.ID, authors); e != nil {
+			return nil, e
+		}
+	}
 	for _, id := range authors {
 		if id == p.ID {
 			return nil, Fail(403, "FORBIDDEN", "author cannot independently accept this change")
@@ -392,6 +399,24 @@ func (s *Service) applyChange(tx *sql.Tx, p Principal, project, id string, b Obj
 	}
 	if receipt["verdict"] != "PASS" || receipt["contract_hash"] != changeHash(proposal) || Hash(receipt["subject_ref"]) != Hash(Ref(proposal, "ChangeProposal")) || receipt["receipt_hash"] != Receipt(receipt) || Hash(receipt["policy_revision"]) != Hash(state["policy_revision"]) {
 		return nil, Fail(422, "GATE_FAILED", "acceptance does not bind this change")
+	}
+	if sourceResolution, e := sourceConflictInProposal(tx, project, proposal); e != nil {
+		return nil, e
+	} else if sourceResolution {
+		var author string
+		if e := tx.QueryRow("SELECT author FROM context_changes WHERE project=? AND proposal_id=?", project, proposal["id"]).Scan(&author); e != nil {
+			return nil, e
+		}
+		authors, e := s.candidateAuthors(tx, project, proposal, author)
+		if e != nil {
+			return nil, e
+		}
+		if Hash(authors) != Hash(receipt["executor_principal_ids"]) {
+			return nil, Fail(412, "STALE_INPUT", "source resolution authors changed")
+		}
+		if e := sourceConflictVerifier(tx, project, Str(receipt, "verifier_principal_id"), authors); e != nil {
+			return nil, e
+		}
 	}
 	values, e := s.checkChange(tx, p, project, proposal)
 	if e != nil {
