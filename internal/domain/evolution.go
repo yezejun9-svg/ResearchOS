@@ -61,6 +61,16 @@ func (s *Service) evolutionBytes(tx *sql.Tx, project string, ref Object) (Object
 // RegisterEvolutionFixture is trusted local test-host provisioning, not an HTTP
 // operation or OS-service qualification. It can only register a fresh temp root.
 func (s *Service) RegisterEvolutionFixture(ctx context.Context, project, supervisorID, releasePrincipal, root string, stable, suite, rollback Object) error {
+	return s.registerEvolutionFixture(ctx, project, supervisorID, releasePrincipal, root, stable, suite, rollback, false)
+}
+
+// RegisterEvolutionReleaseFixture is a host-only same-user mechanism fixture.
+// Its host remains os_service_qualified=false and cannot enable LIVE release.
+func (s *Service) RegisterEvolutionReleaseFixture(ctx context.Context, project, supervisorID, releasePrincipal, root string, stable, suite, rollback Object) error {
+	return s.registerEvolutionFixture(ctx, project, supervisorID, releasePrincipal, root, stable, suite, rollback, true)
+}
+
+func (s *Service) registerEvolutionFixture(ctx context.Context, project, supervisorID, releasePrincipal, root string, stable, suite, rollback Object, releaseMechanism bool) error {
 	abs, e := filepath.Abs(root)
 	if e != nil {
 		return e
@@ -86,7 +96,8 @@ func (s *Service) RegisterEvolutionFixture(ctx context.Context, project, supervi
 		return e
 	}
 	defer tx.Rollback()
-	if _, _, e = s.evolutionBytes(tx, project, stable); e != nil {
+	_, stableBytes, e := s.evolutionBytes(tx, project, stable)
+	if e != nil {
 		return e
 	}
 	_, b, e := s.evolutionBytes(tx, project, suite)
@@ -104,13 +115,19 @@ func (s *Service) RegisterEvolutionFixture(ctx context.Context, project, supervi
 		return e
 	}
 	h := Object{"supervisor_id": supervisorID, "release_principal": releasePrincipal, "root": abs, "stable_ref": stable, "suite_ref": suite, "rollback_ref": rollback, "policy_hash": Digest(evolution.Bytes(evolution.Policy())), "scope": evolution.Scope, "os_service_qualified": false}
+	if releaseMechanism {
+		h["release_mechanism"] = "R2_NATIVE_FIXTURE"
+		if e = os.WriteFile(filepath.Join(abs, "stable.exe"), stableBytes, 0600); e != nil { return e }
+		defer func() { if e != nil { _ = os.Remove(filepath.Join(abs, "stable.exe")) } }()
+	}
 	if _, e = tx.Exec("INSERT INTO evolution_hosts(project,body) VALUES(?,?)", project, string(Bytes(h))); e != nil {
 		return e
 	}
 	if _, e = tx.Exec("INSERT INTO evolution_slots(project,active_hash,stable_hash,candidate,epoch,state) VALUES(?,?,?,NULL,1,'STABLE')", project, stable["content_hash"], stable["content_hash"]); e != nil {
 		return e
 	}
-	return tx.Commit()
+	e = tx.Commit()
+	return e
 }
 
 // RegisterEvolutionBuild retains reviewed host build provenance. Candidates have

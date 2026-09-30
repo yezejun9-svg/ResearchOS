@@ -4,6 +4,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"researchos.local/research-os/evaluation/evolution"
 	"time"
 )
@@ -11,6 +12,12 @@ import (
 var variant = "stable"
 
 func main() {
+	// R2 tests use the exact previously evaluated bytes as a disposable
+	// long-lived process. This mode has no product API, task dispatch or LIVE
+	// authority; the normal single-request evaluation path remains unchanged.
+	if len(os.Args) == 4 && os.Args[1] == "--release-fixture" && os.Args[2] != "" && filepath.IsAbs(os.Args[3]) {
+		for { time.Sleep(time.Hour) }
+	}
 	if len(os.Args) != 2 {
 		os.Exit(2)
 	}

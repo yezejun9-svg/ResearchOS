@@ -15,6 +15,10 @@ import (
 // This package only exercises a same-schema fixture; it never manufactures
 // verifier authority from candidate-writable domain state.
 type ReleaseAdmission struct {
+	Project               string    `json:"project"`
+	CandidateID           string    `json:"candidate_id"`
+	AcceptanceID          string    `json:"acceptance_id"`
+	ExecutionSHA256       string    `json:"execution_sha256"`
 	Operation             string    `json:"operation"`
 	ExpectedEpoch         uint64    `json:"expected_epoch"`
 	StableSHA256          string    `json:"stable_sha256"`
@@ -110,7 +114,7 @@ func (e *ReleaseEngine) PrepareFixture(a ReleaseAdmission, candidatePath string)
 	if s.Phase != "STABLE" && s.Phase != "ROLLED_BACK" {
 		return s, errors.New("release operation already in progress")
 	}
-	if a.Operation == "" || a.ExpectedEpoch != s.Epoch || a.StableSHA256 != s.Active || !validDigest(a.BackupReceiptSHA256) || !validDigest(a.VerifierReceiptSHA256) || !validDigest(a.HoldoutProofSHA256) || !a.SameSchema || !a.NoUnknownEffects || !a.ExpiresUTC.After(time.Now().UTC()) {
+	if a.Project == "" || a.CandidateID == "" || a.AcceptanceID == "" || a.Operation == "" || !validDigest(a.ExecutionSHA256) || a.ExpectedEpoch != s.Epoch || a.StableSHA256 != s.Active || !validDigest(a.BackupReceiptSHA256) || !validDigest(a.VerifierReceiptSHA256) || !validDigest(a.HoldoutProofSHA256) || !a.SameSchema || !a.NoUnknownEffects || !a.ExpiresUTC.After(time.Now().UTC()) {
 		return s, errors.New("release admission incomplete or stale")
 	}
 	for _, frozen := range s.Frozen {
