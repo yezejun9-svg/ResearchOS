@@ -67,11 +67,11 @@ def main(command_key='test.jev.fixture'):
         'command_key': command_key, 'registered_command_revision': digest(ROOT / 'execution/commands.json'),
         'argv': command, 'cwd': str(ROOT), 'environment_names': sorted(env), 'version_manifest': manifest,
         'go_version': subprocess.check_output([go, 'version'], cwd=ROOT, text=True).strip(),
-        'expected_assertion_ids': sorted(expected), 'implementation_model': 'gpt-6-astra', 'reasoning_effort': 'high',
+        'expected_assertion_ids': sorted(expected), 'implementation_model': 'gpt-6-sol' if w16_c20 else 'gpt-6-astra', 'reasoning_effort': 'high',
         'runtime_model': {'provider': 'LOOPBACK_FIXTURE', 'model': 'jev-1.13.0', 'real_provider_called': False},
         'scope': 'W16 C20 Jev rubric-only fixture interface' if w16_c20 else 'W11 typed adapter, authenticated host invocation, C07 hard gates, C08 fallback and W11 interface portion of C20',
         'excluded': ['real provider', 'LIVE qualification', 'automatic authority', 'full C20 acceptance'] if w16_c20 else ['A08 LIVE_SERVICE', 'W11-G02', 'W11-G03', 'W11-G04 protected identity isolation', 'W16 full C20'],
-        'rubric': 'spec/v2.0/contracts/acceptance.json C07/C08; tests/jev/expected.json exact assertion inventory',
+        'rubric': 'W16 C20 unchanged objective outcome and no automatic authority; tests/jev/expected.json exact assertion inventory' if w16_c20 else 'spec/v2.0/contracts/acceptance.json C07/C08; tests/jev/expected.json exact assertion inventory',
         'automatic_authority': 'NONE', 'qualification_maximum_mode': 'ADVISORY',
     }
     save(out / 'before.json', before)
