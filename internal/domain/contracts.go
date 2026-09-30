@@ -253,6 +253,12 @@ func init() {
 	}
 }
 func operationOwner(id string) string {
+	if resourceOperations[id] {
+		return "W12"
+	}
+	if strings.Contains(id, "Experiment") {
+		return "W10"
+	}
 	if id == "claimTask" || id == "actOnGoal" {
 		return "W06"
 	}
