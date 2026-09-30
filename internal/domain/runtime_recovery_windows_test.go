@@ -3,6 +3,7 @@
 package domain
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,77 @@ import (
 
 	"researchos.local/research-os/internal/store"
 )
+
+// The receipt runner builds apps/control and supplies its exact path. This
+// checks the real executable against a database already containing READY work.
+func TestRuntimeCoordinatorControlStartup(t *testing.T) {
+	binary := os.Getenv("RUNTIME_CONTROL_BINARY")
+	if binary == "" {
+		t.Skip("requires separately built actual apps/control binary")
+	}
+	c, _, r, _ := nativeNormalFixture(t, false)
+	f := r.f
+	root, e := filepath.Abs("../..")
+	if e != nil {
+		t.Fatal(e)
+	}
+	web := filepath.Join(c.config.DataRoot, "web")
+	if e = os.Mkdir(web, 0700); e != nil {
+		t.Fatal(e)
+	}
+	if e = os.WriteFile(filepath.Join(web, "index.html"), []byte("fixture"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	config := c.config
+	config.APIURL = ""
+	path := filepath.Join(config.DataRoot, "control-startup.json")
+	raw, e := json.Marshal(config)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = os.WriteFile(path, raw, 0600); e != nil {
+		t.Fatal(e)
+	}
+	c.Close()
+	// Copy only this test's temporary fixture into the application's filename.
+	database := filepath.Join(config.DataRoot, "researchos.sqlite")
+	if _, e = f.db.Exec("VACUUM INTO ?", database); e != nil {
+		t.Fatal(e)
+	}
+	observer, e := store.Open(database)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer observer.Close()
+	command := exec.Command(binary, "--runtime-coordinator-config", path)
+	command.Dir = root
+	command.Env = append(os.Environ(), "RESEARCHOS_DATA_DIR="+config.DataRoot, "RESEARCHOS_WEB_DIR="+web, "RESEARCHOS_LISTEN=127.0.0.1:0")
+	var output bytes.Buffer
+	command.Stdout, command.Stderr = &output, &output
+	if e = command.Start(); e != nil {
+		t.Fatal(e)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	defer func() { command.Process.Kill(); <-done; t.Logf("CONTROL_STARTUP_OUTPUT %s", output.String()) }()
+	deadline := time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		var raw string
+		if e = observer.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='Task' AND id=?", f.project, r.task["id"]).Scan(&raw); e != nil {
+			t.Fatal(e)
+		}
+		task, e := Decode([]byte(raw))
+		if e != nil {
+			t.Fatal(e)
+		}
+		if task["status"] == "EXECUTION_REPORTED" {
+			t.Logf("RUNTIME_CONTROL_STARTUP actual_control_pid=%d existing_ready=EXECUTION_REPORTED ephemeral_listen=true", command.Process.Pid)
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("real control startup did not report the pre-existing READY Task")
+}
 
 type coordinatorProcessInput struct {
 	Config   RuntimeCoordinatorConfig `json:"config"`

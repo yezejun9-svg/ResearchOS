@@ -131,6 +131,12 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	listener, err := net.Listen("tcp", listen)
+	if err != nil {
+		log.Fatalf("control listener unavailable: %v", err)
+	}
+	defer listener.Close()
+	server.Addr = listener.Addr().String()
 	if *coordinatorFile != "" {
 		raw, e := os.ReadFile(*coordinatorFile)
 		if e != nil {
@@ -144,7 +150,7 @@ func main() {
 			config.DataRoot = dataDir
 		}
 		if config.APIURL == "" {
-			config.APIURL = "http://" + listen
+			config.APIURL = "http://" + server.Addr
 		}
 		coordinator, e := service.NewRuntimeCoordinator(ctx, config)
 		if e != nil {
@@ -165,7 +171,7 @@ func main() {
 		server.Shutdown(shutdown)
 	}()
 	log.Printf("development server listening on %s", server.Addr)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }
