@@ -324,8 +324,13 @@ func Evaluate(e Envelope, threshold float64) Result {
 					}
 				}
 				p, ok := a.Probabilities[*a.Choice]
-				if !ok || math.Abs(p-*a.Confidence) > 1e-5 {
-					return invalid("UNKNOWN_ACTION_OR_CONFIDENCE")
+				if !ok {
+					return invalid("UNKNOWN_ACTION")
+				}
+				for _, alternative := range a.Probabilities {
+					if alternative > p+1e-5 {
+						return invalid("CHOICE_NOT_MAXIMUM")
+					}
 				}
 				signal.Value = a.Choice
 				if id == "action" {
