@@ -327,24 +327,25 @@ func (s *Service) recordExperimentResult(tx *sql.Tx, project, id string, b Objec
 		return nil, Fail(422, "GATE_FAILED", "receipt run not part of experiment")
 	}
 	// The independently checked sealed JSON is the observation source, never caller-supplied metrics.
-	artifacts := Arr(receipt, "artifact_refs")
-	if len(artifacts) != 1 {
-		return nil, Fail(422, "GATE_FAILED", "one independently verified result artifact required")
+
+	artifacts := Empty()
+	for _, v := range Arr(receipt, "artifact_refs") {
+		a, e := version(tx, project, v.(map[string]any))
+		if e != nil {
+			return nil, e
+		}
+		var raw []byte
+		if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, a["storage_key"]).Scan(&raw); e != nil {
+			return nil, e
+		}
+		if Digest(raw) != a["content_hash"] {
+			return nil, Fail(422, "CONTENT_HASH_MISMATCH", "result bytes changed")
+		}
+		artifacts = append(artifacts, Object{"artifact": a, "bytes": raw})
 	}
-	a, e := version(tx, project, artifacts[0].(map[string]any))
+	observed, e := experimentObservation(artifacts)
 	if e != nil {
-		return nil, e
-	}
-	var raw []byte
-	if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, a["storage_key"]).Scan(&raw); e != nil {
-		return nil, e
-	}
-	if Digest(raw) != a["content_hash"] {
-		return nil, Fail(422, "CONTENT_HASH_MISMATCH", "result bytes changed")
-	}
-	observed, e := Decode(raw)
-	if e != nil {
-		return nil, e
+		return nil, Fail(422, "GATE_FAILED", e.Error())
 	}
 	if observed["experiment_id"] != id || observed["preregistration_hash"] != x["preregistration_hash"] || Hash(observed["results"]) != Hash(b["results"]) || observed["outcome"] != b["outcome"] {
 		return nil, Fail(422, "GATE_FAILED", "metrics differ from independently verified observations")
