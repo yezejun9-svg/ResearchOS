@@ -28,6 +28,21 @@ def ref(value, kind):
     return {'entity_type': kind, 'id': value['id'], 'revision': value['revision'], 'content_hash': value.get('content_hash')}
 
 
+def pdf_document():
+    objects = [b'<</Type/Catalog/Pages 2 0 R>>', b'<</Type/Pages/Count 1/Kids[3 0 R]>>',
+               b'<</Type/Page/Parent 2 0 R/MediaBox[0 0 500 300]/Resources<</Font<</F1 5 0 R>>>>/Contents 4 0 R>>']
+    stream = b'BT /F1 24 Tf 50 230 Td (PDF preview fixture) Tj ET'
+    objects += [b'<</Length ' + str(len(stream)).encode() + b'>>\nstream\n' + stream + b'\nendstream',
+                b'<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>']
+    raw, offsets = b'%PDF-1.4\n', [0]
+    for index, obj in enumerate(objects, 1):
+        offsets.append(len(raw))
+        raw += str(index).encode() + b' 0 obj\n' + obj + b'\nendobj\n'
+    start = len(raw)
+    raw += b'xref\n0 6\n0000000000 65535 f \n' + b''.join(f'{value:010d} 00000 n \n'.encode() for value in offsets[1:])
+    return raw + b'trailer<</Size 6/Root 1 0 R>>\nstartxref\n' + str(start).encode() + b'\n%%EOF'
+
+
 def change_background(api, base, credentials, project_api, text, owner_token):
     token = credentials['editor_token']
     artifact = seal(api, base, token, credentials['editor_id'], project_api, text)
@@ -107,7 +122,7 @@ def preview_formats(page, base, project_path, token, credentials, fixture_artifa
         ('text/csv', b'name,value\nfixture,42', '.preview-text', 'fixture,42'),
         ('text/javascript', b'const fixture = "code-preview";', '.preview-text', 'code-preview'),
         ('image/png', base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j+WQAAAAASUVORK5CYII='), '.preview-image', None),
-        ('application/pdf', b'%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Count 0/Kids[]>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF', 'iframe[title="PDF 预览"]', None),
+        ('application/pdf', pdf_document(), 'iframe[title="PDF 预览"]', None),
     ]
     for media, content, selector, expected in formats:
         artifact, evidence = fixture_artifact(base, credentials['token'], credentials['principal_id'], project_path, media, content, media + ' fixture')
@@ -123,6 +138,8 @@ def preview_formats(page, base, project_path, token, credentials, fixture_artifa
             page.get_by_role('link', name='下载已核对的内容').click()
         assert hashlib.sha256(open(download.value.path(), 'rb').read()).hexdigest() == artifact['content_hash'].split(':')[1]
         report['checks'].append(f'{media} real sealed content hash and controlled download verified; browser preview mounted')
+        if media == 'application/pdf':
+            report['pdf_fixture'] = {'artifact_id': artifact['id'], 'evidence_id': evidence['id'], 'content_hash': artifact['content_hash']}
     report.setdefault('limitations', []).append('PDF sandbox iframe mounted and downloaded bytes verified; browser PDF document rendering is not certified by this fixture')
 
 
@@ -278,7 +295,53 @@ def responsive_screen(page, path, report, out):
             report.setdefault('responsive_matrix', []).append({'screen': path, 'theme': theme, 'width': width, 'height': height, 'no_overflow': True, 'mobile_targets_44px': True if width <= 390 else None})
             if width in (390, 1440):
                 name = f'{path}-{theme}-{width}.png'
-                page.screenshot(path=str(out / name), full_page=True)
+                page.evaluate('scrollTo(0, 0)')
+                page.screenshot(path=str(out / name), full_page=width >= 768)
                 report['screenshots'].append(name)
     page.set_viewport_size({'width': 1440, 'height': 1000})
     page.get_by_role('button', name='切换为浅色主题').click()
+
+
+def native_browser_checks(playwright, profile_dir, base, project_path, token, report, out):
+    context = playwright.chromium.launch_persistent_context(str(profile_dir), channel='chromium', headless=True,
+                                                           viewport={'width': 1440, 'height': 1000}, device_scale_factor=1)
+    page = context.pages[0]
+    try:
+        page.goto('chrome://settings', wait_until='domcontentloaded')
+        zoom = page.evaluate('async()=>{await chrome.settingsPrivate.setDefaultZoom(2);return await chrome.settingsPrivate.getDefaultZoom()}')
+        assert zoom == 2
+        for suffix in ['', '/cycles', '/tasks', '/releases', '/evidence', '/experiments', '/knowledge', '/team', '/resources', '/settings']:
+            login(page, base, project_path + suffix, token)
+            page.locator('main h1').wait_for()
+            metrics = page.evaluate('({innerWidth,outerWidth,devicePixelRatio,scale:visualViewport.scale,overflow:document.documentElement.scrollWidth>innerWidth+1})')
+            assert metrics == {'innerWidth': 720, 'outerWidth': 1440, 'devicePixelRatio': 2, 'scale': 1, 'overflow': False}, metrics
+            boxes = page.evaluate('''() => [...document.querySelectorAll('button,a,input,select,textarea,summary')].filter(e=>getComputedStyle(e).visibility==='visible' && e.getClientRects().length && !e.closest('[inert]')).map(e=>({name:e.getAttribute('aria-label')||e.textContent.trim().slice(0,50),left:e.getBoundingClientRect().left,right:e.getBoundingClientRect().right,width:e.getBoundingClientRect().width}))''')
+            assert all(box['left'] >= -1 and box['right'] <= metrics['innerWidth'] + 1 for box in boxes), (suffix, boxes)
+            report.setdefault('browser_zoom_200_percent', []).append({'path': suffix or 'workbench', **metrics, 'controls_within_viewport': boxes})
+        page.get_by_role('button', name='打开导航').click()
+        page.get_by_role('button', name='关闭导航').wait_for()
+        page.keyboard.press('Escape')
+        assert page.evaluate('document.activeElement.getAttribute("aria-label")') == '打开导航'
+        page.get_by_role('button', name='编辑项目背景草稿').click()
+        page.get_by_label('本地背景草稿').fill('200 percent zoom draft remains usable')
+        assert page.get_by_label('本地背景草稿').input_value() == '200 percent zoom draft remains usable'
+        page.evaluate('scrollTo(0,0)')
+        page.screenshot(path=str(out / 'settings-real-browser-200-percent.png'), full_page=False)
+        report['screenshots'].append('settings-real-browser-200-percent.png')
+        report['checks'].append('Real Chromium default zoom preference 2.0 renders ten project screens at outerWidth1440/innerWidth720/DPR2/visualScale1 without whole-page overflow')
+        report['limitations'] = [value for value in report['limitations'] if not value.startswith('Actual 200% browser zoom')]
+        page.goto('chrome://settings', wait_until='domcontentloaded')
+        page.evaluate('chrome.settingsPrivate.setDefaultZoom(1)')
+        login(page, base, project_path + '/evidence?focus=' + report['pdf_fixture']['evidence_id'], token)
+        page.get_by_role('button', name='受控预览').click()
+        page.wait_for_timeout(1800)
+        viewer = next((frame for frame in page.frames if frame.url.startswith('chrome-extension://')), None)
+        assert viewer is not None, [(frame.url) for frame in page.frames]
+        viewer.locator('pdf-viewer').wait_for()
+        page.screenshot(path=str(out / 'pdf-native-rendered.png'), full_page=True)
+        report['screenshots'].append('pdf-native-rendered.png')
+        report['native_pdf'] = {'viewer_extension_loaded': True, 'viewer_origin': viewer.url, 'pdf_viewer_enabled': page.evaluate('navigator.pdfViewerEnabled'), 'viewer_controls': viewer.locator('input').evaluate_all('(elements)=>elements.map(e=>({id:e.id,value:e.value,title:e.title}))')}
+        report['checks'].append('Full Chromium native PDF viewer loads the one-page sealed PDF; actual page pixels and viewer controls captured for visual review')
+        report['limitations'] = [value for value in report['limitations'] if not value.startswith('PDF sandbox iframe')]
+    finally:
+        context.close()
