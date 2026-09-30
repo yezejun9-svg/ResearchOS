@@ -55,7 +55,7 @@ try {
 }
 $state = & $installed --status | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0) { throw 'REPAIRED_STATUS_UNAVAILABLE' }
-if ($state.frozen.run_state -eq 'NOT_CONFIGURED') {
+if ($state.frozen_run.run_state -eq 'NOT_CONFIGURED') {
     $secured=$null; $bstr=[IntPtr]::Zero; $bytes=$null; $helper=$null
     try {
         $secured = Get-Content -LiteralPath (Join-Path $ProjectRoot '.local/secrets/typesafe.dpapi') -Raw | ConvertTo-SecureString
@@ -79,4 +79,5 @@ if ($state.frozen.run_state -eq 'NOT_CONFIGURED') {
     $state = & $installed --status | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'CONFIGURED_STATUS_UNAVAILABLE' }
 }
+if ($state.frozen_run.run_state -ne 'READY') { throw 'REPAIRED_SERVICE_NOT_READY' }
 $state | ConvertTo-Json -Depth 10
