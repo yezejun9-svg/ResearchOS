@@ -4,15 +4,20 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"mime"
 	"researchos.local/research-os/adapters/decision"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 var decisionOperations = map[string]bool{"recordDecision": true, "getDecisionReceipt": true, "listDecisionReceipt": true, "createQualification": true, "getQualification": true, "listQualification": true, "recordQualificationResult": true}
 
 func init() {
 	for op := range decisionOperations {
+		if op == "recordQualificationResult" {
+			continue
+		}
 		implemented[op] = true
 	}
 }
@@ -41,6 +46,91 @@ type DecisionRubric struct {
 // This in-process capability cannot be represented by a JSON request. Only the
 // host invocation path can attest that a LIVE response was actually requested.
 type decisionInvocationProof struct{ RawHash string }
+
+const decisionArtifactLimit = 256 << 10
+const decisionPromptLimit = 1 << 20
+
+// The local entry point has no HTTP middleware, so it must enforce the same
+// visible graph and current-version rules itself, both before and after IO.
+func (s *Service) checkDecisionGraph(tx *sql.Tx, p Principal, project string, b Object) error {
+	if !s.visible(tx, p, project, b) || !s.visible(tx, Principal{ID: p.ID, Roles: []string{"READER"}, Grants: []Grant{{ProjectID: project}}}, project, b) {
+		return Fail(403, "FORBIDDEN", "decision graph contains inaccessible or protected evidence")
+	}
+	for _, ref := range semanticReferences("DecisionReceipt", b) {
+		if _, e := s.readObject(tx, p, project, Str(ref, "entity_type"), Str(ref, "id")); e != nil {
+			return e
+		}
+		if e := s.effective(tx, project, ref); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+func (s *Service) decisionPromptInputs(tx *sql.Tx, p Principal, project string, b Object) ([]any, error) {
+	if e := s.checkDecisionGraph(tx, p, project, b); e != nil {
+		return nil, e
+	}
+	inputs := Empty()
+	total := 0
+	for _, ref := range semanticReferences("DecisionReceipt", b) {
+		o, e := s.readObject(tx, p, project, Str(ref, "entity_type"), Str(ref, "id"))
+		if e != nil {
+			return nil, e
+		}
+		entry := Object{"ref": ref, "metadata": o}
+		if ref["entity_type"] == "Artifact" {
+			if o["access_class"] != "PROJECT" {
+				return nil, Fail(403, "FORBIDDEN", "protected evidence cannot enter prompts")
+			}
+			if e = s.requireCurrentArtifactBody(tx, project, o); e != nil {
+				return nil, e
+			}
+			media, _, e := mime.ParseMediaType(Str(o, "media_type"))
+			if e != nil || !(strings.HasPrefix(media, "text/") || media == "application/json" || strings.HasSuffix(media, "+json")) {
+				return nil, Fail(422, "GATE_FAILED", "decision evidence must be text or JSON; binary body is not sent")
+			}
+			size, e := Num(o, "byte_size")
+			if e != nil || size < 0 || size > decisionArtifactLimit {
+				return nil, Fail(422, "GATE_FAILED", "decision artifact exceeds 256 KiB bound")
+			}
+			var raw []byte
+			if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1 AND length(bytes)<=?", project, o["storage_key"], decisionArtifactLimit).Scan(&raw); e != nil || int64(len(raw)) != size || Digest(raw) != o["content_hash"] {
+				return nil, Fail(422, "CONTENT_HASH_MISMATCH", "current sealed decision body unavailable")
+			}
+			if !utf8.Valid(raw) {
+				return nil, Fail(422, "GATE_FAILED", "decision evidence must be valid UTF-8")
+			}
+			if media == "application/json" || strings.HasSuffix(media, "+json") {
+				var value any
+				if decision.Strict(raw, &value) != nil {
+					return nil, Fail(422, "GATE_FAILED", "decision JSON evidence must be strict valid JSON")
+				}
+			}
+			entry["body"] = string(raw)
+			entry["body_sha256"] = o["content_hash"]
+		}
+		total += len(Bytes(entry))
+		if total > decisionPromptLimit {
+			return nil, Fail(422, "GATE_FAILED", "decision prompt exceeds 1 MiB bound")
+		}
+		inputs = append(inputs, entry)
+	}
+	return inputs, nil
+}
+
+func (s *Service) sealDecisionEnvelope(tx *sql.Tx, p Principal, project string, b Object, envelope decision.Envelope) (Object, error) {
+	raw := Bytes(envelope)
+	u, e := s.upload(tx, p, project, raw)
+	if e != nil {
+		return nil, e
+	}
+	refs := Empty()
+	for _, ref := range semanticReferences("DecisionReceipt", b) {
+		refs = append(refs, ref)
+	}
+	return s.seal(tx, p, project, Object{"run_id": nil, "kind": "REPORT", "evidence_kind": "OBSERVED", "measurement_mode": envelope.MeasurementMode, "content_hash": u["content_hash"], "storage_key": u["storage_key"], "media_type": "application/json", "byte_size": len(raw), "input_refs": refs, "source_refs": Empty(), "produced_by": p.ID, "access_class": "PROJECT"})
+}
 
 func (s *Service) decisionRubric(tx *sql.Tx, project string, b Object) (DecisionRubric, error) {
 	var rubric DecisionRubric
@@ -76,14 +166,8 @@ func (s *Service) prepareDecision(tx *sql.Tx, p Principal, project string, b Obj
 	b = copyObject(b)
 	proof, _ := b["_host_invocation"].(decisionInvocationProof)
 	delete(b, "_host_invocation")
-	for _, v := range Arr(b, "input_refs") {
-		ref := v.(map[string]any)
-		if _, e := s.readObject(tx, p, project, Str(ref, "entity_type"), Str(ref, "id")); e != nil {
-			return nil, e
-		}
-		if e := s.effective(tx, project, ref); e != nil {
-			return nil, e
-		}
+	if e := s.checkDecisionGraph(tx, p, project, b); e != nil {
+		return nil, e
 	}
 	reasons := []string{}
 	signals := Empty()
@@ -200,14 +284,14 @@ func (s *Service) InvokeJev(ctx context.Context, token, project string, b Object
 	}
 	var rubric DecisionRubric
 	if e == nil {
-		rubric, e = s.decisionRubric(tx, project, b)
+		e = s.checkDecisionGraph(tx, p, project, b)
 	}
 	if e == nil {
-		for _, v := range Arr(b, "input_refs") {
-			if e = s.effective(tx, project, v.(map[string]any)); e != nil {
-				break
-			}
-		}
+		rubric, e = s.decisionRubric(tx, project, b)
+	}
+	var inputs []any
+	if e == nil {
+		inputs, e = s.decisionPromptInputs(tx, p, project, b)
 	}
 	if e == nil && b["input_hash"] != Hash(b["input_refs"]) {
 		e = Fail(422, "GATE_FAILED", "input hash mismatch")
@@ -217,20 +301,6 @@ func (s *Service) InvokeJev(ctx context.Context, token, project string, b Object
 		binding.ProjectID = project
 		binding.InputHash = Str(b, "input_hash")
 		binding.RubricHash = Str(b["rubric_ref"].(map[string]any), "content_hash")
-		inputs := []any{}
-		for _, v := range Arr(b, "input_refs") {
-			ref := v.(map[string]any)
-			o, err := s.readObject(tx, p, project, Str(ref, "entity_type"), Str(ref, "id"))
-			if err != nil {
-				e = err
-				break
-			}
-			if o["access_class"] == "VERIFIER_ONLY" {
-				e = Fail(403, "FORBIDDEN", "protected evaluation material cannot enter decision prompts")
-				break
-			}
-			inputs = append(inputs, o)
-		}
 		request = decision.Request{Model: binding.Scope.ModelRevision, State: Object{"binding": binding, "inputs": inputs}, Questions: rubric.Questions}
 		principal = p.ID
 	}
@@ -254,17 +324,16 @@ func (s *Service) InvokeJev(ctx context.Context, token, project string, b Object
 	if p.ID != principal || !p.Allowed(project, "", "", false) || !(p.HasRole("OWNER") || p.HasRole("PLANNER")) {
 		return nil, Fail(403, "FORBIDDEN", "planner authorization changed")
 	}
-	// Freeze actual response even on timeout; then record the decision transactionally.
-	raw := Bytes(envelope)
-	u, e := s.upload(tx, p, project, raw)
+	currentInputs, e := s.decisionPromptInputs(tx, p, project, b)
 	if e != nil {
 		return nil, e
 	}
-	artifact := Merge(Base(project), Object{"run_id": nil, "kind": "REPORT", "evidence_kind": "OBSERVED", "measurement_mode": envelope.MeasurementMode, "content_hash": u["content_hash"], "storage_key": u["storage_key"], "media_type": "application/json", "byte_size": len(raw), "input_refs": b["input_refs"], "source_refs": Empty(), "produced_by": p.ID, "access_class": "PROJECT", "validity": "CURRENT", "sealed_at": Now()})
-	if e = s.put(tx, "Artifact", artifact); e != nil {
-		return nil, e
+	if Hash(currentInputs) != Hash(inputs) {
+		return nil, Fail(412, "STALE_INPUT", "decision evidence changed during model invocation")
 	}
-	if _, e = tx.Exec("UPDATE uploaded_content SET sealed=1 WHERE project=? AND storage_key=?", project, artifact["storage_key"]); e != nil {
+	// Freeze actual response even on timeout; then record the decision transactionally.
+	artifact, e := s.sealDecisionEnvelope(tx, p, project, b, envelope)
+	if e != nil {
 		return nil, e
 	}
 	b = copyObject(b)
