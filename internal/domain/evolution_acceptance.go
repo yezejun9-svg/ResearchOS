@@ -3,6 +3,7 @@
 package domain
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -44,7 +45,20 @@ func (s *Service) evolutionRecordValid(tx *sql.Tx, project string, x, r Object) 
 		if e != nil {
 			return e
 		}
-		if p.Scope != evolution.Scope || p.SuiteHash != r["suite_hash"] || p.PolicyHash != r["policy_hash"] || !p.StablePreserved || Hash(b) != Hash(p.BaselineResult) || Hash(c) != Hash(p.CandidateResult) || r["required_passed"] != c.RequiredPassed || r["improved"] != evolution.Improved(b, c) {
+		holdout, proofHash, err := s.evolutionHoldoutVerdict(context.Background(), tx, project, x)
+		if err != nil {
+			return err
+		}
+		improved := evolution.Improved(b, c)
+		if holdout != nil {
+			improved = improved && holdout["gain"] == true
+			if Hash(r["holdout_summary"]) != Hash(holdout) || r["holdout_proof_hash"] != proofHash {
+				return Fail(422, "GATE_FAILED", "private holdout receipt does not match frozen host result")
+			}
+		} else if r["holdout_summary"] != nil || r["holdout_proof_hash"] != nil {
+			return Fail(422, "GATE_FAILED", "unregistered private holdout claim")
+		}
+		if p.Scope != evolution.Scope || p.SuiteHash != r["suite_hash"] || p.PolicyHash != r["policy_hash"] || !p.StablePreserved || Hash(b) != Hash(p.BaselineResult) || Hash(c) != Hash(p.CandidateResult) || r["required_passed"] != c.RequiredPassed || r["improved"] != improved {
 			return Fail(422, "GATE_FAILED", "raw native outcomes differ from host derived verdict")
 		}
 		observation := r["observation"].(map[string]any)
