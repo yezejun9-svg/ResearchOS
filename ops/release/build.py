@@ -164,9 +164,8 @@ def collect_sources(root: Path) -> dict[str, bytes]:
             relative = path.relative_to(root).as_posix()
             if any(part in EXCLUDED_PARTS or part.startswith(".") for part in path.relative_to(root).parts):
                 continue
-            # This legacy browser fixture hardcodes a developer tool path. It
-            # remains a source-checkout prerequisite, never release content.
-            if relative == "tests/ui/browser_smoke.py":
+            # Construction checks pin developer tools or one historical private store.
+            if relative in {"tests/ui/browser_smoke.py", "tests/evolution/control_private_recompute/main.go"}:
                 continue
             add_source(files, root, relative)
     for relative in ("ops/release/start.ps1", "ops/release/stop.ps1", "ops/release/verify.ps1"):
@@ -282,7 +281,7 @@ def command_requirements(files: dict[str, bytes]):
         raise RuntimeError("declared command script absent: " + ", ".join(missing))
     return {"bound": bound, "unbound_not_implemented": unbound,
             "execution_scope": "construction source checkout and pinned tools required; bundled scripts do not grant acceptance",
-            "source_checkout_gap": "tests/ui/browser_smoke.py excluded for developer absolute path; W13 browser command requires clean source checkout"}
+            "source_checkout_gap": "tests/ui/browser_smoke.py and tests/evolution/control_private_recompute/main.go excluded for developer-only tool/store pins; construction replay requires the original source checkout"}
 
 
 def build(root: Path, output: Path, lock_path: Path):

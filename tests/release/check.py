@@ -52,6 +52,8 @@ def run(archive: Path, fixture: bool):
                               and manifest["database"]["fresh_fixture_schema"] == 20, "exact-final-upgrade-mechanism-declared"))
         checks.append(require(manifest["database"]["schema13_to_final_qualification"] == "BOUNDED_FIXTURE_MECHANISM_ONLY; ACTUAL_ACTIVATION_BLOCKED", "actual-activation-not-qualified"))
         checks.append(require("bin/release_host.exe" in listed, "existing-release-host-packaged"))
+        checks.append(require("tests/evolution/control_private_recompute/main.go" not in listed
+                              and "control_private_recompute" in manifest["commands"]["source_checkout_gap"], "historical-private-helper-excluded"))
         checks.append(require("release.reproduce" in manifest["commands"]["unbound_not_implemented"], "release-command-unbound"))
         with tempfile.TemporaryDirectory(prefix="researchos-r1-check-") as temporary:
             root = Path(temporary) / "release"
