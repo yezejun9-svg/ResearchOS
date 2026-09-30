@@ -466,9 +466,9 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 		result.Evidence = append(result.Evidence, ev)
 		refs = append(refs, Str(ev, "id"))
 	}
-	// X UI has no durable provider cursor. Its visible articles are still
-	// evidence, but can never become an exhaustive page checkpoint.
-	if config["kind"] != "X" {
+	// The production XBrowser never reports a complete page or a durable cursor.
+	// A trusted adapter with actual pagination can checkpoint its bounded window.
+	if config["kind"] != "X" || page.Complete || page.NextCursor != "" {
 		if !page.Complete && page.NextCursor == "" {
 			return SourceCapture{}, Fail(422, "GATE_FAILED", "incomplete page lacks resumable provider cursor")
 		}
@@ -493,7 +493,7 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 	if page.ObservedTo != nil {
 		observedTo = page.ObservedTo.UTC().Format(time.RFC3339Nano)
 	}
-	manifestBytes := Bytes(Object{"source_id": config["source_id"], "query_hash": cursor["query_hash"], "window_from": q.From.Format(time.RFC3339Nano), "window_to": q.To.Format(time.RFC3339Nano), "observed_from": observedFrom, "observed_to": observedTo, "fetched_at": page.FetchedAt.UTC().Format(time.RFC3339Nano), "request_urls": page.RequestURLs, "final_urls": page.FinalURLs, "page_cursor_in": pageCursor, "page_cursor_out": page.NextCursor, "complete": page.Complete && config["kind"] != "X", "visible_empty": page.VisibleEmpty, "raw_artifact_ref": Ref(raw, "Artifact"), "evidence_refs": manifestRefs[1:]})
+	manifestBytes := Bytes(Object{"source_id": config["source_id"], "query_hash": cursor["query_hash"], "window_from": q.From.Format(time.RFC3339Nano), "window_to": q.To.Format(time.RFC3339Nano), "observed_from": observedFrom, "observed_to": observedTo, "fetched_at": page.FetchedAt.UTC().Format(time.RFC3339Nano), "request_urls": page.RequestURLs, "final_urls": page.FinalURLs, "page_cursor_in": pageCursor, "page_cursor_out": page.NextCursor, "complete": page.Complete, "visible_empty": page.VisibleEmpty, "raw_artifact_ref": Ref(raw, "Artifact"), "evidence_refs": manifestRefs[1:]})
 	u, e := s.upload(tx, p, project, manifestBytes)
 	if e != nil {
 		return SourceCapture{}, e
