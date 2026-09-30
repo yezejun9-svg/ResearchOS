@@ -30,7 +30,7 @@ func (s *Service) researchStageSnapshot(tx *sql.Tx, project string, task Object)
 	var expected Object
 	switch w.Stage {
 	case "delivery":
-		expected, err = s.researchCycleFacts(tx, project, cycle)
+		expected, err = s.researchCycleFacts(tx, project, cycle, nil)
 	case "discovery":
 		if w.SourceReceipt == nil {
 			return nil, Fail(422, "GATE_FAILED", "real source capture receipt required")
@@ -82,7 +82,7 @@ func verifyResearchStage(snap Object, command string) (string, string) {
 	return "PASS", "Exact source, stage receipts, costs and unresolved gaps recomputed from current durable evidence; no business improvement inferred."
 }
 
-func (s *Service) researchCycleFacts(tx *sql.Tx, project string, cycle Object) (Object, error) {
+func (s *Service) researchCycleFacts(tx *sql.Tx, project string, cycle Object, manualActor *Principal) (Object, error) {
 	profile, err := version(tx, project, cycle["profile_ref"].(map[string]any))
 	if err != nil {
 		return nil, err
@@ -102,6 +102,16 @@ func (s *Service) researchCycleFacts(tx *sql.Tx, project string, cycle Object) (
 	if err != nil {
 		return nil, err
 	}
+	// Both durable tables fence manual compatibility, including a bound cycle
+	// before its first work item and after its monitor has been retired.
+	var monitorBindings, workBindings int
+	if err = tx.QueryRow("SELECT count(*) FROM research_monitor_cycles WHERE project=? AND cycle=?", project, cycle["id"]).Scan(&monitorBindings); err != nil {
+		return nil, err
+	}
+	if err = tx.QueryRow("SELECT count(*) FROM research_cycle_work WHERE project=? AND cycle=?", project, cycle["id"]).Scan(&workBindings); err != nil {
+		return nil, err
+	}
+	manual := manualActor != nil && monitorBindings == 0 && workBindings == 0
 	complete, progress := true, false
 	gaps, stages, candidates, experiments, costs := Empty(), Empty(), Empty(), Empty(), Empty()
 	var monitorGoal string
@@ -191,14 +201,22 @@ func (s *Service) researchCycleFacts(tx *sql.Tx, project string, cycle Object) (
 			return nil, err
 		}
 		candidate := Object{"evidence_ref": Ref(ev, "Evidence"), "review": nil}
-		review, gate := s.currentResearchReview(tx, project, Str(cycle, "id"), id.(string))
+		var review Object
+		var gate error
+		reason := "Current independent source review and disposition required"
+		if manual {
+			review, gate = s.currentManualResearchReview(tx, *manualActor, project, cycle, id.(string))
+			reason = "Current manual negative disposition and source snapshot revalidation required"
+		} else {
+			review, gate = s.currentResearchReview(tx, project, Str(cycle, "id"), id.(string))
+		}
 		if gate != nil {
 			complete = false
-			gaps = append(gaps, Object{"code": "CANDIDATE_REVIEW_REQUIRED", "evidence_id": id, "reason": "Current independent source review and disposition required"})
+			gaps = append(gaps, Object{"code": "CANDIDATE_REVIEW_REQUIRED", "evidence_id": id, "reason": reason})
 		} else {
 			candidate["review"] = review
 		}
-		// The typed review binding is revalidated before it can populate this field.
+		// Manual annotations remain visibly separate from accepted monitor review.
 		candidates = append(candidates, candidate)
 	}
 	for _, id := range Arr(cycle, "required_experiment_ids") {

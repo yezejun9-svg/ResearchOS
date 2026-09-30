@@ -311,7 +311,7 @@ func (s *Service) holdResearchMonitor(tx *sql.Tx, p Principal, project string, g
 			if len(reason) > 0 {
 				summary = reason[0]
 			}
-			cycle, err := s.closeResearchCycle(tx, project, active, Object{"requested_status": "CANCELLED", "outcome_summary": summary})
+			cycle, err := s.closeResearchCycle(tx, p, project, active, Object{"requested_status": "CANCELLED", "outcome_summary": summary})
 			if err != nil {
 				var fault *Fault
 				if errors.As(err, &fault) && fault.Status == 409 {

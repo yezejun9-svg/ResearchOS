@@ -36,7 +36,7 @@ func (s *Service) researchOperation(tx *sql.Tx, p Principal, project, id string,
 		o, err := s.checkpointResearchCycle(tx, project, id, b)
 		return o, "ResearchCycle", 200, err
 	case "closeResearchCycle":
-		o, err := s.closeResearchCycle(tx, project, id, b)
+		o, err := s.closeResearchCycle(tx, p, project, id, b)
 		return o, "ResearchCycle", 200, err
 	}
 	return nil, "", 0, Fail(503, "RESOURCE_UNAVAILABLE", "research operation unavailable")
@@ -362,7 +362,7 @@ func (s *Service) validateCycleCheckpoint(tx *sql.Tx, project, id string, b Obje
 	return nil
 }
 
-func (s *Service) closeResearchCycle(tx *sql.Tx, project, id string, b Object) (Object, error) {
+func (s *Service) closeResearchCycle(tx *sql.Tx, p Principal, project, id string, b Object) (Object, error) {
 	o, err := load(tx, project, "ResearchCycle", id)
 	if err != nil {
 		return nil, err
@@ -384,7 +384,7 @@ func (s *Service) closeResearchCycle(tx *sql.Tx, project, id string, b Object) (
 	actual := "CANCELLED"
 	var monitorMeta, reportTask, reportReceipt, reportFacts Object
 	if b["requested_status"] != "CANCELLED" {
-		facts, e := s.researchCycleFacts(tx, project, o)
+		facts, e := s.researchCycleFacts(tx, project, o, &p)
 		if e != nil {
 			return nil, e
 		}
