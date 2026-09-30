@@ -19,16 +19,18 @@ function pathFor(pattern, params) {
 }
 
 export function createApi(getToken) {
+  let principalId = null
   async function call(operation, { params = {}, query, body, signal, etag, key, raw = false } = {}) {
     const spec = operations[operation]
     if (!spec) throw new Error(`未知操作 ${operation}`)
     const url = new URL(pathFor(spec.path, params), window.location.origin)
     if (query) Object.entries(query).forEach(([name, value]) => { if (value != null && value !== '') url.searchParams.set(name, String(value)) })
     const headers = { Authorization: `Bearer ${getToken()}`, Accept: raw ? '*/*' : 'application/json' }
-    if (body != null) headers['Content-Type'] = 'application/json'
+    if (body != null) headers['Content-Type'] = body instanceof Blob ? 'application/octet-stream' : 'application/json'
     if (etag) headers['If-Match'] = etag
     if (spec.method !== 'GET') headers['Idempotency-Key'] = key || crypto.randomUUID()
-    const response = await fetch(url, { method: spec.method, headers, body: body == null ? undefined : JSON.stringify(body), signal, cache: 'no-store' })
+    const response = await fetch(url, { method: spec.method, headers, body: body == null ? undefined : body instanceof Blob ? body : JSON.stringify(body), signal, cache: 'no-store' })
+    principalId = response.headers.get('X-ResearchOS-Principal-ID') || principalId
     if (!response.ok) {
       let detail
       try { detail = await response.json() } catch { detail = null }
@@ -37,7 +39,7 @@ export function createApi(getToken) {
     if (raw) return { blob: await response.blob(), headers: response.headers, status: response.status }
     return response.status === 204 ? null : response.json()
   }
-  async function stream(projectId, afterSequence, onEvent, signal, shouldStop = () => false) {
+  async function stream(projectId, afterSequence, onEvent, signal, shouldStop = () => false, onOpen = () => {}) {
     const url = new URL(pathFor(operations.streamEvents.path, { projectId }), window.location.origin)
     const headers = { Authorization: `Bearer ${getToken()}`, Accept: 'text/event-stream' }
     if (afterSequence != null) headers['Last-Event-ID'] = String(afterSequence)
@@ -48,6 +50,7 @@ export function createApi(getToken) {
       throw new ApiError(response.status, detail, 'streamEvents')
     }
     if (!response.body) throw new Error('事件流不可用')
+    onOpen()
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
@@ -75,7 +78,7 @@ export function createApi(getToken) {
       reader.releaseLock()
     }
   }
-  return { call, stream }
+  return { call, stream, principalId: () => principalId }
 }
 
 export function classify(error) {

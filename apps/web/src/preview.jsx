@@ -54,7 +54,7 @@ export function ArtifactPreview({ artifact, expectedRef, api, projectId }) {
       setTimeout(() => URL.revokeObjectURL(url), 60000)
     } catch (error) { if (!controller.signal.aborted) setDownloadError(error.message) }
   }
-  return <article className="artifact-preview"><div className="artifact-head"><div><strong>{artifact.kind || '产物'}</strong><small>修订 {artifact.revision} · {artifact.validity} · {artifact.evidence_kind} · 待独立验收</small><small className="break-all">{artifact.content_hash}</small><small>{media} · {size ? `${Math.ceil(size / 1024)} KiB` : '大小未知'} · {artifact.access_class}</small></div><button onClick={load} disabled={state.status === 'loading'}>{state.status === 'idle' ? '受控预览' : '重新读取'}</button></div>
+  return <article className="artifact-preview"><div className="artifact-head"><div><strong>{artifact.kind || '产物'}</strong><small>修订 {artifact.revision} · {artifact.validity} · {artifact.evidence_kind} · {artifact.measurement_mode} · 验收状态见关联回执</small><small className="break-all">{artifact.content_hash}</small><small>{media} · {size ? `${Math.ceil(size / 1024)} KiB` : '大小未知'} · {artifact.access_class}</small></div><button onClick={load} disabled={state.status === 'loading'}>{state.status === 'idle' ? '受控预览' : '重新读取'}</button></div>
     {state.status === 'loading' && <p role="status">正在读取并核对哈希…</p>}
     {state.status === 'oversize' && <p className="warning">超过 5 MiB 行内上限；可下载后在受信任的本地应用查看。</p>}
     {state.status === 'error' && <p className="form-error" role="alert">预览失败：{state.message}</p>}
