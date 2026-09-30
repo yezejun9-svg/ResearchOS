@@ -294,11 +294,16 @@ func TestW07Provider429PersistsRetryBeforeAnotherFetch(t *testing.T) {
 	}
 	count := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/__researchos_fixture_readiness__" {
+			w.WriteHeader(404)
+			return
+		}
 		count++
 		w.Header().Set("Retry-After", "60")
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	defer server.Close()
+	fixtureHTTPReady(t, server.Client(), server.URL+"/__researchos_fixture_readiness__")
 	adapter := sources.GitHubReleases{BaseURL: server.URL, Client: server.Client(), AllowedOrigins: []string{server.URL}}
 	from := time.Now().UTC().Add(-time.Hour)
 	to := time.Now().UTC().Add(-time.Minute)
