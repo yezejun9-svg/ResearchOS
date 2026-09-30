@@ -64,7 +64,7 @@ def main():
         'executor_identity': os.getenv('RESEARCHOS_EXECUTOR_ID', 'codex:/root/resources'), 'verifier_identity': None,
         'code_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         'dirty': subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True),
-        'command_key': 'test.backup', 'registered_command_revision': 'ROOT_INTEGRATION_PENDING', 'argv': command, 'cwd': str(ROOT),
+        'command_key': 'test.backup', 'registered_command_revision': digest(ROOT / 'execution/commands.json'), 'argv': command, 'cwd': str(ROOT),
         'environment_names': sorted(env), 'version_manifest': manifest,
         'go_version': subprocess.check_output([go, 'version'], cwd=ROOT, text=True).strip(), 'python_version': platform.python_version(),
         'implementation_model': 'gpt-6-astra', 'reasoning_effort': 'high', 'runtime_model': {'status': 'NOT_APPLICABLE', 'reason': 'storage recovery invokes no external model'},
@@ -106,7 +106,8 @@ def main():
               'scope': before['scope'], 'w05_runtime_qualification': 'BLOCKED_RQ-W05-CLI-POLICY-001',
               'global_evidence': 'CANDIDATE_PENDING_INDEPENDENT_VERIFIER'}
     save(out / 'report.json', report)
-    print(json.dumps({'status': report['status'], 'assertions': len(rows), 'receipt': str(out / 'report.json')}))
+    print(json.dumps({'status': report['status'], 'assertions': len(rows), 'assertion_ids': ids,
+                      'scope': before['environment_mode'], 'receipt': str(out / 'report.json')}))
     return 0 if passed else 1
 
 

@@ -41,6 +41,9 @@ func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
 	if _, e = os.Stat(migrationFile); e != nil {
 		return nil, e
 	}
+	if e = CheckMigrationSafety(db, files); e != nil {
+		return nil, e
+	}
 	tx, e := db.Begin()
 	if e != nil {
 		return nil, e
