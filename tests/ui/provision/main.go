@@ -34,6 +34,49 @@ func main() {
 				log.Fatal("runtime id required")
 			}
 			err = service.RegisterOrchestrationFixture(context.Background(), os.Args[1], os.Args[3])
+		case "verifying":
+			// C18 transient-state fixture only: real reported Tasks and Runs
+			// remain intact; no acceptance or product authority is fabricated.
+			var ids []string
+			if err = json.NewDecoder(os.Stdin).Decode(&ids); err != nil {
+				log.Fatal(err)
+			}
+			tx, beginErr := db.Begin()
+			if beginErr != nil {
+				log.Fatal(beginErr)
+			}
+			defer tx.Rollback()
+			for _, id := range ids {
+				var raw string
+				if err = tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='Task' AND id=?", os.Args[1], id).Scan(&raw); err != nil {
+					log.Fatal(err)
+				}
+				task, decodeErr := domain.Decode([]byte(raw))
+				if decodeErr != nil {
+					log.Fatal(decodeErr)
+				}
+				if task["status"] != "EXECUTION_REPORTED" {
+					log.Fatal("only real reported task may enter transient fixture")
+				}
+				revision, revErr := domain.Num(task, "revision")
+				if revErr != nil {
+					log.Fatal(revErr)
+				}
+				task["status"] = "VERIFYING"
+				task["revision"] = revision + 1
+				task["updated_at"] = domain.Now()
+				if err = service.Contracts.Validate("Task", task); err != nil {
+					log.Fatal(err)
+				}
+				body := string(domain.Bytes(task))
+				if _, err = tx.Exec("UPDATE domain_objects SET revision=?,body=? WHERE project=? AND kind='Task' AND id=?", revision+1, body, os.Args[1], id); err != nil {
+					log.Fatal(err)
+				}
+				if _, err = tx.Exec("INSERT INTO domain_versions(project,kind,id,revision,body) VALUES(?,'Task',?,?,?)", os.Args[1], id, revision+1, body); err != nil {
+					log.Fatal(err)
+				}
+			}
+			err = tx.Commit()
 		case "observe":
 			raw, readErr := io.ReadAll(os.Stdin)
 			if readErr != nil {
