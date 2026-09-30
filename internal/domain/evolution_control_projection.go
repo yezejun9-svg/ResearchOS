@@ -4,6 +4,7 @@ package domain
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,8 +22,16 @@ import (
 // cross into the AppContainer input. This narrow profile excludes monitor work,
 // experiments and successful closure; future coverage requires a new profile.
 func PrepareEvolutionControlBundle(ctx context.Context, snapshot []byte, root, project, cycleID string) (evolution.ControlBundle, error) {
+	return prepareEvolutionControlBundle(ctx, snapshot, root, project, cycleID, false)
+}
+
+func prepareEvolutionControlBundle(ctx context.Context, snapshot []byte, root, project, cycleID string, privateSource bool) (evolution.ControlBundle, error) {
 	bundle := evolution.ControlBundle{Files: map[string][]byte{}}
-	if len(snapshot) < 16 || len(snapshot) > 32*1024*1024 || string(snapshot[:16]) != "SQLite format 3\x00" {
+	limit := 32 * 1024 * 1024
+	if privateSource {
+		limit = currentSnapshotLimit
+	}
+	if len(snapshot) < 16 || len(snapshot) > limit || string(snapshot[:16]) != "SQLite format 3\x00" {
 		return bundle, fmt.Errorf("CONTROL_SOURCE_SNAPSHOT")
 	}
 	_, _, err := upgradeRelease(root, 20)
@@ -41,11 +50,16 @@ func PrepareEvolutionControlBundle(ctx context.Context, snapshot []byte, root, p
 		return bundle, err
 	}
 	defer os.RemoveAll(work)
-	sourcePath := filepath.Join(work, "source.sqlite")
-	if err = os.WriteFile(sourcePath, snapshot, 0600); err != nil {
-		return bundle, err
+	var source *sql.DB
+	if privateSource {
+		source, err = controlSnapshotMemoryDB(ctx, snapshot)
+	} else {
+		sourcePath := filepath.Join(work, "source.sqlite")
+		if err = os.WriteFile(sourcePath, snapshot, 0600); err != nil {
+			return bundle, err
+		}
+		source, err = store.Open(sourcePath)
 	}
-	source, err := store.Open(sourcePath)
 	if err != nil {
 		return bundle, err
 	}
