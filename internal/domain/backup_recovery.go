@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -42,6 +43,7 @@ func (s *Service) backupRelocateSources(stage, destination string) error {
 		if e != nil {
 			return e
 		}
+		written := map[string]backupSourceFile{}
 		for rows.Next() {
 			var name, hash string
 			var raw []byte
@@ -59,7 +61,7 @@ func (s *Service) backupRelocateSources(stage, destination string) error {
 				rows.Close()
 				return e
 			}
-			if e = backupWrite(target, raw); e != nil {
+			if e = backupWriteSource(target, raw, hash, written); e != nil {
 				rows.Close()
 				return e
 			}
@@ -82,6 +84,46 @@ func (s *Service) backupRelocateSources(stage, destination string) error {
 		}
 	}
 	return nil
+}
+
+type backupSourceFile struct {
+	info os.FileInfo
+	hash string
+}
+
+// Snapshot origin paths remain unchanged. Two paths may name the same native
+// file (including Windows case aliases), but may only share identical content.
+// An existing file is reusable only if this restore created that exact file.
+func backupWriteSource(target string, raw []byte, hash string, written map[string]backupSourceFile) error {
+	err := backupWrite(target, raw)
+	if err == nil {
+		info, err := os.Lstat(target)
+		if err != nil {
+			return err
+		}
+		written[target] = backupSourceFile{info: info, hash: hash}
+		return nil
+	}
+	if !os.IsExist(err) {
+		return err
+	}
+	info, err := os.Lstat(target)
+	if err != nil || !info.Mode().IsRegular() {
+		return fmt.Errorf("RESTORE_SOURCE_CONFLICT")
+	}
+	for _, prior := range written {
+		if os.SameFile(prior.info, info) {
+			if prior.hash != hash {
+				return fmt.Errorf("RESTORE_SOURCE_CONFLICT")
+			}
+			actual, err := os.ReadFile(target)
+			if err != nil || Digest(actual) != hash || !bytes.Equal(actual, raw) {
+				return fmt.Errorf("RESTORE_SOURCE_CONFLICT")
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("RESTORE_SOURCE_CONFLICT")
 }
 
 func (s *Service) backupPublishSourcePaths(stage, destination string) error {
