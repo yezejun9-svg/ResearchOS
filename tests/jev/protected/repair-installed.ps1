@@ -40,9 +40,14 @@ if (-not $priorBackup) {
     Set-Acl -LiteralPath $backupManifest -AclObject (Get-Acl -LiteralPath $manifestPath)
 }
 $serviceProcess = if ($service.ProcessId -ne 0) { Get-Process -Id $service.ProcessId } else { $null }
-Stop-Service -Name $name
-(Get-Service -Name $name).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
-if ($serviceProcess -and -not $serviceProcess.WaitForExit(15000)) { throw 'SERVICE_PROCESS_EXIT_TIMEOUT_DATA_PRESERVED' }
+try {
+    if ($serviceProcess) { $null = $serviceProcess.SafeHandle }
+    Stop-Service -Name $name
+    (Get-Service -Name $name).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+    if ($serviceProcess -and -not $serviceProcess.WaitForExit(15000)) { throw 'SERVICE_PROCESS_EXIT_TIMEOUT_DATA_PRESERVED' }
+} finally {
+    if ($serviceProcess) { $serviceProcess.Dispose() }
+}
 try {
     Copy-Item -LiteralPath $Binary -Destination $installed -Force
     Set-Acl -LiteralPath $installed -AclObject $binaryACL
