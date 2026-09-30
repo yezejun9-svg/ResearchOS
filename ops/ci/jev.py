@@ -27,7 +27,7 @@ def save(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
-def main():
+def main(command_key='test.jev.fixture'):
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['fixture'], default='fixture')
     args = parser.parse_args()
@@ -61,7 +61,7 @@ def main():
         'os': platform.platform(), 'architecture': platform.machine(), 'executor_identity': os.getenv('RESEARCHOS_EXECUTOR_ID', 'codex:/root/resources'),
         'verifier_identity': None, 'code_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
         'dirty': subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True),
-        'command_key': 'test.jev.fixture', 'registered_command_revision': digest(ROOT / 'execution/commands.json'),
+        'command_key': command_key, 'registered_command_revision': digest(ROOT / 'execution/commands.json'),
         'argv': command, 'cwd': str(ROOT), 'environment_names': sorted(env), 'version_manifest': manifest,
         'go_version': subprocess.check_output([go, 'version'], cwd=ROOT, text=True).strip(),
         'expected_assertion_ids': sorted(expected), 'implementation_model': 'gpt-6-astra', 'reasoning_effort': 'high',

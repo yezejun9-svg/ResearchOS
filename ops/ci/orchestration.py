@@ -26,6 +26,9 @@ def digest(path):
 
 
 def main():
+    if os.getenv('RESEARCHOS_TASK_ID') == 'W11':
+        from jev import main as jev_main
+        return jev_main('test.orchestration')
     if os.getenv('RESEARCHOS_TASK_ID') == 'W12':
         from resources import main as resources_main
         return resources_main('test.orchestration')
