@@ -1,6 +1,6 @@
 // Package protectedstore keeps private bytes outside the control-plane database.
-// This slice ships only a CANARY_ONLY provider. No independent-identity LIVE
-// provider is installed or implied by the interface.
+// CANARY_ONLY supports public fixtures; FrozenProvider exposes authenticated
+// service terminal metadata without returning private body bytes.
 package protectedstore
 
 import (
@@ -62,21 +62,22 @@ func (b Blob) Valid() bool {
 
 // SafeSummary has no arbitrary strings, identifiers, per-case fields, reasons,
 // input text or lineage refs. It is only a validator; publication/declassification
-// still requires the future independent protected service and explicit review.
+// is confined to the fixed independent protected service and explicit review.
 type SafeSummary struct {
-	Schema              string `json:"schema"`
-	Status              string `json:"status"`
-	Total               int64  `json:"total"`
-	Correct             int64  `json:"correct"`
-	FalseAccept         int64  `json:"false_accept"`
-	FalseReject         int64  `json:"false_reject"`
-	Abstain             int64  `json:"abstain"`
-	CriticalFalseAccept int64  `json:"critical_false_accept"`
-	MaximumMode         string `json:"maximum_mode"`
+	Schema              string            `json:"schema"`
+	Status              string            `json:"status"`
+	Total               int64             `json:"total"`
+	Correct             int64             `json:"correct"`
+	FalseAccept         int64             `json:"false_accept"`
+	FalseReject         int64             `json:"false_reject"`
+	Abstain             int64             `json:"abstain"`
+	CriticalFalseAccept int64             `json:"critical_false_accept"`
+	MaximumMode         string            `json:"maximum_mode"`
+	Frozen              *FrozenRunSummary `json:"frozen_run,omitempty"`
 }
 
 func (s SafeSummary) Validate() error {
-	if s.Schema != "researchos.protected-summary.v1" || (s.Status != "BLOCKED" && s.Status != "EXECUTION_REPORTED") || s.MaximumMode != "ADVISORY" || s.Total < 0 || s.Total > 1000000 {
+	if s.Schema != "researchos.protected-summary.v1" || (s.Status != "BLOCKED" && s.Status != "EXECUTION_REPORTED" && !(s.Frozen != nil && (s.Status == "READY" || s.Status == "RUNNING"))) || s.MaximumMode != "ADVISORY" || s.Total < 0 || s.Total > 1000000 {
 		return ErrIntegrity
 	}
 	for _, v := range []int64{s.Correct, s.FalseAccept, s.FalseReject, s.Abstain, s.CriticalFalseAccept} {
@@ -87,7 +88,7 @@ func (s SafeSummary) Validate() error {
 	if s.Correct+s.FalseAccept+s.FalseReject+s.Abstain != s.Total || s.CriticalFalseAccept > s.FalseAccept {
 		return ErrIntegrity
 	}
-	return nil
+	return s.validateFrozen()
 }
 
 func ParseSafeSummary(raw []byte) (SafeSummary, error) {
