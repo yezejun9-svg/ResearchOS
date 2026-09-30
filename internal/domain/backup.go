@@ -1,0 +1,512 @@
+package domain
+
+// Local administrative backup APIs are deliberately not registered as HTTP
+// operations. Possession of the separately stored recovery key is required.
+import (
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"researchos.local/research-os/internal/store"
+)
+
+type BackupFile struct {
+	Name string `json:"name"`
+	Hash string `json:"hash"`
+	Size int    `json:"size"`
+}
+type BackupManifest struct {
+	Format            string       `json:"format"`
+	ID                string       `json:"id"`
+	Started           string       `json:"started_at"`
+	SnapshotCompleted string       `json:"snapshot_completed_at"`
+	Migrations        []int        `json:"migrations"`
+	Files             []BackupFile `json:"files"`
+	Inventory         Object       `json:"inventory"`
+	KeyPolicy         string       `json:"key_policy"`
+	CachePolicy       string       `json:"cache_policy"`
+	MAC               string       `json:"mac"`
+}
+
+func backupCipher(key []byte) (cipher.AEAD, error) {
+	if len(key) != 32 {
+		return nil, fmt.Errorf("BACKUP_KEY_UNAVAILABLE: separate 32-byte key required")
+	}
+	block, e := aes.NewCipher(key)
+	if e != nil {
+		return nil, e
+	}
+	return cipher.NewGCM(block)
+}
+func backupMAC(m BackupManifest, key []byte) string {
+	m.MAC = ""
+	raw, _ := json.Marshal(m)
+	h := hmac.New(sha256.New, key)
+	h.Write(raw)
+	return hex.EncodeToString(h.Sum(nil))
+}
+func backupWrite(path string, raw []byte) error {
+	f, e := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if e != nil {
+		return e
+	}
+	if _, e = f.Write(raw); e == nil {
+		e = f.Sync()
+	}
+	closeErr := f.Close()
+	if e != nil {
+		return e
+	}
+	return closeErr
+}
+func backupEncrypt(a cipher.AEAD, id, name string, raw []byte) ([]byte, error) {
+	nonce := make([]byte, a.NonceSize())
+	if _, e := rand.Read(nonce); e != nil {
+		return nil, e
+	}
+	return a.Seal(nonce, nonce, raw, []byte(id+"/"+name)), nil
+}
+func backupDecrypt(a cipher.AEAD, id, name string, raw []byte) ([]byte, error) {
+	if len(raw) < a.NonceSize() {
+		return nil, fmt.Errorf("BACKUP_CORRUPT")
+	}
+	b, e := a.Open(nil, raw[:a.NonceSize()], raw[a.NonceSize():], []byte(id+"/"+name))
+	if e != nil {
+		return nil, fmt.Errorf("BACKUP_KEY_OR_CONTENT_INVALID")
+	}
+	return b, nil
+}
+func backupNewStage(destination string) (string, error) {
+	abs, e := filepath.Abs(destination)
+	if e != nil {
+		return "", e
+	}
+	if _, e = os.Lstat(abs); !os.IsNotExist(e) {
+		return "", fmt.Errorf("DESTINATION_EXISTS: use a new empty destination")
+	}
+	parent := filepath.Dir(abs)
+	if e = os.MkdirAll(parent, 0700); e != nil {
+		return "", e
+	}
+	return os.MkdirTemp(parent, ".researchos-backup-stage-")
+}
+
+// Only removes files underneath a directory freshly created by this invocation.
+func backupDiscard(stage string) {
+	if strings.HasPrefix(filepath.Base(stage), ".researchos-backup-stage-") {
+		_ = os.RemoveAll(stage)
+	}
+}
+func backupMigrations(db *sql.DB) ([]int, error) {
+	rows, e := db.Query("SELECT version FROM schema_migrations ORDER BY version")
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	v := []int{}
+	for rows.Next() {
+		var n int
+		if e = rows.Scan(&n); e != nil {
+			return nil, e
+		}
+		v = append(v, n)
+	}
+	return v, rows.Err()
+}
+func backupObjects(db *sql.DB, query string) ([]Object, error) {
+	rows, e := db.Query(query)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	out := []Object{}
+	for rows.Next() {
+		var raw string
+		if e = rows.Scan(&raw); e != nil {
+			return nil, e
+		}
+		o, e := Decode([]byte(raw))
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+func backupInventory(db *sql.DB) (Object, error) {
+	inventory := Object{}
+	for _, table := range []string{"domain_objects", "domain_versions", "domain_refs", "uploaded_content", "outbox", "source_pages", "consumer_positions", "consumer_inbox", "resource_effects"} {
+		var n int
+		if e := db.QueryRow("SELECT count(*) FROM " + table).Scan(&n); e != nil {
+			return nil, e
+		}
+		inventory[table] = n
+	}
+	rows, e := db.Query("SELECT project,kind,id,revision,body FROM domain_objects ORDER BY project,kind,id")
+	if e != nil {
+		return nil, e
+	}
+	entries := []any{}
+	for rows.Next() {
+		var p, k, id, b string
+		var rev int
+		if e = rows.Scan(&p, &k, &id, &rev, &b); e != nil {
+			rows.Close()
+			return nil, e
+		}
+		entries = append(entries, []any{p, k, id, rev, Digest([]byte(b))})
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return nil, e
+	}
+	inventory["entity_revision_digest"] = Hash(entries)
+	var seq int64
+	if e = db.QueryRow("SELECT coalesce(max(sequence),0) FROM outbox").Scan(&seq); e != nil {
+		return nil, e
+	}
+	inventory["max_event_sequence"] = seq
+	return inventory, nil
+}
+func backupIntegrity(db *sql.DB) error {
+	var result string
+	if e := db.QueryRow("PRAGMA integrity_check").Scan(&result); e != nil {
+		return e
+	}
+	if result != "ok" {
+		return fmt.Errorf("BACKUP_DB_INTEGRITY")
+	}
+	rows, e := db.Query("PRAGMA foreign_key_check")
+	if e != nil {
+		return e
+	}
+	bad := rows.Next()
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return e
+	}
+	if bad {
+		return fmt.Errorf("BACKUP_DANGLING_REFERENCE")
+	}
+	// Every version, including historical accepted evidence, must retain its bytes.
+	arts, e := backupObjects(db, "SELECT body FROM domain_versions WHERE kind='Artifact'")
+	if e != nil {
+		return e
+	}
+	for _, o := range arts {
+		if o["access_class"] != "PROJECT" {
+			return fmt.Errorf("PROTECTED_BACKUP_REQUIRES_W17")
+		}
+		var raw []byte
+		var hash string
+		var sealed int
+		if e = db.QueryRow("SELECT bytes,content_hash,sealed FROM uploaded_content WHERE storage_key=? AND project=?", o["storage_key"], o["project_id"]).Scan(&raw, &hash, &sealed); e != nil {
+			return fmt.Errorf("BACKUP_ARTIFACT_MISSING")
+		}
+		if sealed != 1 || Digest(raw) != hash || hash != o["content_hash"] {
+			return fmt.Errorf("BACKUP_ARTIFACT_HASH")
+		}
+	}
+	receipts, e := backupObjects(db, "SELECT body FROM domain_versions WHERE json_type(body,'$.receipt_hash')='text'")
+	if e != nil {
+		return e
+	}
+	for _, o := range receipts {
+		if o["receipt_hash"] != Receipt(o) {
+			return fmt.Errorf("BACKUP_RECEIPT_HASH")
+		}
+	}
+	return nil
+}
+
+// CreateBackup uses a transactional SQLite snapshot, including WAL commits and
+// sealed BLOBs in the same consistency window. Files are derived ONLY from that
+// closed snapshot. Publication happens after all hashes and the manifest pass.
+func (s *Service) CreateBackup(ctx context.Context, destination string, key []byte) (BackupManifest, error) {
+	m := BackupManifest{Format: "RESEARCHOS_BACKUP_V1", ID: ID(), Started: Now(), KeyPolicy: "AES-256-GCM; key stored separately; credentials require fresh provisioning after restore", CachePolicy: "SQLite FTS cache included; external worker/context workspaces excluded and rebuilt from sealed content"}
+	a, e := backupCipher(key)
+	if e != nil {
+		return m, e
+	}
+	stage, e := backupNewStage(destination)
+	if e != nil {
+		return m, e
+	}
+	defer backupDiscard(stage)
+	plain := filepath.Join(stage, "snapshot.sqlite")
+	if _, e = s.DB.ExecContext(ctx, "VACUUM INTO ?", plain); e != nil {
+		return m, e
+	}
+	m.SnapshotCompleted = Now()
+	db, e := store.Open(plain)
+	if e != nil {
+		return m, e
+	}
+	defer db.Close()
+	if e = backupIntegrity(db); e != nil {
+		return m, e
+	}
+	if m.Migrations, e = backupMigrations(db); e != nil {
+		return m, e
+	}
+	if m.Inventory, e = backupInventory(db); e != nil {
+		return m, e
+	}
+	files := map[string][]byte{}
+	rows, e := db.Query("SELECT storage_key,bytes,content_hash FROM uploaded_content WHERE sealed=1 ORDER BY storage_key")
+	if e != nil {
+		return m, e
+	}
+	for rows.Next() {
+		var k, h string
+		var b []byte
+		if e = rows.Scan(&k, &b, &h); e != nil {
+			rows.Close()
+			return m, e
+		}
+		if Digest(b) != h {
+			rows.Close()
+			return m, fmt.Errorf("BACKUP_CONTENT_HASH")
+		}
+		files["content-"+strings.TrimPrefix(Digest([]byte(k)), "sha256:")+".bin"] = b
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return m, e
+	}
+	objects, e := backupObjects(db, "SELECT body FROM domain_versions ORDER BY project,kind,id,revision")
+	if e != nil {
+		return m, e
+	}
+	files["portable.json"] = Bytes(Object{"format": "RESEARCHOS_PORTABLE_V1", "objects": objects, "authority": "state.sqlite; portable objects preserve IDs, revisions, source relationships and receipt hashes"})
+	if _, e = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); e != nil {
+		return m, e
+	}
+	if e = db.Close(); e != nil {
+		return m, e
+	}
+	files["state.sqlite"], e = os.ReadFile(plain)
+	if e != nil {
+		return m, e
+	}
+	for name, raw := range files {
+		encrypted, e := backupEncrypt(a, m.ID, name, raw)
+		if e != nil {
+			return m, e
+		}
+		if e = backupWrite(filepath.Join(stage, name+".enc"), encrypted); e != nil {
+			return m, e
+		}
+		m.Files = append(m.Files, BackupFile{Name: name, Hash: Digest(raw), Size: len(raw)})
+	}
+	sort.Slice(m.Files, func(i, j int) bool { return m.Files[i].Name < m.Files[j].Name })
+	m.MAC = backupMAC(m, key)
+	if e = backupWrite(filepath.Join(stage, "manifest.json"), Bytes(m)); e != nil {
+		return m, e
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if e = os.Remove(plain + suffix); e != nil && !os.IsNotExist(e) {
+			return m, e
+		}
+	}
+	if e = ctx.Err(); e != nil {
+		return m, e
+	}
+	if e = os.Rename(stage, destination); e != nil {
+		return m, e
+	}
+	return m, nil
+}
+
+func readBackup(directory string, key []byte) (BackupManifest, map[string][]byte, error) {
+	var m BackupManifest
+	a, e := backupCipher(key)
+	if e != nil {
+		return m, nil, e
+	}
+	raw, e := os.ReadFile(filepath.Join(directory, "manifest.json"))
+	if e != nil {
+		return m, nil, e
+	}
+	if e = json.Unmarshal(raw, &m); e != nil {
+		return m, nil, e
+	}
+	if m.Format != "RESEARCHOS_BACKUP_V1" || !hmac.Equal([]byte(m.MAC), []byte(backupMAC(m, key))) {
+		return m, nil, fmt.Errorf("BACKUP_MANIFEST_INVALID")
+	}
+	files := map[string][]byte{}
+	for _, f := range m.Files {
+		if filepath.Base(f.Name) != f.Name || strings.ContainsAny(f.Name, "/\\:") || files[f.Name] != nil {
+			return m, nil, fmt.Errorf("BACKUP_MANIFEST_PATH")
+		}
+		raw, e = os.ReadFile(filepath.Join(directory, f.Name+".enc"))
+		if e != nil {
+			return m, nil, fmt.Errorf("BACKUP_FILE_MISSING: %s", f.Name)
+		}
+		raw, e = backupDecrypt(a, m.ID, f.Name, raw)
+		if e != nil {
+			return m, nil, e
+		}
+		if len(raw) != f.Size || Digest(raw) != f.Hash {
+			return m, nil, fmt.Errorf("BACKUP_FILE_HASH: %s", f.Name)
+		}
+		files[f.Name] = raw
+	}
+	if files["state.sqlite"] == nil || files["portable.json"] == nil {
+		return m, nil, fmt.Errorf("BACKUP_REQUIRED_FILE_MISSING")
+	}
+	return m, files, nil
+}
+
+type RestoreOptions struct {
+	Key                 []byte
+	SupportedMigrations []int
+	Contracts           *Contracts
+	// Migration executes only against the unpublished isolated copy. Irreversible
+	// migration is never promoted automatically; restore the old backup instead.
+	Migration    func(context.Context, *sql.DB) error
+	Irreversible bool
+}
+type RestoreReport struct {
+	BackupID   string `json:"backup_id"`
+	Started    string `json:"started_at"`
+	Finished   string `json:"finished_at"`
+	DurationMS int64  `json:"duration_ms"`
+	Before     Object `json:"before"`
+	After      Object `json:"after"`
+	Recovery   Object `json:"recovery"`
+	Status     string `json:"status"`
+}
+
+func RestoreBackup(ctx context.Context, directory, destination string, opt RestoreOptions) (RestoreReport, error) {
+	start := time.Now()
+	r := RestoreReport{Started: Now(), Status: "FAILED"}
+	if opt.Contracts == nil || len(opt.SupportedMigrations) == 0 {
+		return r, fmt.Errorf("RESTORE_VERSION_POLICY_REQUIRED")
+	}
+	if opt.Irreversible {
+		return r, fmt.Errorf("IRREVERSIBLE_MIGRATION_MAINTENANCE_REQUIRED")
+	}
+	m, files, e := readBackup(directory, opt.Key)
+	if e != nil {
+		return r, e
+	}
+	r.BackupID = m.ID
+	if Hash(m.Migrations) != Hash(opt.SupportedMigrations) {
+		return r, fmt.Errorf("MIGRATION_INCOMPATIBLE: restore with matching application version")
+	}
+	stage, e := backupNewStage(destination)
+	if e != nil {
+		return r, e
+	}
+	defer backupDiscard(stage)
+	if e = backupWrite(filepath.Join(stage, "state.sqlite"), files["state.sqlite"]); e != nil {
+		return r, e
+	}
+	db, e := store.Open(filepath.Join(stage, "state.sqlite"))
+	if e != nil {
+		return r, e
+	}
+	defer db.Close()
+	if e = backupIntegrity(db); e != nil {
+		return r, e
+	}
+	actual, e := backupMigrations(db)
+	if e != nil {
+		return r, e
+	}
+	if Hash(actual) != Hash(m.Migrations) {
+		return r, fmt.Errorf("MIGRATION_MANIFEST_MISMATCH")
+	}
+	r.Before, e = backupInventory(db)
+	if e != nil {
+		return r, e
+	}
+	if Hash(r.Before) != Hash(m.Inventory) {
+		return r, fmt.Errorf("RESTORE_INVENTORY_MISMATCH")
+	}
+	rows, e := db.Query("SELECT storage_key,bytes FROM uploaded_content WHERE sealed=1")
+	if e != nil {
+		return r, e
+	}
+	for rows.Next() {
+		var k string
+		var b []byte
+		if e = rows.Scan(&k, &b); e != nil {
+			rows.Close()
+			return r, e
+		}
+		name := "content-" + strings.TrimPrefix(Digest([]byte(k)), "sha256:") + ".bin"
+		raw, ok := files[name]
+		if !ok || Digest(raw) != Digest(b) {
+			rows.Close()
+			return r, fmt.Errorf("RESTORE_ARTIFACT_MANIFEST_MISMATCH")
+		}
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return r, e
+	}
+	svc := &Service{DB: db, Contracts: opt.Contracts}
+	if e = svc.backupRelocateSources(stage, destination); e != nil {
+		return r, e
+	}
+	if r.Recovery, e = svc.backupFence(ctx); e != nil {
+		return r, e
+	}
+	if opt.Migration != nil {
+		if e = opt.Migration(ctx, db); e != nil {
+			return r, fmt.Errorf("MIGRATION_FAILED: isolated copy discarded; stable backup retained: %w", e)
+		}
+	}
+	acceptance, e := svc.backupRecomputeAcceptance()
+	if e != nil {
+		return r, e
+	}
+	r.Recovery["acceptance_revalidation"] = acceptance
+	if e = svc.backupPublishSourcePaths(stage, destination); e != nil {
+		return r, e
+	}
+	if e = backupIntegrity(db); e != nil {
+		return r, e
+	}
+	r.After, e = backupInventory(db)
+	if e != nil {
+		return r, e
+	}
+	if _, e = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); e != nil {
+		return r, e
+	}
+	if e = db.Close(); e != nil {
+		return r, e
+	}
+	if e = ctx.Err(); e != nil {
+		return r, e
+	}
+	r.Status = "RESTORED_RECONCILIATION_REQUIRED"
+	r.Finished = Now()
+	r.DurationMS = time.Since(start).Milliseconds()
+	if e = backupWrite(filepath.Join(stage, "restore-report.json"), Bytes(r)); e != nil {
+		return r, e
+	}
+	if e = os.Rename(stage, destination); e != nil {
+		return r, e
+	}
+	return r, nil
+}
