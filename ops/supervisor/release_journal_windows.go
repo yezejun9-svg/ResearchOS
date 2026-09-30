@@ -52,6 +52,10 @@ func releaseHash(v any) string {
 	return hex.EncodeToString(h[:])
 }
 
+// ReleaseDigest is the raw lowercase SHA-256 used by the private journal and
+// effect ledger. Domain Artifact digests use a separate sha256: prefix.
+func ReleaseDigest(v any) string { return releaseHash(v) }
+
 func entryHash(e releaseEntry) string {
 	e.Hash = ""
 	return releaseHash(e)

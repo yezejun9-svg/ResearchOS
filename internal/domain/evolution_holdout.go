@@ -195,10 +195,20 @@ func (s *Service) RegisterEvolutionHoldoutFixture(ctx context.Context, token, pr
 	if err != nil {
 		return err
 	}
-	if _, _, err = decodeEvolutionHoldout(inputsRaw, labelsRaw); err != nil {
+	inputs, _, err := decodeEvolutionHoldout(inputsRaw, labelsRaw)
+	if err != nil {
 		return Fail(422, "GATE_FAILED", "private holdout labels are not objective and distinct")
 	}
-	entry := Object{"revision": evolution.HoldoutRevision, "verifier_id": p.ID, "input_ref": inputsRef, "labels_ref": labelsRef,
+	if inputs.Revision == evolution.HoldoutReleaseRevision {
+		h, hostErr := s.evolutionCurrent(tx, project, x)
+		if hostErr != nil {
+			return hostErr
+		}
+		if h["release_mechanism"] != releaseFixtureMechanism || h["os_service_qualified"] != false {
+			return Fail(422, "GATE_FAILED", "R2 private revision requires explicit native fixture host")
+		}
+	}
+	entry := Object{"revision": inputs.Revision, "verifier_id": p.ID, "input_ref": inputsRef, "labels_ref": labelsRef,
 		"inputs_hash": Digest(inputsRaw), "labels_hash": Digest(labelsRaw), "plan_hash": Hash(evolutionPlan(x)),
 		"stable_hash": x["stable_artifact_ref"].(map[string]any)["content_hash"], "candidate_hash": x["candidate_artifact_ref"].(map[string]any)["content_hash"],
 		"public_suite_hash": Digest(evolution.Bytes(evolution.Suite())), "policy_hash": Digest(evolution.Bytes(evolution.Policy())), "model_revision": "NONE"}
@@ -260,7 +270,7 @@ func (s *Service) EvaluateEvolutionHoldoutFixture(ctx context.Context, token, pr
 		return nil, err
 	}
 	inputs, labels, err := decodeEvolutionHoldout(inputsRaw, labelsRaw)
-	if err != nil || frozen["inputs_hash"] != Digest(inputsRaw) || frozen["labels_hash"] != Digest(labelsRaw) {
+	if err != nil || frozen["revision"] != inputs.Revision || frozen["inputs_hash"] != Digest(inputsRaw) || frozen["labels_hash"] != Digest(labelsRaw) {
 		return nil, Fail(422, "GATE_FAILED", "frozen private holdout changed")
 	}
 	_, stable, err := s.evolutionBytes(tx, project, x["stable_artifact_ref"].(map[string]any))
@@ -321,7 +331,7 @@ func (s *Service) EvaluateEvolutionHoldoutFixture(ctx context.Context, token, pr
 }
 
 func evolutionHoldoutSummary(v supervisor.HoldoutVerdict) Object {
-	return Object{"revision": evolution.HoldoutRevision, "measurement_mode": "FIXTURE", "model_revision": "NONE", "total": v.Total,
+	return Object{"revision": v.Revision, "measurement_mode": "FIXTURE", "model_revision": "NONE", "total": v.Total,
 		"baseline_correct": v.BaselineCorrect, "candidate_correct": v.CandidateCorrect, "outcomes_equal": v.OutcomesEqual, "gain": v.Gain}
 }
 
@@ -338,8 +348,17 @@ func (s *Service) evolutionHoldoutVerdict(ctx context.Context, tx *sql.Tx, proje
 	if err != nil || !present {
 		return nil, "", Fail(422, "GATE_FAILED", "private holdout result missing")
 	}
-	if frozen["revision"] != evolution.HoldoutRevision || frozen["model_revision"] != "NONE" || frozen["plan_hash"] != Hash(evolutionPlan(x)) || frozen["stable_hash"] != x["stable_artifact_ref"].(map[string]any)["content_hash"] || frozen["candidate_hash"] != x["candidate_artifact_ref"].(map[string]any)["content_hash"] || frozen["public_suite_hash"] != Digest(evolution.Bytes(evolution.Suite())) || frozen["policy_hash"] != Digest(evolution.Bytes(evolution.Policy())) || evaluated["plan_hash"] != frozen["plan_hash"] || evaluated["verifier_id"] != frozen["verifier_id"] {
+	if !evolution.ValidHoldoutRevision(Str(frozen, "revision")) || frozen["model_revision"] != "NONE" || frozen["plan_hash"] != Hash(evolutionPlan(x)) || frozen["stable_hash"] != x["stable_artifact_ref"].(map[string]any)["content_hash"] || frozen["candidate_hash"] != x["candidate_artifact_ref"].(map[string]any)["content_hash"] || frozen["public_suite_hash"] != Digest(evolution.Bytes(evolution.Suite())) || frozen["policy_hash"] != Digest(evolution.Bytes(evolution.Policy())) || evaluated["plan_hash"] != frozen["plan_hash"] || evaluated["verifier_id"] != frozen["verifier_id"] {
 		return nil, "", Fail(422, "GATE_FAILED", "private holdout version or candidate binding changed")
+	}
+	if frozen["revision"] == evolution.HoldoutReleaseRevision {
+		h, hostErr := s.evolutionCurrent(tx, project, x)
+		if hostErr != nil {
+			return nil, "", hostErr
+		}
+		if h["release_mechanism"] != releaseFixtureMechanism || h["os_service_qualified"] != false {
+			return nil, "", Fail(422, "GATE_FAILED", "R2 private revision host changed")
+		}
 	}
 	if err = s.evolutionHoldoutVerifierCurrent(tx, project, x, Str(frozen, "verifier_id")); err != nil {
 		return nil, "", err
@@ -362,6 +381,9 @@ func (s *Service) evolutionHoldoutVerdict(ctx context.Context, tx *sql.Tx, proje
 	inputs, labels, err := decodeEvolutionHoldout(inputsRaw, labelsRaw)
 	if err != nil {
 		return nil, "", Fail(422, "GATE_FAILED", "private holdout objective labels invalid")
+	}
+	if inputs.Revision != frozen["revision"] {
+		return nil, "", Fail(422, "GATE_FAILED", "private holdout revision differs from frozen binding")
 	}
 	var proof supervisor.HoldoutProof
 	if err = json.Unmarshal(proofRaw, &proof); err != nil {
