@@ -41,7 +41,7 @@ python tests/jev/protected/run.py
 ```
 
 The runner records the pre-run source revision/manifest, Windows/Go versions,
-exact command, raw logs and all **40** frozen assertions in `expected.json` under
+exact command, raw logs and all **41** frozen assertions in `expected.json` under
 `execution/receipts/W11/protected/<run_id>`. Missing/duplicate/malformed assertions,
 source drift, test errors and incorrect scope fields fail the runner. It makes no
 network or model calls and propagates no Jev/Typesafe environment credentials.

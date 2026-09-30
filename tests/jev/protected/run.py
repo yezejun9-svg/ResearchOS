@@ -31,8 +31,8 @@ def main():
         raise SystemExit('pinned Go 1.27.1 required')
     inventory = json.loads((ROOT / 'tests/jev/protected/expected.json').read_text(encoding='utf-8'))
     expected = [item for items in inventory.values() for item in items]
-    if len(expected) != 40 or len(set(expected)) != 40:
-        raise SystemExit('exact frozen 40-assertion inventory required')
+    if len(expected) != 41 or len(set(expected)) != 41:
+        raise SystemExit('exact frozen 41-assertion inventory required')
     run_id = str(uuid.uuid4())
     out = ROOT / 'execution/receipts/W11/protected' / run_id
     out.mkdir(parents=True)
