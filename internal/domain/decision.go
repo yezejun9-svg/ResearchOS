@@ -15,9 +15,6 @@ var decisionOperations = map[string]bool{"recordDecision": true, "getDecisionRec
 
 func init() {
 	for op := range decisionOperations {
-		if op == "recordQualificationResult" {
-			continue
-		}
 		implemented[op] = true
 	}
 }
@@ -29,8 +26,6 @@ func (s *Service) decisionOperation(tx *sql.Tx, p Principal, project, id string,
 	case "createQualification":
 		o, e := s.createQualification(tx, p, project, b)
 		return o, "Qualification", 201, e
-	case "recordQualificationResult":
-		return nil, "", 0, Fail(503, "RESOURCE_UNAVAILABLE", "independent protected evaluation provenance is required; client statistics cannot grant qualification")
 	}
 	return nil, "", 0, Fail(503, "RESOURCE_UNAVAILABLE", "decision operation unavailable")
 }

@@ -126,5 +126,5 @@ func TestW11RawReuse(t *testing.T) {
 	altered["evidence_refs"] = []any{Ref(extra, "Artifact")}
 	_, e = f.s.sealDecisionEnvelope(tx, p, f.project, altered, env)
 	w11Assert(t, "JEV-RAW-REUSE-PROVENANCE", true, e != nil, errorString(e))
-	w11Assert(t, "QUAL-RESULT-DEFERRED", false, implemented["recordQualificationResult"], "protected result admission is not advertised as implemented")
+	w11Assert(t, "QUAL-RESULT-TRUSTED-ONLY", true, implemented["recordQualificationResult"], "result admission requires an independent protected service proof")
 }
