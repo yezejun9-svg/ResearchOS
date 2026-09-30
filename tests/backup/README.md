@@ -8,4 +8,6 @@
 
 当前原生演练并未进行 Windows 重启/隔夜（W19），未运行外部模型（W05/W12），未取得 W17 受限产物备份资格。自动启动迁移拦截器需根 owner 合入 `ops/restore/guard-proposal.patch` 才覆盖现有 Service.New。执行者只提供 `GLOBAL_EVIDENCE_V1_CANDIDATE`，独立 Verifier 签发最终门。
 
-别名恢复追加 6 个真实注册路径断言：./、Windows 大小写、混合分隔符各有同内容成功和异内容拒绝。通过 RegisterLocalRoot/CaptureLocalSnapshot 建立快照；成功后保留原始路径与产物，冲突返回 RESTORE_SOURCE_CONFLICT 且目标不发布，两者均核对源数据与加密备份包未改变。恢复仅复用本次创建、文件身份匹配且 hash/bytes 一致的普通文件。总清单为 32 个断言；修复回执可用 --receipt-subdir alias-repair 单独归档。
+别名恢复追加 6 个真实注册路径断言：./、Windows 大小写、混合分隔符各有同内容成功和异内容拒绝。通过 RegisterLocalRoot/CaptureLocalSnapshot 建立快照；成功后保留原始路径与产物，冲突返回 RESTORE_SOURCE_CONFLICT 且目标不发布，两者均核对源数据与加密备份包未改变。恢复仅复用本次创建、文件身份匹配且 hash/bytes 一致的普通文件。总清单为 33 个断言；修复回执可用 --receipt-subdir alias-repair 单独归档。
+
+额外原生身份回归覆盖：已创建文件改名后，在原路径重新创建相同字节的新文件，恢复必须拒绝。Windows 身份从创建/读取的打开句柄立即获取，不能缓存延迟按路径取 ID 的 Lstat 结果；重复项的身份与 bytes 通过同一读取句柄验证。

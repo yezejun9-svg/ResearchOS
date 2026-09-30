@@ -150,3 +150,32 @@ func TestW18SourceAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestW18SourceReplacement(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "item.txt")
+	raw := []byte("same bytes, different file")
+	hash := Digest(raw)
+	written := map[string]backupSourceFile{}
+	if err := backupWriteSource(target, raw, hash, written); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(target, target+".preserved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := os.Open(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := replacement.Stat()
+	closeErr := replacement.Close()
+	if err != nil || closeErr != nil {
+		t.Fatal(err, closeErr)
+	}
+	identityChanged := !os.SameFile(written[target].info, info)
+	err = backupWriteSource(target, raw, hash, written)
+	backupAssert(t, "W18-ALIAS-REPLACED-IDENTITY", true, identityChanged && err != nil && strings.Contains(err.Error(), "RESTORE_SOURCE_CONFLICT"),
+		Object{"native_identity_changed": identityChanged, "same_bytes": true, "error": fmt.Sprint(err)})
+}

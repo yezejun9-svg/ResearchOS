@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,11 +96,23 @@ type backupSourceFile struct {
 // file (including Windows case aliases), but may only share identical content.
 // An existing file is reusable only if this restore created that exact file.
 func backupWriteSource(target string, raw []byte, hash string, written map[string]backupSourceFile) error {
-	err := backupWrite(target, raw)
+	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err == nil {
-		info, err := os.Lstat(target)
+		if _, err = file.Write(raw); err == nil {
+			err = file.Sync()
+		}
+		// File.Stat freezes the identity from this open handle. On Windows,
+		// Lstat may defer loading the file ID until SameFile reopens its path.
+		info, statErr := file.Stat()
+		closeErr := file.Close()
 		if err != nil {
 			return err
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if closeErr != nil {
+			return closeErr
 		}
 		written[target] = backupSourceFile{info: info, hash: hash}
 		return nil
@@ -111,12 +124,23 @@ func backupWriteSource(target string, raw []byte, hash string, written map[strin
 	if err != nil || !info.Mode().IsRegular() {
 		return fmt.Errorf("RESTORE_SOURCE_CONFLICT")
 	}
+	file, err = os.Open(target)
+	if err != nil {
+		return fmt.Errorf("RESTORE_SOURCE_CONFLICT")
+	}
+	defer file.Close()
+	info, err = file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return fmt.Errorf("RESTORE_SOURCE_CONFLICT")
+	}
 	for _, prior := range written {
 		if os.SameFile(prior.info, info) {
 			if prior.hash != hash {
 				return fmt.Errorf("RESTORE_SOURCE_CONFLICT")
 			}
-			actual, err := os.ReadFile(target)
+			// Identity and bytes must come from the same handle, even if the
+			// pathname is replaced after it is opened.
+			actual, err := io.ReadAll(io.LimitReader(file, int64(len(raw))+1))
 			if err != nil || Digest(actual) != hash || !bytes.Equal(actual, raw) {
 				return fmt.Errorf("RESTORE_SOURCE_CONFLICT")
 			}
