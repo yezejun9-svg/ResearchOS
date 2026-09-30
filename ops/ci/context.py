@@ -54,6 +54,8 @@ def version_manifest():
             "external_services": {"status": "NOT_APPLICABLE", "reason": "No external service or provider is used."}}
 
 def main():
+    if os.getenv('RESEARCHOS_TASK_ID') == 'W17':
+        return subprocess.call([sys.executable, "-X", "utf8", str(ROOT / "tests/security/c02_fixture.py"), *sys.argv[1:]])
     if os.getenv('RESEARCHOS_TASK_ID') == 'W12':
         from resources import main as resources_main
         return resources_main('test.context')

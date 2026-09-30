@@ -86,6 +86,8 @@ def run(command, evidence, timeout=180):
 
 def main():
     task = os.getenv("RESEARCHOS_TASK_ID", "W09")
+    if task == "W17":
+        return subprocess.call([sys.executable, "-X", "utf8", str(ROOT / "tests/security/c02_fixture.py"), *sys.argv[1:]])
     if task == "W08":
         import research
         return research.main("test.research.fixture")
