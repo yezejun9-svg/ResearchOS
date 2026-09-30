@@ -30,6 +30,13 @@ UNSAFE_BYTES = (b"C:" + bytes((92,)) + b"Users" + bytes((92,)),
                 ("D:" + chr(92) + "作品集" + chr(92)).encode(),
                 ("D:" + chr(47) + "作品集" + chr(47)).encode())
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
+FROZEN_DIRS = (
+    "adapters", "apps", "bootstrap", "contracts", "evaluation", "internal",
+    "migrations", "ops", "qualification", "release", "spec", "tests",
+    "docs/installation", "execution/command_dispatcher",
+)
+FROZEN_ROOT_FILES = {"go.mod", "go.sum", "go.work", "go.work.sum"}
+GENERATED_DIRS = {".git", ".local", "node_modules", "dist", "__pycache__"}
 
 
 def digest(data: bytes) -> str:
@@ -38,6 +45,73 @@ def digest(data: bytes) -> str:
 
 def canonical(value) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def frozen_path(relative: str) -> bool:
+    parts = Path(relative).parts
+    if any(part in GENERATED_DIRS for part in parts):
+        return False
+    return relative in FROZEN_ROOT_FILES or any(
+        relative == directory or relative.startswith(directory + "/") for directory in FROZEN_DIRS
+    )
+
+
+def check_frozen_inputs(root: Path, previous=None):
+    """Refuse dirty, missing, or untracked build/package inputs, including ignored files."""
+    oid_format = run(["git", "rev-parse", "--show-object-format"], root).strip()
+    if oid_format not in ("sha1", "sha256"):
+        raise RuntimeError("unsupported Git object format")
+    tree = subprocess.run(["git", "ls-tree", "-r", "-z", "HEAD"], cwd=root, capture_output=True, check=True).stdout
+    expected = {}
+    for entry in tree.split(b"\0"):
+        if not entry:
+            continue
+        meta, name = entry.split(b"\t", 1)
+        relative = name.decode("utf-8")
+        if frozen_path(relative):
+            mode, kind, oid = meta.decode("ascii").split()
+            if kind != "blob" or mode not in ("100644", "100755"):
+                raise RuntimeError(f"non-regular frozen Git input: {relative}")
+            expected[relative] = oid
+    actual = set()
+    roots = [root / directory for directory in FROZEN_DIRS]
+    for base in roots:
+        if not base.is_dir() or base.is_symlink():
+            raise RuntimeError(f"frozen input directory unavailable: {base.relative_to(root)}")
+        for current, dirs, files in os.walk(base, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in GENERATED_DIRS]
+            for directory in dirs:
+                if (Path(current) / directory).is_symlink():
+                    raise RuntimeError(f"symlink in frozen input: {(Path(current) / directory).relative_to(root)}")
+            for name in files:
+                path = Path(current) / name
+                relative = path.relative_to(root).as_posix()
+                if not frozen_path(relative):
+                    continue
+                if path.is_symlink() or not path.is_file() or relative not in expected:
+                    raise RuntimeError(f"untracked or non-regular frozen input: {relative}")
+                raw = path.read_bytes()
+                oid = hashlib.new(oid_format, f"blob {len(raw)}\0".encode() + raw).hexdigest()
+                if oid != expected[relative]:
+                    raise RuntimeError(f"dirty frozen Git input: {relative}")
+                actual.add(relative)
+    for relative in FROZEN_ROOT_FILES:
+        path = root / relative
+        if path.exists() or relative in expected:
+            if path.is_symlink() or not path.is_file() or relative not in expected:
+                raise RuntimeError(f"untracked or missing frozen root input: {relative}")
+            raw = path.read_bytes()
+            oid = hashlib.new(oid_format, f"blob {len(raw)}\0".encode() + raw).hexdigest()
+            if oid != expected[relative]:
+                raise RuntimeError(f"dirty frozen Git input: {relative}")
+            actual.add(relative)
+    missing = set(expected) - actual
+    if missing:
+        raise RuntimeError(f"missing frozen Git input: {sorted(missing)[0]}")
+    snapshot = digest(canonical(expected))
+    if previous is not None and snapshot != previous:
+        raise RuntimeError("frozen Git inputs changed during build")
+    return snapshot
 
 
 def run(argv, cwd: Path, env=None) -> str:
@@ -185,11 +259,12 @@ def command_requirements(files: dict[str, bytes]):
 
 
 def build(root: Path, output: Path, lock_path: Path):
+    frozen = check_frozen_inputs(root)
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
     go = checked_tool(lock, "go")
     node = checked_tool(lock, "node")
     npm = checked_tool(lock, "npm_cli")
-    env = dict(os.environ, GOTOOLCHAIN="local", GOENV="off", GOPROXY="off", GOSUMDB="off", CGO_ENABLED="0")
+    env = dict(os.environ, GOTOOLCHAIN="local", GOENV="off", GOPROXY="off", GOSUMDB="off", CGO_ENABLED="0", GOWORK="off", GOFLAGS="-mod=mod", NODE_OPTIONS="")
     for name, tool, argv in (("go", go, [go, "version"]), ("node", node, [node, "--version"]),
                              ("npm_cli", npm, [node, npm, "--version"])):
         if run(argv, root, env).strip() != lock["tools"][name]["version_output"]:
@@ -212,6 +287,7 @@ def build(root: Path, output: Path, lock_path: Path):
     go_modules, go_gaps = module_licenses(go, root, env, files)
     npm_modules, npm_gaps = npm_licenses(root, files)
     command_scope = command_requirements(files)
+    check_frozen_inputs(root, frozen)
     commit = run(["git", "rev-parse", "HEAD"], root).strip()
     source_hash = digest(canonical({name: digest(raw) for name, raw in sorted(files.items()) if not name.startswith(("bin/", "web/dist/", "licenses/"))}))
     migration_names = sorted(p.name for p in (root / "migrations/sqlite").glob("[0-9][0-9][0-9][0-9]_*.sql"))
