@@ -27,3 +27,5 @@ This runner does not read/create holdout data or grant qualification. W11-G02/G0
 The host prompt contains current authorized text/strict JSON bodies with exact artifact hashes, bounded to 256 KiB per artifact and 1 MiB aggregate input. Binary, oversized, invalid UTF-8/JSON and protected-lineage inputs are rejected before calling. Visibility and current inputs/rubric/evidence are rechecked after network IO. Raw envelope sealing uses the canonical seal/reuse path and preserves producer/input/source provenance. The protected-result operation remains DEFERRED, even though the rejecting handler exists.
 
 Choice confidence is independent of the selected-option probability, as documented at https://docs.typesafe.ai/confidence. Both remain bounded; the selected option must have maximal probability. The frozen confidence threshold remains 0.8.
+
+Use --replay-from <original live run> instead of --authorized-live for offline reanalysis. This mode reads no credential, makes no provider calls, binds all 60 requests and raw input hashes, and preserves original live reports. It does not create new evaluation samples.
