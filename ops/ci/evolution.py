@@ -15,7 +15,7 @@ CASE_ASSERTIONS = {
     'C09': ['C09-REQUIRED', 'C09-01', 'C09-02'],
     'C10': ['C10-01', 'C10-02', 'C10-03'],
     'C12': ['C12-ADMITTED', 'C12-01', 'C12-02', 'C12-03', 'C12-STABLE'],
-    'C20': ['C20-01', 'C20-02', 'C20-03', 'C20-PRIVATE-MISSING', 'C20-PRIVATE-TAMPER', 'C20-PRIVATE-REVOKED', 'C20-PRIVATE-GRANT-REMOVED'],
+    'C20': ['C20-01', 'C20-02', 'C20-03', 'C20-PRIVATE-MISSING', 'C20-PRIVATE-TAMPER', 'C20-PRIVATE-REVOKED', 'C20-PRIVATE-GRANT-REMOVED', 'C20-PRIVATE-REMOTE-DENIED'],
     'A16': ['A16-PARTIAL-' + v for mode in ('canary_startup_failure', 'canary_hang')
             for v in (mode, 'STABLE-' + mode)],
 }
@@ -68,7 +68,8 @@ def main(command_key='test.evolution'):
     tests = ['TestW16' + ('A16Partial' if c == 'A16' else c) for c in cases]
     if 'C20' in cases:
         tests.extend(('TestW16C20PrivateProofMissing', 'TestW16C20PrivateProofTampered',
-                      'TestW16C20PrivateVerifierRevoked', 'TestW16C20PrivateVerifierGrantRemoved'))
+                      'TestW16C20PrivateVerifierRevoked', 'TestW16C20PrivateVerifierGrantRemoved',
+                      'TestW16C20PrivateRemoteVerifier'))
     out = ROOT / 'execution/receipts/W16' / ('c20-private' if 'C20' in cases else '') / str(uuid.uuid4())
     out.mkdir(parents=True)
     env = {k: v for k, v in os.environ.items() if k.upper() in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'PATH', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'COMSPEC', 'PATHEXT')}
