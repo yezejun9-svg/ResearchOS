@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -33,6 +35,8 @@ type BackupManifest struct {
 	Started           string       `json:"started_at"`
 	SnapshotCompleted string       `json:"snapshot_completed_at"`
 	Migrations        []int        `json:"migrations"`
+	SchemaHash        string       `json:"schema_hash"`
+	Runtime           Object       `json:"runtime_versions"`
 	Files             []BackupFile `json:"files"`
 	Inventory         Object       `json:"inventory"`
 	KeyPolicy         string       `json:"key_policy"`
@@ -125,6 +129,41 @@ func backupMigrations(db *sql.DB) ([]int, error) {
 	}
 	return v, rows.Err()
 }
+
+func backupSchema(db *sql.DB) (string, error) {
+	rows, e := db.Query("SELECT type,name,tbl_name,coalesce(sql,'') FROM sqlite_master ORDER BY type,name")
+	if e != nil {
+		return "", e
+	}
+	defer rows.Close()
+	all := []any{}
+	for rows.Next() {
+		var kind, name, table, sqlText string
+		if e = rows.Scan(&kind, &name, &table, &sqlText); e != nil {
+			return "", e
+		}
+		all = append(all, []any{kind, name, table, sqlText})
+	}
+	return Hash(all), rows.Err()
+}
+func backupRuntime(db *sql.DB) (Object, error) {
+	var sqlite string
+	if e := db.QueryRow("SELECT sqlite_version()").Scan(&sqlite); e != nil {
+		return nil, e
+	}
+	out := Object{"go": runtime.Version(), "sqlite": sqlite, "platform": runtime.GOOS + "/" + runtime.GOARCH, "vcs_revision": nil, "module_versions": Object{}}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, dep := range info.Deps {
+			out["module_versions"].(Object)[dep.Path] = dep.Version
+		}
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.revision" {
+				out["vcs_revision"] = setting.Value
+			}
+		}
+	}
+	return out, nil
+}
 func backupObjects(db *sql.DB, query string) ([]Object, error) {
 	rows, e := db.Query(query)
 	if e != nil {
@@ -142,6 +181,27 @@ func backupObjects(db *sql.DB, query string) ([]Object, error) {
 			return nil, e
 		}
 		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+func backupPortable(db *sql.DB) ([]Object, error) {
+	rows, e := db.Query("SELECT kind,body FROM domain_versions ORDER BY project,kind,id,revision")
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	out := []Object{}
+	for rows.Next() {
+		var kind, raw string
+		if e = rows.Scan(&kind, &raw); e != nil {
+			return nil, e
+		}
+		obj, e := Decode([]byte(raw))
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, Object{"entity_type": kind, "object": obj})
 	}
 	return out, rows.Err()
 }
@@ -263,6 +323,12 @@ func (s *Service) CreateBackup(ctx context.Context, destination string, key []by
 	if m.Migrations, e = backupMigrations(db); e != nil {
 		return m, e
 	}
+	if m.SchemaHash, e = backupSchema(db); e != nil {
+		return m, e
+	}
+	if m.Runtime, e = backupRuntime(db); e != nil {
+		return m, e
+	}
 	if m.Inventory, e = backupInventory(db); e != nil {
 		return m, e
 	}
@@ -289,7 +355,7 @@ func (s *Service) CreateBackup(ctx context.Context, destination string, key []by
 	if e != nil {
 		return m, e
 	}
-	objects, e := backupObjects(db, "SELECT body FROM domain_versions ORDER BY project,kind,id,revision")
+	objects, e := backupPortable(db)
 	if e != nil {
 		return m, e
 	}
@@ -432,6 +498,40 @@ func RestoreBackup(ctx context.Context, directory, destination string, opt Resto
 	}
 	if Hash(actual) != Hash(m.Migrations) {
 		return r, fmt.Errorf("MIGRATION_MANIFEST_MISMATCH")
+	}
+	schema, e := backupSchema(db)
+	if e != nil {
+		return r, e
+	}
+	if schema != m.SchemaHash {
+		return r, fmt.Errorf("BACKUP_SCHEMA_HASH_MISMATCH")
+	}
+	// Types are loaded separately so schema evolution cannot silently reinterpret
+	// stored objects under a changed application contract.
+	types, e := db.Query("SELECT kind,body FROM domain_versions")
+	if e != nil {
+		return r, e
+	}
+	for types.Next() {
+		var kind, raw string
+		if e = types.Scan(&kind, &raw); e != nil {
+			types.Close()
+			return r, e
+		}
+		obj, e := Decode([]byte(raw))
+		if e != nil {
+			types.Close()
+			return r, e
+		}
+		if e = opt.Contracts.Validate(kind, obj); e != nil {
+			types.Close()
+			return r, fmt.Errorf("RESTORE_CONTRACT_INCOMPATIBLE: %s", kind)
+		}
+	}
+	e = types.Err()
+	types.Close()
+	if e != nil {
+		return r, e
 	}
 	r.Before, e = backupInventory(db)
 	if e != nil {
