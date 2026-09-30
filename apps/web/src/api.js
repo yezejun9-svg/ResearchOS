@@ -83,21 +83,33 @@ export function createApi(getToken) {
     const url = new URL(pathFor(operations.streamEvents.path, { projectId }), window.location.origin)
     const headers = { Authorization: `Bearer ${getToken()}`, Accept: 'text/event-stream' }
     if (afterSequence != null) headers['Last-Event-ID'] = String(afterSequence)
-    const response = await fetch(url, { headers, signal, cache: 'no-store' })
-    if (!response.ok) {
-      let detail
-      try { detail = await response.json() } catch { detail = null }
-      throw new ApiError(response.status, detail, 'streamEvents')
-    }
-    if (!response.body) throw new Error('事件流不可用')
-    onOpen()
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
+    // The server sends a comment heartbeat every 15 seconds. Three missed
+    // heartbeats also bound a fetch which never returns response headers.
+    const stale = new AbortController()
+    const streamSignal = AbortSignal.any([signal, stale.signal])
+    const timeout = new ApiError(408, { code: 'STREAM_STALE', message: '事件连接超过 45 秒未响应，正在重新同步' }, 'streamEvents')
+    let lastActivity = Date.now()
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastActivity >= 45000) stale.abort(timeout)
+    }, 1000)
+    let reader
     try {
-      while (!signal.aborted) {
+      const response = await fetch(url, { headers, signal: streamSignal, cache: 'no-store' })
+      if (!response.ok) {
+        let detail
+        try { detail = await response.json() } catch { detail = null }
+        throw new ApiError(response.status, detail, 'streamEvents')
+      }
+      if (!response.body) throw new Error('事件流不可用')
+      onOpen()
+      reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (!streamSignal.aborted) {
         const { done, value } = await reader.read()
+        if (streamSignal.aborted) throw streamSignal.reason
         if (done) throw new Error('事件流已断开')
+        lastActivity = Date.now()
         buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
         let end
         while ((end = buffer.indexOf('\n\n')) >= 0) {
@@ -113,9 +125,16 @@ export function createApi(getToken) {
           if (shouldStop()) throw new ApiError(409, { code: 'EVENT_GAP', message: '事件序号出现缺口' }, 'streamEvents')
         }
       }
+      if (stale.signal.aborted) throw timeout
+    } catch (error) {
+      if (stale.signal.aborted && !signal.aborted) throw timeout
+      throw error
     } finally {
-      try { await reader.cancel() } catch { /* response already aborted */ }
-      reader.releaseLock()
+      clearInterval(watchdog)
+      if (reader) {
+        try { await reader.cancel() } catch { /* response already aborted */ }
+        reader.releaseLock()
+      }
     }
   }
   return { call, stream, principalId: () => principalId, deviceRole: () => deviceRole }

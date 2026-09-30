@@ -206,7 +206,7 @@ def partial_cycle(page, base, token, api, provision_binary, environment, root, r
     return project_id
 
 
-def event_recovery(page, base, project_path, token, api, report, out, other_project):
+def event_recovery(page, base, project_path, token, api, report, out, other_project, other_name="X missing coverage fixture", other_status="PARTIAL"):
     project_id = project_path.rsplit('/', 1)[1]
     project_api = project_path.replace('/p/', '/v1/projects/')
     initial = api(base, token, 'GET', project_api + '/progress')
@@ -270,10 +270,11 @@ def event_recovery(page, base, project_path, token, api, report, out, other_proj
     page.locator('.connection-banner').wait_for(state='hidden', timeout=15000)
     assert page.evaluate('window.readerEvidence.opened - window.readerEvidence.released') <= 1
     page.get_by_role('link', name='W13 浏览器验收 切换项目').click()
-    page.get_by_role('link').filter(has_text='X missing coverage fixture').click()
-    page.get_by_role('heading', name='X missing coverage fixture').wait_for()
+    page.get_by_role('link').filter(has_text=other_name).click()
+    page.get_by_role('heading', name=other_name).wait_for()
     assert '建立可验收的研究目标' not in page.locator('main').inner_text()
-    page.get_by_text('PARTIAL', exact=True).wait_for()
+    if other_status:
+        page.get_by_text(other_status, exact=True).wait_for()
     report['checks'].append('Browser SSE deduplicates real replay event, ignores foreign project frame, cancels gap reader, resets 410 cursor from server snapshot; offline last-sync and project switch remain isolated')
 
 
