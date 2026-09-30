@@ -314,11 +314,18 @@ func (s *Service) checkChange(tx *sql.Tx, p Principal, project string, proposal 
 	return values, nil
 }
 func (s *Service) serverArtifact(tx *sql.Tx, project, principal, kind string, data []byte, refs []any) (Object, error) {
+	return s.serverArtifactMode(tx, project, principal, kind, "FIXTURE", data, refs)
+}
+
+func (s *Service) serverArtifactMode(tx *sql.Tx, project, principal, kind, mode string, data []byte, refs []any) (Object, error) {
+	if mode != "FIXTURE" && mode != "LIVE" {
+		return nil, Fail(422, "GATE_FAILED", "trusted artifact mode required")
+	}
 	u, e := s.upload(tx, Principal{ID: principal}, project, data)
 	if e != nil {
 		return nil, e
 	}
-	o := Merge(Base(project), Object{"run_id": nil, "kind": kind, "evidence_kind": "OBSERVED", "measurement_mode": "FIXTURE", "content_hash": u["content_hash"], "storage_key": u["storage_key"], "media_type": artifactMedia(data), "byte_size": len(data), "input_refs": refs, "source_refs": Empty(), "produced_by": principal, "access_class": "PROJECT", "validity": "CURRENT", "sealed_at": Now()})
+	o := Merge(Base(project), Object{"run_id": nil, "kind": kind, "evidence_kind": "OBSERVED", "measurement_mode": mode, "content_hash": u["content_hash"], "storage_key": u["storage_key"], "media_type": artifactMedia(data), "byte_size": len(data), "input_refs": refs, "source_refs": Empty(), "produced_by": principal, "access_class": "PROJECT", "validity": "CURRENT", "sealed_at": Now()})
 	if e = s.put(tx, "Artifact", o); e != nil {
 		return nil, e
 	}

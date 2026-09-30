@@ -10,14 +10,13 @@ import (
 var runtimeOperations = map[string]bool{}
 
 func init() {
-	for _, id := range strings.Fields("registerRuntime getRuntimeRegistration listRuntimeRegistration getRun listRun heartbeatRun reportRun cancelRun acknowledgeRunCancellation reconcileRun") {
+	for _, id := range strings.Fields("registerRuntime getRuntimeRegistration listRuntimeRegistration qualifyRuntime getRun listRun heartbeatRun reportRun cancelRun acknowledgeRunCancellation reconcileRun") {
 		runtimeOperations[id] = true
 		implemented[id] = true
 	}
 }
 
-// BeginRuntimeQualification is a trusted local construction/qualification entry, not claimTask.
-// It deliberately rejects normal tasks and creates no READY scheduling authority.
+// BeginRuntimeQualification consumes a host-approved private plan in one transaction.
 func (s *Service) BeginRuntimeQualification(ctx context.Context, token, project, taskID, runtimeID, executor string) (Object, string, error) {
 	tx, e := s.DB.BeginTx(ctx, nil)
 	if e != nil {
@@ -31,40 +30,8 @@ func (s *Service) BeginRuntimeQualification(ctx context.Context, token, project,
 	if !p.HasRole("OWNER") || !p.Allowed(project, "", "", false) {
 		return nil, "", Fail(403, "FORBIDDEN", "qualification requires local owner")
 	}
-	task, e := load(tx, project, "Task", taskID)
+	r, lease, e := s.beginRuntimeQualification(tx, p, project, taskID, runtimeID, executor)
 	if e != nil {
-		return nil, "", e
-	}
-	if task["task_type"] != "runtime_qualification" || task["status"] != "DRAFT" || len(Arr(task, "dependency_task_ids")) != 0 {
-		return nil, "", Fail(409, "STATE_CONFLICT", "only dependency-free DRAFT runtime_qualification tasks are admitted here")
-	}
-	var unresolved int
-	if e = tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='Run' AND json_extract(body,'$.task_id')=? AND json_extract(body,'$.status') NOT IN ('SETTLED','FAILED','CANCELLED')", project, taskID).Scan(&unresolved); e != nil {
-		return nil, "", e
-	}
-	if unresolved != 0 {
-		return nil, "", Fail(409, "STATE_CONFLICT", "prior run outcome unresolved; execution ownership retained")
-	}
-	if e = s.taskContext(tx, project, task); e != nil {
-		return nil, "", e
-	}
-	rt, e := load(tx, project, "RuntimeRegistration", runtimeID)
-	if e != nil {
-		return nil, "", e
-	}
-	if rt["status"] == "REVOKED" || rt["status"] == "UNAVAILABLE" {
-		return nil, "", Fail(409, "STATE_CONFLICT", "runtime unavailable")
-	}
-	var roles string
-	var revoked int
-	if e = tx.QueryRow("SELECT roles,revoked FROM auth_principals WHERE id=?", executor).Scan(&roles, &revoked); e != nil || revoked != 0 || !strings.Contains(roles, `"EXECUTOR"`) {
-		return nil, "", Fail(403, "FORBIDDEN", "executor principal unavailable")
-	}
-	r, lease, e := s.createRuntimeRun(tx, project, task, runtimeID, executor)
-	if e != nil {
-		return nil, "", e
-	}
-	if e = s.event(tx, project, "Run", r, p.ID, ID(), "RUN_CHANGED"); e != nil {
 		return nil, "", e
 	}
 	return r, lease, tx.Commit()
@@ -165,6 +132,10 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 		r := Merge(Base(project), b)
 		Merge(r, Object{"status": "REGISTERED", "qualification_ids": Empty(), "health_checked_at": nil, "supports_resume": false, "resume_evidence_ref": nil})
 		return r, "RuntimeRegistration", 201, s.put(tx, "RuntimeRegistration", r)
+	}
+	if op == "qualifyRuntime" {
+		r, e := s.qualifyRuntime(tx, p, project, id, b)
+		return r, "RuntimeRegistration", 200, e
 	}
 	r, e := currentRun(tx, p, project, id)
 	if e != nil {
@@ -274,6 +245,9 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 				return nil, "", 0, e
 			}
 		}
+		if e = s.releaseQualificationReservation(tx, project, r); e != nil {
+			return nil, "", 0, e
+		}
 	case "acknowledgeRunCancellation":
 		o, err := runtimeObservation(tx, project, r)
 		if err != nil {
@@ -286,6 +260,9 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 			return nil, "", 0, e
 		}
 		Merge(r, Object{"status": "CANCELLED", "children_stopped": true, "queue_empty": true, "cancel_confirmed_at": Now(), "ended_at": Now()})
+		if e = s.releaseQualificationReservation(tx, project, r); e != nil {
+			return nil, "", 0, e
+		}
 	case "reconcileRun":
 		o, err := runtimeObservation(tx, project, r)
 		if err != nil {
@@ -335,6 +312,10 @@ func (s *Service) runtimeReceipt(tx *sql.Tx, project string, r Object, value any
 
 // Scope checks are tied to current persisted Run relationships, never only a caller-supplied id.
 func (s *Service) runtimeScope(tx *sql.Tx, p Principal, project, id, op string, b Object) bool {
+	if op == "qualifyRuntime" {
+		_, e := load(tx, project, "RuntimeRegistration", id)
+		return e == nil && p.Allowed(project, "", "", false)
+	}
 	if op == "getTask" {
 		task, e := load(tx, project, "Task", id)
 		return e == nil && p.Allowed(project, id, Str(task, "active_run_id"), false)

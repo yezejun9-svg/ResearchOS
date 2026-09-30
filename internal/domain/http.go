@@ -154,7 +154,11 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		s.writeError(w, cid, Fail(404, "NOT_FOUND", "project or object unavailable"))
 		return
 	}
-	if !s.visible(tx, p, project, b) {
+	requestKind := ""
+	if op.ID == "qualifyRuntime" {
+		requestKind = "RuntimeRegistration"
+	}
+	if !s.visibleAs(tx, p, project, requestKind, b) {
 		s.writeError(w, cid, Fail(403, "FORBIDDEN", "restricted reference unavailable"))
 		return
 	}
@@ -430,7 +434,14 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		s.writeError(w, cid, e)
 		return
 	}
-	if !s.visible(tx, p, project, result) {
+	visibilityKind := kind
+	if op.ID == "listRuntimeRegistration" {
+		visibilityKind = "RuntimeRegistration"
+	}
+	if op.ID == "getRuntimeRegistration" {
+		visibilityKind = "RuntimeRegistration"
+	}
+	if !s.visibleAs(tx, p, project, visibilityKind, result) {
 		s.writeError(w, cid, Fail(403, "FORBIDDEN", "result references restricted content"))
 		return
 	}
@@ -530,19 +541,29 @@ func (s *Service) replayAllowed(tx *sql.Tx, p Principal, op Operation, raw []byt
 	if project := Str(o, "project_id"); project != "" && !p.Allowed(project, "", "", false) && !s.runtimeScope(tx, p, project, Str(o, "id"), op.ID, o) && !(op.ID == "sealArtifact" && s.artifactUseScope(tx, p, project, Str(o, "id"))) {
 		return false
 	}
-	return s.visible(tx, p, Str(o, "project_id"), o)
+	kind := ""
+	if op.ID == "qualifyRuntime" {
+		kind = "RuntimeRegistration"
+	}
+	return s.visibleAs(tx, p, Str(o, "project_id"), kind, o)
 }
 
 func (s *Service) visible(tx *sql.Tx, p Principal, project string, value any) bool {
-	return s.visibleGraph(tx, p, project, value, map[string]bool{})
+	return s.visibleAs(tx, p, project, "", value)
 }
 func (s *Service) visibleGraph(tx *sql.Tx, p Principal, project string, value any, seen map[string]bool) bool {
+	return s.visibleGraphKind(tx, p, project, "", value, seen)
+}
+func (s *Service) visibleAs(tx *sql.Tx, p Principal, project, ownerKind string, value any) bool {
+	return s.visibleGraphKind(tx, p, project, ownerKind, value, map[string]bool{})
+}
+func (s *Service) visibleGraphKind(tx *sql.Tx, p Principal, project, ownerKind string, value any, seen map[string]bool) bool {
 	switch o := value.(type) {
 	case map[string]any:
 		if project == "" {
 			project = Str(o, "project_id")
 		}
-		if !s.workbenchVisible(tx, p, project, o, seen) {
+		if !s.workbenchVisible(tx, p, project, ownerKind, o, seen) {
 			return false
 		}
 		if o["access_class"] == "VERIFIER_ONLY" && (!p.Allowed(project, "", "", true) || !(p.HasRole("OWNER") || p.HasRole("VERIFIER"))) {
@@ -559,19 +580,19 @@ func (s *Service) visibleGraph(tx *sql.Tx, p Principal, project string, value an
 			if !seen[key] {
 				seen[key] = true
 				obj, e := version(tx, project, o)
-				if e == nil && !s.visibleGraph(tx, p, project, obj, seen) {
+				if e == nil && !s.visibleGraphKind(tx, p, project, kind, obj, seen) {
 					return false
 				}
 			}
 		}
 		for _, v := range o {
-			if !s.visibleGraph(tx, p, project, v, seen) {
+			if !s.visibleGraphKind(tx, p, project, ownerKind, v, seen) {
 				return false
 			}
 		}
 	case []any:
 		for _, v := range o {
-			if !s.visibleGraph(tx, p, project, v, seen) {
+			if !s.visibleGraphKind(tx, p, project, ownerKind, v, seen) {
 				return false
 			}
 		}
@@ -587,7 +608,7 @@ func (s *Service) readObject(tx *sql.Tx, p Principal, project, kind, id string) 
 		}
 	}
 	o, e := load(tx, project, kind, id)
-	if e == nil && !s.visible(tx, p, project, o) {
+	if e == nil && !s.visibleAs(tx, p, project, kind, o) {
 		return nil, Fail(404, "NOT_FOUND", "object unavailable")
 	}
 	return o, e
@@ -736,7 +757,7 @@ func (s *Service) page(tx *sql.Tx, p Principal, project string, op Operation, r 
 		// Resolve event/reference permissions after closing rows on the single connection.
 		visible := Empty()
 		for _, v := range items {
-			if s.visible(tx, p, Str(v.(map[string]any), "project_id"), v) {
+			if s.visibleAs(tx, p, Str(v.(map[string]any), "project_id"), kind, v) {
 				visible = append(visible, v)
 			}
 		}

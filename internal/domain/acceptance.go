@@ -80,6 +80,62 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 	if root == executorRoot {
 		return nil, Fail(403, "FORBIDDEN", "executor, alias or delegated authority cannot accept own output")
 	}
+	var qualificationRun string
+	markerError := tx.QueryRow("SELECT run FROM runtime_qualification_runs WHERE project=? AND task=?", project, t["id"]).Scan(&qualificationRun)
+	if markerError != nil && markerError != sql.ErrNoRows {
+		return nil, markerError
+	}
+	qualification := markerError == nil
+	if qualification {
+		if qualificationRun != r["id"] || t["task_type"] != "runtime_qualification" {
+			return nil, Fail(422, "GATE_FAILED", "qualification marker does not bind current task")
+		}
+		plan, planHash, authorRoot, err := qualificationPlan(tx, project, Str(t, "id"), Str(r, "runtime_id"))
+		if err != nil {
+			return nil, err
+		}
+		if root == authorRoot {
+			return nil, Fail(403, "FORBIDDEN", "host author cannot independently accept qualification")
+		}
+		var epoch int64
+		var storedPlan, storedProfile, storedContract, storedInputs, storedContext, storedRoot string
+		if err = tx.QueryRow("SELECT epoch,plan_hash,profile_hash,contract_hash,input_hash,context_bundle,owner_root FROM runtime_qualification_runs WHERE project=? AND task=?", project, t["id"]).Scan(&epoch, &storedPlan, &storedProfile, &storedContract, &storedInputs, &storedContext, &storedRoot); err != nil {
+			return nil, err
+		}
+		if plan["task_hash"] != qualificationTaskHash(t) || storedPlan != planHash || storedContract != c["contract_hash"] || storedInputs != Hash(t["input_refs"]) || storedContext != t["context_bundle_id"] || storedRoot != authorRoot || Hash(epoch) != Hash(r["lease_epoch"]) {
+			return nil, Fail(412, "STALE_INPUT", "frozen qualification binding changed")
+		}
+		if err = effectsReconciled(tx, project, Str(r, "id")); err != nil {
+			return nil, err
+		}
+		if rt, err := load(tx, project, "RuntimeRegistration", Str(r, "runtime_id")); err != nil {
+			return nil, err
+		} else {
+			ref, profile, err := s.currentRuntimeBinding(tx, project, rt)
+			if err != nil {
+				return nil, err
+			}
+			profileBody, err := runtimeProfileBody(tx, project, profile)
+			if err != nil {
+				return nil, err
+			}
+			spec, _ := observation["spec"].(map[string]any)
+			if Hash(ref) != storedProfile || Hash(ref) != Hash(plan["profile_ref"]) || spec["profile_hash"] != Hash(ref) || spec["technical_hash"] != runtimeTechnicalHash(rt) || !runtimeProfileObserved(spec, profileBody) {
+				return nil, Fail(422, "GATE_FAILED", "host observation does not bind frozen profile")
+			}
+			observed := map[string]bool{}
+			for _, v := range Arr(spec, "capabilities") {
+				if c, ok := v.(string); ok {
+					observed[c] = true
+				}
+			}
+			for _, v := range Arr(plan, "required_capabilities") {
+				if !observed[v.(string)] {
+					return nil, Fail(422, "GATE_FAILED", "frozen capability not observed")
+				}
+			}
+		}
+	}
 	if Hash(b["executor_principal_ids"]) != Hash([]any{r["executor_principal_id"]}) {
 		return nil, Fail(422, "GATE_FAILED", "executor identity binding mismatch")
 	}
@@ -101,7 +157,7 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 	if e = tx.QueryRow("SELECT count(*) FROM orchestration_fixtures WHERE project=? AND runtime=?", project, rt["id"]).Scan(&fixture); e != nil {
 		return nil, e
 	}
-	if fixture != 1 || rt["measurement_mode"] != "FIXTURE" || b["measurement_mode"] != "FIXTURE" {
+	if (!qualification && fixture != 1) || rt["measurement_mode"] != "FIXTURE" || b["measurement_mode"] != "FIXTURE" {
 		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "LIVE acceptance requires qualified runtime and verification resources")
 	}
 	if b["independence_basis"] != "DETERMINISTIC_SERVICE" || len(Arr(b, "qualification_ids")) != 0 {
@@ -149,7 +205,7 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 	if len(artifacts) == 0 || Hash(refs) != Hash(b["artifact_refs"]) {
 		return nil, Fail(422, "GATE_FAILED", "exact output artifact vector required")
 	}
-	return Object{"task": t, "run": r, "contract": c, "artifacts": artifacts, "artifact_refs": refs, "policy_revision": state["policy_revision"], "runtime": rt, "authority": root, "observation": observation, "dependency_refs": dependencies}, nil
+	return Object{"task": t, "run": r, "contract": c, "artifacts": artifacts, "artifact_refs": refs, "policy_revision": state["policy_revision"], "runtime": rt, "authority": root, "observation": observation, "dependency_refs": dependencies, "runtime_qualification": qualification}, nil
 }
 
 type preparedAcceptance struct {
@@ -248,14 +304,15 @@ func (s *Service) acceptTask(tx *sql.Tx, p Principal, project string, b Object, 
 	}
 	t := current["task"].(map[string]any)
 	r := current["run"].(map[string]any)
-	ev, e := s.serverArtifact(tx, project, p.ID, "REPORT", Bytes(Object{"task_ref": Ref(t, "Task"), "run_ref": Ref(r, "Run"), "lease_epoch": r["lease_epoch"], "contract_hash": b["contract_hash"], "input_refs": t["input_refs"], "artifact_refs": current["artifact_refs"], "checks": a.checks, "started_at": a.started, "finished_at": a.finished}), Arr(current, "artifact_refs"))
+	mode := Str(current["runtime"].(map[string]any), "measurement_mode")
+	ev, e := s.serverArtifactMode(tx, project, p.ID, "REPORT", mode, Bytes(Object{"task_ref": Ref(t, "Task"), "run_ref": Ref(r, "Run"), "lease_epoch": r["lease_epoch"], "contract_hash": b["contract_hash"], "input_refs": t["input_refs"], "artifact_refs": current["artifact_refs"], "checks": a.checks, "started_at": a.started, "finished_at": a.finished}), Arr(current, "artifact_refs"))
 	if e != nil {
 		return nil, e
 	}
 	for _, v := range a.checks {
 		v.(map[string]any)["evidence_refs"] = []any{Ref(ev, "Artifact")}
 	}
-	receipt := Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now(), "subject_ref": Ref(t, "Task"), "run_id": r["id"], "contract_hash": b["contract_hash"], "input_refs": t["input_refs"], "artifact_refs": current["artifact_refs"], "checks": a.checks, "verdict": a.verdict, "verifier_principal_id": p.ID, "executor_principal_ids": []any{r["executor_principal_id"]}, "independence_basis": "DETERMINISTIC_SERVICE", "blocking_conflict_ids": Empty(), "qualification_ids": Empty(), "policy_revision": current["policy_revision"], "measurement_mode": "FIXTURE", "reason": "Server recomputed frozen deterministic checks; no model or LIVE qualification claimed."}
+	receipt := Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now(), "subject_ref": Ref(t, "Task"), "run_id": r["id"], "contract_hash": b["contract_hash"], "input_refs": t["input_refs"], "artifact_refs": current["artifact_refs"], "checks": a.checks, "verdict": a.verdict, "verifier_principal_id": p.ID, "executor_principal_ids": []any{r["executor_principal_id"]}, "independence_basis": "DETERMINISTIC_SERVICE", "blocking_conflict_ids": Empty(), "qualification_ids": Empty(), "policy_revision": current["policy_revision"], "measurement_mode": mode, "reason": "Server recomputed frozen deterministic checks against trusted runtime evidence."}
 	receipt["receipt_hash"] = Receipt(receipt)
 	if e = s.put(tx, "AcceptanceReceipt", receipt); e != nil {
 		return nil, e
