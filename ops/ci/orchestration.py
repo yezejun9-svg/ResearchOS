@@ -64,7 +64,7 @@ def main():
         'dirty':subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True),
         'argv':cmd, 'cwd':str(ROOT), 'environment_names':sorted(env),
         'versions':{str(p.relative_to(ROOT)):digest(p) for group in ('internal/domain/*.go','migrations/sqlite/*.sql','spec/v2.0/contracts/*.json','go.mod','go.sum','execution/route.json','qualification/core/*.json','tests/orchestration/*','ops/ci/orchestration.py') for p in ROOT.glob(group) if p.is_file()},
-        'executor':'codex:/root/runtime_executor', 'implementation_model':'gpt-6-astra', 'reasoning_effort':'high',
+        'executor':os.getenv('RESEARCHOS_EXECUTOR_ID', 'local:operator'), 'implementation_model':'gpt-6-astra', 'reasoning_effort':'high',
         'runtime_model':None, 'live_provider':None, 'rubric_mode':'deterministic service; unavailable model rubric remains BLOCKED',
         'resource_request_id':'RQ-W05-CLI-POLICY-001', 'scope':'DEVELOPMENT_ONLY',
         'expected_assertion_ids':sorted(expected), 'selector':selector,

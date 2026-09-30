@@ -57,6 +57,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if os.getenv("RESEARCHOS_TASK_ID") == "W06" and os.getenv("RESEARCHOS_CASE_ID") == "A03":
+        sys.exit(subprocess.call([sys.executable, "-X", "utf8", str(ROOT / "ops/ci/orchestration.py"), "--mode", "fixture"]))
     try:
         report = main()
     except Exception as exc:

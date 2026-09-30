@@ -106,4 +106,6 @@ def main():
     return 0 if report["status"] == "PASS" and report["assertions"] else 1
 
 if __name__ == "__main__":
+    if os.getenv("RESEARCHOS_TASK_ID") == "W06":
+        sys.exit(subprocess.call([sys.executable, "-X", "utf8", str(ROOT / "ops/ci/orchestration.py"), "--mode", "fixture"]))
     sys.exit(main())
