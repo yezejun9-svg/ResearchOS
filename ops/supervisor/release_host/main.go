@@ -1,0 +1,56 @@
+//go:build windows
+
+// release_host is a same-user disposable R2 fixture process. It has no LIVE
+// authority and never installs or controls a Windows service.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"researchos.local/research-os/adapters/protectedstore"
+	"researchos.local/research-os/internal/domain"
+	"researchos.local/research-os/internal/store"
+)
+
+func run() error {
+	dbPath := flag.String("db", "", "fixture authority SQLite path")
+	contracts := flag.String("contracts", "", "contracts directory")
+	migration := flag.String("migration", "", "migration path")
+	private := flag.String("private", "", "existing CanaryStore root")
+	project := flag.String("project", "", "project")
+	operation := flag.String("operation", "", "operation")
+	flag.Parse()
+	if *dbPath == "" || *contracts == "" || *migration == "" || *private == "" || *project == "" || *operation == "" {
+		return fmt.Errorf("R2_FIXTURE_ARGUMENTS_REQUIRED")
+	}
+	protected, err := protectedstore.OpenCanary(*private)
+	if err != nil {
+		return err
+	}
+	defer protected.Close()
+	db, err := store.Open(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	svc, err := domain.New(db, *contracts, *migration)
+	if err != nil {
+		return err
+	}
+	svc.Protected = protected
+	result, err := svc.RunEvolutionReleaseFixtureOnce(context.Background(), *project, *operation)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(result)
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}

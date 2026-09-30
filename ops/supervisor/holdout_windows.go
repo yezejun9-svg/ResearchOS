@@ -57,6 +57,7 @@ type BenefitRow struct {
 }
 
 type HoldoutVerdict struct {
+	Revision         string       `json:"revision"`
 	Total            int          `json:"total"`
 	BaselineCorrect  int          `json:"baseline_correct"`
 	CandidateCorrect int          `json:"candidate_correct"`
@@ -102,7 +103,7 @@ func invokeHoldout(ctx context.Context, binary []byte, c evolution.Case) (Holdou
 // EvaluateHoldout executes both sealed builds for each private question. Each
 // invocation creates a new zero-capability AppContainer and sees one case only.
 func EvaluateHoldout(ctx context.Context, stable, candidate []byte, inputs evolution.HoldoutInputs, labelsHash, planHash string) (HoldoutProof, error) {
-	proof := HoldoutProof{Revision: evolution.HoldoutRevision, ModelRevision: "NONE", PlanHash: planHash,
+	proof := HoldoutProof{Revision: inputs.Revision, ModelRevision: "NONE", PlanHash: planHash,
 		InputsHash: evolution.Digest(evolution.Bytes(inputs)), LabelsHash: labelsHash,
 		StableHash: evolution.Digest(stable), CandidateHash: evolution.Digest(candidate),
 		PublicSuite: evolution.Digest(evolution.Bytes(evolution.Suite())), PolicyHash: evolution.Digest(evolution.Bytes(evolution.Policy()))}
@@ -143,11 +144,11 @@ func checkHoldoutInvocation(v HoldoutInvocation, c evolution.Case, buildHash str
 // CheckHoldout recomputes the objective outcome from private raw processes;
 // model self-scores are retained as evidence but never count as improvement.
 func CheckHoldout(proof HoldoutProof, inputs evolution.HoldoutInputs, labels evolution.HoldoutLabels, planHash, stableHash, candidateHash string) (HoldoutVerdict, error) {
-	v := HoldoutVerdict{OutcomesEqual: true}
+	v := HoldoutVerdict{Revision: inputs.Revision, OutcomesEqual: true}
 	if err := evolution.ValidateHoldout(inputs, labels); err != nil {
 		return v, err
 	}
-	if proof.Revision != evolution.HoldoutRevision || proof.ModelRevision != "NONE" || proof.PlanHash != planHash || proof.InputsHash != evolution.Digest(evolution.Bytes(inputs)) || proof.LabelsHash != evolution.Digest(evolution.Bytes(labels)) || proof.StableHash != stableHash || proof.CandidateHash != candidateHash || proof.PublicSuite != evolution.Digest(evolution.Bytes(evolution.Suite())) || proof.PolicyHash != evolution.Digest(evolution.Bytes(evolution.Policy())) || len(proof.Pairs) != len(inputs.Cases) {
+	if proof.Revision != inputs.Revision || proof.ModelRevision != "NONE" || proof.PlanHash != planHash || proof.InputsHash != evolution.Digest(evolution.Bytes(inputs)) || proof.LabelsHash != evolution.Digest(evolution.Bytes(labels)) || proof.StableHash != stableHash || proof.CandidateHash != candidateHash || proof.PublicSuite != evolution.Digest(evolution.Bytes(evolution.Suite())) || proof.PolicyHash != evolution.Digest(evolution.Bytes(evolution.Policy())) || len(proof.Pairs) != len(inputs.Cases) {
 		return v, fmt.Errorf("private proof version, frozen inputs, or build binding changed")
 	}
 	seenSID := map[string]bool{}

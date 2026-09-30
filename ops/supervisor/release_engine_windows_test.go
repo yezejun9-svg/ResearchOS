@@ -78,7 +78,7 @@ func openFixtureEngine(t *testing.T, root string, driver ProcessDriver) (*Releas
 }
 
 func fixtureAdmission(s ReleaseState, candidate string) ReleaseAdmission {
-	return ReleaseAdmission{Operation: "operation-1", ExpectedEpoch: s.Epoch, StableSHA256: s.Active, CandidateSHA256: candidate,
+	return ReleaseAdmission{Project: "fixture-project", CandidateID: "fixture-candidate", AcceptanceID: "fixture-acceptance", ExecutionSHA256: releaseHash("fixture-execution"), Operation: "operation-1", ExpectedEpoch: s.Epoch, StableSHA256: s.Active, CandidateSHA256: candidate,
 		BackupReceiptSHA256: releaseHash("isolated-fixture-backup"), VerifierReceiptSHA256: releaseHash("independent-fixture-review"),
 		HoldoutProofSHA256: releaseHash("private-fixture-proof"), SameSchema: true, NoUnknownEffects: true, ExpiresUTC: time.Now().Add(time.Hour).UTC()}
 }
@@ -257,7 +257,7 @@ func TestReleaseAdmissionRevokedBeforeDispatch(t *testing.T) {
 	}
 	defer j.Close()
 	stable, candidate := releaseHash("stable"), releaseHash("candidate")
-	a := ReleaseAdmission{Operation: "op", ExpectedEpoch: 1, StableSHA256: stable, CandidateSHA256: candidate, BackupReceiptSHA256: releaseHash("backup"), VerifierReceiptSHA256: releaseHash("review"), HoldoutProofSHA256: releaseHash("holdout"), SameSchema: true, NoUnknownEffects: true, ExpiresUTC: time.Now().Add(time.Hour).UTC()}
+	a := ReleaseAdmission{Project: "project", CandidateID: "candidate", AcceptanceID: "acceptance", ExecutionSHA256: releaseHash("execution"), Operation: "op", ExpectedEpoch: 1, StableSHA256: stable, CandidateSHA256: candidate, BackupReceiptSHA256: releaseHash("backup"), VerifierReceiptSHA256: releaseHash("review"), HoldoutProofSHA256: releaseHash("holdout"), SameSchema: true, NoUnknownEffects: true, ExpiresUTC: time.Now().Add(time.Hour).UTC()}
 	s := ReleaseState{Epoch: 2, Phase: "PREPARED", Operation: "op", Active: stable, ActivePath: filepath.Join(root, "stable.exe"), LastGood: stable, LastGoodPath: filepath.Join(root, "stable.exe"), Candidate: candidate, CandidatePath: filepath.Join(root, "candidate.exe"), Data: root, Admission: releaseHash(a), AdmissionBundle: &a, PID: 123, CreatedNS: 456, ImageSHA256: stable}
 	if e = j.Append(s); e != nil {
 		t.Fatal(e)
