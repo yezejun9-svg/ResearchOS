@@ -180,6 +180,23 @@ func CheckHoldout(proof HoldoutProof, inputs evolution.HoldoutInputs, labels evo
 			CandidateRubric: candidate.Rubric, InputHash: pair.Baseline.InputHash})
 	}
 	v.Total = len(inputs.Cases)
-	v.Gain = v.CandidateCorrect > v.BaselineCorrect && v.BaselineCorrect == v.Total
+	v.Gain = objectiveHoldoutGain(v.Rows)
 	return v, nil
+}
+
+// Improvement requires a newly correct objective answer without losing any
+// answer the stable build already got right. Self-scores never enter this gate.
+func objectiveHoldoutGain(rows []BenefitRow) bool {
+	newCorrect := false
+	for _, row := range rows {
+		baselineCorrect := row.BaselineOutcome == row.Expected
+		candidateCorrect := row.CandidateOutcome == row.Expected
+		if baselineCorrect && !candidateCorrect {
+			return false
+		}
+		if !baselineCorrect && candidateCorrect {
+			newCorrect = true
+		}
+	}
+	return newCorrect
 }
