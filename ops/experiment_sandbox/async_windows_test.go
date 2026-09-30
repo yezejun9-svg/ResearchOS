@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -154,4 +155,46 @@ func TestRuntimeSandboxStreamLimit(t *testing.T) {
 		t.Fatalf("stream limit not enforced: size=%d stopped=%v drained=%v err=%v", len(r.Stdout), r.Stopped, r.StreamsDrained, err)
 	}
 	t.Logf("RUNTIME_STREAM_LIMIT bytes=%d stopped=%v drained=%v error=%v", len(r.Stdout), r.Stopped, r.StreamsDrained, err)
+}
+
+func TestRuntimeSandboxQueuedWriteDeadline(t *testing.T) {
+	p, err := Start(context.Background(), runtimeSandboxCommand(t, "wait"), StartOptions{Interactive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := make(chan error, 1)
+	go func() { first <- p.Write(context.Background(), bytes.Repeat([]byte("x"), 64*1024)) }()
+	deadline := time.Now().Add(time.Second)
+	for len(p.writeGate) == 0 {
+		if time.Now().After(deadline) {
+			p.Cancel()
+			t.Fatal("first writer did not acquire gate")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = p.Write(ctx, []byte("queued\n"))
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) || elapsed > 200*time.Millisecond {
+		p.Cancel()
+		t.Fatalf("queued deadline: %v %s", err, elapsed)
+	}
+	select {
+	case <-p.stopped:
+		t.Fatal("queued caller cancellation stopped active writer")
+	default:
+	}
+	p.Cancel()
+	select {
+	case <-first:
+	case <-time.After(time.Second):
+		t.Fatal("blocked first writer did not stop")
+	}
+	r, err := p.Wait(context.Background())
+	if err != nil || !r.Stopped || !r.CleanupComplete {
+		t.Fatalf("cancel cleanup: %+v %v", r, err)
+	}
+	t.Logf("RUNTIME_QUEUED_WRITE deadline_ms=40 elapsed_ms=%d stopped=%v", elapsed.Milliseconds(), r.Stopped)
 }
