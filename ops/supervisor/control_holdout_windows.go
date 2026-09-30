@@ -5,6 +5,7 @@ package supervisor
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -195,8 +196,13 @@ func checkControlInvocation(v ControlInvocation, c evolution.ControlCase, bindin
 	if r.ExitCode != 0 || !r.Stopped || r.TimedOut || !r.StreamsDrained || !r.CleanupComplete || !r.OutputCopied || len(r.Capabilities) != 0 || r.PID == 0 || r.Created == 0 || r.SID == "" || id.PID != r.PID || id.Created != r.Created || id.Job != r.Job || id.SID != r.SID || id.Profile != r.Profile || !strings.EqualFold(v.ImagePath, r.Executable) || !strings.EqualFold(v.ImagePath, filepath.Join(id.StagingDirectory, "input", "control.exe")) || !strings.EqualFold(r.Directory, filepath.Join(id.StagingDirectory, "output")) || len(r.Args) != 2 || r.Args[0] != "--fixture-control-replay" || !strings.EqualFold(r.Args[1], filepath.Join(id.StagingDirectory, "input", "current-case.json")) {
 		return result, fmt.Errorf("CONTROL_NATIVE_PROCESS_PROOF")
 	}
-	if len(v.OutputDatabaseHash) != 71 || len(v.OutputStateHash) != 71 {
-		return result, fmt.Errorf("CONTROL_EXTERNAL_STATE_PROOF")
+	for _, hash := range []string{v.OutputDatabaseHash, v.OutputStateHash} {
+		if !strings.HasPrefix(hash, "sha256:") || len(hash) != 71 {
+			return result, fmt.Errorf("CONTROL_EXTERNAL_STATE_PROOF")
+		}
+		if _, err := hex.DecodeString(hash[7:]); err != nil {
+			return result, fmt.Errorf("CONTROL_EXTERNAL_STATE_PROOF")
+		}
 	}
 	if err := evolution.StrictControlJSON([]byte(v.Raw), &result); err != nil {
 		return result, err
