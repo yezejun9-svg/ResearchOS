@@ -85,14 +85,14 @@ func upgradePath(path string, existing bool) (string, error) {
 		return "", e
 	}
 	if existing {
-		return filepath.EvalSymlinks(abs)
+		return upgradeExistingPath(abs)
 	}
 	if _, e = os.Lstat(abs); !os.IsNotExist(e) {
 		return "", fmt.Errorf("DESTINATION_EXISTS")
 	}
 	ancestor := filepath.Dir(abs)
 	for {
-		resolved, err := filepath.EvalSymlinks(ancestor)
+		resolved, err := upgradeExistingPath(ancestor)
 		if err == nil {
 			rel, err := filepath.Rel(ancestor, abs)
 			if err != nil || !filepath.IsLocal(rel) {
