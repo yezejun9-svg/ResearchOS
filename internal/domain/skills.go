@@ -160,15 +160,30 @@ func (s *Service) validateSkillSources(tx *sql.Tx, project string, b, doc Object
 	}
 	for _, v := range Arr(doc, "conflicts") {
 		entry, ok := v.(map[string]any)
-		if !ok || !conflicts[Str(entry, "conflict_id")] || Str(entry, "resolution") != "UNRESOLVED" && len(Arr(entry, "conditions")) == 0 {
+		if !ok || !conflicts[Str(entry, "conflict_id")] {
 			return Fail(422, "GATE_FAILED", "unresolved conflict or applicability conditions required")
 		}
 		c, e := load(tx, project, "Conflict", Str(entry, "conflict_id"))
 		if e != nil {
 			return e
 		}
-		if c["status"] != "OPEN" || len(Arr(c, "subject_refs")) < 2 {
+		if len(Arr(c, "subject_refs")) < 2 {
 			return Fail(422, "GATE_FAILED", "source conflict record required")
+		}
+		switch c["status"] {
+		case "OPEN":
+			if entry["resolution"] != "UNRESOLVED" {
+				return Fail(422, "GATE_FAILED", "open source conflict must remain unresolved")
+			}
+		case "RESOLVED":
+			if entry["resolution"] != "CONDITIONAL" || len(Arr(entry, "conditions")) == 0 {
+				return Fail(422, "GATE_FAILED", "resolved contradiction requires explicit applicability conditions")
+			}
+			if e := s.resolvedSkillSourceConflict(tx, project, c, entry); e != nil {
+				return e
+			}
+		default:
+			return Fail(422, "GATE_FAILED", "source conflict has no accepted resolution")
 		}
 		for _, v := range Arr(c, "subject_refs") {
 			r := v.(map[string]any)
@@ -178,6 +193,77 @@ func (s *Service) validateSkillSources(tx *sql.Tx, project string, b, doc Object
 		}
 	}
 	return nil
+}
+
+func (s *Service) skillConflictLedgerCurrent(tx *sql.Tx, project string, o Object) error {
+	manifest := map[string]bool{}
+	for _, v := range Arr(o, "source_refs") {
+		r := v.(map[string]any)
+		manifest[Str(r, "entity_type")+":"+Str(r, "id")] = true
+	}
+	disclosed := map[string]bool{}
+	for _, v := range Arr(o, "conflict_ids") {
+		disclosed[v.(string)] = true
+	}
+	rows, e := tx.Query("SELECT body FROM domain_objects WHERE project=? AND kind='Conflict' AND json_extract(body,'$.status') IN ('OPEN','RESOLVED')", project)
+	if e != nil {
+		return e
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		if e = rows.Scan(&raw); e != nil {
+			return e
+		}
+		c, e := Decode([]byte(raw))
+		if e != nil {
+			return e
+		}
+		if !sourceEvidenceConflict(c) {
+			continue
+		}
+		for _, v := range Arr(c, "subject_refs") {
+			r := v.(map[string]any)
+			if manifest[Str(r, "entity_type")+":"+Str(r, "id")] && !disclosed[Str(c, "id")] {
+				return Fail(422, "GATE_FAILED", "relevant source conflict omitted from skill ledger")
+			}
+		}
+	}
+	return rows.Err()
+}
+
+func (s *Service) resolvedSkillSourceConflict(tx *sql.Tx, project string, c, entry Object) error {
+	if !sourceEvidenceConflict(c) || Str(c, "resolution_proposal_id") == "" {
+		return Fail(422, "GATE_FAILED", "formal source conflict resolution required")
+	}
+	state, e := singleton(tx, project, "ProjectState")
+	if e != nil {
+		return e
+	}
+	for _, v := range Arr(state, "current_decision_refs") {
+		ref := v.(map[string]any)
+		d, e := version(tx, project, ref)
+		if e != nil {
+			return e
+		}
+		oldRef, ok := d["subject_ref"].(map[string]any)
+		if !ok || oldRef["entity_type"] != "Conflict" || oldRef["id"] != c["id"] {
+			continue
+		}
+		resolved, e := s.resolvedSourceDecision(tx, project, d, oldRef)
+		if e != nil {
+			return e
+		}
+		if !resolved {
+			continue
+		}
+		for _, condition := range Arr(entry, "conditions") {
+			if condition == d["rationale"] {
+				return nil
+			}
+		}
+	}
+	return Fail(422, "GATE_FAILED", "skill conditions lack current accepted source decision")
 }
 
 func (s *Service) createSkillCandidate(tx *sql.Tx, p Principal, project string, b Object) (Object, error) {
@@ -437,6 +523,9 @@ func (s *Service) acceptSkill(tx *sql.Tx, p Principal, project string, b Object)
 	if e = s.validateSkillSources(tx, project, o, doc); e != nil {
 		return nil, e
 	}
+	if e = s.skillConflictLedgerCurrent(tx, project, o); e != nil {
+		return nil, e
+	}
 	x, experimentReceipt, e := s.skillExperiment(tx, project, o, doc)
 	if e != nil {
 		return nil, e
@@ -499,6 +588,12 @@ func (s *Service) promoteSkill(tx *sql.Tx, project, id string, b Object) (Object
 	}
 	doc, e := s.skillDocument(tx, project, o["content_artifact_ref"].(map[string]any))
 	if e != nil {
+		return nil, e
+	}
+	if e = s.validateSkillSources(tx, project, o, doc); e != nil {
+		return nil, e
+	}
+	if e = s.skillConflictLedgerCurrent(tx, project, o); e != nil {
 		return nil, e
 	}
 	x, _, e := s.skillExperiment(tx, project, o, doc)
