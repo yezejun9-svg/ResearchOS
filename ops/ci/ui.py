@@ -16,12 +16,16 @@ WEB = ROOT / 'apps/web'
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--phase', choices=['core', 'contracts', 'workflow', 'content', 'recovery'], default='core')
-    phase = parser.parse_args().phase
+    parser.add_argument('--scenario', choices=['all', 'freshness'], default='all')
+    args = parser.parse_args()
+    phase, scenario = args.phase, args.scenario
+    if scenario != 'all' and phase != 'recovery':
+        parser.error('freshness scenario requires recovery phase')
     check, case = os.getenv('RESEARCHOS_CHECK_ID', ''), os.getenv('RESEARCHOS_CASE_ID', '')
     allowed = {'core': ['W13-G02', 'C24'], 'contracts': ['W13-G01', 'C17', 'C18'], 'workflow': ['C23'], 'content': ['C25'], 'recovery': ['C26']}
     if os.getenv('RESEARCHOS_TASK_ID') != 'W13' or bool(check) == bool(case) or (check or case) not in allowed[phase]:
         parser.error('one matching W13 task gate or case selector required')
-    expected = json.loads((ROOT / 'tests/ui/expected.json').read_text(encoding='utf-8'))[phase]
+    expected = json.loads((ROOT / 'tests/ui/expected.json').read_text(encoding='utf-8'))[phase if scenario == 'all' else phase + '_' + scenario]
     if not expected or len(expected) != len(set(expected)):
         raise RuntimeError('empty or duplicate expected browser checks')
     run_id = str(uuid.uuid4())
@@ -36,7 +40,7 @@ def main():
                 'spec/v2.0/ui/*.json', 'tests/ui/**/*.go', 'tests/ui/*.py', 'tests/ui/expected.json',
                 'ops/ci/ui.py', 'execution/commands.json', 'go.mod', 'go.sum', 'execution/toolchains/locked.json']
     sources = {p.relative_to(ROOT).as_posix(): digest(p) for pattern in patterns for p in ROOT.glob(pattern) if p.is_file()}
-    before = {'task_id': 'W13', 'run_id': run_id, 'phase': phase, 'check_id': check, 'case_id': case,
+    before = {'task_id': 'W13', 'run_id': run_id, 'phase': phase, 'scenario': scenario, 'check_id': check, 'case_id': case,
               'code_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
               'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'source_manifest': sources,
               'executor_identity': os.getenv('RESEARCHOS_EXECUTOR_ID', 'local:operator'), 'expected_checks': expected,
@@ -50,14 +54,14 @@ def main():
         raise SystemExit('pinned Node or npm ci dependencies unavailable')
     build_command = [str(node), str(vite), 'build']
     command = [sys.executable, '-X', 'utf8', str(ROOT / 'tests/ui/browser_smoke.py')]
-    save('commands.json', [{'argv': build_command, 'cwd': str(WEB)}, {'argv': command, 'cwd': str(ROOT), 'phase': phase}])
+    save('commands.json', [{'argv': build_command, 'cwd': str(WEB)}, {'argv': command, 'cwd': str(ROOT), 'phase': phase, 'scenario': scenario}])
     build = subprocess.run(build_command, cwd=WEB, capture_output=True, timeout=120)
     (out / 'build.stdout.txt').write_bytes(build.stdout)
     (out / 'build.stderr.txt').write_bytes(build.stderr)
     code, report, child = build.returncode, {}, None
     if code == 0:
         try:
-            run = subprocess.run(command, cwd=ROOT, env=dict(os.environ, RESEARCHOS_UI_PHASE=phase), capture_output=True, timeout=480)
+            run = subprocess.run(command, cwd=ROOT, env=dict(os.environ, RESEARCHOS_UI_PHASE=phase, RESEARCHOS_UI_RECOVERY_SCENARIO=scenario), capture_output=True, timeout=480)
             stdout, stderr, code = run.stdout, run.stderr, run.returncode
         except subprocess.TimeoutExpired as error:
             stdout, stderr, code = error.stdout or b'', error.stderr or b'', 124
@@ -76,17 +80,18 @@ def main():
                 break
     actual = report.get('checks', [])
     drift = [p for p, h in sources.items() if not (ROOT / p).is_file() or digest(ROOT / p) != h]
-    passed = code == 0 and report.get('status') == 'PASS' and report.get('phase') == phase and actual == expected and not drift
+    passed = code == 0 and report.get('status') == 'PASS' and report.get('phase') == phase and report.get('scenario', 'all') == scenario and actual == expected and not drift
     if child:
         for name, h in report.get('screenshot_hashes', {}).items():
             if digest(child.parent / name) != h:
                 passed = False
-    rows = [{'assertion_id': f'W13-UI-{phase.upper()}-{i+1:02}', 'expected': value,
+    assertion_phase = phase.upper() if scenario == 'all' else phase.upper() + '-' + scenario.upper()
+    rows = [{'assertion_id': f'W13-UI-{assertion_phase}-{i+1:02}', 'expected': value,
              'actual': actual[i] if i < len(actual) else None, 'status': 'PASS' if passed else 'FAIL',
              'evidence': {'report': child.relative_to(ROOT).as_posix() if child else None, 'check_index': i}}
             for i, value in enumerate(expected)]
     hashes = {p.name: digest(p) for p in out.iterdir() if p.is_file()}
-    save('report.json', {'task_id': 'W13', 'run_id': run_id, 'phase': phase, 'status': 'PASS' if passed else 'FAIL',
+    save('report.json', {'task_id': 'W13', 'run_id': run_id, 'phase': phase, 'scenario': scenario, 'status': 'PASS' if passed else 'FAIL',
                          'exit_code': code, 'assertions': rows, 'assertion_ids': [r['assertion_id'] for r in rows],
                          'expected_checks': expected, 'actual_checks': actual, 'source_drift': drift,
                          'child_report': child.relative_to(ROOT).as_posix() if child else None,

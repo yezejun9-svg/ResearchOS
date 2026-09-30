@@ -9,13 +9,14 @@ STALE = 'C26 silent online SSE expires within 47 seconds, shows stale last-sync,
 RESUME = 'C26 browser lifecycle freeze resumes through a new snapshot and rejects late bytes from the aborted old connection'
 
 
-def recovery_cases(page, base, project_path, owner, api, report, out):
+def recovery_cases(page, base, project_path, owner, api, report, out, freshness_only=False):
     other = api(base, owner, 'POST', '/v1/projects', {
         'name': 'C26 isolated project', 'intent': 'Isolated recovery project', 'facts': [],
         'accepted_scope': ['Local C26 fixture'], 'constraints': [], 'source_document_refs': [],
         'read_snapshot_ids': [], 'source_configs': []})
-    event_recovery(page, base, project_path, owner, api, report, out,
-                   other['project_id'], 'C26 isolated project', None)
+    if not freshness_only:
+        event_recovery(page, base, project_path, owner, api, report, out,
+                       other['project_id'], 'C26 isolated project', None)
     prefix = project_path.replace('/p/', '/v1/projects/')
     # Real server stream is the default. Only the next requested stream can be
     # replaced with an explicitly stalled browser ReadableStream.
@@ -61,15 +62,16 @@ def recovery_cases(page, base, project_path, owner, api, report, out):
     page.wait_for_timeout(1500)
     before = page.locator('.progress-rail').inner_text()
     start = page.evaluate('({...recoveryEvidence, at:Date.now()})')
-    page.wait_for_timeout(47000)
-    idle = page.evaluate('({...recoveryEvidence, at:Date.now()})')
-    assert idle['opens'] == start['opens'] and idle['queries'] == start['queries'], (start, idle)
-    assert idle['heartbeats'] - start['heartbeats'] >= 3, (start, idle)
-    assert before == page.locator('.progress-rail').inner_text()
-    assert not page.locator('.connection-banner').count()
-    report['idle_heartbeat'] = {'before': start, 'after': idle, 'business_progress_unchanged': True}
-    report['checks'].append(IDLE)
-
+    idle = start
+    if not freshness_only:
+        page.wait_for_timeout(47000)
+        idle = page.evaluate('({...recoveryEvidence, at:Date.now()})')
+        assert idle['opens'] == start['opens'] and idle['queries'] == start['queries'], (start, idle)
+        assert idle['heartbeats'] - start['heartbeats'] >= 3, (start, idle)
+        assert before == page.locator('.progress-rail').inner_text()
+        assert not page.locator('.connection-banner').count()
+        report['idle_heartbeat'] = {'before': start, 'after': idle, 'business_progress_unchanged': True}
+        report['checks'].append(IDLE)
     baseline = api(base, owner, 'GET', prefix + '/progress')
     # Give late bytes a valid next sequence: absence of a fence would accept it.
     late = {'id': 'late-aborted-fixture', 'project_id': other['project_id'],
