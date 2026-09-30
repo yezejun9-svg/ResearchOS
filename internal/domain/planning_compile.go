@@ -57,6 +57,9 @@ func (s *Service) compileIntentPlan(tx *sql.Tx, project string, snap, receipt Ob
 		}
 		return nil
 	}
+	if b.Monitor != nil {
+		return s.compileMonitorPlan(tx, owner, project, b, meta, planningGoal, artifactRef.(map[string]any), receipt)
+	}
 	for _, n := range ordered {
 		if !planningNodeSupported(n, meta) {
 			return Fail(422, "GATE_FAILED", "unsupported business node cannot be compiled")

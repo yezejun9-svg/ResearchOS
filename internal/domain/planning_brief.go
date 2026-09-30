@@ -67,6 +67,7 @@ type GoalBrief struct {
 	FailureExits    []string           `json:"failure_exits"`
 	OpenQuestions   []PlanningQuestion `json:"open_questions"`
 	CapabilityGaps  []PlanningGap      `json:"capability_gaps"`
+	Monitor         *MonitorPlan       `json:"monitor,omitempty"`
 }
 type PlanningFact struct {
 	Text       string `json:"text"`
@@ -138,6 +139,10 @@ func parseGoalBrief(raw []byte) (*GoalBrief, error) {
 }
 
 func (s *Service) planningOwner(tx *sql.Tx, project, actor string) (Principal, error) {
+	return intentPrincipal(tx, project, actor, "OWNER")
+}
+
+func intentPrincipal(tx *sql.Tx, project, actor, role string) (Principal, error) {
 	p := Principal{ID: actor}
 	var roles string
 	if e := tx.QueryRow("SELECT roles FROM auth_principals WHERE id=? AND revoked=0", actor).Scan(&roles); e != nil {
@@ -165,7 +170,7 @@ func (s *Service) planningOwner(tx *sql.Tx, project, actor string) (Principal, e
 	if e = constrainRemotePrincipal(tx, &p); e != nil {
 		return p, e
 	}
-	if !p.HasRole("OWNER") || !p.Allowed(project, "", "", false) {
+	if !p.HasRole(role) || !p.Allowed(project, "", "", false) {
 		return p, Fail(403, "FORBIDDEN", "original intent Owner grant no longer current")
 	}
 	return p, nil
@@ -204,6 +209,8 @@ func (s *Service) planningSnapshot(tx *sql.Tx, project string, task Object) (Obj
 		return nil, e
 	}
 	budget := Object(nil)
+	profile, runPolicy := Object(nil), Object(nil)
+	experiments := Empty()
 	sources := Empty()
 	for _, v := range Arr(ctx, "version_vector") {
 		ref, ok := v.(map[string]any)
@@ -216,6 +223,20 @@ func (s *Service) planningSnapshot(tx *sql.Tx, project string, task Object) (Obj
 		if ref["entity_type"] == "BudgetPolicy" {
 			budget = ref
 		}
+		if ref["entity_type"] == "ProjectProfile" || ref["entity_type"] == "RunPolicy" || ref["entity_type"] == "Experiment" {
+			value, err := version(tx, project, ref)
+			if err != nil {
+				return nil, err
+			}
+			switch ref["entity_type"] {
+			case "ProjectProfile":
+				profile = value
+			case "RunPolicy":
+				runPolicy = value
+			case "Experiment":
+				experiments = append(experiments, value)
+			}
+		}
 		if ref["entity_type"] == "Requirement" {
 			r, e := version(tx, project, ref)
 			if e != nil {
@@ -227,7 +248,7 @@ func (s *Service) planningSnapshot(tx *sql.Tx, project string, task Object) (Obj
 	if budget == nil {
 		return nil, Fail(422, "GATE_FAILED", "planning needs the current budget policy")
 	}
-	return Object{"requirement": req, "context": ctx, "budget_ref": budget, "sources": sources, "owner": owner.ID, "owner_roles": owner.Roles, "owner_grants": owner.Grants}, nil
+	return Object{"requirement": req, "context": ctx, "budget_ref": budget, "sources": sources, "owner": owner.ID, "owner_roles": owner.Roles, "owner_grants": owner.Grants, "profile": profile, "run_policy": runPolicy, "registered_experiments": experiments}, nil
 }
 
 func planningRaw(snap Object) (*GoalBrief, Object, error) {
@@ -310,6 +331,15 @@ func planningNodeSupported(n PlanningNode, meta Object) bool {
 }
 
 func planningOrder(b *GoalBrief, meta Object) ([]PlanningNode, error) {
+	if b.Monitor != nil {
+		if e := verifyMonitorPlan(b.Monitor, meta); e != nil {
+			return nil, e
+		}
+		if len(b.Nodes) != 1 || !monitorNodeSupported(b.Nodes[0], b) {
+			return nil, fmt.Errorf("monitor requires its one typed bounded cycle driver node")
+		}
+		return b.Nodes, nil
+	}
 	nodes := map[string]PlanningNode{}
 	checks := map[string]bool{}
 	allowed := map[string]bool{}

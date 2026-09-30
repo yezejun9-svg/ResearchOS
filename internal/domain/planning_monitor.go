@@ -99,3 +99,23 @@ func verifyMonitorPlan(plan *MonitorPlan, meta Object) error {
 	}
 	return nil
 }
+
+func monitorNodeSupported(n PlanningNode, b *GoalBrief) bool {
+	if n.ID != "monitor" || n.Action != "research_monitor" || n.Title == "" || n.Dependencies == nil || len(n.Dependencies) != 0 || n.Inputs == nil || len(n.Outputs) != 1 || n.Outputs[0] != "cycle-report.json" || len(n.Checks) != 1 || n.Checks[0].ID != "cycle-report" || n.Checks[0].Command != "research.cycle-report-v1" || n.Checks[0].Expected != "current required stage evidence and explicit gaps" || n.WallTime != b.Monitor.WallTimeSeconds || n.MaxAttempts < 1 || n.MaxAttempts > 2 {
+		return false
+	}
+	allowed := map[string]bool{}
+	for _, ref := range b.VersionVector {
+		allowed[Hash(ref)] = true
+	}
+	for _, ref := range n.Inputs {
+		if !allowed[Hash(ref)] {
+			return false
+		}
+	}
+	return true
+}
+
+func monitorPlanningPrompt(profile, policy Object) string {
+	return "\nMonitoring catalog: only an explicit positive request to keep monitoring the current project with existing settings is supported: 请持续监控当前项目，按现有配置定期生成研究报告，直到我暂停或取消。 (长期/沿用 also supported; optionally ，并运行已预注册实验 before the final exit clause). Never turn a mention, negation, other topic or changed budget into authorization. For that exact bounded intent attach monitor {schema:MonitorPlan/v1,profile_ref,run_policy_ref,context_target:exact current project intent,sources:[{source_id,config_hash:sha256 canonical config}],period_seconds,first_lookback_seconds,pages_per_source:1..4,items_per_page:1..100,max_tasks:1..32,wall_time_seconds:1..300,required_experiment_refs:[],exit:OWNER_PAUSE_OR_CANCEL}. Copy ALL source configs including disabled/required sources and exact current policy values. Current profile=" + string(Bytes(profile)) + "; run_policy=" + string(Bytes(policy)) + ". Use exactly one node logical_id=monitor, action=research_monitor, depends_on=[], outputs=[cycle-report.json], checks=[{check_id:cycle-report,command_key:research.cycle-report-v1,expected:current required stage evidence and explicit gaps}], wall_time_seconds matching monitor, max_attempts<=2. Stage state is decided by the trusted cycle driver, not by this proposal. If experiments were requested and no approved preregistration is available, omit monitor and return NEEDS_INPUT with a blocking question. Source/runtime gaps become visible requests during bounded execution; no configuration is silently enabled. The monitor remains ACTIVE until an Owner lifecycle action; a completed cycle never completes long-term monitoring."
+}
