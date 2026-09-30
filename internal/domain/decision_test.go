@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"researchos.local/research-os/adapters/decision"
 	"strings"
 	"testing"
@@ -33,7 +32,11 @@ func w11Response() string {
 }
 func w11Client(t *testing.T, scenario string) decision.Client {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server, _ := fixtureHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/__researchos_fixture_readiness__" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		raw := w11Response()
 		switch scenario {
 		case "timeout":

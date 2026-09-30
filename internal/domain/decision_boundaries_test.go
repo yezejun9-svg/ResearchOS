@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"researchos.local/research-os/adapters/decision"
 	"strings"
 	"testing"
@@ -62,7 +61,11 @@ func TestW11PromptBoundaries(t *testing.T) {
 				}
 			}
 			called, bodySent := false, false
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server, _ := fixtureHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/__researchos_fixture_readiness__" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
 				called = true
 				var request decision.Request
 				if e := json.NewDecoder(r.Body).Decode(&request); e != nil {
