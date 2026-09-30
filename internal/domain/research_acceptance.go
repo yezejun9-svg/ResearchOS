@@ -104,6 +104,27 @@ func (s *Service) researchCycleFacts(tx *sql.Tx, project string, cycle Object) (
 	}
 	complete, progress := true, false
 	gaps, stages, candidates, experiments, costs := Empty(), Empty(), Empty(), Empty(), Empty()
+	var monitorGoal string
+	boundErr := tx.QueryRow("SELECT json_extract(t.body,'$.goal_id') FROM research_cycle_work w JOIN domain_objects t ON t.project=w.project AND t.kind='Task' AND t.id=w.task WHERE w.project=? AND w.cycle=? LIMIT 1", project, cycle["id"]).Scan(&monitorGoal)
+	if boundErr != nil && boundErr != sql.ErrNoRows {
+		return nil, boundErr
+	}
+	if boundErr == nil {
+		_, plan, e := s.monitorSnapshot(tx, project, monitorGoal, true)
+		if e != nil {
+			return nil, e
+		}
+		for _, ref := range plan.RequiredExperimentRefs {
+			var count int
+			if e = tx.QueryRow("SELECT count(*) FROM research_cycle_work WHERE project=? AND cycle=? AND stage='experiment' AND json_extract(parameters,'$.template_ref.id')=? AND json_extract(parameters,'$.template_ref.revision')=?", project, cycle["id"], ref["id"], ref["revision"]).Scan(&count); e != nil {
+				return nil, e
+			}
+			if count == 0 {
+				complete = false
+				gaps = append(gaps, Object{"code": "REQUIRED_EXPERIMENT_NOT_MATERIALIZED", "template_ref": ref, "reason": "Frozen finite work capacity was exhausted; required preregistration remains pending."})
+			}
+		}
+	}
 	for _, raw := range coverage {
 		source := raw.(map[string]any)
 		if source["status"] == "COMPLETE" {

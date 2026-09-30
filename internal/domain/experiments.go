@@ -153,6 +153,21 @@ func (s *Service) BeginExperiment(ctx context.Context, token, project, id, runID
 	if !p.HasRole("SCHEDULER") || !p.Allowed(project, "", "", false) {
 		return nil, Fail(403, "FORBIDDEN", "scheduler required")
 	}
+	r, e := load(tx, project, "Run", runID)
+	if e != nil {
+		return nil, e
+	}
+	if r["status"] != "QUEUED" {
+		return nil, Fail(409, "STATE_CONFLICT", "current claimed run required")
+	}
+	x, e := s.beginExperimentTx(tx, p, project, id, runID)
+	if e != nil {
+		return nil, e
+	}
+	return x, tx.Commit()
+}
+
+func (s *Service) beginExperimentTx(tx *sql.Tx, p Principal, project, id, runID string) (Object, error) {
 	x, e := load(tx, project, "Experiment", id)
 	if e != nil {
 		return nil, e
@@ -168,7 +183,17 @@ func (s *Service) BeginExperiment(ctx context.Context, token, project, id, runID
 		return nil, e
 	}
 	if r["status"] != "QUEUED" {
-		return nil, Fail(409, "STATE_CONFLICT", "current claimed run required")
+		w, err := loadResearchWork(tx, project, Str(r, "task_id"))
+		if err != nil || r["status"] != "RUNNING" || w.Stage != "experiment" || w.Experiment != id {
+			return nil, Fail(409, "STATE_CONFLICT", "current claimed run required")
+		}
+		task, err := load(tx, project, "Task", w.Task)
+		if err != nil {
+			return nil, err
+		}
+		if _, _, err = s.monitorSnapshot(tx, project, Str(task, "goal_id"), true); err != nil {
+			return nil, err
+		}
 	}
 	var n int
 	if e = tx.QueryRow("SELECT count(*) FROM experiment_tasks WHERE project=? AND experiment=? AND task=?", project, id, r["task_id"]).Scan(&n); e != nil || n != 1 {
@@ -217,7 +242,7 @@ func (s *Service) BeginExperiment(ctx context.Context, token, project, id, runID
 	if e = s.event(tx, project, "Experiment", x, p.ID, ID(), "PROJECT_UPDATED"); e != nil {
 		return nil, e
 	}
-	return x, tx.Commit()
+	return x, nil
 }
 func metricStatus(m, r Object) (string, error) {
 	n, e := Num(r, "sample_count")
