@@ -171,23 +171,37 @@ func (s *Service) RegisterEvolutionHoldoutFixture(ctx context.Context, token, pr
 	if err != nil {
 		return err
 	}
-	inputs, _, err := decodeEvolutionHoldout(inputsRaw, labelsRaw)
+	h, err := s.evolutionCurrent(tx, project, x)
 	if err != nil {
-		return Fail(422, "GATE_FAILED", "private holdout labels are not objective and distinct")
+		return err
 	}
-	if inputs.Revision == evolution.HoldoutReleaseRevision {
-		h, hostErr := s.evolutionCurrent(tx, project, x)
-		if hostErr != nil {
-			return hostErr
+	metadata := Object{}
+	if controlHost(h) {
+		metadata, err = s.controlHoldoutFrozen(tx, project, x, h, inputsRaw, labelsRaw)
+		if err != nil {
+			return err
 		}
-		if h["release_mechanism"] != releaseFixtureMechanism || h["os_service_qualified"] != false {
-			return Fail(422, "GATE_FAILED", "R2 private revision requires explicit native fixture host")
+	} else {
+		inputs, _, err := decodeEvolutionHoldout(inputsRaw, labelsRaw)
+		if err != nil {
+			return Fail(422, "GATE_FAILED", "private holdout labels are not objective and distinct")
+		}
+		metadata["revision"] = inputs.Revision
+		if inputs.Revision == evolution.HoldoutReleaseRevision {
+			h, hostErr := s.evolutionCurrent(tx, project, x)
+			if hostErr != nil {
+				return hostErr
+			}
+			if h["release_mechanism"] != releaseFixtureMechanism || h["os_service_qualified"] != false {
+				return Fail(422, "GATE_FAILED", "R2 private revision requires explicit native fixture host")
+			}
 		}
 	}
-	entry := Object{"revision": inputs.Revision, "verifier_id": p.ID, "input_ref": inputsRef, "labels_ref": labelsRef,
+	entry := Object{"revision": metadata["revision"], "verifier_id": p.ID, "input_ref": inputsRef, "labels_ref": labelsRef,
 		"inputs_hash": Digest(inputsRaw), "labels_hash": Digest(labelsRaw), "plan_hash": Hash(evolutionPlan(x)),
 		"stable_hash": x["stable_artifact_ref"].(map[string]any)["content_hash"], "candidate_hash": x["candidate_artifact_ref"].(map[string]any)["content_hash"],
 		"public_suite_hash": Digest(evolution.Bytes(evolution.Suite())), "policy_hash": Digest(evolution.Bytes(evolution.Policy())), "model_revision": "NONE"}
+	Merge(entry, metadata)
 	if err = evolutionJournal(tx, project, candidate, "", "HOLDOUT_FROZEN", entry); err != nil {
 		return err
 	}
@@ -245,9 +259,30 @@ func (s *Service) EvaluateEvolutionHoldoutFixture(ctx context.Context, token, pr
 	if err != nil {
 		return nil, err
 	}
-	inputs, labels, err := decodeEvolutionHoldout(inputsRaw, labelsRaw)
-	if err != nil || frozen["revision"] != inputs.Revision || frozen["inputs_hash"] != Digest(inputsRaw) || frozen["labels_hash"] != Digest(labelsRaw) {
-		return nil, Fail(422, "GATE_FAILED", "frozen private holdout changed")
+	h, err := s.evolutionCurrent(tx, project, x)
+	if err != nil {
+		return nil, err
+	}
+	var inputs evolution.HoldoutInputs
+	var labels evolution.HoldoutLabels
+	if controlHost(h) {
+		metadata, err := s.controlHoldoutFrozen(tx, project, x, h, inputsRaw, labelsRaw)
+		if err != nil {
+			return nil, err
+		}
+		for key, value := range metadata {
+			if Hash(frozen[key]) != Hash(value) {
+				return nil, Fail(422, "GATE_FAILED", "frozen control inputs changed")
+			}
+		}
+	} else {
+		inputs, labels, err = decodeEvolutionHoldout(inputsRaw, labelsRaw)
+		if err != nil || frozen["revision"] != inputs.Revision {
+			return nil, Fail(422, "GATE_FAILED", "frozen private holdout changed")
+		}
+	}
+	if frozen["inputs_hash"] != Digest(inputsRaw) || frozen["labels_hash"] != Digest(labelsRaw) {
+		return nil, Fail(422, "GATE_FAILED", "frozen private bytes changed")
 	}
 	_, stable, err := s.evolutionBytes(tx, project, x["stable_artifact_ref"].(map[string]any))
 	if err != nil {
@@ -260,16 +295,25 @@ func (s *Service) EvaluateEvolutionHoldoutFixture(ctx context.Context, token, pr
 	if err = tx.Rollback(); err != nil {
 		return nil, err
 	}
-	proof, err := supervisor.EvaluateHoldout(ctx, stable, trial, inputs, Digest(labelsRaw), Hash(evolutionPlan(x)))
-	if err != nil {
-		return nil, err
-	}
-	verdict, err := supervisor.CheckHoldout(proof, inputs, labels, Hash(evolutionPlan(x)), Digest(stable), Digest(trial))
-	if err != nil {
-		return nil, err
+	var raw []byte
+	var safe Object
+	if controlHost(h) {
+		raw, safe, err = s.evaluateControlHoldout(ctx, project, x, inputsRaw, labelsRaw, stable, trial)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		proof, err := supervisor.EvaluateHoldout(ctx, stable, trial, inputs, Digest(labelsRaw), Hash(evolutionPlan(x)))
+		if err != nil {
+			return nil, err
+		}
+		verdict, err := supervisor.CheckHoldout(proof, inputs, labels, Hash(evolutionPlan(x)), Digest(stable), Digest(trial))
+		if err != nil {
+			return nil, err
+		}
+		raw, safe = Bytes(proof), evolutionHoldoutSummary(verdict)
 	}
 	store := s.Protected.(*protectedstore.CanaryStore)
-	raw := Bytes(proof)
 	blob, err := store.CreateCanary(ctx, project, "application/json", raw)
 	if err != nil {
 		return nil, err
@@ -280,7 +324,6 @@ func (s *Service) EvaluateEvolutionHoldoutFixture(ctx context.Context, token, pr
 	if err != nil {
 		return nil, err
 	}
-	safe := evolutionHoldoutSummary(verdict)
 	tx, err = s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -316,13 +359,23 @@ func evolutionHoldoutSummary(v supervisor.HoldoutVerdict) Object {
 // private result blocks normal acceptance and START_CANARY.
 func (s *Service) evolutionHoldoutVerdict(ctx context.Context, tx *sql.Tx, project string, x Object) (Object, string, error) {
 	id := Str(x, "id")
+	h, hostErr := evolutionHost(tx, project)
+	if hostErr != nil {
+		return nil, "", hostErr
+	}
 	frozen, present, err := evolutionHoldoutEntry(tx, project, id, "HOLDOUT_FROZEN")
 	if err != nil || !present {
+		if err == nil && controlHost(h) {
+			err = Fail(422, "GATE_FAILED", "control private proof required")
+		}
 		return nil, "", err
 	}
 	evaluated, present, err := evolutionHoldoutEntry(tx, project, id, "HOLDOUT_EVALUATED")
 	if err != nil || !present {
 		return nil, "", Fail(422, "GATE_FAILED", "private holdout result missing")
+	}
+	if controlHost(h) {
+		return s.controlHoldoutVerdict(ctx, tx, project, x, h, frozen, evaluated)
 	}
 	if !evolution.ValidHoldoutRevision(Str(frozen, "revision")) || frozen["model_revision"] != "NONE" || frozen["plan_hash"] != Hash(evolutionPlan(x)) || frozen["stable_hash"] != x["stable_artifact_ref"].(map[string]any)["content_hash"] || frozen["candidate_hash"] != x["candidate_artifact_ref"].(map[string]any)["content_hash"] || frozen["public_suite_hash"] != Digest(evolution.Bytes(evolution.Suite())) || frozen["policy_hash"] != Digest(evolution.Bytes(evolution.Policy())) || evaluated["plan_hash"] != frozen["plan_hash"] || evaluated["verifier_id"] != frozen["verifier_id"] {
 		return nil, "", Fail(422, "GATE_FAILED", "private holdout version or candidate binding changed")
