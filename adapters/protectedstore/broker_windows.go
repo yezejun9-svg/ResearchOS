@@ -220,6 +220,24 @@ func serveCanaryPipe(ctx context.Context, h windows.Handle, summary SafeSummary,
 // ProbeCanaryService verifies that SCM's running, expected virtual-account
 // service owns the connected pipe. It returns only a validated fixed aggregate.
 func ProbeCanaryService() (SafeSummary, error) {
+	deadline := time.Now().Add(3 * time.Second)
+	type result struct {
+		summary SafeSummary
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() { summary, e := probeCanaryService(deadline); done <- result{summary, e} }()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case value := <-done:
+		return value.summary, value.err
+	case <-timer.C:
+		return SafeSummary{}, ErrUnavailable
+	}
+}
+
+func probeCanaryService(deadline time.Time) (SafeSummary, error) {
 	scm, e := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
 	if e != nil {
 		return SafeSummary{}, ErrUnavailable
@@ -240,31 +258,48 @@ func ProbeCanaryService() (SafeSummary, error) {
 	if e != nil || status.State != svc.Running || status.ProcessId == 0 {
 		return SafeSummary{}, ErrUnavailable
 	}
-	pipe, e := windows.CreateFile(windows.StringToUTF16Ptr(canaryPipe), pipeClientRights, 0, nil, windows.OPEN_EXISTING, windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
+	pipe, e := windows.CreateFile(windows.StringToUTF16Ptr(canaryPipe), pipeClientRights, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED|windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
 	if e != nil {
 		return SafeSummary{}, ErrUnavailable
 	}
-	defer windows.CloseHandle(pipe)
+	file := os.NewFile(uintptr(pipe), "canary-summary-pipe")
+	defer file.Close()
 	var pid uint32
 	if windows.GetNamedPipeServerProcessId(pipe, &pid) != nil || pid != status.ProcessId {
 		return SafeSummary{}, ErrIsolation
 	}
-	var n uint32
-	if windows.WriteFile(pipe, []byte("summary-v1"), &n, nil) != nil {
+	summary, e := requestCanarySummary(file, deadline)
+	if e != nil {
+		return SafeSummary{}, e
+	}
+	after, e := s.Query()
+	if e != nil || after.ProcessId != pid || after.State != svc.Running {
+		return SafeSummary{}, ErrIsolation
+	}
+	return summary, nil
+}
+
+func requestCanarySummary(file *os.File, deadline time.Time) (SafeSummary, error) {
+	// Overlapped pipe handles are integrated with Go's Windows poller. One
+	// absolute deadline covers request, response and acknowledgement; timeout
+	// cancels the native operation even if the server never sends any bytes.
+	if file.SetDeadline(deadline) != nil {
+		return SafeSummary{}, ErrUnavailable
+	}
+	if _, e := file.Write([]byte("summary-v1")); e != nil {
 		return SafeSummary{}, ErrUnavailable
 	}
 	buffer := make([]byte, 4096)
-	if windows.ReadFile(pipe, buffer, &n, nil) != nil {
+	n, e := file.Read(buffer)
+	if e != nil {
 		return SafeSummary{}, ErrUnavailable
 	}
 	summary, e := ParseSafeSummary(buffer[:n])
 	if e != nil {
 		return SafeSummary{}, e
 	}
-	windows.WriteFile(pipe, []byte("ack"), &n, nil)
-	after, e := s.Query()
-	if e != nil || after.ProcessId != pid || after.State != svc.Running {
-		return SafeSummary{}, ErrIsolation
+	if _, e = file.Write([]byte("ack")); e != nil {
+		return SafeSummary{}, ErrUnavailable
 	}
 	return summary, nil
 }

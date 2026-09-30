@@ -44,6 +44,30 @@ func TestCanaryServiceRejectsInteractive(t *testing.T) {
 	fmt.Println("BROKER_ASSERTION INTERACTIVE_SERVICE_REFUSED PASS CANARY_ONLY")
 }
 
+func TestCanaryProbeUnresponsiveServer(t *testing.T) {
+	name := fmt.Sprintf(`\\.\pipe\ResearchOSCanarySilentTest-%d-%d`, os.Getpid(), time.Now().UnixNano())
+	h, e := windows.CreateNamedPipe(windows.StringToUTF16Ptr(name), windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_FIRST_PIPE_INSTANCE, windows.PIPE_TYPE_MESSAGE|windows.PIPE_READMODE_MESSAGE|windows.PIPE_NOWAIT|windows.PIPE_REJECT_REMOTE_CLIENTS, 1, 4096, 64, 0, nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer windows.CloseHandle(h)
+	// This actual native server exists and accepts the client; it deliberately
+	// never reads a request, emits a response or closes to rescue the client.
+	client, e := windows.CreateFile(windows.StringToUTF16Ptr(name), pipeClientRights, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED|windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
+	file := os.NewFile(uintptr(client), "silent-canary-pipe")
+	defer file.Close()
+	started := time.Now()
+	_, e = requestCanarySummary(file, started.Add(75*time.Millisecond))
+	elapsed := time.Since(started)
+	if e == nil || elapsed < 50*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("deadline failed err=%v elapsed=%s", e, elapsed)
+	}
+	fmt.Println("BROKER_ASSERTION UNRESPONSIVE_SERVER_TIMEOUT PASS CANARY_ONLY")
+}
+
 func TestCanaryBrokerProtocol(t *testing.T) {
 	for _, scenario := range []string{"summary", "invalid-request", "body-drift"} {
 		t.Run(scenario, func(t *testing.T) {
