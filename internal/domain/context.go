@@ -159,6 +159,15 @@ func (s *Service) taskContext(tx *sql.Tx, project string, task Object) error {
 		if cycle["status"] != "RUNNING" {
 			return Fail(409, "STATE_CONFLICT", "closed research cycle permits no execution")
 		}
+		if work.Stage != "delivery" && task["active_run_id"] == nil {
+			var reports int
+			if err = tx.QueryRow("SELECT count(*) FROM research_cycle_work WHERE project=? AND cycle=? AND stage='delivery'", project, work.Cycle).Scan(&reports); err != nil {
+				return err
+			}
+			if reports != 0 {
+				return Fail(409, "STATE_CONFLICT", "research round already entered report delivery")
+			}
+		}
 		if _, _, err = s.monitorSnapshot(tx, project, Str(task, "goal_id"), true); err != nil {
 			return err
 		}

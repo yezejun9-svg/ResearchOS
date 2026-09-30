@@ -231,6 +231,21 @@ func (s *Service) holdResearchMonitor(tx *sql.Tx, p Principal, project string, g
 }
 
 func (s *Service) advanceResearchStages(tx *sql.Tx, owner Principal, project string, meta Object, plan *MonitorPlan, cycle Object) error {
+	// Report materialization freezes this finite round. Later ticks cannot append
+	// new stage facts behind an already-running independent report.
+	var reportID string
+	if err := tx.QueryRow("SELECT task FROM research_cycle_work WHERE project=? AND cycle=? AND stage='delivery'", project, cycle["id"]).Scan(&reportID); err == nil {
+		report, err := load(tx, project, "Task", reportID)
+		if err != nil {
+			return err
+		}
+		if report["status"] == "ACCEPTED" {
+			return s.closeReportedResearchCycle(tx, owner, project, meta, cycle, report)
+		}
+		return nil
+	} else if err != sql.ErrNoRows {
+		return err
+	}
 	profile := meta["profile"].(map[string]any)
 	readyForReport := true
 	deps := Empty()
@@ -294,7 +309,11 @@ func (s *Service) advanceResearchStages(tx *sql.Tx, owner Principal, project str
 			readyForReport = false
 		}
 	}
-	if !readyForReport {
+	candidatesReady, err := s.advanceResearchCandidates(tx, owner, project, meta, plan, cycle)
+	if err != nil {
+		return err
+	}
+	if !readyForReport || !candidatesReady {
 		return nil
 	}
 	key := stringsDigest(Hash([]any{"delivery", cycle["id"], meta["brief_ref"]}))
@@ -306,7 +325,7 @@ func (s *Service) advanceResearchStages(tx *sql.Tx, owner Principal, project str
 		if _, err = s.researchAcceptedTask(tx, project, report); err != nil {
 			return err
 		}
-		return nil // Current report-driven checkpoint/close is wired with its verifier next.
+		return s.closeReportedResearchCycle(tx, owner, project, meta, cycle, report)
 	}
 	return nil
 }
