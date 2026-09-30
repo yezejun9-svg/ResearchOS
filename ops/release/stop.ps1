@@ -18,12 +18,18 @@ $identityArgs = "-- researchos-fixture-$($record.instance) data-$dataHash root-$
 $processId = [int]$record.pid
 $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
 if (-not $process) { throw 'recorded fixture process is absent; retain identity file for investigation' }
-$native = Get-CimInstance Win32_Process -Filter "ProcessId=$processId"
-$expected = [IO.Path]::GetFullPath((Join-Path $root 'bin/control.exe'))
-if (-not $native -or -not [string]::Equals($expected, $native.ExecutablePath, [StringComparison]::OrdinalIgnoreCase) -or -not $native.CommandLine.Contains($identityArgs) -or $process.StartTime.ToUniversalTime().Ticks -ne [int64]$record.created_utc_ticks) { throw 'recorded PID does not match fixture creation and OS command line' }
-# The Process object holds the validated process handle; do not re-resolve a PID.
-$process.Kill()
-$process.WaitForExit(10000) | Out-Null
-if (-not $process.HasExited) { throw 'fixture process did not stop; retain identity file' }
-Remove-Item -LiteralPath $pidFile
+try {
+    # .NET Framework opens Process.Handle lazily. Pin it before checking identity.
+    $handle = $process.Handle
+    if ($handle -eq [IntPtr]::Zero) { throw 'fixture process handle unavailable' }
+    $native = Get-CimInstance Win32_Process -Filter "ProcessId=$processId"
+    $expected = [IO.Path]::GetFullPath((Join-Path $root 'bin/control.exe'))
+    if (-not $native -or -not [string]::Equals($expected, $native.ExecutablePath, [StringComparison]::OrdinalIgnoreCase) -or -not $native.CommandLine.Contains($identityArgs) -or $process.StartTime.ToUniversalTime().Ticks -ne [int64]$record.created_utc_ticks) { throw 'recorded PID does not match fixture creation and OS command line' }
+    $process.Kill()
+    $process.WaitForExit(10000) | Out-Null
+    if (-not $process.HasExited) { throw 'fixture process did not stop; retain identity file' }
+    Remove-Item -LiteralPath $pidFile
+} finally {
+    $process.Dispose()
+}
 @{ status = 'FIXTURE_STOPPED'; pid = $processId; data_preserved = $data } | ConvertTo-Json -Compress
