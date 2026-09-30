@@ -1,0 +1,23 @@
+# W11 Jev development integration
+
+`adapters/decision` implements the official [System One API](https://docs.typesafe.ai/api) and [OpenAPI contract](https://api.typesafe.ai/openapi.json), checked on 2026-09-30. It accepts the documented choice, score and noul response types. Host abstention is explicit; the upstream API has no ABSTAIN answer type.
+
+`Service.InvokeJev` authenticates a planner, freezes the scope/input/rubric bindings, calls the adapter, seals raw response bytes and creates a DecisionReceipt. The default mode is supplied explicitly as SHADOW or ADVISORY. Every BOUNDED_AUTO request is rejected until independent protected qualification is implemented. A raw envelope imported through the HTTP decision API cannot attest a real call: an imported LIVE claim yields ABSTAIN with `UNVERIFIED_IMPORTED_INVOCATION`. Only the host method can carry the non-JSON invocation capability. Raw fixture calls remain FIXTURE and `jev_called=false`.
+
+The record API derives signals from sealed raw bytes rather than client scores. A failed or incomplete deterministic check, missing evidence, inconsistent actions, low confidence, invalid response, model drift or missing action yields ABSTAIN. Raw bytes and hard-check counterevidence remain referenced by the immutable receipt. Task acceptance and decision adoption still run the pre-existing independent gates; this adapter never makes an acceptance decision.
+
+Qualification creation stores a frozen DRAFT with maximum_mode ADVISORY. Submitted `jev_called` is not trusted; rates remain null. The result endpoint rejects client statistics with RESOURCE_UNAVAILABLE pending a verified protected evaluator. DRAFT case counts are declarations, not certified sample counts. No passing fixture qualification or automatic grant is fabricated.
+
+## Fixture command
+
+Set `RESEARCHOS_TASK_ID=W11` and exactly one of `RESEARCHOS_CHECK_ID=W11-G01`, `RESEARCHOS_CASE_ID=C07`, or `RESEARCHOS_CASE_ID=C08`. Set `RESEARCHOS_GO` to the pinned Go executable, then run `python ops/ci/jev.py --mode fixture`. There are 58 frozen subassertions in `expected.json`. The receipt records the source manifest, exact command, raw logs and nonzero assertion inventory; owner PASS awaits independent verification.
+
+C07 uses loopback maximum-score responses and actual task acceptance/adoption requests against SQLite. The failed-experiment fixture is a failed deterministic experiment-result report, not a live scientific experiment. C08 checks the four fault classes, preserved state/evidence and continuing non-model work. The earlier W04 deterministic decision path remains compatible. Full C20 still belongs to W16.
+
+## Public development dataset and future live runner
+
+`evaluation/development/jev/dataset.json` contains 60 DEVELOPMENT_ONLY objective cases, 30 Chinese and 30 mixed Chinese/English. Labels use six frozen checks, not model majority vote. Each language has 15 ACCEPT and 15 REJECT cases. The deterministic generator is `tests/jev/make_development.py`; `manifest.json` freezes the raw dataset hash and threshold 0.8. These cases are public development material and cannot serve as an independent holdout.
+
+`tests/jev/live` is an explicitly invoked development runner. Build it with the pinned Go tool and invoke with `--authorized-live --dataset <path> --expected-sha256 <manifest hash> --out <new directory>`, supplying the token through stdin. The program validates local inputs before reading the token, permits only the official HTTPS endpoint, retains per-case raw envelopes and partial results, and never persists credentials. Expected labels are excluded from provider request state. Cost remains UNKNOWN without billing evidence. No live request is made during fixture tests or builds.
+
+This runner does not read/create holdout data or grant qualification. W11-G02/G03/A08 need separately authorized live execution plus an independent protected evaluator. W11-G04 needs actual OS identity isolation and protected storage; a different Agent or ordinary directory permissions in the same identity are insufficient. Each current development qualification key has only 30 cases, so no key can be promoted from aggregate performance.
