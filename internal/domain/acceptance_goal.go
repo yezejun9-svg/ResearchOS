@@ -68,8 +68,17 @@ func (s *Service) goalAcceptanceSnapshot(tx *sql.Tx, p Principal, project string
 	if b["run_id"] != nil || b["independence_basis"] != "DETERMINISTIC_SERVICE" || len(Arr(b, "qualification_ids")) != 0 {
 		return nil, Fail(422, "GATE_FAILED", "goal acceptance uses current accepted task runs")
 	}
-	if b["measurement_mode"] != "FIXTURE" {
+	var planningTask string
+	planningErr := tx.QueryRow("SELECT planning_task FROM intent_plan_bindings WHERE project=? AND planning_goal=?", project, g["id"]).Scan(&planningTask)
+	if planningErr != nil && planningErr != sql.ErrNoRows {
+		return nil, planningErr
+	}
+	mode := Str(b, "measurement_mode")
+	if mode != "FIXTURE" && (mode != "LIVE" || planningErr != nil) {
 		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "LIVE goal acceptance remains unavailable")
+	}
+	if planningErr == nil && (len(Arr(g, "task_ids")) != 1 || Arr(g, "task_ids")[0] != planningTask) {
+		return nil, Fail(422, "GATE_FAILED", "planning Goal must contain its exact bound Task")
 	}
 	if len(Arr(g, "task_ids")) == 0 {
 		return nil, Fail(422, "GATE_FAILED", "goal needs accepted deliverable tasks")
@@ -109,8 +118,33 @@ func (s *Service) goalAcceptanceSnapshot(tx *sql.Tx, p Principal, project string
 		if e != nil {
 			return nil, e
 		}
-		if receipt["measurement_mode"] != "FIXTURE" {
-			return nil, Fail(503, "RESOURCE_UNAVAILABLE", "fixture goal cannot claim LIVE task verification")
+		if receipt["measurement_mode"] != mode {
+			return nil, Fail(422, "GATE_FAILED", "goal and task verification modes differ")
+		}
+		if planningErr == nil {
+			run, err := load(tx, project, "Run", Str(receipt, "run_id"))
+			if err != nil {
+				return nil, err
+			}
+			dispatch, err := runtimeDispatch(tx, project, Str(run, "id"), run["lease_epoch"])
+			if err == nil {
+				observation, err := runtimeObservation(tx, project, run)
+				if err != nil {
+					return nil, err
+				}
+				if _, err = nativeDispatchProof(tx, project, run, observation); err != nil {
+					return nil, err
+				}
+				admission, err := s.currentDispatchAdmission(tx, project, t, run, dispatch, "accept")
+				if err != nil {
+					return nil, err
+				}
+				if admission["mode"] != mode {
+					return nil, Fail(422, "GATE_FAILED", "planning runtime mode changed")
+				}
+			} else if err != sql.ErrNoRows || mode != "FIXTURE" {
+				return nil, Fail(422, "GATE_FAILED", "planning Goal requires current native dispatch evidence")
+			}
 		}
 		for _, v := range Arr(receipt, "executor_principal_ids") {
 			id := v.(string)
@@ -134,6 +168,9 @@ func (s *Service) goalAcceptanceSnapshot(tx *sql.Tx, p Principal, project string
 			a, use, e := s.artifactUse(tx, project, run, Str(ref, "id"), true)
 			if e != nil {
 				return nil, e
+			}
+			if use["measurement_mode"] != mode || Hash(Ref(a, "Artifact")) != Hash(ref) {
+				return nil, Fail(422, "GATE_FAILED", "goal output use differs from accepted artifact")
 			}
 			var data []byte
 			if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, use["storage_key"]).Scan(&data); e != nil {
@@ -179,7 +216,18 @@ func (s *Service) goalAcceptanceSnapshot(tx *sql.Tx, p Principal, project string
 			return nil, Fail(422, "GATE_FAILED", "goal check mismatch")
 		}
 	}
-	return Object{"goal": g, "contract": c, "tasks": tasks, "artifacts": artifacts, "artifact_refs": refs, "input_refs": inputs, "executor_ids": executorIDs, "policy_revision": state["policy_revision"], "authority": root}, nil
+	var planning Object
+	if planningErr == nil {
+		planning, e = s.planningSnapshot(tx, project, tasks[0].(map[string]any))
+		if e != nil {
+			return nil, e
+		}
+	}
+	compiled, e := s.compiledPlanningSnapshot(tx, project, g)
+	if e != nil {
+		return nil, e
+	}
+	return Object{"goal": g, "contract": c, "tasks": tasks, "artifacts": artifacts, "artifact_refs": refs, "input_refs": inputs, "executor_ids": executorIDs, "policy_revision": state["policy_revision"], "authority": root, "measurement_mode": mode, "planning": planning, "compiled_plan": compiled}, nil
 }
 
 func (s *Service) acceptGoal(tx *sql.Tx, p Principal, project string, b Object, a *preparedAcceptance, cid string) (Object, error) {
@@ -194,14 +242,14 @@ func (s *Service) acceptGoal(tx *sql.Tx, p Principal, project string, b Object, 
 		return nil, Fail(422, "GATE_FAILED", "goal verdict differs from computed checks")
 	}
 	g := current["goal"].(map[string]any)
-	ev, e := s.serverArtifact(tx, project, p.ID, "REPORT", Bytes(Object{"goal_ref": Ref(g, "Goal"), "checks": a.checks, "input_refs": current["input_refs"], "artifact_refs": current["artifact_refs"], "started_at": a.started, "finished_at": a.finished}), Arr(current, "artifact_refs"))
+	ev, e := s.serverArtifactMode(tx, project, p.ID, "REPORT", Str(current, "measurement_mode"), Bytes(Object{"goal_ref": Ref(g, "Goal"), "checks": a.checks, "input_refs": current["input_refs"], "artifact_refs": current["artifact_refs"], "started_at": a.started, "finished_at": a.finished}), Arr(current, "artifact_refs"))
 	if e != nil {
 		return nil, e
 	}
 	for _, v := range a.checks {
 		v.(map[string]any)["evidence_refs"] = []any{Ref(ev, "Artifact")}
 	}
-	receipt := Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now(), "subject_ref": Ref(g, "Goal"), "run_id": nil, "contract_hash": b["contract_hash"], "input_refs": current["input_refs"], "artifact_refs": current["artifact_refs"], "checks": a.checks, "verdict": a.verdict, "verifier_principal_id": p.ID, "executor_principal_ids": current["executor_ids"], "independence_basis": "DETERMINISTIC_SERVICE", "blocking_conflict_ids": Empty(), "qualification_ids": Empty(), "policy_revision": current["policy_revision"], "measurement_mode": "FIXTURE", "reason": "Independent deterministic goal deliverable verification."}
+	receipt := Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now(), "subject_ref": Ref(g, "Goal"), "run_id": nil, "contract_hash": b["contract_hash"], "input_refs": current["input_refs"], "artifact_refs": current["artifact_refs"], "checks": a.checks, "verdict": a.verdict, "verifier_principal_id": p.ID, "executor_principal_ids": current["executor_ids"], "independence_basis": "DETERMINISTIC_SERVICE", "blocking_conflict_ids": Empty(), "qualification_ids": Empty(), "policy_revision": current["policy_revision"], "measurement_mode": current["measurement_mode"], "reason": "Independent deterministic goal deliverable verification."}
 	receipt["receipt_hash"] = Receipt(receipt)
 	if e = s.put(tx, "AcceptanceReceipt", receipt); e != nil {
 		return nil, e
@@ -236,6 +284,11 @@ func (s *Service) acceptGoal(tx *sql.Tx, p Principal, project string, b Object, 
 	}
 	if e = s.event(tx, project, "Goal", g, p.ID, cid, "PROJECT_UPDATED"); e != nil {
 		return nil, e
+	}
+	if planning, _ := current["planning"].(map[string]any); a.verdict == "PASS" && planning != nil {
+		if e = s.compileIntentPlan(tx, project, current, receipt); e != nil {
+			return nil, e
+		}
 	}
 	return receipt, nil
 }
