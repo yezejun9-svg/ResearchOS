@@ -83,9 +83,11 @@ def recovery_cases(page, base, project_path, owner, api, report, out):
         'basis': 'USER_STATED', 'source_refs': [], 'rationale': 'C26 silent recovery',
         'supersedes_id': None, 'acceptance_check_ids': []}, f'"r{state["revision"]}"')
     expected = api(base, owner, 'GET', prefix + '/progress')
-    page.locator('.connection-banner', has_text='45 秒').wait_for(timeout=50000)
+    page.locator('.connection-banner').wait_for(timeout=50000)
     banner = page.locator('.connection-banner').inner_text()
     assert '最后同步' in banner and '可能过期' in banner and page.evaluate('navigator.onLine')
+    last_sync_age = page.evaluate('Date.now() - new Date(document.querySelector(".connection-banner").textContent.split("最后同步 " )[1].slice(0,-1)).getTime()')
+    assert last_sync_age >= 44000, last_sync_age
     page.screenshot(path=str(out / 'silent-stream-stale.png'), full_page=False)
     report['screenshots'].append('silent-stream-stale.png')
     page.locator('.connection-banner').wait_for(state='hidden', timeout=15000)
@@ -96,7 +98,7 @@ def recovery_cases(page, base, project_path, owner, api, report, out):
     assert silent['queries'] > idle['queries'] and silent['opens'] >= idle['opens'] + 2
     report['silent_stream'] = {'transport': 'One explicitly injected silent ReadableStream; browser stays online',
         'before_watermark': baseline['as_of_event_sequence'], 'after_watermark': expected['as_of_event_sequence'],
-        'banner': banner, 'reader_evidence': silent}
+        'banner': banner, 'last_sync_age_ms': last_sync_age, 'reader_evidence': silent}
     report['checks'].append(STALE)
 
     # This time use a same-project stale event; abort must fence it before it can
