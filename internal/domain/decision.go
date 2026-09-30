@@ -156,20 +156,33 @@ func (s *Service) decisionRubric(tx *sql.Tx, project string, b Object) (Decision
 	}
 	return rubric, nil
 }
+func decisionHardFailures(b Object) []string {
+	reasons := []string{}
+	for _, v := range Arr(b, "deterministic_results") {
+		check := v.(map[string]any)
+		if check["status"] != "PASS" && check["status"] != "NOT_APPLICABLE" {
+			reasons = append(reasons, "DETERMINISTIC_CHECK_NOT_PASSED:"+Str(check, "check_id"))
+		}
+	}
+	if len(Arr(b, "missing_evidence")) > 0 {
+		reasons = append(reasons, "MISSING_EVIDENCE")
+	}
+	return reasons
+}
+
 func (s *Service) prepareDecision(tx *sql.Tx, p Principal, project string, b Object) (Object, error) {
 	if b["mode"] == "BOUNDED_AUTO" {
 		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "BOUNDED_AUTO awaits independent protected qualification; automatic authority is disabled")
 	}
-	if len(Arr(b, "signals")) == 0 && b["qualification_id"] == nil {
-		return b, nil
-	}
 	b = copyObject(b)
 	proof, _ := b["_host_invocation"].(decisionInvocationProof)
 	delete(b, "_host_invocation")
-	if e := s.checkDecisionGraph(tx, p, project, b); e != nil {
-		return nil, e
+	if len(Arr(b, "signals")) > 0 || b["qualification_id"] != nil {
+		if e := s.checkDecisionGraph(tx, p, project, b); e != nil {
+			return nil, e
+		}
 	}
-	reasons := []string{}
+	reasons := decisionHardFailures(b)
 	signals := Empty()
 	selected := ""
 	if qid := Str(b, "qualification_id"); qid != "" {
@@ -239,15 +252,6 @@ func (s *Service) prepareDecision(tx *sql.Tx, p Principal, project string, b Obj
 		} else if selected != b["selected"] {
 			reasons = append(reasons, "SELECTED_DIFFERS_FROM_MEASURED_ACTION")
 		}
-	}
-	for _, v := range Arr(b, "deterministic_results") {
-		check := v.(map[string]any)
-		if check["status"] != "PASS" && check["status"] != "NOT_APPLICABLE" {
-			reasons = append(reasons, "DETERMINISTIC_CHECK_NOT_PASSED:"+Str(check, "check_id"))
-		}
-	}
-	if len(Arr(b, "missing_evidence")) > 0 {
-		reasons = append(reasons, "MISSING_EVIDENCE")
 	}
 	if b["status"] != "DECIDED" {
 		reasons = append(reasons, "CALLER_ABSTAIN_OR_ERROR")

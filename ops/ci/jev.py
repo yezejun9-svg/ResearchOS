@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 EXPECTED = json.loads((ROOT / 'tests/jev/expected.json').read_text(encoding='utf-8'))
 GROUPS = {
     'W11-G01': list(EXPECTED),
-    'C07': ['TestW11HardGates'],
+    'C07': ['TestW11HardGates', 'TestW11ManualDecisionHardGate'],
     'C08': ['TestW11HostAndFallback', 'TestW11QualificationClosed', 'TestW11ImportedProvenance'],
 }
 
@@ -103,7 +103,7 @@ def main(command_key='test.jev.fixture'):
               'independent_acceptance': 'NOT_REQUESTED', 'global_evidence': 'CANDIDATE_PENDING_INDEPENDENT_VERIFIER',
               'scope': before['scope'], 'excluded': before['excluded'], 'automatic_authority': 'NONE'}
     save(out / 'report.json', report)
-    print(json.dumps({'status': report['status'], 'assertions': len(rows), 'receipt': str(out / 'report.json')}))
+    print(json.dumps({'status': report['status'], 'assertions': len(rows), 'assertion_ids': ids, 'scope': before['scope'], 'receipt': str(out / 'report.json')}))
     return 0 if passed else 1
 
 

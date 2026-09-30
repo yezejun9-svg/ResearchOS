@@ -104,6 +104,9 @@ func (s *Service) validateDecisions(tx *sql.Tx, project string, old, newValue an
 		if d["status"] != "DECIDED" {
 			return Fail(422, "GATE_FAILED", "abstained or failed decision cannot be adopted")
 		}
+		if len(decisionHardFailures(d)) > 0 {
+			return Fail(422, "GATE_FAILED", "failed checks or missing evidence prevent decision adoption")
+		}
 		var root string
 		if e = tx.QueryRow("SELECT root_id FROM decision_lineage WHERE project=? AND receipt_id=?", project, r["id"]).Scan(&root); e != nil {
 			return e

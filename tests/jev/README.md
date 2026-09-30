@@ -10,7 +10,7 @@ Qualification creation stores a frozen DRAFT with maximum_mode ADVISORY. Submitt
 
 ## Fixture command
 
-Set `RESEARCHOS_TASK_ID=W11` and exactly one of `RESEARCHOS_CHECK_ID=W11-G01`, `RESEARCHOS_CASE_ID=C07`, or `RESEARCHOS_CASE_ID=C08`. Set `RESEARCHOS_GO` to the pinned Go executable, then run `python ops/ci/jev.py --mode fixture`. There are 69 frozen subassertions in `expected.json`. The receipt records the source manifest, exact command, raw logs and nonzero assertion inventory; owner PASS awaits independent verification.
+Set `RESEARCHOS_TASK_ID=W11` and exactly one of `RESEARCHOS_CHECK_ID=W11-G01`, `RESEARCHOS_CASE_ID=C07`, or `RESEARCHOS_CASE_ID=C08`. Set `RESEARCHOS_GO` to the pinned Go executable, then run `python ops/ci/jev.py --mode fixture`. There are 75 frozen subassertions in `expected.json`. The receipt records the source manifest, exact command, raw logs and nonzero assertion inventory; owner PASS awaits independent verification.
 
 C07 uses loopback maximum-score responses and actual task acceptance/adoption requests against SQLite. The failed-experiment fixture is a failed deterministic experiment-result report, not a live scientific experiment. C08 checks the four fault classes, preserved state/evidence and continuing non-model work. The earlier W04 deterministic decision path remains compatible. Full C20 still belongs to W16.
 
