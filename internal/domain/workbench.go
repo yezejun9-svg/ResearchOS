@@ -22,12 +22,12 @@ func init() {
 
 // Called by the existing recursive visibility gate for each object. ID-only
 // relations need the same classification checks as explicit VersionRefs.
-func (s *Service) workbenchVisible(tx *sql.Tx, p Principal, project string, o Object, seen map[string]bool) bool {
+func (s *Service) workbenchVisible(tx *sql.Tx, p Principal, project, ownerKind string, o Object, seen map[string]bool) bool {
 	if o["channel"] == "IN_APP" && o["recipient_id"] != nil && o["recipient_id"] != p.ID {
 		return false
 	}
 	for field, value := range o {
-		kind := idTargets[field]
+		kind := relationKind(ownerKind, field)
 		if kind == "" || value == nil {
 			continue
 		}
@@ -53,7 +53,7 @@ func (s *Service) workbenchVisible(tx *sql.Tx, p Principal, project string, o Ob
 				}
 				return false
 			}
-			if !s.visibleGraph(tx, p, project, related, seen) {
+			if !s.visibleGraphKind(tx, p, project, kind, related, seen) {
 				return false
 			}
 		}
