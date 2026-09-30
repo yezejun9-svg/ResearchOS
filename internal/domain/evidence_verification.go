@@ -28,6 +28,10 @@ func (s *Service) verifyEvidence(tx *sql.Tx, p Principal, project, id string, b 
 	if Hash(Ref(snapshot, "Artifact")) != Hash(snapshotRef) || snapshot["validity"] != "CURRENT" {
 		return nil, Fail(412, "STALE_INPUT", "evidence snapshot changed")
 	}
+	// A fixture's JSON equality only authenticates its report, not a LIVE source claim.
+	if ev["evidence_kind"] != "SIMULATED" || snapshot["kind"] != "SOURCE_SNAPSHOT" || snapshot["evidence_kind"] != "SIMULATED" || snapshot["measurement_mode"] != "FIXTURE" {
+		return nil, Fail(422, "GATE_FAILED", "fixture verification requires simulated evidence and fixture snapshot")
+	}
 	if e = s.requireCurrentArtifactBody(tx, project, snapshot); e != nil {
 		return nil, e
 	}
