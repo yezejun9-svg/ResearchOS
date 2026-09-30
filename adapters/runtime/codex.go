@@ -20,6 +20,8 @@ type Protocol struct {
 	ToolsCompleted int             `json:"tools_completed"`
 }
 
+var reconnectDiagnostic = regexp.MustCompile(`^Reconnecting\.\.\. [1-9][0-9]*/[1-9][0-9]* \(stream disconnected before completion: .+\)$`)
+
 func Parse(raw []byte, exit int) Protocol {
 	p := Protocol{}
 	seen := map[string]bool{}
@@ -42,8 +44,16 @@ func Parse(raw []byte, exit int) Protocol {
 		case "turn.completed":
 			p.Settled = true
 			p.Usage, _ = o["usage"].(map[string]any)
-		case "turn.failed", "error":
+		case "turn.failed":
 			p.Failure = "request_failed"
+		case "error":
+			message, _ := o["message"].(string)
+			if reconnectDiagnostic.MatchString(message) {
+				// A transport retry still needs a later completed turn; terminal failures stay sticky.
+				p.Settled = false
+			} else {
+				p.Failure = "request_failed"
+			}
 		case "item.completed":
 			if item, ok := o["item"].(map[string]any); ok {
 				if item["type"] == "agent_message" {
