@@ -100,6 +100,7 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		s.writeError(w, cid, e)
 		return
 	}
+	w.Header().Set("X-ResearchOS-Principal-ID", p.ID)
 	roleOK := false
 	for _, role := range op.Roles {
 		if p.HasRole(role) {
