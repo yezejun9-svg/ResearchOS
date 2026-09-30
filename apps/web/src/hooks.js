@@ -42,9 +42,9 @@ export function useProjectEvents(api, projectId) {
     let transport = null
     const seen = new Set()
     setStatus({ api, projectId, online: false, lastSync: null, sequence: null, refresh: 0, message: '正在同步快照' })
-    const reset = async () => {
-      const progress = await api.call('getProgressProjection', { params: { projectId }, signal: controller.signal })
-      if (controller.signal.aborted) return
+    const reset = async (signal) => {
+      const progress = await api.call('getProgressProjection', { params: { projectId }, signal })
+      if (signal.aborted) return
       sequence = Number(progress.as_of_event_sequence)
       seen.clear()
       setStatus(old => ({ ...old, api, projectId, online: true, authExpired: false, lastSync: new Date(), sequence, refresh: old.refresh + 1, message: null }))
@@ -54,13 +54,15 @@ export function useProjectEvents(api, projectId) {
         if (!navigator.onLine) { await new Promise(resolve => setTimeout(resolve, 1000)); continue }
         const abortTransport = () => transport?.abort()
         try {
-          if (sequence === null) await reset()
-          if (controller.signal.aborted) break
           transport = new AbortController()
           controller.signal.addEventListener('abort', abortTransport, { once: true })
+          if (sequence === null) await reset(transport.signal)
+          if (controller.signal.aborted) break
+          if (transport.signal.aborted) continue
+          const connection = transport
           let gap = false
           await api.stream(projectId, sequence, event => {
-            if (controller.signal.aborted || event.project_id !== projectId || !event.id || seen.has(event.id)) return
+            if (connection.signal.aborted || event.project_id !== projectId || !event.id || seen.has(event.id)) return
             const next = Number(event.sequence)
             if (!Number.isSafeInteger(next) || next <= sequence) return
             if (next !== sequence + 1) { gap = true; return }
@@ -69,22 +71,47 @@ export function useProjectEvents(api, projectId) {
             sequence = next
             setStatus(old => ({ ...old, online: true, authExpired: false, lastSync: new Date(), sequence, refresh: old.refresh + 1 }))
           }, transport.signal, () => gap, () => {
-            if (!controller.signal.aborted) setStatus(old => ({ ...old, online: true, authExpired: false, lastSync: new Date(), message: null, refresh: old.refresh + 1 }))
+            if (!connection.signal.aborted) setStatus(old => ({ ...old, online: true, authExpired: false, message: null, refresh: old.refresh + 1 }))
           })
           if (gap) sequence = null
         } catch (error) {
           if (controller.signal.aborted) break
-          if (error.status === 410 || error.code === 'EVENT_GAP') sequence = null
+          if (error.status === 410 || error.code === 'EVENT_GAP' || error.code === 'STREAM_STALE') sequence = null
           setStatus(old => ({ ...old, online: false, authExpired: error.status === 401, message: error.status === 410 ? '事件游标过期，正在重取快照' : error.message }))
-          await new Promise(resolve => setTimeout(resolve, 2200))
+          if (error.name !== 'AbortError') await new Promise(resolve => setTimeout(resolve, 2200))
         } finally { controller.signal.removeEventListener('abort', abortTransport) }
       }
     }
     loop()
     const off = () => { transport?.abort(); setStatus(old => ({ ...old, online: false, message: '网络已断开' })) }
     const on = () => setStatus(old => ({ ...old, message: '正在重新连接' }))
+    // Resume invalidates the connection and takes a new snapshot. Keep the last
+    // observed data time until that snapshot arrives; heartbeats are not data.
+    const resume = () => {
+      if (controller.signal.aborted) return
+      sequence = null
+      transport?.abort()
+      setStatus(old => ({ ...old, online: false, message: '恢复后正在核对最新快照' }))
+    }
+    const visible = () => { if (document.visibilityState === 'visible') resume() }
+    const shown = event => { if (event.persisted) resume() }
+    let lastTick = Date.now()
+    const wakeWatch = setInterval(() => {
+      const now = Date.now()
+      if (now - lastTick > 20000) resume()
+      lastTick = now
+    }, 5000)
     addEventListener('offline', off); addEventListener('online', on)
-    return () => { controller.abort(); removeEventListener('offline', off); removeEventListener('online', on) }
+    addEventListener('pageshow', shown)
+    document.addEventListener('visibilitychange', visible)
+    document.addEventListener('resume', resume)
+    return () => {
+      controller.abort(); clearInterval(wakeWatch)
+      removeEventListener('offline', off); removeEventListener('online', on)
+      removeEventListener('pageshow', shown)
+      document.removeEventListener('visibilitychange', visible)
+      document.removeEventListener('resume', resume)
+    }
   }, [api, projectId])
   return status.api === api && status.projectId === projectId ? status : { api, projectId, online: false, lastSync: null, sequence: null, refresh: 0, message: '正在同步快照' }
 }

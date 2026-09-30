@@ -15,17 +15,17 @@ WEB = ROOT / 'apps/web'
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--phase', choices=['core', 'contracts', 'workflow', 'content'], default='core')
+    parser.add_argument('--phase', choices=['core', 'contracts', 'workflow', 'content', 'recovery'], default='core')
     phase = parser.parse_args().phase
     check, case = os.getenv('RESEARCHOS_CHECK_ID', ''), os.getenv('RESEARCHOS_CASE_ID', '')
-    allowed = {'core': ['W13-G02', 'C24'], 'contracts': ['W13-G01', 'C17', 'C18'], 'workflow': ['C23'], 'content': ['C25']}
+    allowed = {'core': ['W13-G02', 'C24'], 'contracts': ['W13-G01', 'C17', 'C18'], 'workflow': ['C23'], 'content': ['C25'], 'recovery': ['C26']}
     if os.getenv('RESEARCHOS_TASK_ID') != 'W13' or bool(check) == bool(case) or (check or case) not in allowed[phase]:
         parser.error('one matching W13 task gate or case selector required')
     expected = json.loads((ROOT / 'tests/ui/expected.json').read_text(encoding='utf-8'))[phase]
     if not expected or len(expected) != len(set(expected)):
         raise RuntimeError('empty or duplicate expected browser checks')
     run_id = str(uuid.uuid4())
-    out = ROOT / 'execution/receipts/W13/registered' / run_id
+    out = ROOT / ('execution/receipts/W13/c26-recovery/registered' if phase == 'recovery' else 'execution/receipts/W13/registered') / run_id
     out.mkdir(parents=True)
     def digest(path):
         return 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()
@@ -41,6 +41,7 @@ def main():
               'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'source_manifest': sources,
               'executor_identity': os.getenv('RESEARCHOS_EXECUTOR_ID', 'local:operator'), 'expected_checks': expected,
               'scope': 'REAL_WINDOWS_BROWSER_WITH_EXPLICIT_SQLITE_FIXTURES', 'physical_phone': False, 'physical_os_sleep': False}
+    before['dirty_before'] = subprocess.check_output(['git', 'status', '--short', '--untracked-files=all'], cwd=ROOT, text=True).splitlines()
     save('before.json', before)
     locked = json.loads((ROOT / 'execution/toolchains/locked.json').read_text(encoding='utf-8'))
     node = Path(locked['tools']['node']['path'])
@@ -69,7 +70,7 @@ def main():
                 continue
             if isinstance(value, dict) and 'report' in value:
                 child = Path(value['report']).resolve()
-                if not child.is_relative_to(ROOT / 'execution/receipts/W13/frontend'):
+                if not child.is_relative_to(ROOT / ('execution/receipts/W13/c26-recovery/browser' if phase == 'recovery' else 'execution/receipts/W13/frontend')):
                     raise RuntimeError('browser receipt escaped evidence directory')
                 report = json.loads(child.read_text(encoding='utf-8'))
                 break
@@ -91,6 +92,8 @@ def main():
                          'child_report': child.relative_to(ROOT).as_posix() if child else None,
                          'child_report_hash': digest(child) if child else None, 'raw_evidence_hashes': hashes,
                          'scope': before['scope'], 'independent_acceptance': 'PENDING',
+                         'qualification_status': 'PARTIAL' if phase == 'recovery' else 'NOT_ASSESSED',
+                         'physical_os_sleep': False, 'physical_phone': False,
                          'ended_at': datetime.datetime.now(datetime.timezone.utc).isoformat()})
     print(json.dumps({'status': 'PASS' if passed else 'FAIL', 'assertions': len(rows), 'assertion_ids': [r['assertion_id'] for r in rows], 'receipt': str(out / 'report.json')}))
     return 0 if passed else 1
