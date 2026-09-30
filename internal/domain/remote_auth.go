@@ -82,5 +82,8 @@ func (s *Service) remoteOperationBoundary(w http.ResponseWriter, r *http.Request
 		s.writeError(w, ID(), Fail(403, "FORBIDDEN", "device is limited to its granted projects"))
 		return false
 	}
+	if p.DeviceID != "" {
+		w.Header().Set("X-ResearchOS-Device-Role", p.Roles[0])
+	}
 	return true
 }

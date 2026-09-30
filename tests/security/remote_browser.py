@@ -96,6 +96,7 @@ def main():
             mobile.wait_for_url(base + '/p/' + project)
             mobile.locator('.connection-text').filter(has_text='已连接').wait_for(state='attached')
             mobile.wait_for_timeout(1000)
+            mobile.get_by_text('此设备为只读监督；控制操作需要电脑显式授权。', exact=True).wait_for()
             report['checks'].append('Desktop generated/copies real one-use link; phone consumes through actual API; fragment removed before submit; explicit READER project scope')
             assert not mobile.evaluate('document.documentElement.scrollWidth > innerWidth + 1')
             stored = mobile.evaluate('JSON.stringify({local:{...localStorage}, session:{...sessionStorage}})')
@@ -123,12 +124,14 @@ def main():
             login(page, base, '/p/' + project + '/settings', owner)
             page.get_by_role('button', name='允许项目控制').click()
             page.get_by_text('可控制指定项目', exact=True).wait_for()
+            mobile.get_by_text('此设备可控制已授权项目；设备和全局设置仍由电脑管理。', exact=True).wait_for()
             page.get_by_role('button', name='改为只读').click()
             page.get_by_text('只读监督', exact=True).wait_for()
+            mobile.get_by_text('此设备为只读监督；控制操作需要电脑显式授权。', exact=True).wait_for()
             with mobile.expect_response(lambda r: '/v1/' in r.url and r.status == 401, timeout=12000):
                 page.get_by_role('button', name='撤销设备', exact=True).click()
             page.get_by_text('已撤销', exact=True).wait_for()
-            mobile.get_by_text('连接已断开，状态可能过期。', exact=False).wait_for()
+            mobile.get_by_text('设备会话已过期或被撤销，请在电脑重新配对。', exact=True).wait_for()
             mobile.screenshot(path=str(out / 'phone-revoked.png'))
             report['checks'].append('Real desktop grant/downgrade/revoke controls persist; phone next polling request receives 401')
             assert not errors, errors

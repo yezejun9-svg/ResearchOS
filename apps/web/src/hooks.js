@@ -75,7 +75,7 @@ export function useProjectEvents(api, projectId) {
         } catch (error) {
           if (controller.signal.aborted) break
           if (error.status === 410 || error.code === 'EVENT_GAP') sequence = null
-          setStatus(old => ({ ...old, online: false, message: error.status === 410 ? '事件游标过期，正在重取快照' : error.message }))
+          setStatus(old => ({ ...old, online: false, authExpired: error.status === 401, message: error.status === 410 ? '事件游标过期，正在重取快照' : error.message }))
           await new Promise(resolve => setTimeout(resolve, 2200))
         } finally { controller.signal.removeEventListener('abort', abortTransport) }
       }
