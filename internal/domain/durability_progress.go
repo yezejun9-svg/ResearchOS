@@ -43,6 +43,9 @@ func (s *Service) advanceNoProgress(tx *sql.Tx, p Principal, project, id string,
 		if _, e = tx.Exec("INSERT INTO resource_progress_resumes(id,project,record,body) VALUES(?,?,?,?)", ID(), project, id, string(Bytes(record))); e != nil {
 			return nil, e
 		}
+		if e = s.refreshRetainedProgress(tx, project, n); e != nil {
+			return nil, e
+		}
 		n["resume_conditions"] = mergeUnique(Arr(n, "resume_conditions"), []any{"New input version required: " + Str(b, "resume_reason")})
 		if e = bump(n); e != nil {
 			return nil, e

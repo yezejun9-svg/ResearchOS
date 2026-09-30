@@ -71,6 +71,9 @@ func (s *Service) taskFailed(tx *sql.Tx, project string, t Object, reason string
 	if e != nil {
 		return e
 	}
+	if e = s.refreshRetainedProgress(tx, project, n); e != nil {
+		return e
+	}
 	if _, e = tx.Exec("INSERT INTO resource_progress_runs(project,run,record,body) VALUES(?,?,?,?)", project, t["active_run_id"], n["id"], string(Bytes(Object{"reason": reason, "at": Now()}))); e != nil {
 		return e
 	}
