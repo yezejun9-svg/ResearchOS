@@ -17,6 +17,8 @@
 
 精确源码 commit、ZIP 路径、SHA-256、双构建比较和独立夹具检查定位由 `execution/checkpoint.json` 的当前交付记录及 `execution/verifier/W21/current-handoff-index/6374df3/` 的增量定位提供。索引原快照不覆盖，后续定位单独追加。
 
+当前开发包为 `.local/researchos-development-d4ed8ff-a.zip`，冻结源码 `d4ed8ff90b198b1853eb9af803030b818f03591a`，SHA-256 `2689666c9738e0073edfd7148efce71830d466267bc79f5b070d113769b4b31a`。两次构建均退出 0，ZIP 字节一致。当前包唯一静态检查退出 0、16 项通过，未启动产品进程；a418 包的 28 项已执行检查按 511 个未改载荷逐字节一致性保留历史绑定，不是当前 ZIP 的新启动验收。独立报告为 `execution/verifier/W20/final-bundle/d4ed8ff/review.md`；最终定位追加在 `doc-package-supplement.json`。本段仅更新仓库交接，包内文档仍对应冻结源码。
+
 按 `docs/installation/README.md` 验证并解压包，在新绝对数据路径和空闲 loopback 端口用 `scripts/start.ps1 -Fresh` 启动，以 `scripts/stop.ps1` 停止。停止脚本保留数据，并核验实例身份。该入口只启动临时开发实例；不能用于现有权威数据库迁移、SCM 安装或正式发布。
 
 原实例与受保护服务的最后登记 PID 为 32736、79136，仅作续跑线索。使用前需重核身份；不要仅凭 PID 停止进程。原 schema13 数据与保护服务保持原状，已拒绝的启用动作不自动重试。
