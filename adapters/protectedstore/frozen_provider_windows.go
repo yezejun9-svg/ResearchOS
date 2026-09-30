@@ -27,8 +27,8 @@ func (p *FrozenProvider) Boundary(ctx context.Context) (Boundary, error) {
 	}
 	return Boundary{Mode: "INDEPENDENT_VERIFIER", OwnerSID: "S-1-5-80-2827915021-3673354303-1056739677-2648886565-40618300", IndependentIdentity: true, UnrestrictedSameUserCanRead: false}, nil
 }
-func (p *FrozenProvider) Ready(ctx context.Context, project string) error {
-	if project == "" {
+func (p *FrozenProvider) Ready(ctx context.Context, mode string) error {
+	if mode != "LIVE" {
 		return ErrBoundary
 	}
 	_, err := p.terminal(ctx)
