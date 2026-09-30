@@ -103,30 +103,26 @@ func TestCanaryBrokerProtocol(t *testing.T) {
 			done := make(chan struct{})
 			go func() { defer close(done); serveCanaryPipe(ctx, h, summary, s) }()
 			defer func() { cancel(); <-done }()
-			client, e := windows.CreateFile(windows.StringToUTF16Ptr(name), pipeClientRights, 0, nil, windows.OPEN_EXISTING, windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
+			client, e := windows.CreateFile(windows.StringToUTF16Ptr(name), pipeClientRights, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED|windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
 			if e != nil {
 				t.Fatal(e)
 			}
-			defer windows.CloseHandle(client)
-			var n uint32
-			request := "summary-v1"
+			file := os.NewFile(uintptr(client), "protocol-canary-pipe")
+			defer file.Close()
 			if scenario == "invalid-request" {
-				request = "read C:\\private"
-			}
-			if e = windows.WriteFile(client, []byte(request), &n, nil); e != nil {
-				t.Fatal(e)
-			}
-			buffer := make([]byte, 4096)
-			e = windows.ReadFile(client, buffer, &n, nil)
-			if scenario == "invalid-request" {
+				if e = file.SetDeadline(time.Now().Add(time.Second)); e != nil {
+					t.Fatal(e)
+				}
+				if _, e = file.Write([]byte("read-private")); e != nil {
+					t.Fatal(e)
+				}
+				buffer := make([]byte, 4096)
+				n, e := file.Read(buffer)
 				if e == nil || n != 0 {
 					t.Fatal("arbitrary request accepted")
 				}
 			} else {
-				if e != nil {
-					t.Fatal(e)
-				}
-				result, e := ParseSafeSummary(buffer[:n])
+				result, e := requestCanarySummary(file, time.Now().Add(time.Second))
 				if e != nil {
 					t.Fatal(e)
 				}
@@ -137,7 +133,6 @@ func TestCanaryBrokerProtocol(t *testing.T) {
 				} else if result != summary {
 					t.Fatal("summary mismatch")
 				}
-				windows.WriteFile(client, []byte("ack"), &n, nil)
 			}
 			fmt.Println("BROKER_ASSERTION", scenario, "PASS CANARY_ONLY")
 		})
