@@ -63,7 +63,7 @@ export function ArtifactPreview({ artifact, expectedRef, api, projectId }) {
     {state.status === 'ready' && <>
       {media === 'text/html' ? <iframe className="preview-frame" title="无脚本 HTML 预览" sandbox="" referrerPolicy="no-referrer" srcDoc={`<meta http-equiv="Content-Security-Policy" content="${htmlCsp}">${state.text}`}/> :
        media.startsWith('image/') ? <img className="preview-image" src={state.url} alt="产物图片预览" onError={() => setState({ status: 'error', message: '图片无法渲染，可下载已封存内容' })}/> :
-       media === 'application/pdf' ? <iframe className="preview-frame" title="PDF 预览" sandbox="" src={state.url}/> :
+       media === 'application/pdf' ? <iframe className="preview-frame" title="PDF 预览" referrerPolicy="no-referrer" src={state.url}/> :
        media === 'text/markdown' ? <MarkdownPreview text={state.text || ''}/> :
        state.text != null ? <pre className="preview-text">{media === 'application/json' ? prettyJson(state.text) : state.text}</pre> : <p>此格式不支持行内预览。</p>}
       <a href={state.url} download={`artifact-${artifact.id}`}>下载已核对的内容</a>
