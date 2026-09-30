@@ -69,7 +69,7 @@ def main(command_key='test.evolution'):
     if 'C20' in cases:
         tests.extend(('TestW16C20PrivateProofMissing', 'TestW16C20PrivateProofTampered',
                       'TestW16C20PrivateVerifierRevoked', 'TestW16C20PrivateVerifierGrantRemoved'))
-    out = ROOT / 'execution/receipts/W16' / str(uuid.uuid4())
+    out = ROOT / 'execution/receipts/W16' / ('c20-private' if 'C20' in cases else '') / str(uuid.uuid4())
     out.mkdir(parents=True)
     env = {k: v for k, v in os.environ.items() if k.upper() in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'PATH', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'COMSPEC', 'PATHEXT')}
     env.update(GOTOOLCHAIN='local', GOENV='off', GOFLAGS='-mod=readonly', RESEARCHOS_GO=go, W16_EVIDENCE_DIR=str(out))
