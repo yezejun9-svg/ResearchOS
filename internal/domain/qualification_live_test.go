@@ -167,6 +167,51 @@ func (q *qualificationFixture) accept(t *testing.T) (Object, error) {
 	q.result = Object{"requested_maximum_mode": "BOUNDED_AUTO", "acceptance_id": receipt["id"], "test_receipt_refs": receipt["artifact_refs"], "critical_false_accept_count": k.CriticalFalseAccept, "false_accept_rate": float64(k.FalseAccept) / float64(k.Planned), "false_reject_rate": float64(k.FalseReject) / float64(k.PositiveLabelCount), "abstain_rate": float64(k.Abstain) / float64(k.Planned)}
 	return receipt, nil
 }
+
+func TestW11FrozenDeclarationImport(t *testing.T) {
+	q := newQualificationFixture(t)
+	tx, e := q.f.db.Begin()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer tx.Rollback()
+	p, e := authenticate(tx, q.f.token)
+	if e != nil {
+		t.Fatal(e)
+	}
+	first, e := q.f.s.frozenDeclarations(tx, p, q.f.project, q.proof.Summary, q.dev, q.private)
+	if e != nil {
+		t.Fatal(e)
+	}
+	second, e := q.f.s.frozenDeclarations(tx, p, q.f.project, q.proof.Summary, q.dev, q.private)
+	if e != nil {
+		t.Fatal(e)
+	}
+	qualificationIntegrationAssert(t, "QUAL-IMPORT-IDEMPOTENT", Hash(first), Hash(second))
+	var count int
+	if e = tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='Qualification'", q.f.project).Scan(&count); e != nil {
+		t.Fatal(e)
+	}
+	qualificationIntegrationAssert(t, "QUAL-IMPORT-TWO-SEPARATE-KEYS", 2, count)
+	for _, entry := range Arr(first, "qualifications") {
+		item := entry.(map[string]any)
+		declaration := item["qualification"].(map[string]any)
+		qualificationIntegrationAssert(t, "QUAL-IMPORT-DECLARATION-ONLY-"+Str(declaration["scope"].(map[string]any), "language"), []any{"DRAFT", "ADVISORY", false, nil}, []any{declaration["status"], declaration["maximum_mode"], declaration["jev_called"], declaration["acceptance_id"]})
+	}
+	tx.Rollback()
+	_, e = q.f.s.ImportFrozenQualifications(context.Background(), q.f.token, q.f.project, []byte("untrusted replacement"))
+	if e == nil {
+		t.Fatal("unfrozen corpus admitted")
+	}
+	raw, e := os.ReadFile("../../evaluation/development/jev-v2/dataset.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, e = q.f.s.ImportFrozenQualifications(context.Background(), q.f.token, q.f.project, raw)
+	if fault, ok := e.(*Fault); !ok || fault.Status != 403 {
+		t.Fatalf("non-owner import reached provider: %v", e)
+	}
+}
 func (q *qualificationFixture) record() (Object, error) {
 	tx, e := q.f.db.Begin()
 	if e != nil {
