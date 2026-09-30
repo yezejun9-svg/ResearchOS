@@ -1,5 +1,6 @@
 // Paths and methods from spec/v2.0/contracts/openapi.json.
 export const operations = {
+  "sealArtifact": { "method": "POST", "path": "/v1/projects/{project_id}/artifacts" },
   "listProjects": {
     "method": "GET",
     "path": "/v1/projects"
