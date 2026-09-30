@@ -22,7 +22,9 @@ def recovery_cases(page, base, project_path, owner, api, report, out, freshness_
     # replaced with an explicitly stalled browser ReadableStream.
     page.add_init_script("""(() => {
       const evidence = window.recoveryEvidence = {opens:0, queries:0, heartbeats:0,
-        stallNext:false, stalled:0, aborted:0, lateBytes:0};
+        stallNext:false, stalled:0, aborted:0, lateBytes:0, lifecycle:[], ticks:[]};
+      for (const name of ['freeze','resume','visibilitychange']) document.addEventListener(name, () => evidence.lifecycle.push({name, at:Date.now(), visibility:document.visibilityState}));
+      setInterval(() => evidence.ticks.push(Date.now()), 5000);
       const originalFetch = window.fetch;
       const getReader = ReadableStream.prototype.getReader;
       ReadableStream.prototype.getReader = function(...args) {
@@ -121,7 +123,11 @@ def recovery_cases(page, base, project_path, owner, api, report, out, freshness_
         'supersedes_id': None, 'acceptance_check_ids': []}, f'"r{state["revision"]}"')
     expected = api(base, owner, 'GET', prefix + '/progress')
     session.send('Page.setWebLifecycleState', {'state': 'active'})
-    page.wait_for_function('recoveryEvidence.aborted === 2', timeout=15000)
+    report['resume_observation'] = {'before': frozen_before, 'immediately_after_active': page.evaluate('({...recoveryEvidence, observedAt:Date.now(), visibility:document.visibilityState})')}
+    try:
+        page.wait_for_function('recoveryEvidence.aborted === 2', timeout=15000, polling=100)
+    finally:
+        report['resume_observation']['after_wait'] = page.evaluate('({...recoveryEvidence, observedAt:Date.now(), visibility:document.visibilityState})')
     page.locator('.connection-banner').wait_for(state='hidden', timeout=15000)
     page.wait_for_function('(n) => document.querySelector(".progress-rail").textContent.includes("事件水位 " + n)', arg=expected['as_of_event_sequence'])
     resumed = page.evaluate('({...recoveryEvidence})')
