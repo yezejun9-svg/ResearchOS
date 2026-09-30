@@ -12,7 +12,7 @@ import (
 var contextOperations = map[string]bool{}
 
 func init() {
-	for _, name := range strings.Fields("createContextBundle getContextBundle listContextBundle createChangeProposal getChangeProposal listChangeProposal applyChangeProposal createImpactLink getImpactLink listImpactLink createConflict getConflict listConflict resolveConflict sendAgentMessage getAgentMessage listAgentMessage recordDecision getDecisionReceipt listDecisionReceipt recordAcceptance getAcceptanceReceipt listAcceptanceReceipt") {
+	for _, name := range strings.Fields("createContextBundle getContextBundle listContextBundle createChangeProposal getChangeProposal listChangeProposal analyzeChangeImpact applyChangeProposal createImpactLink getImpactLink listImpactLink createConflict getConflict listConflict resolveConflict sendAgentMessage getAgentMessage listAgentMessage recordDecision getDecisionReceipt listDecisionReceipt recordAcceptance getAcceptanceReceipt listAcceptanceReceipt") {
 		implemented[name] = true
 		contextOperations[name] = true
 	}
@@ -561,6 +561,10 @@ func (s *Service) contextOperation(tx *sql.Tx, p Principal, project, id string, 
 	case "createChangeProposal":
 		o, e = s.createChange(tx, p, project, b)
 		kind = "ChangeProposal"
+	case "analyzeChangeImpact":
+		o, e = s.analyzeChangeImpact(tx, p, project, id, b)
+		kind = "ChangeProposal"
+		status = 200
 	case "applyChangeProposal":
 		o, e = s.applyChange(tx, p, project, id, b)
 		kind = "ChangeProposal"

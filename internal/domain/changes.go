@@ -282,18 +282,33 @@ func (s *Service) checkChange(tx *sql.Tx, p Principal, project string, proposal 
 			roots = append(roots, r)
 		}
 	}
-	affected, links, e := s.closure(tx, project, roots)
+	semanticConflicts := Empty()
+	var e error
+	if proposal["semantic_review_run_id"] != nil {
+		var reviews []semanticReview
+		reviews, e = s.semanticReviews(tx, project, proposal, false)
+		if e != nil {
+			return nil, e
+		}
+		semanticConflicts = Arr(reviews[0].report, "conflict_ids")
+	}
+	var affected, links []any
+	if proposal["semantic_review_run_id"] != nil {
+		affected, links, e = s.reviewClosure(tx, project, proposal)
+	} else {
+		affected, links, e = s.closure(tx, project, roots)
+	}
 	if e != nil {
 		return nil, e
 	}
 	if Hash(affected) != Hash(proposal["impacted_refs"]) || Hash(links) != Hash(proposal["impact_link_ids"]) {
 		return nil, Fail(412, "STALE_INPUT", "impact closure changed")
 	}
-	conflicts, e := s.changeConflicts(tx, project, proposal)
+	conflicts, e := s.changeConflictsExcept(tx, project, proposal, stringSet(semanticConflicts))
 	if e != nil {
 		return nil, e
 	}
-	if Hash(conflicts) != Hash(proposal["conflict_ids"]) {
+	if Hash(append(conflicts, semanticConflicts...)) != Hash(proposal["conflict_ids"]) {
 		return nil, Fail(412, "STALE_INPUT", "conflict set changed")
 	}
 	return values, nil
@@ -348,7 +363,7 @@ func (s *Service) acceptChange(tx *sql.Tx, p Principal, project string, b Object
 	}
 	if sourceResolution, e := sourceConflictInProposal(tx, project, proposal); e != nil {
 		return nil, e
-	} else if sourceResolution {
+	} else if sourceResolution || proposal["semantic_review_run_id"] != nil {
 		if e := sourceConflictVerifier(tx, project, p.ID, authors); e != nil {
 			return nil, e
 		}
@@ -371,10 +386,16 @@ func (s *Service) acceptChange(tx *sql.Tx, p Principal, project string, b Object
 		return nil, e
 	}
 	checks := Empty()
-	for _, id := range changeChecks {
-		checks = append(checks, Object{"check_id": id, "status": "PASS", "evidence_refs": []any{Ref(evidence, "Artifact")}, "command_key": "test.context", "actual": "Server recomputed frozen inputs, exact impact and independent authority.", "exit_code": 0, "started_at": started, "finished_at": Now()})
+	actual := "Server recomputed frozen inputs, exact impact and independent authority."
+	reason := "Independent deterministic change validation; not Task acceptance."
+	if proposal["semantic_review_run_id"] != nil {
+		actual = "Server checked sealed report provenance, merged impact closure and independent authority; semantic content remains a fixture claim."
+		reason = "Independent structural validation of fixture semantic review; semantic truth is not established."
 	}
-	o := Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now(), "subject_ref": r, "run_id": nil, "contract_hash": changeHash(proposal), "input_refs": []any{r}, "artifact_refs": []any{Ref(evidence, "Artifact")}, "checks": checks, "verdict": "PASS", "verifier_principal_id": p.ID, "executor_principal_ids": authors, "independence_basis": "DETERMINISTIC_SERVICE", "blocking_conflict_ids": Empty(), "qualification_ids": Empty(), "policy_revision": state["policy_revision"], "measurement_mode": "FIXTURE", "reason": "Independent deterministic change validation; not Task acceptance."}
+	for _, id := range changeChecks {
+		checks = append(checks, Object{"check_id": id, "status": "PASS", "evidence_refs": []any{Ref(evidence, "Artifact")}, "command_key": "test.context", "actual": actual, "exit_code": 0, "started_at": started, "finished_at": Now()})
+	}
+	o := Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now(), "subject_ref": r, "run_id": nil, "contract_hash": changeHash(proposal), "input_refs": []any{r}, "artifact_refs": []any{Ref(evidence, "Artifact")}, "checks": checks, "verdict": "PASS", "verifier_principal_id": p.ID, "executor_principal_ids": authors, "independence_basis": "DETERMINISTIC_SERVICE", "blocking_conflict_ids": Empty(), "qualification_ids": Empty(), "policy_revision": state["policy_revision"], "measurement_mode": "FIXTURE", "reason": reason}
 	o["receipt_hash"] = Receipt(o)
 	return o, s.put(tx, "AcceptanceReceipt", o)
 }
@@ -402,7 +423,7 @@ func (s *Service) applyChange(tx *sql.Tx, p Principal, project, id string, b Obj
 	}
 	if sourceResolution, e := sourceConflictInProposal(tx, project, proposal); e != nil {
 		return nil, e
-	} else if sourceResolution {
+	} else if sourceResolution || proposal["semantic_review_run_id"] != nil {
 		var author string
 		if e := tx.QueryRow("SELECT author FROM context_changes WHERE project=? AND proposal_id=?", project, proposal["id"]).Scan(&author); e != nil {
 			return nil, e
@@ -412,7 +433,7 @@ func (s *Service) applyChange(tx *sql.Tx, p Principal, project, id string, b Obj
 			return nil, e
 		}
 		if Hash(authors) != Hash(receipt["executor_principal_ids"]) {
-			return nil, Fail(412, "STALE_INPUT", "source resolution authors changed")
+			return nil, Fail(412, "STALE_INPUT", "change authors changed")
 		}
 		if e := sourceConflictVerifier(tx, project, Str(receipt, "verifier_principal_id"), authors); e != nil {
 			return nil, e
@@ -500,7 +521,8 @@ func (s *Service) applyChange(tx *sql.Tx, p Principal, project, id string, b Obj
 			object Object
 		}{kind, o})
 	}
-	for _, id := range Arr(proposal, "conflict_ids") {
+	formalConflicts := Arr(proposal, "conflict_ids")
+	for _, id := range formalConflicts {
 		c, e := load(tx, project, "Conflict", id.(string))
 		if e != nil {
 			return nil, e
@@ -518,7 +540,7 @@ func (s *Service) applyChange(tx *sql.Tx, p Principal, project, id string, b Obj
 	remaining := Empty()
 	for _, id := range Arr(state, "blocking_conflict_ids") {
 		resolved := false
-		for _, rid := range Arr(proposal, "conflict_ids") {
+		for _, rid := range formalConflicts {
 			resolved = resolved || id == rid
 		}
 		if !resolved {
@@ -617,6 +639,15 @@ func artifactMedia(data []byte) string {
 // Source snapshots and unrelated/current decisions are not candidate authorship.
 func (s *Service) candidateAuthors(tx *sql.Tx, project string, proposal Object, author string) ([]any, error) {
 	authors := map[string]bool{author: true}
+	if proposal["semantic_review_run_id"] != nil {
+		reviews, e := s.semanticReviews(tx, project, proposal, false)
+		if e != nil {
+			return nil, e
+		}
+		for _, review := range reviews {
+			authors[review.executor] = true
+		}
+	}
 	visited := map[string]bool{}
 	var artifact func(Object, bool) error
 	artifact = func(ref Object, direct bool) error {

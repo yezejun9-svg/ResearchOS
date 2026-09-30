@@ -12,6 +12,10 @@ type sourceDecisionEdit struct {
 
 // Integration requires a real task with valid context and sealed candidate evidence.
 func (s *Service) changeConflicts(tx *sql.Tx, project string, proposal Object) ([]any, error) {
+	return s.changeConflictsExcept(tx, project, proposal, nil)
+}
+
+func (s *Service) changeConflictsExcept(tx *sql.Tx, project string, proposal Object, excluded map[string]bool) ([]any, error) {
 	chosen := map[string]bool{}
 	integration := false
 	edits := []sourceDecisionEdit{}
@@ -71,6 +75,9 @@ func (s *Service) changeConflicts(tx *sql.Tx, project string, proposal Object) (
 	}
 	ids := Empty()
 	for _, c := range conflicts {
+		if excluded[Str(c, "id")] {
+			continue
+		}
 		if sourceEvidenceConflict(c) {
 			if e := s.checkSourceConflictResolution(tx, project, c, edits); e != nil {
 				return nil, e
