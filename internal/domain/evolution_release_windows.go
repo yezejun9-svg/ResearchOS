@@ -213,6 +213,9 @@ func (s *Service) releaseActorsCurrent(tx *sql.Tx, project string, x, h, accepte
 // This callback is used by both PrepareFixture and SwitchFixture. It reads
 // current domain state, not merely the historical sealed admission or ledger.
 func (s *Service) releaseAdmissionCurrent(ctx context.Context, a supervisor.ReleaseAdmission) error {
+	if !a.ExpiresUTC.After(time.Now().UTC()) {
+		return errors.New("release admission expired before effect")
+	}
 	tx, e := s.DB.BeginTx(ctx, nil)
 	if e != nil {
 		return e
