@@ -5,6 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
+	"path"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"researchos.local/research-os/internal/domain"
@@ -28,6 +31,14 @@ func Handler(db *sql.DB, webDir string, service *domain.Service) http.Handler {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ready", "scope": "DEVELOPMENT_ONLY", "database": "sqlite"})
 	})
 	mux.Handle("/v1/", service.Handler())
-	mux.Handle("/", http.FileServer(http.Dir(webDir)))
+	files := http.FileServer(http.Dir(webDir))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if (r.Method == "GET" || r.Method == "HEAD") && path.Ext(r.URL.Path) == "" && strings.Contains(r.Header.Get("Accept"), "text/html") {
+			w.Header().Set("Cache-Control", "no-store")
+			http.ServeFile(w, r, filepath.Join(webDir, "index.html"))
+			return
+		}
+		files.ServeHTTP(w, r)
+	})
 	return mux
 }
