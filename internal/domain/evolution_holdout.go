@@ -122,6 +122,9 @@ func (s *Service) evolutionHoldoutVerifierCurrent(tx *sql.Tx, project string, x 
 	if err != nil {
 		return err
 	}
+	if err = constrainRemotePrincipal(tx, &p); err != nil {
+		return err
+	}
 	if !protectedAllowed(p, project) {
 		return Fail(403, "FORBIDDEN", "restricted private holdout verifier grant required")
 	}
