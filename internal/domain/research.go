@@ -3,6 +3,7 @@ package domain
 import (
 	"database/sql"
 	"errors"
+	"sort"
 	"time"
 )
 
@@ -114,6 +115,18 @@ func (s *Service) createResearchCycle(tx *sql.Tx, p Principal, project string, b
 	if err = s.put(tx, "ResearchCycle", o); err != nil {
 		return nil, err
 	}
+	var monitorGoal string
+	if err = tx.QueryRow("SELECT compiled_goal FROM intent_plan_bindings WHERE project=? AND monitor_current=1", project).Scan(&monitorGoal); err == nil {
+		meta, plan, e := s.monitorSnapshot(tx, project, monitorGoal, true)
+		if e != nil {
+			return nil, e
+		}
+		if e = bindResearchMonitorCycle(tx, project, o, meta, plan); e != nil {
+			return nil, e
+		}
+	} else if err != sql.ErrNoRows {
+		return nil, err
+	}
 	if err = bump(state); err != nil {
 		return nil, err
 	}
@@ -203,10 +216,15 @@ func (s *Service) researchCoverage(tx *sql.Tx, project string, profile Object, f
 		}
 		end, endErr := time.Parse(time.RFC3339Nano, Str(cursor, "covered_until"))
 		success, successErr := time.Parse(time.RFC3339Nano, Str(cursor, "last_success_at"))
+		type coveredInterval struct {
+			from, to time.Time
+			ids      map[string]bool
+		}
+		intervals := []coveredInterval{}
 		for _, window := range windows {
 			start, startErr := time.Parse(time.RFC3339Nano, window[0])
 			stop, stopErr := time.Parse(time.RFC3339Nano, window[1])
-			if endErr != nil || successErr != nil || startErr != nil || stopErr != nil || start.After(from) || stop.Before(to) || end.Before(stop) {
+			if endErr != nil || successErr != nil || startErr != nil || stopErr != nil || !start.Before(stop) || !start.Before(to) || !stop.After(from) || end.Before(stop) {
 				continue
 			}
 			ids := map[string]bool{}
@@ -222,9 +240,29 @@ func (s *Service) researchCoverage(tx *sql.Tx, project string, profile Object, f
 				return nil, e
 			}
 			if final {
-				c["status"], c["observed_from"], c["observed_to"], c["record_count"], c["gap_reason"] = "COMPLETE", window[0], window[1], len(ids), nil
-				break
+				intervals = append(intervals, coveredInterval{start, stop, ids})
 			}
+		}
+		sort.Slice(intervals, func(i, j int) bool { return intervals[i].from.Before(intervals[j].from) })
+		coveredTo := from
+		ids := map[string]bool{}
+		for _, interval := range intervals {
+			if interval.from.After(coveredTo) {
+				break // Neither max(covered_until) nor a later page fills this gap.
+			}
+			if interval.to.After(coveredTo) {
+				coveredTo = interval.to
+			}
+			for id := range interval.ids {
+				ids[id] = true
+			}
+		}
+		if coveredTo.After(from) {
+			c["observed_from"], c["observed_to"], c["record_count"] = from.UTC().Format(time.RFC3339Nano), coveredTo.UTC().Format(time.RFC3339Nano), len(ids)
+			c["gap_reason"] = "verified contiguous source intervals do not cover the full cycle"
+		}
+		if !coveredTo.Before(to) {
+			c["status"], c["gap_reason"] = "COMPLETE", nil
 		}
 		if c["status"] != "COMPLETE" && kind == "X" {
 			c["gap_reason"] = "X visible observations do not prove a complete bounded window"
@@ -339,77 +377,57 @@ func (s *Service) closeResearchCycle(tx *sql.Tx, project, id string, b Object) (
 	if state["active_cycle_id"] != id {
 		return nil, Fail(409, "STATE_CONFLICT", "cycle is not active")
 	}
-	profile, err := version(tx, project, o["profile_ref"].(map[string]any))
-	if err != nil {
+	if err = researchCycleSettled(tx, project, id); err != nil {
 		return nil, err
 	}
-	current, err := singleton(tx, project, "ProjectProfile")
-	if err != nil {
-		return nil, err
-	}
-	if current["revision"] != profile["revision"] {
-		return nil, Fail(412, "STALE_INPUT", "project profile changed")
-	}
-	from, to, err := parseCycleWindow(Str(o, "window_from"), Str(o, "window_to"))
-	if err != nil {
-		return nil, err
-	}
-	coverage, err := s.researchCoverage(tx, project, profile, from, to)
-	if err != nil {
-		return nil, err
-	}
-	complete, progress := true, false
-	for _, raw := range coverage {
-		c := raw.(map[string]any)
-		if c["status"] == "COMPLETE" {
-			progress = true
+	coverage := Arr(o, "source_coverage")
+	actual := "CANCELLED"
+	var monitorMeta, reportTask, reportReceipt, reportFacts Object
+	if b["requested_status"] != "CANCELLED" {
+		facts, e := s.researchCycleFacts(tx, project, o)
+		if e != nil {
+			return nil, e
 		}
-		if c["required"] == true && c["status"] != "COMPLETE" {
-			complete = false
+		coverage, actual = Arr(facts, "source_coverage"), Str(facts, "cycle_outcome")
+		var bound int
+		if e = tx.QueryRow("SELECT count(*) FROM research_monitor_cycles WHERE project=? AND cycle=?", project, id).Scan(&bound); e != nil {
+			return nil, e
 		}
-	}
-	for _, raw := range Arr(o, "required_experiment_ids") {
-		x, err := load(tx, project, "Experiment", raw.(string))
-		if err != nil {
-			return nil, err
-		}
-		if x["cycle_id"] != id || x["status"] != "COMPLETED" || x["acceptance_id"] == nil {
-			complete = false
-			continue
-		}
-		if _, err = s.experimentAcceptance(tx, project, x, Str(x, "acceptance_id")); err != nil {
-			var fault *Fault
-			if !errors.As(err, &fault) || fault.Status >= 500 {
-				return nil, err
+		if bound != 0 {
+			var reportID string
+			if e = tx.QueryRow("SELECT task FROM research_cycle_work WHERE project=? AND cycle=? AND stage='delivery'", project, id).Scan(&reportID); e != nil {
+				return nil, Fail(422, "GATE_FAILED", "monitor cycle requires independent report before close")
 			}
-			complete = false
-			continue
+			reportTask, e = load(tx, project, "Task", reportID)
+			if e != nil {
+				return nil, e
+			}
+			monitorMeta, _, e = s.monitorSnapshot(tx, project, Str(reportTask, "goal_id"), true)
+			if e != nil {
+				return nil, e
+			}
+			reportReceipt, e = s.researchAcceptedTask(tx, project, reportTask)
+			if e != nil {
+				return nil, e
+			}
+			outputs := Arr(reportTask, "output_artifact_ids")
+			if len(outputs) != 1 {
+				return nil, Fail(422, "GATE_FAILED", "one accepted cycle report required")
+			}
+			a, e := load(tx, project, "Artifact", outputs[0].(string))
+			if e != nil {
+				return nil, e
+			}
+			body, e := s.artifactJSON(tx, project, Ref(a, "Artifact"))
+			if e != nil {
+				return nil, e
+			}
+			if Hash(body) != Hash(facts) {
+				return nil, Fail(412, "STALE_INPUT", "accepted report differs from current cycle evidence")
+			}
+			o["checkpoint_artifact_id"] = a["id"]
+			reportFacts = facts
 		}
-		progress = true
-	}
-	for _, raw := range Arr(o, "candidate_evidence_ids") {
-		var count int
-		if err := tx.QueryRow("SELECT count(*) FROM research_candidate_reviews WHERE project=? AND cycle_id=? AND evidence_id=?", project, id, raw).Scan(&count); err != nil {
-			return nil, err
-		}
-		if count != 1 {
-			complete = false
-		} else {
-			progress = true
-		}
-	}
-	if len(Arr(o, "decision_ids")) > 0 || o["checkpoint_artifact_id"] != nil {
-		progress = true
-	}
-	actual := "COMPLETE"
-	if !complete {
-		actual = "PARTIAL"
-		if !progress {
-			actual = "BLOCKED"
-		}
-	}
-	if b["requested_status"] == "CANCELLED" {
-		actual = "CANCELLED"
 	}
 	if b["requested_status"] != actual {
 		return nil, Fail(422, "GATE_FAILED", "requested cycle status differs from verified coverage and experiments: "+actual)
@@ -427,6 +445,11 @@ func (s *Service) closeResearchCycle(tx *sql.Tx, project, id string, b Object) (
 	state["active_cycle_id"] = nil
 	if err = s.put(tx, "ProjectState", state); err != nil {
 		return nil, err
+	}
+	if monitorMeta != nil {
+		if err = s.recordResearchIteration(tx, project, monitorMeta, reportTask, reportReceipt, reportFacts); err != nil {
+			return nil, err
+		}
 	}
 	return o, nil
 }

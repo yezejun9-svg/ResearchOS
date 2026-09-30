@@ -19,25 +19,32 @@ import (
 )
 
 const LocalUpgradePlan = "schema13-to14-remote-access-v1"
+const FinalSchemaUpgradePlan = "schema13-to20-research-runtime-v1"
 const localUpgradeFormat = "RESEARCHOS_SAME_HOST_UPGRADE_V1"
 const upgradeServiceSID = "S-1-5-80-2827915021-3673354303-1056739677-2648886565-40618300"
 
 // Exact release input bytes, not a caller supplied SQL script or version subset.
 var upgradeMigrationHashes = map[string]string{
-	"0001_bootstrap.sql":               "sha256:bb87c889e31fd5412b49743d106679f783b6dd21d874fe29d82d18a729ce3dbc",
-	"0002_domain.sql":                  "sha256:90d6c36100cbfaddf85c23f603b686336d161e43eeeed47c034ab85415b25db4",
-	"0003_context.sql":                 "sha256:50aa1579e4233cbb64ac30777e27c55cba29bab7ee0cc221a677f9a420a7159a",
-	"0004_sources.sql":                 "sha256:d40152642778d8ea4e21148fd6517bdc8bf4c2582a8d6212b8cfdf7a470dea06",
-	"0005_runtime.sql":                 "sha256:f3b9cd4c03f101c22c47a4fd7ad72593babe69de9abcd8a1ee3056fa6c23ade5",
-	"0006_orchestration.sql":           "sha256:cbc9ede2d2e46e1e68ac7120d2a99b29627f2e13b1fc82937e3ed13ac9b2317b",
-	"0007_retrieval.sql":               "sha256:eaa3963a3acdfcc1791982432c42dea9d4dd8f0baf7de51d278fce70bcd626bb",
-	"0008_artifact_uses.sql":           "sha256:adf17ad69203f0e700897a426f2d596496081bd5f3a964cbea8e3db9fc561ee7",
-	"0009_retrieval_root_identity.sql": "sha256:48219da409abc3f9d353e8d91a71a387ea342e5c13aae711a36c28410b22fb4f",
-	"0010_experiments.sql":             "sha256:c197ff792f62a1be5903bb6967175512cb53bdb09ff276e06fa8542822024287",
-	"0011_resources.sql":               "sha256:45c082ae0980af14f5b0be2d5aae02622dcc15c8c566b442077b4c1fb0c9942b",
-	"0012_experiment_execution.sql":    "sha256:c81411769ef2bd3ec1d101f311ce37722036485b8e9d99d45ae9c9be48f088c0",
-	"0013_research_cycles.sql":         "sha256:188e0d6fbcffd3901d36109dcd421a21f7ef704574f62cd5c0f8af862c191d1e",
-	"0014_remote_access.sql":           "sha256:687b01552260301a8f3f39e92422f16d0b2e310b38f77d1b025566f9a9cfa4d7",
+	"0001_bootstrap.sql":                    "sha256:bb87c889e31fd5412b49743d106679f783b6dd21d874fe29d82d18a729ce3dbc",
+	"0002_domain.sql":                       "sha256:90d6c36100cbfaddf85c23f603b686336d161e43eeeed47c034ab85415b25db4",
+	"0003_context.sql":                      "sha256:50aa1579e4233cbb64ac30777e27c55cba29bab7ee0cc221a677f9a420a7159a",
+	"0004_sources.sql":                      "sha256:d40152642778d8ea4e21148fd6517bdc8bf4c2582a8d6212b8cfdf7a470dea06",
+	"0005_runtime.sql":                      "sha256:f3b9cd4c03f101c22c47a4fd7ad72593babe69de9abcd8a1ee3056fa6c23ade5",
+	"0006_orchestration.sql":                "sha256:cbc9ede2d2e46e1e68ac7120d2a99b29627f2e13b1fc82937e3ed13ac9b2317b",
+	"0007_retrieval.sql":                    "sha256:eaa3963a3acdfcc1791982432c42dea9d4dd8f0baf7de51d278fce70bcd626bb",
+	"0008_artifact_uses.sql":                "sha256:adf17ad69203f0e700897a426f2d596496081bd5f3a964cbea8e3db9fc561ee7",
+	"0009_retrieval_root_identity.sql":      "sha256:48219da409abc3f9d353e8d91a71a387ea342e5c13aae711a36c28410b22fb4f",
+	"0010_experiments.sql":                  "sha256:c197ff792f62a1be5903bb6967175512cb53bdb09ff276e06fa8542822024287",
+	"0011_resources.sql":                    "sha256:45c082ae0980af14f5b0be2d5aae02622dcc15c8c566b442077b4c1fb0c9942b",
+	"0012_experiment_execution.sql":         "sha256:c81411769ef2bd3ec1d101f311ce37722036485b8e9d99d45ae9c9be48f088c0",
+	"0013_research_cycles.sql":              "sha256:188e0d6fbcffd3901d36109dcd421a21f7ef704574f62cd5c0f8af862c191d1e",
+	"0014_remote_access.sql":                "sha256:687b01552260301a8f3f39e92422f16d0b2e310b38f77d1b025566f9a9cfa4d7",
+	"0015_evolution_fixture.sql":            "sha256:d70dd0580e89e2a7940c90ee771b2bd94551a42d8cda7fadfe83b60509852fe9",
+	"0016_runtime_qualification.sql":        "sha256:7fd44c42be4c0753c367fc8361e9990b56e4f9a001a5f443ef62d0d87d05a03f",
+	"0017_runtime_dispatch.sql":             "sha256:e5a2671c25725205bb5306c7fcbab254d53e3ef7a0448a163a41c5ac24a7b558",
+	"0018_intent_planning.sql":              "sha256:7592b2b47d2e305f9ec26937830b5c0606c7d90622401a0b6b80a8c8a67db4e0",
+	"0019_evolution_release_operations.sql": "sha256:54ff6eb7a7ca588df738f5bd68b6f6851d86916cef435abaac15d1f8bd6e131e",
+	"0020_research_cycle_work.sql":          "sha256:3f90bdb0e828cec90bc370f34abed0cf0629dc78dcc01dda250c18cda49e528a",
 }
 
 type LocalUpgradeOptions struct {
@@ -150,6 +157,9 @@ func upgradePaths(opt *LocalUpgradeOptions) error {
 }
 
 func upgradeRelease(root string, count int) (Object, [][]byte, error) {
+	if count != 13 && count != 14 && count != 20 {
+		return nil, nil, fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+	}
 	files, e := filepath.Glob(filepath.Join(root, "migrations/sqlite/*.sql"))
 	if e != nil || len(files) != count {
 		return nil, nil, fmt.Errorf("UPGRADE_RELEASE_MIGRATIONS: require exact 1..%d", count)
@@ -223,8 +233,10 @@ func upgradeTemplate(ctx context.Context, sqls [][]byte, contracts *Contracts) (
 	if _, e = (&Service{DB: db, Contracts: contracts}).backupFence(ctx); e != nil {
 		return "", "", e
 	}
-	if _, e = db.ExecContext(ctx, string(sqls[13])); e != nil {
-		return "", "", e
+	for _, raw := range sqls[13:] {
+		if _, e = db.ExecContext(ctx, string(raw)); e != nil {
+			return "", "", e
+		}
 	}
 	after, e := backupSchema(db)
 	return before, after, e
@@ -232,7 +244,12 @@ func upgradeTemplate(ctx context.Context, sqls [][]byte, contracts *Contracts) (
 
 func upgradeLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (RestoreReport, error) {
 	report := RestoreReport{Started: Now(), Status: "FAILED"}
-	if opt.Plan != LocalUpgradePlan {
+	targetVersion := 14
+	switch opt.Plan {
+	case LocalUpgradePlan:
+	case FinalSchemaUpgradePlan:
+		targetVersion = 20
+	default:
 		return report, fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
 	}
 	if e := upgradePaths(&opt); e != nil {
@@ -242,7 +259,7 @@ func upgradeLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgrade
 	if e != nil {
 		return report, e
 	}
-	targetRelease, sqls, e := upgradeRelease(opt.TargetRoot, 14)
+	targetRelease, sqls, e := upgradeRelease(opt.TargetRoot, targetVersion)
 	if e != nil {
 		return report, e
 	}
@@ -294,12 +311,16 @@ func upgradeLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgrade
 	if e != nil || host == "" {
 		return report, fmt.Errorf("UPGRADE_HOST_UNAVAILABLE")
 	}
-	plan := Object{"id": opt.Plan, "source_versions": versions, "target_versions": upgradeVersions(14),
+	plan := Object{"id": opt.Plan, "source_versions": versions, "target_versions": upgradeVersions(targetVersion),
 		"source_schema_hash": schema, "target_schema_with_restore_fence_hash": expectedTargetSchema,
 		"source_release_hash": Hash(sourceRelease), "target_release_hash": Hash(targetRelease),
 		"migration_sql_hash": Digest(sqls[13]), "source_database_logical_hash": Hash(original),
 		"program_hashes": programHashes, "host_binding_hash": Hash(host), "service_summary_hash": guard.summaryHash,
 		"source_path_hash": Hash(opt.Source), "target_path_hash": Hash(opt.Destination)}
+	if targetVersion == 20 {
+		delete(plan, "migration_sql_hash")
+		plan["migration_sql_hashes"] = upgradeFinalSQLManifest()
+	}
 	purpose := Object{"kind": "SAME_HOST_CONTROL_PLANE_UPGRADE", "scope": "SameHostExternalReferenceContinuityOnly",
 		"plan": plan, "plan_hash": Hash(plan), "protected_reference_versions": guard.count,
 		"protected_reference_digest": guard.referencesHash, "protected_payloads_included": false,
@@ -323,7 +344,7 @@ func upgradeLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgrade
 		if e != nil {
 			return e
 		}
-		if e = upgradeRecoveryInvariant(original, rows, opt.Destination); e != nil {
+		if e = upgradeRecoveryInvariantForTarget(original, rows, opt.Destination, targetVersion); e != nil {
 			return e
 		}
 		sourceNow, e := upgradeRows(db)
@@ -336,7 +357,7 @@ func upgradeLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgrade
 			n    int
 			hash string
 		}{
-			{opt.SourceRoot, 13, Hash(sourceRelease)}, {opt.TargetRoot, 14, Hash(targetRelease)},
+			{opt.SourceRoot, 13, Hash(sourceRelease)}, {opt.TargetRoot, targetVersion, Hash(targetRelease)},
 		} {
 			current, _, err := upgradeRelease(entry.root, entry.n)
 			if err != nil || Hash(current) != entry.hash {
@@ -358,6 +379,9 @@ func upgradeLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgrade
 	return restoreBackupPolicy(ctx, opt.Snapshot, opt.Destination, RestoreOptions{
 		Key: key, SupportedMigrations: versions, Contracts: contracts,
 		Migration: func(ctx context.Context, target *sql.DB) error {
+			if targetVersion == 20 {
+				return upgradeFinalMigration(ctx, target, sqls[13:])
+			}
 			return upgradeMigration(ctx, target, sqls[13])
 		},
 	}, policy)
@@ -764,6 +788,20 @@ func upgradeWithout(row Object, names ...string) Object {
 }
 
 func upgradeRecoveryInvariant(before, after upgradeData, destination string) error {
+	return upgradeRecoveryInvariantForTarget(before, after, destination, 14)
+}
+
+func upgradeRecoveryInvariantForTarget(before, after upgradeData, destination string, target int) error {
+	if target != 14 && target != 20 {
+		return fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
+	}
+	if target == 20 {
+		projected, e := upgradeFinalProjection(before, after)
+		if e != nil {
+			return e
+		}
+		after = projected
+	}
 	active := map[string]Object{}
 	projectRuns := map[string]int64{}
 	oldObjects, newObjects := map[string]Object{}, map[string]Object{}
@@ -901,7 +939,15 @@ func upgradeRecoveryInvariant(before, after upgradeData, destination string) err
 			}
 		case "schema_migrations":
 			extra, e := upgradeExtra(old, current)
-			if e != nil || len(extra) != 1 || Hash(extra[0]["version"]) != Hash(14) {
+			seen := map[int64]bool{}
+			for _, row := range extra {
+				version, err := Num(row, "version")
+				if err != nil || version < 14 || version > int64(target) || seen[version] {
+					return fmt.Errorf("UPGRADE_MIGRATION_HISTORY")
+				}
+				seen[version] = true
+			}
+			if e != nil || len(seen) != target-13 {
 				return fmt.Errorf("UPGRADE_MIGRATION_HISTORY")
 			}
 		default:
@@ -923,7 +969,7 @@ func upgradeRecoveryInvariant(before, after upgradeData, destination string) err
 					return fmt.Errorf("UPGRADE_RESTORE_BARRIER")
 				}
 			}
-		} else if !strings.HasPrefix(table, "remote_") || len(rows) != 0 {
+		} else if (target == 14 && !strings.HasPrefix(table, "remote_")) || (target == 20 && !upgradeFinalTables[table]) || len(rows) != 0 {
 			return fmt.Errorf("UPGRADE_UNEXPECTED_TABLE")
 		}
 	}

@@ -339,6 +339,12 @@ func (s *Service) sourceConfig(ctx context.Context, token, project, cursorID str
 }
 
 func (s *Service) captureSourcePage(ctx context.Context, token, project string, cursor, config Object, from, to time.Time, limit int, adapter sources.Adapter) (SourceCapture, error) {
+	return s.captureSourcePageBound(ctx, token, project, cursor, config, from, to, limit, adapter, nil)
+}
+
+// The host callback binds a real page to its original Run/effect in the same
+// transaction. Legacy manual capture keeps the exact replay behavior above.
+func (s *Service) captureSourcePageBound(ctx context.Context, token, project string, cursor, config Object, from, to time.Time, limit int, adapter sources.Adapter, bind func(*sql.Tx, SourceCapture) error) (SourceCapture, error) {
 	var result SourceCapture
 	if from.IsZero() || !from.Before(to) || to.After(time.Now().Add(time.Minute)) || limit < 1 || limit > 100 {
 		return result, Fail(400, "INVALID_REQUEST", "invalid bounded source window")
@@ -536,7 +542,13 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 			if e == nil {
 				e = s.effective(tx, project, Ref(result.Manifest, "Artifact"))
 			}
-			return result, e // The deferred rollback preserves exact replay idempotence.
+			if e == nil && bind != nil {
+				e = bind(tx, result)
+				if e == nil {
+					e = tx.Commit()
+				}
+			}
+			return result, e // Unbound replay preserves exact idempotence.
 		} else if errors.Is(e, sql.ErrNoRows) {
 			_, e = tx.Exec("INSERT INTO source_pages(project,cursor_id,source_id,query_hash,window_from,window_to,page_cursor_in,page_cursor_out,raw_artifact_id,item_refs_json,complete,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", project, cursor["id"], config["source_id"], cursor["query_hash"], q.From.Format(time.RFC3339Nano), q.To.Format(time.RFC3339Nano), pageCursor, page.NextCursor, raw["id"], string(encoded), complete, Now())
 		}
@@ -571,6 +583,11 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 	}
 	if e = s.event(tx, project, "Artifact", manifest, p.ID, ID(), eventType); e != nil {
 		return SourceCapture{}, e
+	}
+	if bind != nil {
+		if e = bind(tx, result); e != nil {
+			return SourceCapture{}, e
+		}
 	}
 	return result, tx.Commit()
 }

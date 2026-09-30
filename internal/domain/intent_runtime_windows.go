@@ -114,6 +114,9 @@ func (c *RuntimeCoordinator) advanceIntentProject(tx *sql.Tx, project string, ro
 			if profile == nil || profile["command_id"] != route.CommandID || !runtimeExecutorAllowed(tx, route.ExecutorID, project, Str(task, "id")) {
 				continue
 			}
+			if task["task_type"] == "research_discovery" && !c.researchSourceAvailable(tx, project, task, route, profile) {
+				continue
+			}
 			executor, err := authenticate(tx, route.ExecutorToken)
 			if err != nil || executor.ID != route.ExecutorID || !executor.HasRole("EXECUTOR") {
 				continue

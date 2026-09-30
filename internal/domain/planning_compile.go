@@ -57,6 +57,9 @@ func (s *Service) compileIntentPlan(tx *sql.Tx, project string, snap, receipt Ob
 		}
 		return nil
 	}
+	if b.Monitor != nil {
+		return s.compileMonitorPlan(tx, owner, project, b, meta, planningGoal, artifactRef.(map[string]any), receipt)
+	}
 	for _, n := range ordered {
 		if !planningNodeSupported(n, meta) {
 			return Fail(422, "GATE_FAILED", "unsupported business node cannot be compiled")
@@ -140,6 +143,14 @@ func toAnyStrings(values []string) []any {
 }
 
 func (s *Service) compiledPlanningSnapshot(tx *sql.Tx, project string, goal Object) (Object, error) {
+	var kind string
+	if err := tx.QueryRow("SELECT plan_kind FROM intent_plan_bindings WHERE project=? AND compiled_goal=?", project, goal["id"]).Scan(&kind); err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if kind == "MONITOR" {
+		meta, _, err := s.monitorSnapshot(tx, project, Str(goal, "id"), true)
+		return meta, err
+	}
 	var planningGoal, briefRaw, receiptRaw, mappingRaw string
 	e := tx.QueryRow("SELECT planning_goal,brief_ref,acceptance_ref,node_mapping FROM intent_plan_bindings WHERE project=? AND compiled_goal=?", project, goal["id"]).Scan(&planningGoal, &briefRaw, &receiptRaw, &mappingRaw)
 	if e == sql.ErrNoRows {

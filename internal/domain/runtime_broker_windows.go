@@ -32,6 +32,10 @@ type RuntimeProviderRoute struct {
 	BearerToken        string `json:"bearer_token"`
 	UpperBound         Object `json:"upper_bound"`
 	MeasurementMode    string `json:"measurement_mode"`
+	SourceID           string `json:"source_id,omitempty"`
+	SourceToken        string `json:"source_token,omitempty"`
+	BrowserActPath     string `json:"browser_act_path,omitempty"`
+	BrowserID          string `json:"browser_id,omitempty"`
 }
 
 func (c *RuntimeCoordinator) providerRoute(tx *sql.Tx, route RuntimeCoordinatorRoute, run, dispatch Object, frame rt.BridgeFrame) (RuntimeProviderRoute, error) {
@@ -61,6 +65,15 @@ func (c *RuntimeCoordinator) providerRoute(tx *sql.Tx, route RuntimeCoordinatorR
 		}
 		if !bound {
 			return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "provider differs from frozen route permission")
+		}
+		if provider.Capability == "SOURCE" {
+			if provider.SourceID == "" || provider.SourceToken == "" {
+				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "host source identity required")
+			}
+			return provider, nil
+		}
+		if provider.Capability == "EXPERIMENT" {
+			return provider, nil
 		}
 		u, e := url.Parse(provider.Endpoint)
 		if e != nil || u.User != nil || u.Fragment != "" || u.Hostname() == "" || (u.Scheme != "https" && !(u.Scheme == "http" && net.ParseIP(u.Hostname()) != nil && net.ParseIP(u.Hostname()).IsLoopback() && provider.MeasurementMode == "FIXTURE")) {
@@ -95,7 +108,24 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		tx.Rollback()
 		return nil, e
 	}
+	if provider.Capability == "SOURCE" {
+		var work *researchWork
+		if work, _, _, e = c.researchSourceGate(tx, route.ProjectID, task, provider, payload); e != nil {
+			tx.Rollback()
+			return nil, e
+		}
+		if work.SourceReceipt != nil && (work.SourceReceipt["effect_key"] != frame.Key || work.SourceReceipt["run_id"] != runID || Hash(work.SourceReceipt["epoch"]) != Hash(epoch)) {
+			tx.Rollback()
+			return nil, Fail(409, "STATE_CONFLICT", "one source page permits only its original effect replay")
+		}
+	}
 	request := Object{"route": provider.ID, "capability": provider.Capability, "credential_revision": provider.CredentialRevision, "payload": payload}
+	if provider.Capability == "EXPERIMENT" {
+		if _, _, e = c.researchExperimentGate(tx, route.ProjectID, task, run, frame, payload); e != nil {
+			tx.Rollback()
+			return nil, e
+		}
+	}
 	operation, basis := "RESERVE", "UPPER_BOUND"
 	var money any = provider.UpperBound
 	if provider.UpperBound == nil {
@@ -116,6 +146,9 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		return Object{"sequence": frame.Sequence, "key": frame.Key, "state": intent["state"], "payload": receipt["payload"]}, nil
 	}
 	if intent["state"] != "PREPARED" {
+		if provider.Capability == "EXPERIMENT" {
+			return c.reconcileResearchExperimentEffect(ctx, route.ProjectID, runID, epoch, frame, intent)
+		}
 		return nil, Fail(409, "STATE_CONFLICT", "effect outcome unknown; retry prohibited")
 	}
 	tx, run, dispatch, e = c.dispatchGate(ctx, route, runID, lease, epoch)
@@ -126,6 +159,12 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		tx.Rollback()
 		return nil, e
 	}
+	if provider.Capability == "SOURCE" {
+		if _, _, _, e = c.researchSourceGate(tx, route.ProjectID, task, provider, payload); e != nil {
+			tx.Rollback()
+			return nil, e
+		}
+	}
 	intent, e = c.service.beginEffectTx(tx, c.config.SchedulerToken, route.ProjectID, runID, frame.Key)
 	if e != nil {
 		tx.Rollback()
@@ -135,6 +174,12 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		return nil, e
 	}
 	c.boundary("effect_started", intent)
+	if provider.Capability == "SOURCE" {
+		return c.brokerResearchSource(ctx, route, provider, runID, lease, epoch, frame, payload, intent)
+	}
+	if provider.Capability == "EXPERIMENT" {
+		return c.brokerResearchExperiment(ctx, route, runID, lease, epoch, frame, payload, intent)
+	}
 	body := Object{"key": frame.Key, "epoch": epoch, "run_id": runID, "capability": provider.Capability, "payload": payload}
 	req, e := http.NewRequestWithContext(ctx, "POST", provider.Endpoint, bytes.NewReader(Bytes(body)))
 	if e != nil {

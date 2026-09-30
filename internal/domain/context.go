@@ -147,6 +147,31 @@ func (s *Service) taskContext(tx *sql.Tx, project string, task Object) error {
 	if task["status"] == "NEEDS_REVALIDATION" || task["status"] == "CANCELLED" {
 		return Fail(409, "STATE_CONFLICT", "task needs new validated inputs")
 	}
+	if strings.HasPrefix(Str(task, "task_type"), "research_") && task["status"] != "ACCEPTED" {
+		work, err := loadResearchWork(tx, project, Str(task, "id"))
+		if err != nil {
+			return Fail(422, "GATE_FAILED", "private research work required")
+		}
+		cycle, err := load(tx, project, "ResearchCycle", work.Cycle)
+		if err != nil {
+			return err
+		}
+		if cycle["status"] != "RUNNING" {
+			return Fail(409, "STATE_CONFLICT", "closed research cycle permits no execution")
+		}
+		if work.Stage != "delivery" && task["active_run_id"] == nil {
+			var reports int
+			if err = tx.QueryRow("SELECT count(*) FROM research_cycle_work WHERE project=? AND cycle=? AND stage='delivery'", project, work.Cycle).Scan(&reports); err != nil {
+				return err
+			}
+			if reports != 0 {
+				return Fail(409, "STATE_CONFLICT", "research round already entered report delivery")
+			}
+		}
+		if _, _, err = s.monitorSnapshot(tx, project, Str(task, "goal_id"), true); err != nil {
+			return err
+		}
+	}
 	id := Str(task, "context_bundle_id")
 	if id == "" {
 		return Fail(422, "GATE_FAILED", "task context required")
@@ -259,6 +284,13 @@ func (s *Service) createContext(tx *sql.Tx, p Principal, project string, b Objec
 		}
 	}
 	summary := Str(profile, "intent") + "\nTask: " + Str(task, "title") + "\nNext: follow the frozen acceptance contract; execution is not acceptance."
+	if strings.HasPrefix(Str(task, "task_type"), "research_") {
+		work, err := loadResearchWork(tx, project, Str(task, "id"))
+		if err != nil {
+			return nil, err
+		}
+		summary += "\nBounded research work: " + string(Bytes(work.publicParameters())) + ". Only host effects may capture sources; produce the current structured stage evidence, preserve missing sources and UNKNOWN costs."
+	}
 	if task["task_type"] == "intent_planning" {
 		var requirement, rawHash string
 		var revision int64
@@ -277,6 +309,35 @@ func (s *Service) createContext(tx *sql.Tx, p Principal, project string, b Objec
 			return nil, err
 		}
 		summary += planningPrompt(req)
+		if authorized, _ := monitorAuthorization(Object{"requirement": req}); authorized {
+			rows, err := tx.Query("SELECT body FROM domain_objects WHERE project=? AND kind='Experiment' AND json_extract(body,'$.status')='REGISTERED' ORDER BY id", project)
+			if err != nil {
+				return nil, err
+			}
+			for rows.Next() {
+				var raw string
+				if err = rows.Scan(&raw); err != nil {
+					rows.Close()
+					return nil, err
+				}
+				x, e := Decode([]byte(raw))
+				if e != nil {
+					rows.Close()
+					return nil, e
+				}
+				refs = append(refs, Ref(x, "Experiment"))
+			}
+			err = rows.Err()
+			rows.Close()
+			if err != nil {
+				return nil, err
+			}
+			policy, err := load(tx, project, "RunPolicy", Str(profile, "run_policy_id"))
+			if err != nil {
+				return nil, err
+			}
+			summary += monitorPlanningPrompt(profile, policy)
+		}
 	}
 	decisions := Empty()
 	for _, v := range refs {

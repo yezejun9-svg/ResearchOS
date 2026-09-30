@@ -275,6 +275,22 @@ func (s *Service) ref(tx *sql.Tx, project, kind, id string, rev int64, path, tp,
 		return Fail(422, "GATE_FAILED", "reference unavailable")
 	}
 	history := kind == "Conflict" || kind == "Artifact" || kind == "ContextBundle" || kind == "DecisionReceipt" || kind == "AcceptanceReceipt" || kind == "AgentMessage" || kind == "ImpactLink" || kind == "ChangeProposal" || kind == "EventEnvelope" || kind == "SkillVersion" || ((kind == "Task" || kind == "Goal") && rev > 1)
+	if exact && kind == "ResearchCycle" && path == "/profile_ref" && tk == "ProjectProfile" && tp == project && rev > 1 {
+		var priorRaw, currentRaw string
+		e = tx.QueryRow("SELECT prior.body,current.body FROM domain_versions prior JOIN domain_versions current ON current.project=prior.project AND current.kind=prior.kind AND current.id=prior.id AND current.revision=prior.revision+1 WHERE prior.project=? AND prior.kind='ResearchCycle' AND prior.id=? AND prior.revision=?", project, id, rev-1).Scan(&priorRaw, &currentRaw)
+		if e != nil {
+			return Fail(422, "GATE_FAILED", "cycle cancellation needs its previous version")
+		}
+		prior, err := Decode([]byte(priorRaw))
+		if err != nil {
+			return err
+		}
+		currentCycle, err := Decode([]byte(currentRaw))
+		if err != nil {
+			return err
+		}
+		history = currentCycle["status"] == "CANCELLED" && Hash(currentCycle["profile_ref"]) == Hash(prior["profile_ref"])
+	}
 	if exact && history {
 		e = tx.QueryRow("SELECT revision,content_hash FROM domain_versions WHERE project=? AND kind=? AND id=? AND revision=?", tp, tk, tid, tr).Scan(&current, &h)
 		if e != nil {
