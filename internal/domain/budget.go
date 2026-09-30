@@ -310,14 +310,14 @@ func (s *Service) appendBudget(tx *sql.Tx, project string, b Object) (Object, er
 		if e != nil {
 			return nil, e
 		}
-		if reservation["run_id"] != run["id"] || reservation["provider_request_id"] != b["provider_request_id"] || reservation["policy_id"] != leaf || (reservation["operation"] != "RESERVE" && reservation["operation"] != "UNKNOWN") {
+		if reservation["reservation_id"] != nil || reservation["run_id"] != run["id"] || reservation["provider_request_id"] != b["provider_request_id"] || reservation["policy_id"] != leaf || (reservation["operation"] != "RESERVE" && reservation["operation"] != "UNKNOWN") {
 			return nil, Fail(422, "GATE_FAILED", "settlement must bind original reservation and run")
 		}
 		var terminal int
-		if e = tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.reservation_id')=? AND json_extract(body,'$.operation') IN ('COMMIT','RECONCILE','RELEASE')", project, reservation["id"]).Scan(&terminal); e != nil {
+		if e = tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.provider_request_id')=? AND json_extract(body,'$.operation') IN ('COMMIT','RECONCILE','RELEASE')", project, run["id"], b["provider_request_id"]).Scan(&terminal); e != nil {
 			return nil, e
 		}
-		if terminal != 0 {
+		if terminal != 0 && op != "RECONCILE" {
 			return nil, Fail(409, "STATE_CONFLICT", "request already settled")
 		}
 		if op != "UNKNOWN" && basis != "ACTUAL" {
