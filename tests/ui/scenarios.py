@@ -5,6 +5,7 @@ import json
 import uuid
 import datetime
 import subprocess
+import time
 
 
 def login(page, base, path, token):
@@ -249,7 +250,9 @@ def event_recovery(page, base, project_path, token, api, report, out, other_proj
     page.route('**' + project_api + '/events/stream', stream)
     login(page, base, project_path, token)
     page.wait_for_function('window.readerEvidence.released >= 1', timeout=15000)
-    page.wait_for_timeout(5000)
+    deadline = time.monotonic() + 15
+    while len(requests) < 3 and time.monotonic() < deadline:
+        page.wait_for_timeout(100)
     assert len(requests) >= 3, requests
     current = api(base, token, 'GET', project_api + '/progress')
     assert requests[0] == str(initial['as_of_event_sequence']), requests
