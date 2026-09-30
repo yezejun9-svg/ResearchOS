@@ -253,6 +253,9 @@ func init() {
 	}
 }
 func operationOwner(id string) string {
+	if evolutionOperations[id] {
+		return "W16"
+	}
 	if remoteOperations[id] {
 		return "W17"
 	}

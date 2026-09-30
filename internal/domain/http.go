@@ -290,6 +290,13 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 	case "actOnRequirement":
 		result, e = s.actRequirement(tx, project, id, b)
 		kind = "Requirement"
+	case "createSystemCandidate":
+		result, e = s.createSystemCandidate(tx, p, project, b)
+		kind = "SystemCandidate"
+		status = 201
+	case "actOnSystemCandidate":
+		result, e = s.actSystemCandidate(tx, p, project, id, b)
+		kind = "SystemCandidate"
 	case "createExperiment":
 		result, e = s.createExperiment(tx, project, b)
 		kind = "Experiment"
