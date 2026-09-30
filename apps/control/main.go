@@ -29,6 +29,12 @@ func setting(name, fallback string) string {
 }
 
 func main() {
+	if handled, err := runFixtureControlReplay(os.Args[1:]); handled {
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	bootstrapOwner := flag.Bool("bootstrap-owner", false, "initialize the local Owner and write a private credential file")
 	credentialFile := flag.String("credential-file", "", "private local output path")
 	importSpec := flag.String("import-spec", "", "import a pinned specification directory as the initial ResearchOS goal")
