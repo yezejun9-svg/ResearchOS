@@ -222,7 +222,11 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 	if len(artifacts) == 0 || Hash(refs) != Hash(b["artifact_refs"]) {
 		return nil, Fail(422, "GATE_FAILED", "exact output artifact vector required")
 	}
-	return Object{"task": t, "run": r, "contract": c, "artifacts": artifacts, "artifact_refs": refs, "policy_revision": state["policy_revision"], "runtime": rt, "authority": root, "observation": observation, "dependency_refs": dependencies, "runtime_qualification": qualification}, nil
+	planning, e := s.planningSnapshot(tx, project, t)
+	if e != nil {
+		return nil, e
+	}
+	return Object{"task": t, "run": r, "contract": c, "artifacts": artifacts, "artifact_refs": refs, "policy_revision": state["policy_revision"], "runtime": rt, "authority": root, "observation": observation, "dependency_refs": dependencies, "runtime_qualification": qualification, "planning": planning}, nil
 }
 
 type preparedAcceptance struct {
@@ -253,6 +257,19 @@ func (s *Service) prepareTaskAcceptance(ctx context.Context, token, project stri
 		check := v.(map[string]any)
 		status, actual := "NOT_RUN", "Check requires an unavailable qualified verifier or command handler."
 		var exit any
+		if check["kind"] == "DETERMINISTIC" && check["command_key"] == "planning.compiled-deliverables-v1" && check["rubric_ref"] == nil && check["qualification_id"] == nil {
+			status, actual, exit = "FAIL", "Compiled deliverable check requires an exact private Goal binding and current accepted task outputs.", 1
+			if compiled, _ := snap["compiled_plan"].(map[string]any); compiled != nil && len(Arr(snap, "tasks")) > 0 {
+				status, actual, exit = "PASS", "All exact compiled deliverable tasks independently accepted against current frozen checks; no business facts upgraded.", 0
+			}
+		}
+		if check["kind"] == "DETERMINISTIC" && (check["command_key"] == "planning.provenance-v1" || check["command_key"] == "planning.dag-capabilities-v1" || check["command_key"] == "planning.open-questions-v1") && check["rubric_ref"] == nil && check["qualification_id"] == nil {
+			status, actual = verifyPlanning(snap, Str(check, "command_key"))
+			exit = 1
+			if status == "PASS" {
+				exit = 0
+			}
+		}
 		if check["kind"] == "DETERMINISTIC" && check["command_key"] == "orchestration.json-equals" && check["rubric_ref"] == nil && check["qualification_id"] == nil {
 			expected, err := Decode([]byte(Str(check, "expected")))
 			artifacts := Arr(snap, "artifacts")

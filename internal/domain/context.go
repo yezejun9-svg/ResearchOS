@@ -259,6 +259,25 @@ func (s *Service) createContext(tx *sql.Tx, p Principal, project string, b Objec
 		}
 	}
 	summary := Str(profile, "intent") + "\nTask: " + Str(task, "title") + "\nNext: follow the frozen acceptance contract; execution is not acceptance."
+	if task["task_type"] == "intent_planning" {
+		var requirement, rawHash string
+		var revision int64
+		if err := tx.QueryRow("SELECT requirement,raw_hash,accepted_revision FROM intent_plan_bindings WHERE project=? AND planning_task=? AND planning_goal=?", project, task["id"], task["goal_id"]).Scan(&requirement, &rawHash, &revision); err != nil {
+			return nil, Fail(422, "GATE_FAILED", "planning context requires private intent binding")
+		}
+		req, err := load(tx, project, "Requirement", requirement)
+		if err != nil {
+			return nil, err
+		}
+		rev, _ := Num(req, "revision")
+		if req["status"] != "ACCEPTED" || req["basis"] != "USER_STATED" || rev != revision || rawHash != Digest([]byte(Str(req, "text"))) {
+			return nil, Fail(412, "STALE_INPUT", "planning intent changed")
+		}
+		if err = s.effective(tx, project, Ref(req, "Requirement")); err != nil {
+			return nil, err
+		}
+		summary += planningPrompt(req)
+	}
 	decisions := Empty()
 	for _, v := range refs {
 		r := v.(map[string]any)

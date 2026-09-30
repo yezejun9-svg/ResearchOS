@@ -32,12 +32,16 @@ func (s *Service) registerIntentSubmission(tx *sql.Tx, p Principal, project stri
 
 func (s *Service) acceptIntentRequirement(tx *sql.Tx, p Principal, project, id string, b Object) (Object, error) {
 	var actor, rawHash string
-	err := tx.QueryRow("SELECT actor,raw_hash FROM intent_plan_bindings WHERE project=? AND requirement=?", project, id).Scan(&actor, &rawHash)
+	var accepted sql.NullInt64
+	err := tx.QueryRow("SELECT actor,raw_hash,accepted_revision FROM intent_plan_bindings WHERE project=? AND requirement=?", project, id).Scan(&actor, &rawHash, &accepted)
 	if err == sql.ErrNoRows {
 		return s.actRequirement(tx, project, id, b)
 	}
 	if err != nil {
 		return nil, err
+	}
+	if accepted.Valid || b["action"] != "ACCEPT" {
+		return nil, Fail(409, "STATE_CONFLICT", "intent bootstrap requires its first explicit ACCEPT")
 	}
 	req, err := load(tx, project, "Requirement", id)
 	if err != nil {
@@ -78,6 +82,9 @@ func (s *Service) bootstrapIntent(tx *sql.Tx, p Principal, project string, req O
 	if err != nil {
 		return err
 	}
+	if _, err = tx.Exec("UPDATE intent_plan_bindings SET accepted_revision=?,planning_goal=?,planning_task=? WHERE project=? AND requirement=? AND accepted_revision IS NULL", req["revision"], goal["id"], task["id"], project, req["id"]); err != nil {
+		return err
+	}
 	if _, err = s.actGoal(tx, project, Str(goal, "id"), Object{"action": "ACTIVATE", "reason": "Owner explicitly accepted original intent; bounded planning only"}); err != nil {
 		return err
 	}
@@ -104,10 +111,11 @@ func (s *Service) bootstrapIntent(tx *sql.Tx, p Principal, project string, req O
 	if err = s.put(tx, "Task", task); err != nil {
 		return err
 	}
-	if _, err = tx.Exec("UPDATE intent_plan_bindings SET accepted_revision=?,planning_goal=?,planning_task=? WHERE project=? AND requirement=?", req["revision"], goal["id"], task["id"], project, req["id"]); err != nil {
+	if err = s.intentResource(tx, p, project, task, "PERMISSION", "INTENT_PLANNER_UNAVAILABLE", "等待已通过当前资格、用途权限及独立验收条件的规划运行器；原始想法已保存。", Empty()); err != nil {
 		return err
 	}
-	if err = s.intentResource(tx, p, project, task, "PERMISSION", "INTENT_PLANNER_UNAVAILABLE", "等待已通过当前资格、用途权限及独立验收条件的规划运行器；原始想法已保存。", Empty()); err != nil {
+	goal, err = load(tx, project, "Goal", Str(goal, "id"))
+	if err != nil {
 		return err
 	}
 	if err = s.event(tx, project, "Goal", goal, p.ID, ID(), "PROJECT_UPDATED"); err != nil {
@@ -117,7 +125,11 @@ func (s *Service) bootstrapIntent(tx *sql.Tx, p Principal, project string, req O
 }
 
 func (s *Service) intentResource(tx *sql.Tx, p Principal, project string, task Object, category, code, summary string, artifacts []any) error {
-	request, err := s.createResourceRequest(tx, project, Object{"category": category, "account_ref": nil, "reason_code": code + ":" + Str(task, "id"), "summary": summary, "blocked_task_ids": []any{task["id"]}, "continuable_task_ids": Empty(), "completed_artifact_refs": artifacts, "requested_capability": "intent_planning", "estimated_cost": nil, "cost_known": false, "resume_checkpoint_ref": nil})
+	blocked := []any{task["id"]}
+	if task["status"] == "ACCEPTED" {
+		blocked = Empty()
+	}
+	request, err := s.createResourceRequest(tx, project, Object{"category": category, "account_ref": nil, "reason_code": code + ":" + Str(task, "id"), "summary": summary, "blocked_task_ids": blocked, "continuable_task_ids": Empty(), "completed_artifact_refs": artifacts, "requested_capability": Str(task, "task_type"), "estimated_cost": nil, "cost_known": false, "resume_checkpoint_ref": nil})
 	if err != nil {
 		return err
 	}
