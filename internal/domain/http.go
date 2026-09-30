@@ -280,6 +280,9 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		status = 201
 	case "createRequirement":
 		result, e = s.createRequirement(tx, project, b)
+		if e == nil {
+			e = s.registerIntentSubmission(tx, p, project, result)
+		}
 		kind = "Requirement"
 		status = 201
 	case "createEvidence":
@@ -295,7 +298,7 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		result, e = s.advanceSourceCursor(tx, project, id, b)
 		kind = "SourceCursor"
 	case "actOnRequirement":
-		result, e = s.actRequirement(tx, project, id, b)
+		result, e = s.acceptIntentRequirement(tx, p, project, id, b)
 		kind = "Requirement"
 	case "createSystemCandidate":
 		result, e = s.createSystemCandidate(tx, p, project, b)

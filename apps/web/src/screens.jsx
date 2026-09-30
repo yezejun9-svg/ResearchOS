@@ -8,8 +8,6 @@ import { DevicePanel } from './Pairing'
 
 const briefDate = raw => raw ? new Date(raw).toLocaleString() : '未记录'
 const short = raw => raw ? String(raw).slice(0, 12) : '—'
-function canonical(value) { if (Array.isArray(value)) return value.map(canonical); if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])); return value }
-async function hash(value) { const bytes = new TextEncoder().encode(JSON.stringify(canonical(value))); const digest = await crypto.subtle.digest('SHA-256', bytes); return `sha256:${Array.from(new Uint8Array(digest), x => x.toString(16).padStart(2, '0')).join('')}` }
 function Header({ title, description, action }) { return <header className="page-heading"><div><h1>{title}</h1>{description && <p>{description}</p>}</div>{action}</header> }
 function Section({ title, aside, children, className = '' }) { return <section className={`panel ${className}`}><div className="section-heading"><h2>{title}</h2>{aside}</div>{children}</section> }
 function Tag({ value, type }) { return <span className={`tag ${type || (/失败|受阻|拒绝|限流|过期|PARTIAL|RATE_LIMITED/.test(String(value)) ? 'warning' : /验收|COMPLETE|CURRENT|IMPROVED/.test(String(value)) ? 'good' : '')}`}>{value ?? '未知'}</span> }
@@ -26,31 +24,31 @@ function Table({ headers, rows }) { return <div className="table-wrap"><table><t
 function refFor(value, kind) { return { entity_type: kind, id: value.id, revision: value.revision, content_hash: value.content_hash ?? null } }
 
 function IdeaForm({ api, projectId, onCreated }) {
-  const [open, setOpen] = useState(false), [busy, setBusy] = useState(false), [error, setError] = useState('')
-  const [draft, setDraft] = useState({ idea: '', deliverable: '', check: '', command: '' })
-  const [conflict, setConflict] = useState(null)
-  const stage = useRef(null)
+  const storageKey = `researchos:intent:${projectId}`
+  const saved = useMemo(() => { try { return JSON.parse(localStorage.getItem(storageKey) || 'null') } catch { return null } }, [storageKey])
+  const [open, setOpen] = useState(!!saved), [busy, setBusy] = useState(false), [error, setError] = useState('')
+  const [idea, setIdea] = useState(saved?.draft || '')
+  const stage = useRef(saved?.stage || null)
+  function persist(draft = idea) { localStorage.setItem(storageKey, JSON.stringify({ draft, stage: stage.current })) }
   async function submit(e) {
-    e.preventDefault(); setBusy(true); setError(''); setConflict(null)
+    e.preventDefault(); setBusy(true); setError('')
     try {
-      if (!stage.current) {
-        const check = { check_id: crypto.randomUUID().replaceAll('-', ''), kind: 'DETERMINISTIC', required: true, expected: draft.check, command_key: draft.command, rubric_ref: null, qualification_id: null, not_applicable_reason: null }
-        const contract = { contract_revision: 1, checks: [check], require_independent_verifier: true, version_policy: 'EXACT', frozen_at: new Date().toISOString() }
-        contract.contract_hash = await hash(contract)
-        stage.current = { draft: { ...draft }, contract, requirementKey: crypto.randomUUID(), acceptanceKey: crypto.randomUUID(), goalKey: crypto.randomUUID(), problemId: crypto.randomUUID().replaceAll('-', '') }
-      }
+      if (!stage.current) stage.current = { idea, submission: crypto.randomUUID(), requirementKey: crypto.randomUUID(), acceptanceKey: crypto.randomUUID() }
       const staged = stage.current
+      persist()
       if (!staged.requirement) {
-        const state = await api.call('getProjectState', { params: { projectId } })
-        staged.requirement = await api.call('createRequirement', { params: { projectId }, etag: etagOf(state), key: staged.requirementKey, body: { requirement_key: `IDEA-${staged.problemId}`, text: staged.draft.idea, basis: 'USER_STATED', source_refs: [], rationale: '用户从工作台提交的原始想法', supersedes_id: null, acceptance_check_ids: [] } })
+        if (!staged.stateTag) { const state = await api.call('getProjectState', { params: { projectId } }); staged.stateTag = etagOf(state); persist() }
+        staged.requirement = await api.call('createRequirement', { params: { projectId }, etag: staged.stateTag, key: staged.requirementKey, body: { requirement_key: `INTENT-${staged.submission}`, text: staged.idea, basis: 'USER_STATED', source_refs: [], rationale: '用户从工作台提交的原始想法', supersedes_id: null, acceptance_check_ids: [] } })
+        persist()
       }
-      if (!staged.accepted) staged.accepted = await api.call('actOnRequirement', { params: { projectId, id: staged.requirement.id }, etag: etagOf(staged.requirement), key: staged.acceptanceKey, body: { action: 'ACCEPT', reason: '用户明确提交并确认此需求', source_validation_refs: [] } })
-      const latest = await api.call('getProjectState', { params: { projectId } })
-      const goal = await api.call('createGoal', { params: { projectId }, etag: etagOf(latest), key: staged.goalKey, body: { title: staged.draft.idea.slice(0, 70), original_intent: staged.draft.idea, scope: 'PROJECT', requirement_refs: [refFor(staged.accepted, 'Requirement')], problem_ids: [staged.problemId], deliverables: [staged.draft.deliverable], acceptance_contract: staged.contract } })
-      stage.current = null; setOpen(false); setDraft({ idea: '', deliverable: '', check: '', command: '' }); onCreated(goal)
-    } catch (cause) { setError(cause.message); if (classify(cause) === 'stale') { try { const current = await api.call('getProjectState', { params: { projectId } }); setConflict({ current, draft: stage.current?.draft || draft }) } catch { setConflict({ current: null, draft: stage.current?.draft || draft }) } } } finally { setBusy(false) }
+      await api.call('actOnRequirement', { params: { projectId, id: staged.requirement.id }, etag: etagOf(staged.requirement), key: staged.acceptanceKey, body: { action: 'ACCEPT', reason: '用户明确提交并确认此原始意图；授权先生成可审查规划提案', source_validation_refs: [] } })
+      localStorage.removeItem(storageKey); stage.current = null; setOpen(false); setIdea(''); onCreated()
+    } catch (cause) {
+      if (classify(cause) === 'stale' && !stage.current?.requirement) { delete stage.current.stateTag; persist() }
+      setError(cause.message)
+    } finally { setBusy(false) }
   }
-  return <><button className="primary" onClick={() => setOpen(v => !v)}>{open ? '收起新目标' : '提出新想法'}</button>{open && <form className="form-block" onSubmit={submit}><p>创建目标需同时固定交付物和可独立执行的验收命令；这些条件不会由界面臆造。</p>{stage.current && <p className="callout">草稿已提交部分步骤，字段已冻结。重试会复用原需求与幂等键。</p>}<label>你希望推进什么？<textarea value={draft.idea} onChange={e => setDraft({ ...draft, idea: e.target.value })} disabled={!!stage.current} required/></label><label>交付物<input value={draft.deliverable} onChange={e => setDraft({ ...draft, deliverable: e.target.value })} disabled={!!stage.current} required/></label><label>验收时应看到什么？<input value={draft.check} onChange={e => setDraft({ ...draft, check: e.target.value })} disabled={!!stage.current} required/></label><label>已登记命令键<input value={draft.command} onChange={e => setDraft({ ...draft, command: e.target.value })} disabled={!!stage.current} placeholder="例如 test.domain" required/></label>{error && <p className="form-error" role="alert">{error}。输入仍保留，可检查后重试。</p>}{conflict && <div className="state-notice"><strong>版本已变化，请核对两侧信息</strong><p>当前服务状态修订 {conflict.current?.revision ?? '暂不可读取'}；本地草稿仍在上方。</p><JsonDetails value={conflict.current} label="查看当前服务版本"/><JsonDetails value={conflict.draft} label="查看本地提交内容"/></div>}<button type="submit" disabled={busy}>{busy ? '正在提交…' : stage.current ? '核对后重试' : '创建正式目标'}</button></form>}</>
+  return <><button className="primary" onClick={() => setOpen(v => !v)}>{open ? '收起新想法' : '提出新想法'}</button>{open && <form className="form-block" onSubmit={submit}><p>说出你希望推进的事。系统会保留原话，先生成可审查的规划；需要补充的业务问题和资源会显示在工作台。</p>{stage.current && <p className="callout">提交已保存。刷新或重试会继续同一份想法。</p>}<label>你希望推进什么？<textarea value={idea} onChange={e => { setIdea(e.target.value); persist(e.target.value) }} disabled={!!stage.current} required/></label>{error && <p className="form-error" role="alert">{error}。原话仍保留，可重试。</p>}<button type="submit" disabled={busy}>{busy ? '正在提交…' : stage.current ? '继续提交' : '确认原话并开始规划'}</button></form>}</>
 }
 
 function Projects({ api, navigate, refresh, onRefresh }) {
@@ -67,7 +65,7 @@ function Workbench({ api, projectId, navigate, shared, refresh, onRefresh }) {
   const tasks = itemsOf(more.data.listTask), goals = itemsOf(more.data.listGoal), cycles = itemsOf(more.data.listResearchCycle)
   const active = cycles.find(c => c.id === state?.active_cycle_id) || cycles.at(-1)
   const release = itemsOf(shared.data.listMilestoneRelease).at(-1)
-  return <><Header title={profile?.name || '研究工作台'} description="先看有效进展，再查看执行细节。" action={<IdeaForm api={api} projectId={projectId} onCreated={onRefresh}/>}/><StateNotice state={shared} onRetry={onRefresh}/><StateNotice state={more} onRetry={onRefresh}/><Section title="持续目标" className="goal-section">{goals.length ? goals.filter(g => g.status === 'ACTIVE' || g.status === 'DRAFT').slice(-2).map(goal => <div key={goal.id}><h3>{goal.title}</h3><p>{goal.original_intent}</p><div className="meta-line"><Tag value={goal.status}/><span>修订 {goal.revision}</span></div></div>) : <Empty>尚无目标。用右上角“提出新想法”建立有验收条件的目标。</Empty>}</Section><div className="summary-strip"><div><span>已验收</span><strong>{tasks.filter(t => t.status === 'ACCEPTED').length}</strong><small>计划任务 {tasks.length}</small><small>待执行 {tasks.filter(task => task.status === 'READY').length}</small></div><div><span>待评审</span><strong>{tasks.filter(t => ['EXECUTION_REPORTED', 'VERIFYING'].includes(t.status)).length}</strong><small>执行结果不算已验收</small></div><div><span>{state?.active_cycle_id ? '当前周期' : '最近周期'}</span><strong>{active ? active.status : '—'}</strong><small>{active ? briefDate(active.started_at) : '尚未开始'}</small></div></div><Section title="当前推进" aside={<span className="small-muted">按服务端任务状态</span>}>{tasks.length ? <div className="record-list">{tasks.slice(-8).reverse().map(task => <Link key={task.id} className="task-row" to={`/p/${projectId}/tasks/${task.id}`} navigate={navigate}><span><strong>{task.title}</strong><small>{task.stage} · {short(task.id)}</small></span><Tag value={taskLabels[task.status] || task.status}/></Link>)}</div> : <Empty>尚无任务。</Empty>}</Section><div className="two-column"><Section title="来源覆盖">{active?.source_coverage?.length ? active.source_coverage.map(c => <div className="coverage-row" key={c.source_id}><span>{short(c.source_id)}</span><Tag value={c.status}/><small>{c.gap_reason || `${c.record_count} 条记录`}</small></div>) : <Empty>尚无活动研究周期。</Empty>}</Section><Section title="最近成果">{release ? <Link to={`/p/${projectId}/releases/${release.id}`} navigate={navigate} className="feature-link"><strong>{release.summary}</strong><span>里程碑 {release.sequence} · {briefDate(release.created_at)}</span></Link> : <Empty>还没有已验收成果。执行结果提交后仍需独立验收。</Empty>}</Section></div><Section title="下一步">{itemsOf(more.data.listResourceRequest).filter(r => r.status !== 'RESOLVED').length ? <Link to={`/p/${projectId}/resources`} navigate={navigate}>查看待处理的资源请求 →</Link> : <p>查看当前任务、来源覆盖和待评审结果，按服务端回执推进。</p>}</Section></>
+  return <><Header title={profile?.name || '研究工作台'} description="先看有效进展，再查看执行细节。" action={<IdeaForm api={api} projectId={projectId} onCreated={onRefresh}/>}/><StateNotice state={shared} onRetry={onRefresh}/><StateNotice state={more} onRetry={onRefresh}/><Section title="持续目标" className="goal-section">{goals.length ? goals.filter(g => g.status === 'ACTIVE' || g.status === 'DRAFT').slice(-2).map(goal => <div key={goal.id}><h3>{goal.title}</h3><p>{goal.original_intent}</p><div className="meta-line"><Tag value={goal.status}/><span>修订 {goal.revision}</span></div></div>) : <Empty>尚无目标。用右上角“提出新想法”开始规划。</Empty>}</Section><div className="summary-strip"><div><span>已验收</span><strong>{tasks.filter(t => t.status === 'ACCEPTED').length}</strong><small>计划任务 {tasks.length}</small><small>待执行 {tasks.filter(task => task.status === 'READY').length}</small></div><div><span>待评审</span><strong>{tasks.filter(t => ['EXECUTION_REPORTED', 'VERIFYING'].includes(t.status)).length}</strong><small>执行结果不算已验收</small></div><div><span>{state?.active_cycle_id ? '当前周期' : '最近周期'}</span><strong>{active ? active.status : '—'}</strong><small>{active ? briefDate(active.started_at) : '尚未开始'}</small></div></div><Section title="当前推进" aside={<span className="small-muted">按服务端任务状态</span>}>{tasks.length ? <div className="record-list">{tasks.slice(-8).reverse().map(task => <Link key={task.id} className="task-row" to={`/p/${projectId}/tasks/${task.id}`} navigate={navigate}><span><strong>{task.title}</strong><small>{task.stage} · {short(task.id)}</small></span><Tag value={taskLabels[task.status] || task.status}/></Link>)}</div> : <Empty>尚无任务。</Empty>}</Section><div className="two-column"><Section title="来源覆盖">{active?.source_coverage?.length ? active.source_coverage.map(c => <div className="coverage-row" key={c.source_id}><span>{short(c.source_id)}</span><Tag value={c.status}/><small>{c.gap_reason || `${c.record_count} 条记录`}</small></div>) : <Empty>尚无活动研究周期。</Empty>}</Section><Section title="最近成果">{release ? <Link to={`/p/${projectId}/releases/${release.id}`} navigate={navigate} className="feature-link"><strong>{release.summary}</strong><span>里程碑 {release.sequence} · {briefDate(release.created_at)}</span></Link> : <Empty>还没有已验收成果。执行结果提交后仍需独立验收。</Empty>}</Section></div><Section title="下一步">{itemsOf(more.data.listResourceRequest).filter(r => r.status !== 'RESOLVED').length ? <Link to={`/p/${projectId}/resources`} navigate={navigate}>查看待处理的资源请求 →</Link> : <p>查看当前任务、来源覆盖和待评审结果，按服务端回执推进。</p>}</Section></>
 }
 
 function Cycle({ route, api, navigate, refresh, onRefresh }) {
