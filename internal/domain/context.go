@@ -277,6 +277,13 @@ func (s *Service) createContext(tx *sql.Tx, p Principal, project string, b Objec
 			return nil, err
 		}
 		summary += planningPrompt(req)
+		if authorized, _ := monitorAuthorization(Object{"requirement": req}); authorized {
+			policy, err := load(tx, project, "RunPolicy", Str(profile, "run_policy_id"))
+			if err != nil {
+				return nil, err
+			}
+			summary += monitorPlanningPrompt(profile, policy)
+		}
 	}
 	decisions := Empty()
 	for _, v := range refs {
