@@ -81,6 +81,9 @@ func Normalize(m Manifest, observed Manifest, rawExport []byte, rawHash string, 
 	if e := m.Validate(); e != nil {
 		return nil, e
 	}
+	if !reflect.DeepEqual(m, observed) {
+		return nil, errors.New("observed invocation differs from frozen manifest")
+	}
 	if duration < 0 {
 		return nil, errors.New("negative duration")
 	}

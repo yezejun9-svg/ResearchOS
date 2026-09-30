@@ -113,6 +113,10 @@ func TestProtocol(t *testing.T) {
 			wantRaw = Digest([]byte("wrong"))
 		}
 		bad, e := Normalize(m, changed, Bytes(x), wantRaw, &zero, 1)
+		if field != "unknown" && field != "raw" {
+			check(t, "C21-TAMPER-"+field, true, e != nil && bad == nil)
+			continue
+		}
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -188,4 +192,43 @@ func TestRawIntegrity(t *testing.T) {
 	check(t, "C21-REJECT-REPORT-ROWS-MISMATCH", true, Validate(m, report, changed, Digest(changed)) != nil)
 	_, e = Normalize(m, m, []byte(`[{"case_id":"x","case_id":"y"}]`), Digest([]byte(`[{"case_id":"x","case_id":"y"}]`)), &zero, 1)
 	check(t, "C21-REJECT-AMBIGUOUS-JSON", true, e != nil)
+}
+
+func TestObservedManifestFence(t *testing.T) {
+	m, _, _ := fixture(t)
+	zero := 0
+	hard := true
+	rows := []Result{}
+	for _, id := range m.Expected {
+		rows = append(rows, Result{CaseID: id, Verdict: "PASS", Hard: &hard, Reason: "complete"})
+	}
+	raw := Bytes(rows)
+	for _, field := range []string{"project", "experiment", "run", "engine", "config", "dataset", "candidate", "baseline", "rubric", "expected"} {
+		observed := m
+		observed.Engine = Object{"name": "NATIVE", "version": "1", "config_hash": m.DatasetHash}
+		switch field {
+		case "project":
+			observed.ProjectID = "other"
+		case "experiment":
+			observed.ExperimentID = "other"
+		case "run":
+			observed.RunID = "other"
+		case "engine":
+			observed.Engine["version"] = "other"
+		case "config":
+			observed.Engine["config_hash"] = Digest([]byte("other"))
+		case "dataset":
+			observed.DatasetHash = Digest([]byte("other"))
+		case "candidate":
+			observed.CandidateHash = Digest([]byte("other"))
+		case "baseline":
+			observed.BaselineHash = Digest([]byte("other"))
+		case "rubric":
+			observed.RubricHash = Digest([]byte("other"))
+		case "expected":
+			observed.Expected = []string{"other"}
+		}
+		report, err := Normalize(m, observed, raw, Digest(raw), &zero, 1)
+		check(t, "C21-OBSERVED-FENCE-"+field, true, err != nil && report == nil)
+	}
 }
