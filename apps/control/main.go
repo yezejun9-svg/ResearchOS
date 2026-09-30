@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"researchos.local/research-os/adapters/protectedstore"
+	rt "researchos.local/research-os/adapters/runtime"
 	"researchos.local/research-os/internal/api"
 	"researchos.local/research-os/internal/domain"
 	"researchos.local/research-os/internal/store"
+	"researchos.local/research-os/ops/supervisor"
 )
 
 func setting(name, fallback string) string {
@@ -51,11 +53,25 @@ func main() {
 	if _, err := os.Stat(filepath.Join(webDir, "index.html")); err != nil && adminActions == 0 {
 		log.Fatalf("web build unavailable: %v", err)
 	}
+	lease, err := rt.AcquireDataRootLease(dataDir)
+	if err != nil {
+		log.Fatalf("control data-root lease unavailable: %v", err)
+	}
+	defer func() {
+		if err := lease.Close(); err != nil {
+			log.Fatalf("data-root lease close failed: %v", err)
+		}
+	}()
+	dataDir = lease.Root()
 	db, err := store.Open(filepath.Join(dataDir, "researchos.sqlite"))
 	if err != nil {
 		log.Fatalf("database unavailable: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			log.Fatalf("database close failed: %v", err)
+		}
+	}()
 	if err := store.Bootstrap(context.Background(), db, filepath.Join("migrations", "sqlite", "0001_bootstrap.sql")); err != nil {
 		log.Fatalf("database bootstrap failed: %v", err)
 	}
@@ -123,9 +139,13 @@ func main() {
 	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
 		log.Fatal("remote listen requires W17 qualified TLS and pairing")
 	}
+	gate := &drainGate{}
+	httpContext, cancelHTTP := context.WithCancel(context.Background())
+	defer cancelHTTP()
 	server := &http.Server{
 		Addr:              listen,
-		Handler:           api.Handler(db, webDir, service),
+		Handler:           gate.Wrap(api.Handler(db, webDir, service)),
+		BaseContext:       func(net.Listener) context.Context { return httpContext },
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 	}
@@ -137,6 +157,8 @@ func main() {
 	}
 	defer listener.Close()
 	server.Addr = listener.Addr().String()
+	var coordinator *domain.RuntimeCoordinator
+	coordinatorDone := make(chan struct{})
 	if *coordinatorFile != "" {
 		raw, e := os.ReadFile(*coordinatorFile)
 		if e != nil {
@@ -152,28 +174,59 @@ func main() {
 		if config.APIURL == "" {
 			config.APIURL = "http://" + server.Addr
 		}
-		coordinator, e := service.NewRuntimeCoordinator(ctx, config)
+		coordinator, e = service.NewRuntimeCoordinatorWithLease(ctx, config, lease)
 		if e != nil {
 			log.Fatalf("runtime coordinator unavailable: %v", e)
 		}
-		defer coordinator.Close()
+		defer func() {
+			if err := coordinator.Close(); err != nil {
+				log.Fatalf("coordinator close failed: %v", err)
+			}
+		}()
 		go func() {
+			defer close(coordinatorDone)
 			if e := coordinator.Serve(ctx, func(e error) { log.Printf("runtime coordinator operation stopped: %v", e) }); e != nil {
 				log.Printf("runtime coordinator stopped: %v", e)
 				stop()
 			}
 		}()
+	} else {
+		close(coordinatorDone)
 	}
+	drainDone := make(chan struct{})
+	boot, err := supervisor.ReadInheritedDrainBootstrap(dataDir)
+	if err != nil {
+		log.Fatalf("private drain capability unavailable: %v", err)
+	}
+	if boot != nil {
+		d := &controlDrain{gate: gate, service: service, coordinator: coordinator, pipe: boot.Pipe, root: dataDir, key: boot.Key, peer: boot.Peer, stop: stop}
+		go func() {
+			defer close(drainDone)
+			d.Serve(ctx, func(e error) { log.Printf("private drain stopped: %v", e) })
+		}()
+	} else {
+		close(drainDone)
+	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
+		cancelHTTP() // Cancel SSE/read requests separately from the admission gate.
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		server.Shutdown(shutdown)
+		if err := server.Shutdown(shutdown); err != nil {
+			_ = server.Close()
+		}
 	}()
 	log.Printf("development server listening on %s", server.Addr)
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+		log.Printf("control HTTP stopped: %v", err)
 	}
+	stop()
+	<-shutdownDone
+	gate.Close()
+	<-coordinatorDone
+	<-drainDone
 }
 
 func bootstrap(s *domain.Service, path string) error {
