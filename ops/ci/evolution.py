@@ -50,7 +50,7 @@ def verify(stdout, code, expected):
     return passed, rows
 
 
-def main():
+def main(command_key='test.evolution'):
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=('auto', 'fixture'), default='auto')
     args = parser.parse_args()
@@ -75,7 +75,7 @@ def main():
     before = {
         'run_receipt': {'task_id': task, 'check_id': check or None, 'case_id': case or None, 'run_id': out.name, 'started_at': now(), 'environment_mode': 'FIXTURE_WITH_NATIVE_APPCONTAINER', 'os': platform.platform(), 'architecture': platform.machine(), 'timezone': time.tzname, 'executor_identity': os.getenv('RESEARCHOS_EXECUTOR_ID', 'codex:/root/experiments'), 'independent_verifier_identity': None},
         'version_manifest': {'code_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(), 'dirty': subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True), 'files': {str(p.relative_to(ROOT)): digest(p) for p in files}, 'model': 'NONE; public deterministic executable', 'suite_revision': 'public-system-regression-v1', 'formal_holdout': 'NOT_RUN'},
-        'command_receipt': {'command_key': 'test.evolution', 'argv': cmd, 'cwd': str(ROOT), 'environment_names': sorted(env), 'requested_mode': args.mode, 'resolved_mode': 'fixture'},
+        'command_receipt': {'command_key': command_key, 'argv': cmd, 'cwd': str(ROOT), 'environment_names': sorted(env), 'requested_mode': args.mode, 'resolved_mode': 'fixture'},
         'expected_assertion_ids': expected, 'scope': 'W16_G02_FIXTURE_ONLY', 'execution_status': 'EXECUTION_REPORTED',
         'acceptance_receipt': {'status': 'NOT_REQUESTED', 'verifier_identity': None},
     }
@@ -89,9 +89,9 @@ def main():
     (out / 'stderr.txt').write_bytes(stderr)
     passed, rows = verify(stdout, code, expected)
     ids = [row['assertion_id'] for row in rows]
-    report = {'schema': 'GLOBAL_EVIDENCE_V1_CANDIDATE', 'status': ('PARTIAL' if selector == 'A16' else 'PASS') if passed else 'FAIL', 'fixture_assertion_status': 'PASS' if passed else 'FAIL', 'execution_status': 'EXECUTION_REPORTED', 'scope': 'W16_G02_FIXTURE_ONLY', 'selector': selector, 'exit_code': code, 'assertion_ids': ids, 'assertions': rows, 'missing': sorted(set(expected) - set(ids)), 'unexpected': sorted(set(ids) - set(expected)), 'ended_at': now(), 'hashes': {str(p.relative_to(out)): digest(p) for p in out.rglob('*') if p.is_file()}, 'independent_acceptance': 'NONE', 'formal_A16': 'PARTIAL_FIXTURE_ONLY', 'W16_G01': 'NOT_ACCEPTED', 'W16_G03': 'BLOCKED_W14_LIVE', 'production_scheduler_upgrade': 'NOT_CONNECTED', 'independent_OS_service': 'NOT_QUALIFIED', 'host_crash_restart_reconciliation': 'NOT_TESTED', 'migration_scope': 'NEW_TEMP_SQLITE_ONLY', 'rollback_scope': 'W18 actual isolated data restore and exact stable native health; production data not switched'}
+    report = {'schema': 'GLOBAL_EVIDENCE_V1_CANDIDATE', 'status': ('PARTIAL' if selector in ('A16', 'C20') else 'PASS') if passed else 'FAIL', 'fixture_assertion_status': 'PASS' if passed else 'FAIL', 'execution_status': 'EXECUTION_REPORTED', 'scope': 'W16_G02_FIXTURE_ONLY', 'selector': selector, 'exit_code': code, 'assertion_ids': ids, 'assertions': rows, 'missing': sorted(set(expected) - set(ids)), 'unexpected': sorted(set(ids) - set(expected)), 'ended_at': now(), 'hashes': {str(p.relative_to(out)): digest(p) for p in out.rglob('*') if p.is_file()}, 'independent_acceptance': 'NONE', 'formal_A16': 'PARTIAL_FIXTURE_ONLY', 'W16_G01': 'NOT_ACCEPTED', 'W16_G03': 'BLOCKED_W14_LIVE', 'production_scheduler_upgrade': 'NOT_CONNECTED', 'independent_OS_service': 'NOT_QUALIFIED', 'host_crash_restart_reconciliation': 'NOT_TESTED', 'migration_scope': 'NEW_TEMP_SQLITE_ONLY', 'rollback_scope': 'W18 actual isolated data restore and exact stable native health; production data not switched'}
     (out / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(json.dumps({'status': report['status'], 'fixture_assertion_status': report['fixture_assertion_status'], 'assertions': len(rows), 'receipt': str(out / 'report.json')}))
+    print(json.dumps({'status': report['status'], 'fixture_assertion_status': report['fixture_assertion_status'], 'assertions': len(rows), 'assertion_ids': ids, 'receipt': str(out / 'report.json')}))
     return 0 if passed else 1
 
 
