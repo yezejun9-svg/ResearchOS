@@ -10,7 +10,7 @@ Qualification creation stores a frozen DRAFT with maximum_mode ADVISORY. Submitt
 
 ## Fixture command
 
-Set `RESEARCHOS_TASK_ID=W11` and exactly one of `RESEARCHOS_CHECK_ID=W11-G01`, `RESEARCHOS_CASE_ID=C07`, or `RESEARCHOS_CASE_ID=C08`. Set `RESEARCHOS_GO` to the pinned Go executable, then run `python ops/ci/jev.py --mode fixture`. There are 75 frozen subassertions in `expected.json`. The receipt records the source manifest, exact command, raw logs and nonzero assertion inventory; owner PASS awaits independent verification.
+Set `RESEARCHOS_TASK_ID=W11` and exactly one of `RESEARCHOS_CHECK_ID=W11-G01`, `RESEARCHOS_CASE_ID=C07`, or `RESEARCHOS_CASE_ID=C08`. Set `RESEARCHOS_GO` to the pinned Go executable, then run `python ops/ci/jev.py --mode fixture`. There are 77 frozen subassertions in `expected.json`. The receipt records the source manifest, exact command, raw logs and nonzero assertion inventory; owner PASS awaits independent verification.
 
 C07 uses loopback maximum-score responses and actual task acceptance/adoption requests against SQLite. The failed-experiment fixture is a failed deterministic experiment-result report, not a live scientific experiment. C08 checks the four fault classes, preserved state/evidence and continuing non-model work. The earlier W04 deterministic decision path remains compatible. Full C20 still belongs to W16.
 
@@ -25,3 +25,5 @@ This runner does not read/create holdout data or grant qualification. W11-G02/G0
 `source_families.json` maps every development case to its source family, semantic group and paired-language paraphrase group. All 60 rows derive from **one synthetic source template**, seven explicit check scenarios, and 30 paired numeric variants; there are zero independent empirical sources. Translations, numeric substitutions and synonymous derivatives of this family must be excluded from the future protected holdout. This metadata is not sent to Jev. Dates, missing document bodies, semantic contradiction detection and open-ended research judgment are not covered. Injection coverage is one repeated candidate note, not a broad adversarial evaluation. These limits must remain visible alongside any live score.
 
 The host prompt contains current authorized text/strict JSON bodies with exact artifact hashes, bounded to 256 KiB per artifact and 1 MiB aggregate input. Binary, oversized, invalid UTF-8/JSON and protected-lineage inputs are rejected before calling. Visibility and current inputs/rubric/evidence are rechecked after network IO. Raw envelope sealing uses the canonical seal/reuse path and preserves producer/input/source provenance. The protected-result operation remains DEFERRED, even though the rejecting handler exists.
+
+Choice confidence is independent of the selected-option probability, as documented at https://docs.typesafe.ai/confidence. Both remain bounded; the selected option must have maximal probability. The frozen confidence threshold remains 0.8.

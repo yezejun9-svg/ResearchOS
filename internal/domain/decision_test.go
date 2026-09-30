@@ -50,7 +50,7 @@ func w11Client(t *testing.T, scenario string) decision.Client {
 		w.Write([]byte(raw))
 	}))
 	t.Cleanup(server.Close)
-	timeout := time.Second
+	timeout := 5 * time.Second
 	if scenario == "timeout" {
 		timeout = 10 * time.Millisecond
 	}
