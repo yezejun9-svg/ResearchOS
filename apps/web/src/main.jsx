@@ -95,7 +95,7 @@ function App() {
   const drawerOpener = useRef(null)
   const api = useMemo(() => token ? createApi(() => token) : null, [token])
   const events = useProjectEvents(api, route.projectId)
-  useEffect(() => { if (deviceSession.device && events.authExpired) deviceSession.expire() }, [events.authExpired, deviceSession.device?.id])
+  useEffect(() => { if (deviceSession.device && events.authExpired && !deviceSession.renewalPending) deviceSession.expire() }, [events.authExpired, deviceSession.device?.id, deviceSession.renewalPending])
   const shared = useQueries(api, route.projectId, route.projectId ? [{ op: 'getProjectProfile' }, { op: 'getProjectState' }, { op: 'getProgressProjection' }, { op: 'listMilestoneRelease' }, { op: 'listNotification' }] : [], refresh + events.refresh)
   useEffect(() => {
     document.documentElement.dataset.theme = theme
