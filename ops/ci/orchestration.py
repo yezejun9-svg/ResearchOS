@@ -50,10 +50,13 @@ def main():
     go = os.getenv('RESEARCHOS_GO') or str(ROOT / '.local/tools/go1.27.1/go/bin/go.exe')
     if not Path(go).is_file():
         parser.error('RESEARCHOS_GO must locate the pinned Go executable')
-    out = ROOT / 'execution/receipts/W06' / str(uuid.uuid4())
+    is_c01 = 'TestW06ContextContinuation' in names
+    out = ROOT / 'execution/receipts/W06' / ('continuation-live' if is_c01 else '') / str(uuid.uuid4())
     out.mkdir(parents=True)
     env = {k:v for k,v in os.environ.items() if not k.startswith('W06_')}
     env['W06_EVIDENCE_DIR'] = str(out)
+    if is_c01:
+        env['RESEARCHOS_C01_MODEL'] = '1'
     cmd = [go, 'test', './internal/domain', '-v', '-count=1', '-timeout=2m', '-run', '^('+'|'.join(names)+')$']
     before = {
         'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -64,8 +67,8 @@ def main():
         'dirty':subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True),
         'argv':cmd, 'cwd':str(ROOT), 'environment_names':sorted(env),
         'versions':{str(p.relative_to(ROOT)):digest(p) for group in ('internal/domain/*.go','migrations/sqlite/*.sql','spec/v2.0/contracts/*.json','go.mod','go.sum','execution/route.json','qualification/core/*.json','tests/orchestration/*','ops/ci/orchestration.py') for p in ROOT.glob(group) if p.is_file()},
-        'executor':'codex:/root/runtime_executor', 'implementation_model':'gpt-6-astra', 'reasoning_effort':'high',
-        'runtime_model':None, 'live_provider':None, 'rubric_mode':'deterministic service; unavailable model rubric remains BLOCKED',
+        'executor':os.getenv('RESEARCHOS_EXECUTOR_ID', 'local:operator'), 'implementation_model':'gpt-6-astra', 'reasoning_effort':'high',
+        'runtime_model':'gpt-6-luna' if is_c01 else None, 'live_provider':None, 'rubric_mode':'deterministic service; unavailable model rubric remains BLOCKED',
         'resource_request_id':'RQ-W05-CLI-POLICY-001', 'scope':'DEVELOPMENT_ONLY',
         'expected_assertion_ids':sorted(expected), 'selector':selector,
     }
@@ -99,8 +102,8 @@ def main():
         'timeout':timed_out,'malformed':malformed,'ended_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'hashes':{p.name:digest(p) for p in out.iterdir() if p.is_file()},
         'independent_acceptance':'NOT_REQUESTED','scope':'DEVELOPMENT_ONLY','live_qualification':'BLOCKED',
-        'c01_agent':'MEMORYLESS_FIXTURE_AGENT' if 'TestW06ContextContinuation' in names else None,
-        'real_model_verified':False,
+        'c01_agent':'FRESH_MODEL_NO_OBSERVED_TOOLS' if is_c01 else None,
+        'real_model_verified':passed and is_c01,
     }
     (out/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     print(json.dumps({'status':report['status'],'assertions':len(rows),'assertion_ids':ids,'receipt':str(out/'report.json')}))
