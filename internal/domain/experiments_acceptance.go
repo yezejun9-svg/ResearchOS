@@ -1,8 +1,10 @@
 package domain
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/big"
+	"researchos.local/research-os/adapters/evaluation"
 	"strings"
 )
 
@@ -128,13 +130,15 @@ func (s *Service) verifyExperimentObservation(snap Object) (string, string) {
 	if e != nil {
 		return "FAIL", e.Error()
 	}
-	artifacts := Arr(snap, "artifacts")
-	if len(artifacts) != 1 {
-		return "FAIL", "one paired observation artifact required"
-	}
-	raw, e := Decode(artifacts[0].(map[string]any)["bytes"].([]byte))
+
+	raw, e := experimentObservation(Arr(snap, "artifacts"))
 	if e != nil {
 		return "FAIL", e.Error()
+	}
+	if nativeExperiment(x) {
+		if e = s.verifyNativeExperiment(x, snap, raw); e != nil {
+			return "FAIL", e.Error()
+		}
 	}
 	if raw["experiment_id"] != x["id"] || raw["preregistration_hash"] != x["preregistration_hash"] || x["status"] != "RUNNING" || Hash(x["acceptance_contract"]) != Hash(task["acceptance_contract"]) {
 		return "FAIL", "frozen experiment binding mismatch"
@@ -184,4 +188,95 @@ func experimentCaseIDs(x Object) ([]any, error) {
 		seen[id] = true
 	}
 	return ids, nil
+}
+
+func experimentObservation(artifacts []any) (Object, error) {
+	var found Object
+	for _, v := range artifacts {
+		entry, ok := v.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("artifact entry required")
+		}
+		raw, ok := entry["bytes"].([]byte)
+		if !ok {
+			return nil, fmt.Errorf("artifact bytes required")
+		}
+		o, e := Decode(raw)
+		if e != nil {
+			continue
+		}
+		if _, ok := o["observations"]; !ok {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("ambiguous paired observation artifact")
+		}
+		found = o
+	}
+	if found == nil {
+		return nil, fmt.Errorf("paired observation artifact required")
+	}
+	return found, nil
+}
+func nativeExperiment(x Object) bool {
+	for _, v := range Arr(x["acceptance_contract"].(map[string]any), "checks") {
+		c := v.(map[string]any)
+		if c["command_key"] == "experiments.paired-mean-v1" {
+			config, e := Decode([]byte(Str(c, "expected")))
+			if e == nil {
+				return config["native_execution"] == true
+			}
+		}
+	}
+	return false
+}
+func (s *Service) verifyNativeExperiment(x, snap, observation Object) error {
+	r := snap["run"].(map[string]any)
+	var body, receiptHash, state string
+	if e := s.DB.QueryRow("SELECT body,receipt_hash,state FROM experiment_executions WHERE project=? AND experiment=? AND run=? AND epoch=?", x["project_id"], x["id"], r["id"], r["lease_epoch"]).Scan(&body, &receiptHash, &state); e != nil {
+		return fmt.Errorf("actual native execution receipt unavailable")
+	}
+	record, e := Decode([]byte(body))
+	if e != nil {
+		return e
+	}
+	if state != "RECORDED" || record["receipt_hash"] != receiptHash || receiptHash != Receipt(record) || Hash(record["observation"]) != Hash(observation) || record["preregistration_hash"] != x["preregistration_hash"] || Hash(record["artifact_refs"]) != Hash(snap["artifact_refs"]) {
+		return fmt.Errorf("native receipt/observation/artifact binding mismatch")
+	}
+	var manifest evaluation.Manifest
+	if e = json.Unmarshal(Bytes(record["manifest"]), &manifest); e != nil {
+		return e
+	}
+	if manifest.ProjectID != x["project_id"] || manifest.Engine["name"] != "NATIVE" || manifest.Engine["version"] != "1" || manifest.Engine["config_hash"] != Hash(x["acceptance_contract"]) || manifest.RubricHash != Hash(x["acceptance_contract"]) || manifest.ExperimentID != x["id"] || manifest.RunID != r["id"] || manifest.CandidateHash != x["candidate_ref"].(map[string]any)["content_hash"] || manifest.BaselineHash != Arr(x, "baseline_refs")[0].(map[string]any)["content_hash"] {
+		return fmt.Errorf("native manifest version mismatch")
+	}
+
+	expectedIDs, err := experimentCaseIDs(x)
+	if err != nil || Hash(expectedIDs) != Hash(manifest.Expected) {
+		return fmt.Errorf("native expected case binding mismatch")
+	}
+	var datasetBound bool
+	for _, v := range Arr(x, "input_refs") {
+		if v.(map[string]any)["content_hash"] == manifest.DatasetHash {
+			datasetBound = true
+		}
+	}
+	if !datasetBound {
+		return fmt.Errorf("native dataset binding mismatch")
+	}
+	if len(Arr(record, "reports")) != 2 || len(Arr(record, "raw_exports")) != 2 || len(Arr(record, "raw_hashes")) != 2 || len(Arr(record, "sandbox_receipts")) != 2 {
+		return fmt.Errorf("complete baseline and candidate receipts required")
+	}
+	for i, v := range Arr(record, "reports") {
+		report := v.(map[string]any)
+		if e = evaluation.Validate(manifest, report, []byte(Arr(record, "raw_exports")[i].(string)), Arr(record, "raw_hashes")[i].(string)); e != nil {
+			return e
+		}
+		receipt := Arr(record, "sandbox_receipts")[i].(map[string]any)
+		exit, _ := Num(receipt, "exit_code")
+		if exit != 0 || receipt["children_stopped"] != true || receipt["timed_out"] != false || len(Arr(receipt, "capabilities")) != 0 {
+			return fmt.Errorf("native sandbox did not finish within frozen bounds")
+		}
+	}
+	return nil
 }
