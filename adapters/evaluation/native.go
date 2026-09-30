@@ -72,17 +72,16 @@ func Execute(datasetBytes, programBytes []byte) ([]Result, error) {
 				r.Verdict = "ERROR"
 				r.Hard = nil
 			}
-			if c.Output["duplicate_case_id"] != nil {
-				r.Verdict = "PASS"
-				rows = append(rows, r)
-			}
 		}
-		if selected == c.Expected && hard {
+		if r.Verdict == "FAIL" && selected == c.Expected && hard {
 			r.Verdict = "PASS"
 		}
 		latency := time.Since(start).Milliseconds()
 		r.Latency = &latency
 		rows = append(rows, r)
+		if p.Mode == "PROTOCOL_FIXTURE" && c.Output["duplicate_case_id"] != nil {
+			rows = append(rows, r)
+		}
 	}
 	return rows, nil
 }

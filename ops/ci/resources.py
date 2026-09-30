@@ -16,7 +16,7 @@ GROUPS = {
     'W12-G01': list(EXPECTED),
     'C11': ['TestW12CrashAndResume', 'TestW12DuplicateCallbacks', 'TestW12SessionIdentity'],
     'C13': ['TestW12Budget', 'TestW12CrashAndResume', 'TestW12ConcurrencyAndQueue', 'TestW12ProgressAndLimits'],
-    'C14': ['TestW12Budget', 'TestW12BudgetSettlementChain', 'TestW12BudgetConnections', 'TestW12BudgetPrecisionAndModes', 'TestW12PreparedEffectFences', 'TestW12CancelRetainsAccounting'],
+    'C14': ['TestW12Budget', 'TestW12BudgetSettlementChain', 'TestW12BudgetConnections', 'TestW12BudgetPrecisionAndModes', 'TestW12PreparedEffectFences', 'TestW12CancelRetainsAccounting', 'TestW12ExperimentBudgetScopes'],
     'C15': ['TestW12ResourceRoutes', 'TestW12SessionIdentity'],
     'C16': ['TestW12ProgressAndLimits'],
 }

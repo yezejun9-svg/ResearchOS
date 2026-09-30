@@ -2,7 +2,7 @@
 import argparse, datetime, hashlib, json, os, platform, subprocess, sys, time, uuid
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
-PROTOCOL=['PF-%02d'%i for i in range(1,13)]+['C21-COUNTS','C21-ZERO']+['C21-TAMPER-'+x for x in ('config','dataset','candidate','baseline','rubric','unknown','raw')]+['C21-STABLE','C21-VALID','C21-REGRESSION','C21-HIGH-SCORE','C21-EXIT','C21-COUNT-TAMPER']+['C21-REJECT-'+x for x in ('LAUNDERED-DUPLICATE','LAUNDERED-UNKNOWN','RAW-ROWS-MISMATCH','REPORT-ROWS-MISMATCH','AMBIGUOUS-JSON')]+['C21-OBSERVED-FENCE-'+x for x in ('project','experiment','run','engine','config','dataset','candidate','baseline','rubric','expected')]
+PROTOCOL=['PF-%02d'%i for i in range(1,13)]+['C21-COUNTS','C21-ZERO']+['C21-TAMPER-'+x for x in ('config','dataset','candidate','baseline','rubric','unknown','raw')]+['C21-STABLE','C21-VALID','C21-REGRESSION','C21-HIGH-SCORE','C21-EXIT','C21-COUNT-TAMPER']+['C21-REJECT-'+x for x in ('LAUNDERED-DUPLICATE','LAUNDERED-UNKNOWN','RAW-ROWS-MISMATCH','REPORT-ROWS-MISMATCH','AMBIGUOUS-JSON')]+['C21-NATIVE-PROVIDER-STATUS']+['C21-OBSERVED-FENCE-'+x for x in ('project','experiment','run','engine','config','dataset','candidate','baseline','rubric','expected')]
 DOMAIN=[a+'-'+s for s in ('positive','negative','null','inconclusive','stable') for a in ('A07-HASH','A07-REGISTER-FIRST','A07-POSTHOC','A07-VERIFIED','A07-NO-RECEIPT','A07-METRIC-FORGE','A07-OUTCOME','A07-RECOMPUTE')]
 NATIVE=['A07-NATIVE-'+x for x in ('RECORDED','PAIRED','NO-REPLAY','INDEPENDENT','IMPROVED')]
 SANDBOX=['SANDBOX-HOST-CONTROL']+[a for mode in ('baseline','candidate') for a in ['SANDBOX-EXIT-'+mode]+['SANDBOX-'+mode+'-'+k for k in ('read_denied','write_denied','input_write_denied','network_denied','external_denied')]+['SANDBOX-RECOMPUTE-'+mode]]+['SANDBOX-TIMEOUT','SANDBOX-OBSERVED-EGRESS','SANDBOX-STABLE-UNCHANGED']+['SANDBOX-REJECT-'+x for x in ('equal','output-ancestor','output-descendant')]
@@ -16,7 +16,7 @@ def main(family='evaluation'):
  resolved_mode=('live' if selector=='W10-G02' else 'fixture') if args.mode=='auto' else args.mode
  if (resolved_mode=='live')!=(selector=='W10-G02'):p.error('live mode is only W10-G02; fixture does not establish live qualification')
  if selector=='W10-G02':packages=['./ops/experiment_sandbox','./internal/domain'];names=['TestNativeSandbox','TestSandboxRootOverlap','TestW10NativePair'];expected=SANDBOX+NATIVE
- elif family=='evaluation':packages=['./adapters/evaluation','./ops/experiment_sandbox'];names=['TestProtocol','TestRawIntegrity','TestObservedManifestFence','TestNativeSandbox','TestSandboxRootOverlap'];expected=PROTOCOL+SANDBOX
+ elif family=='evaluation':packages=['./adapters/evaluation','./ops/experiment_sandbox'];names=['TestProtocol','TestRawIntegrity','TestObservedManifestFence','TestNativeProviderStatus','TestNativeSandbox','TestSandboxRootOverlap'];expected=PROTOCOL+SANDBOX
  else:packages=['./internal/domain'];names=['TestW10Experiment','TestW10NativePair'];expected=DOMAIN+NATIVE
  if len(expected)!=len(set(expected)) or not expected:raise RuntimeError('empty/duplicate expectation')
  go=os.getenv('RESEARCHOS_GO','');

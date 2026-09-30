@@ -338,12 +338,8 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 			}
 			result, e = load(tx, project, k, Str(profile, field))
 		}
-	case "getGoalBudgetPolicy":
-		goal, err := load(tx, project, "Goal", id)
-		e = err
-		if e == nil {
-			result, e = load(tx, project, "BudgetPolicy", Str(goal, "budget_policy_id"))
-		}
+	case "getGoalBudgetPolicy", "getExperimentBudgetPolicy":
+		result, e = s.resourcePolicyTarget(tx, project, id, op.ID, b)
 	default:
 		if strings.HasPrefix(op.ID, "get") {
 			kind = strings.TrimPrefix(op.ID, "get")
