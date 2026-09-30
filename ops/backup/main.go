@@ -35,7 +35,7 @@ func run() error {
 	sourceRoot := f.String("source-root", "", "upgrade: exact schema13 release root")
 	sourceProgram := f.String("source-program", "", "upgrade: preserved matching old program")
 	targetProgram := f.String("target-program", "", "upgrade: reviewed target program")
-	plan := f.String("plan", "", "upgrade: schema13-to14-remote-access-v1 only")
+	plan := f.String("plan", "", "upgrade: schema13-to14-remote-access-v1 or schema13-to20-research-runtime-v1 (exact releases only)")
 	if e := f.Parse(os.Args[2:]); e != nil {
 		return e
 	}
