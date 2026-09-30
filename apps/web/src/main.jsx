@@ -25,9 +25,10 @@ function routeOf(path) {
 }
 
 function useRoute() {
-  const [route, setRoute] = useState(() => routeOf(location.pathname))
-  useEffect(() => { const pop = () => setRoute(routeOf(location.pathname)); addEventListener('popstate', pop); return () => removeEventListener('popstate', pop) }, [])
-  const navigate = path => { const target = new URL(path, location.origin); if (target.pathname + target.search !== location.pathname + location.search) history.pushState(null, '', target); setRoute(routeOf(target.pathname)); scrollTo(0, 0) }
+  const currentRoute = () => ({ ...routeOf(location.pathname), search: location.search })
+  const [route, setRoute] = useState(currentRoute)
+  useEffect(() => { const pop = () => setRoute(currentRoute()); addEventListener('popstate', pop); return () => removeEventListener('popstate', pop) }, [])
+  const navigate = path => { const target = new URL(path, location.origin); if (target.pathname + target.search !== location.pathname + location.search) history.pushState(null, '', target); setRoute({ ...routeOf(target.pathname), search: target.search }); scrollTo(0, 0) }
   return [route, navigate]
 }
 

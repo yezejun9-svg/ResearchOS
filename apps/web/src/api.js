@@ -29,15 +29,29 @@ export function createApi(getToken) {
     if (body != null) headers['Content-Type'] = body instanceof Blob ? 'application/octet-stream' : 'application/json'
     if (etag) headers['If-Match'] = etag
     if (spec.method !== 'GET') headers['Idempotency-Key'] = key || crypto.randomUUID()
-    const response = await fetch(url, { method: spec.method, headers, body: body == null ? undefined : body instanceof Blob ? body : JSON.stringify(body), signal, cache: 'no-store' })
-    principalId = response.headers.get('X-ResearchOS-Principal-ID') || principalId
-    if (!response.ok) {
-      let detail
-      try { detail = await response.json() } catch { detail = null }
-      throw new ApiError(response.status, detail, operation)
+    const controller = new AbortController()
+    const abort = () => controller.abort(signal.reason)
+    if (signal?.aborted) abort()
+    else signal?.addEventListener('abort', abort, { once: true })
+    let timedOut = false
+    const timer = setTimeout(() => { timedOut = true; controller.abort() }, 30000)
+    try {
+      const response = await fetch(url, { method: spec.method, headers, body: body == null ? undefined : body instanceof Blob ? body : JSON.stringify(body), signal: controller.signal, cache: 'no-store' })
+      principalId = response.headers.get('X-ResearchOS-Principal-ID') || principalId
+      if (!response.ok) {
+        let detail
+        try { detail = await response.json() } catch (error) { if (controller.signal.aborted) throw error; detail = null }
+        throw new ApiError(response.status, detail, operation)
+      }
+      if (raw) return { blob: await response.blob(), headers: response.headers, status: response.status }
+      return response.status === 204 ? null : await response.json()
+    } catch (error) {
+      if (timedOut && !signal?.aborted) throw new ApiError(408, { code: 'REQUEST_TIMEOUT', message: '请求超过 30 秒未完成，请检查连接后重试。' }, operation)
+      throw error
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
     }
-    if (raw) return { blob: await response.blob(), headers: response.headers, status: response.status }
-    return response.status === 204 ? null : response.json()
   }
   async function stream(projectId, afterSequence, onEvent, signal, shouldStop = () => false, onOpen = () => {}) {
     const url = new URL(pathFor(operations.streamEvents.path, { projectId }), window.location.origin)
@@ -83,6 +97,7 @@ export function createApi(getToken) {
 
 export function classify(error) {
   if (error?.name === 'AbortError') return 'aborted'
+  if (error?.code === 'REQUEST_TIMEOUT') return 'timeout'
   if (error?.status === 401) return 'auth'
   if (error?.status === 403) return 'forbidden'
   if (error?.status === 404) return 'missing'
