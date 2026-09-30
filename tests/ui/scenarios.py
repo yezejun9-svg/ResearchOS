@@ -281,7 +281,7 @@ def responsive_screen(page, path, report, out):
     for theme in ('light', 'dark'):
         if page.evaluate('document.documentElement.dataset.theme') != theme:
             page.get_by_role('button', name='切换为' + ('深色' if theme == 'dark' else '浅色') + '主题').click()
-        for width, height in [(320, 720), (390, 844), (768, 1024), (1024, 768), (1440, 1000), (1920, 1080)]:
+        for width, height in [(320, 780), (390, 844), (768, 1024), (1024, 768), (1440, 1000), (1920, 1080)]:
             page.set_viewport_size({'width': width, 'height': height})
             page.wait_for_timeout(50)
             result = page.evaluate("""() => ({overflow:document.documentElement.scrollWidth>innerWidth+1,
@@ -293,7 +293,7 @@ def responsive_screen(page, path, report, out):
                 small = [target for target in result['targets'] if target['width'] < 44 or target['height'] < 44]
                 assert not small, (path, theme, width, small)
             report.setdefault('responsive_matrix', []).append({'screen': path, 'theme': theme, 'width': width, 'height': height, 'no_overflow': True, 'mobile_targets_44px': True if width <= 390 else None})
-            if width in (390, 1440):
+            if width in (320, 390, 768, 1024, 1440):
                 name = f'{path}-{theme}-{width}.png'
                 page.evaluate('scrollTo(0, 0)')
                 page.screenshot(path=str(out / name), full_page=width >= 768)

@@ -25,7 +25,7 @@ def run(name, argv, cwd=ROOT):
 
 def main():
     task = os.getenv("RESEARCHOS_TASK_ID", "W02")
-    if task not in ("W02", "W03", "W04", "W05", "W06", "W07", "W08", "W09", "W10", "W11", "W12", "W18") or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", *(f"{task}-G0{n}" for n in (1, 2, 3))) or os.getenv("RESEARCHOS_CASE_ID"):
+    if task not in ("W02", "W03", "W04", "W05", "W06", "W07", "W08", "W09", "W10", "W11", "W12", "W13", "W18") or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", *(f"{task}-G0{n}" for n in (1, 2, 3))) or os.getenv("RESEARCHOS_CASE_ID"):
         raise NotImplementedError("unbound task/check/case selection")
     go = os.environ["RESEARCHOS_GO"]
     node = os.environ["RESEARCHOS_NODE"]
