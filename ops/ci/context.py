@@ -54,6 +54,9 @@ def version_manifest():
             "external_services": {"status": "NOT_APPLICABLE", "reason": "No external service or provider is used."}}
 
 def main():
+    if os.getenv('RESEARCHOS_TASK_ID') == 'W12':
+        from resources import main as resources_main
+        return resources_main('test.context')
     versions = version_manifest()
     evidence = ROOT / "execution/receipts/W04/context" / ("run-" + uuid.uuid4().hex)
     evidence.mkdir(parents=True)

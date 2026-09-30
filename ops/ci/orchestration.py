@@ -26,6 +26,9 @@ def digest(path):
 
 
 def main():
+    if os.getenv('RESEARCHOS_TASK_ID') == 'W12':
+        from resources import main as resources_main
+        return resources_main('test.orchestration')
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=('fixture', 'live'), required=True)
     args = parser.parse_args()

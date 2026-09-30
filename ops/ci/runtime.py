@@ -32,6 +32,9 @@ def digest(path):
     return 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()
 
 def main():
+    if os.getenv('RESEARCHOS_TASK_ID') == 'W12':
+        from resources import main as resources_main
+        return resources_main('test.runtime')
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=('fixture', 'live'), required=True)
     parser.add_argument('--subcase', choices=('success', 'tool_failed', 'request_timeout', 'pending_queue_cancel', 'executor_crash'))

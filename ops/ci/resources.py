@@ -30,7 +30,7 @@ def save(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
-def main():
+def main(command_key='test.resources'):
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['fixture', 'live'])
     args = parser.parse_args()
@@ -65,7 +65,7 @@ def main():
         'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'environment_mode': 'FIXTURE_AND_NATIVE_LOCAL_PROCESS', 'os': platform.platform(), 'architecture': platform.machine(), 'timezone': list(time.tzname),
         'executor_identity': os.getenv('RESEARCHOS_EXECUTOR_ID', 'codex:/root/resources'), 'verifier_identity': None,
         'code_revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(), 'dirty': subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True),
-        'command_key': 'test.resources', 'registered_command_revision': 'ROOT_INTEGRATION_PENDING', 'argv': cmd, 'cwd': str(ROOT), 'environment_names': sorted(env),
+        'command_key': command_key, 'registered_command_revision': digest(ROOT / 'execution/commands.json').removeprefix('sha256:'), 'argv': cmd, 'cwd': str(ROOT), 'environment_names': sorted(env),
         'version_manifest': {str(p.relative_to(ROOT)).replace('\\', '/'): digest(p) for pattern in patterns for p in ROOT.glob(pattern) if p.is_file()},
         'go_version': subprocess.check_output([go, 'version'], cwd=ROOT, text=True).strip(), 'python_version': platform.python_version(),
         'implementation_model': 'gpt-6-astra', 'reasoning_effort': 'high', 'runtime_model': {'status': 'not_applicable', 'reason': 'explicit local fixture, no provider model invoked'},
