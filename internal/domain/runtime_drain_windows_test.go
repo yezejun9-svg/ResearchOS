@@ -53,6 +53,20 @@ func TestRuntimeDrainLeaseAndScanFence(t *testing.T) {
 		t.Fatal("quiesce waited for scan mutex")
 	}
 	c.scanMu.Unlock()
+	if _, e = c.QuiesceForRelease(context.Background()); e == nil || c.quiesced {
+		t.Fatal("startup recovery was not complete but drain installed a fence")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Serve(ctx, nil) }()
+	defer cancel()
+	deadline := time.Now().Add(time.Second)
+	for !c.StartupReady() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !c.StartupReady() {
+		t.Fatal("busy pre-start drain stopped normal recovery")
+	}
 	if _, e = c.QuiesceForRelease(context.Background()); e != nil {
 		t.Fatal(e)
 	}
@@ -62,6 +76,15 @@ func TestRuntimeDrainLeaseAndScanFence(t *testing.T) {
 	c.ResumeAfterReleaseAbort()
 	if c.quiesced {
 		t.Fatal("abort failed to resume scans")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("busy/abort stopped coordinator: %v", err)
+	default:
+	}
+	cancel()
+	if e = <-done; e != nil {
+		t.Fatal(e)
 	}
 	if e = c.Close(); e != nil {
 		t.Fatal(e)
@@ -81,5 +104,5 @@ func TestRuntimeDrainLeaseAndScanFence(t *testing.T) {
 		t.Fatal("lease remained after DB and owner close", e)
 	}
 	l.Close()
-	t.Log("single borrower; failed constructor returns borrow; busy scan immediate refusal; coordinator close retains DB owner lock")
+	t.Log("single borrower; busy scan/startup drain refusal; recovery completes before quiesce; abort keeps Serve alive; coordinator close retains DB owner lock")
 }

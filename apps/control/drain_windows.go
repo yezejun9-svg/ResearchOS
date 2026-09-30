@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	rt "researchos.local/research-os/adapters/runtime"
 	"researchos.local/research-os/internal/domain"
 	"researchos.local/research-os/ops/supervisor"
 	"sync"
@@ -77,6 +79,9 @@ type controlDrain struct {
 	gate                      *drainGate
 	service                   *domain.Service
 	coordinator               *domain.RuntimeCoordinator
+	lease                     *rt.DataRootLease
+	listener                  net.Listener
+	startup                   *supervisor.DrainBootstrap
 	pipe, root                string
 	key                       []byte
 	peer                      supervisor.ProcessIdentity
@@ -173,6 +178,30 @@ func (d *controlDrain) handle(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	switch frame.Kind {
+	case "READY":
+		if d.startup == nil || frame.Operation != d.startup.Token || frame.Epoch != d.startup.Epoch || ctx.Err() != nil {
+			return errors.New("startup readiness binding changed")
+		}
+		if d.coordinator != nil && !d.coordinator.StartupReady() {
+			return supervisor.WriteDrainFrame(conn, d.response("BUSY", frame, "", "STARTING"))
+		}
+		d.gate.mu.Lock()
+		available := !d.gate.closing && !d.gate.quiesced
+		d.gate.mu.Unlock()
+		if !available || !d.lease.Held() || d.lease.Root() != d.root || d.listener == nil || d.listener.Addr().String() != d.startup.Listener {
+			return errors.New("control listener or lease not ready")
+		}
+		identity, err := supervisor.ObserveProcess(uint32(os.Getpid()))
+		if err != nil {
+			return err
+		}
+		reply := d.response("READY", frame, "", "READY")
+		reply.Readiness = &supervisor.DrainReadiness{Process: identity, Listener: d.listener.Addr().String(), LeaseHeld: true, StartupComplete: true}
+		reply, err = supervisor.DrainFrameSign(d.key, reply)
+		if err != nil {
+			return err
+		}
+		return supervisor.WriteDrainFrame(conn, reply)
 	case "QUIESCE":
 		if d.operation != "" {
 			return errors.New("another control drain is pending")

@@ -23,14 +23,22 @@ import (
 const drainPipePrefix = `\\.\pipe\researchos-r2-fixture-`
 
 type DrainFrame struct {
-	Kind      string `json:"kind"`
-	Operation string `json:"operation"`
-	Epoch     uint64 `json:"epoch"`
-	Root      string `json:"root"`
-	Nonce     string `json:"nonce"`
-	Receipt   string `json:"receipt,omitempty"`
-	State     string `json:"state,omitempty"`
-	MAC       string `json:"mac"`
+	Kind      string          `json:"kind"`
+	Operation string          `json:"operation"`
+	Epoch     uint64          `json:"epoch"`
+	Root      string          `json:"root"`
+	Nonce     string          `json:"nonce"`
+	Receipt   string          `json:"receipt,omitempty"`
+	State     string          `json:"state,omitempty"`
+	MAC       string          `json:"mac"`
+	Readiness *DrainReadiness `json:"readiness,omitempty"`
+}
+
+type DrainReadiness struct {
+	Process         ProcessIdentity `json:"process"`
+	Listener        string          `json:"listener"`
+	LeaseHeld       bool            `json:"lease_held"`
+	StartupComplete bool            `json:"startup_complete"`
 }
 
 func NewDrainPipeName() (string, error) {
@@ -207,6 +215,10 @@ func AcceptDrainPipe(ctx context.Context, name string, expected ProcessIdentity)
 // DialDrainPipe only retries creation/readiness. Once connected, business
 // frames have one send; a missing response is an unknown outcome.
 func DialDrainPipe(name string, expected ProcessIdentity) (*os.File, error) {
+	return dialDrainPipeUntil(name, expected, time.Now().Add(2*time.Second))
+}
+
+func dialDrainPipeUntil(name string, expected ProcessIdentity, deadline time.Time) (*os.File, error) {
 	if !validDrainPipeName(name) {
 		return nil, errors.New("fixture drain pipe name invalid")
 	}
@@ -214,7 +226,6 @@ func DialDrainPipe(name string, expected ProcessIdentity) (*os.File, error) {
 	if e != nil {
 		return nil, e
 	}
-	deadline := time.Now().Add(2 * time.Second)
 	for {
 		h, openErr := windows.CreateFile(ptr, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED, 0)
 		if openErr == nil {

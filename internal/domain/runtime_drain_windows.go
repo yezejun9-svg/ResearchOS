@@ -18,6 +18,14 @@ type RuntimeDrainSnapshot struct {
 	CheckpointBusy       int `json:"checkpoint_busy"`
 }
 
+func (c *RuntimeCoordinator) StartupReady() bool {
+	if !c.scanMu.TryLock() {
+		return false
+	}
+	defer c.scanMu.Unlock()
+	return c.startupComplete && !c.quiesced
+}
+
 func (s *Service) RuntimeDrainSnapshot(ctx context.Context) (RuntimeDrainSnapshot, error) {
 	var snap RuntimeDrainSnapshot
 	queries := []struct {
@@ -45,6 +53,9 @@ func (c *RuntimeCoordinator) QuiesceForRelease(ctx context.Context) (RuntimeDrai
 		return snap, errors.New("runtime scan busy")
 	}
 	defer c.scanMu.Unlock()
+	if !c.startupComplete {
+		return snap, errors.New("runtime startup recovery not complete")
+	}
 	if c.quiesced {
 		return snap, errors.New("runtime coordinator already quiesced")
 	}

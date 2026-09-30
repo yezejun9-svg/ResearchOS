@@ -29,10 +29,13 @@ const drainHandleEnv = "RESEARCHOS_DRAIN_BOOTSTRAP_HANDLE"
 // The environment contains a handle number, never a key or authority flag.
 // This proves same-user fixture mechanics, not an SCM security boundary.
 type DrainBootstrap struct {
-	Pipe string
-	Root string
-	Key  []byte
-	Peer ProcessIdentity
+	Pipe     string
+	Root     string
+	Key      []byte
+	Peer     ProcessIdentity
+	Token    string
+	Epoch    uint64
+	Listener string
 }
 
 func ReadInheritedDrainBootstrap(root string) (*DrainBootstrap, error) {
@@ -58,7 +61,7 @@ func ReadInheritedDrainBootstrap(root string) (*DrainBootstrap, error) {
 	if e = json.NewDecoder(io.LimitReader(f, 8192)).Decode(&boot); e != nil {
 		return nil, e
 	}
-	if !validDrainPipeName(boot.Pipe) || boot.Root != root || len(boot.Key) != 32 {
+	if !validDrainPipeName(boot.Pipe) || boot.Root != root || len(boot.Key) != 32 || boot.Token == "" || boot.Epoch == 0 || boot.Listener == "" {
 		return nil, errors.New("drain bootstrap binding invalid")
 	}
 	if alive, err := (NativeFixtureDriver{}).Alive(boot.Peer); err != nil || !alive {
@@ -106,7 +109,7 @@ func (d *ControlFixtureDriver) Start(image, token, data string) (ProcessIdentity
 	if e != nil {
 		return ProcessIdentity{}, e
 	}
-	boot := &DrainBootstrap{Pipe: name, Root: filepath.Clean(data), Key: make([]byte, 32), Peer: peer}
+	boot := &DrainBootstrap{Pipe: name, Root: filepath.Clean(data), Key: make([]byte, 32), Peer: peer, Token: token, Epoch: s.Epoch, Listener: d.Listen}
 	if _, e = rand.Read(boot.Key); e != nil {
 		return ProcessIdentity{}, e
 	}
@@ -291,12 +294,57 @@ func (d *ControlFixtureDriver) Stop(p ProcessIdentity) error {
 }
 
 func (d *ControlFixtureDriver) Ready(ctx context.Context, p ProcessIdentity, token string) error {
+	if d.boot == nil || p != d.process || token != d.boot.Token || d.Listen != d.boot.Listener {
+		return errors.New("original child startup capability required")
+	}
+	s := d.Journal.State()
+	// Bootstrap calls Ready while its durable slot is still STARTING/PID=0.
+	// Only this read-only proof accepts that window; mutation connections retain
+	// their complete journal-process identity requirement.
+	starting := (s.Phase == "STARTING" || s.Phase == "SWITCHED") && s.PID == 0
+	if (!starting && processIn(s) != p) || s.Data != d.boot.Root || s.Epoch != d.boot.Epoch || s.Active != p.ImageSHA256 {
+		return errors.New("control startup slot binding changed")
+	}
 	client := &http.Client{Timeout: time.Second}
 	deadline := time.Now().Add(10 * time.Second)
+	if end, ok := ctx.Deadline(); ok && end.Before(deadline) {
+		deadline = end
+	}
 	for time.Now().Before(deadline) && ctx.Err() == nil {
 		alive, e := d.Alive(p)
 		if e != nil || !alive {
 			return errors.New("control not alive")
+		}
+		c, e := dialDrainPipeUntil(d.boot.Pipe, p, deadline)
+		if e != nil {
+			return fmt.Errorf("private control readiness unavailable: %w", e)
+		}
+		if e = c.SetDeadline(deadline); e != nil {
+			c.Close()
+			return e
+		}
+		var nonce [32]byte
+		if _, e = rand.Read(nonce[:]); e != nil {
+			c.Close()
+			return e
+		}
+		frame := DrainFrame{Kind: "READY", Operation: token, Epoch: d.boot.Epoch, Root: d.boot.Root, Nonce: hex.EncodeToString(nonce[:])}
+		if e = d.send(c, frame); e != nil {
+			c.Close()
+			return e
+		}
+		reply, e := d.read(c, frame)
+		c.Close()
+		if e != nil {
+			return e
+		}
+		if reply.Kind == "BUSY" && reply.State == "STARTING" {
+			time.Sleep(25 * time.Millisecond)
+			continue
+		}
+		r := reply.Readiness
+		if reply.Kind != "READY" || reply.State != "READY" || r == nil || r.Process != p || r.Listener != d.Listen || !r.LeaseHeld || !r.StartupComplete {
+			return errors.New("private control readiness binding changed")
 		}
 		req, e := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+d.Listen+"/healthz", nil)
 		if e != nil {
@@ -306,6 +354,9 @@ func (d *ControlFixtureDriver) Ready(ctx context.Context, p ProcessIdentity, tok
 		if e == nil {
 			res.Body.Close()
 			if res.StatusCode == http.StatusOK {
+				if alive, e = d.Alive(p); e != nil || !alive {
+					return errors.New("ready control exited")
+				}
 				return nil
 			}
 		}

@@ -41,6 +41,20 @@ func (l *DataRootLease) Root() string {
 	return l.root
 }
 
+// Held observes the owner's live handle; it neither borrows nor acquires a lease.
+func (l *DataRootLease) Held() bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed || l.file == nil {
+		return false
+	}
+	_, err := l.file.Stat()
+	return err == nil
+}
+
 func (l *DataRootLease) Borrow(directory string) error {
 	if l == nil {
 		return errors.New("control data-root lease required")

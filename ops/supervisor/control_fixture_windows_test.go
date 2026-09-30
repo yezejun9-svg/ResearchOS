@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -216,6 +217,79 @@ func TestActualControlDrain(t *testing.T) {
 			t.Fatal("authority project changed across actual restart")
 		}
 		t.Logf("actual idle stop/same-root restart: old=%+v candidate=%+v durable=%s project=%s revision=%v profile_sha256=%s preserved via actual GET", old, processIn(s), s.Phase, before.project, before.revision, before.profileDigest)
+	})
+	t.Run("occupied_listener_cannot_prove_child_ready", func(t *testing.T) {
+		root := t.TempDir()
+		data := filepath.Join(root, "data")
+		init := exec.Command(exe, "--bootstrap-owner", "--credential-file", filepath.Join(root, "owner.json"))
+		init.Dir = repo
+		init.Env = append(os.Environ(), "RESEARCHOS_DATA_DIR="+data, "RESEARCHOS_WEB_DIR="+web)
+		if raw, e := init.CombinedOutput(); e != nil {
+			t.Fatalf("initialize: %v %s", e, raw)
+		}
+		unrelated := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+		defer unrelated.Close()
+		res, e := unrelated.Client().Get(unrelated.URL + "/healthz")
+		if e != nil {
+			t.Fatal(e)
+		}
+		res.Body.Close()
+		if res.StatusCode != 200 {
+			t.Fatal("unrelated listener not healthy")
+		}
+		// Hold a disposable pre-start SQLite write transaction so the actual
+		// child remains alive in bootstrap until after the readiness check.
+		// No production DB or running control writer is involved.
+		db, e := store.Open(filepath.Join(data, "researchos.sqlite"))
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer db.Close()
+		tx, e := db.Begin()
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer tx.Rollback()
+		if _, e = tx.Exec("UPDATE auth_principals SET revoked=revoked"); e != nil {
+			t.Fatal(e)
+		}
+		j, e := OpenReleaseJournal(filepath.Join(root, "journal"))
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer j.Close()
+		_, hash, e := exactImage(exe)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = j.Append(ReleaseState{Epoch: 1, Operation: "bootstrap", Phase: "STARTING", Active: hash, ActivePath: exe, LastGood: hash, LastGoodPath: exe, Data: data}); e != nil {
+			t.Fatal(e)
+		}
+		logfile, e := os.Create(filepath.Join(root, "control.log"))
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer logfile.Close()
+		d := &ControlFixtureDriver{Journal: j, WorkDir: repo, WebDir: web, Listen: strings.TrimPrefix(unrelated.URL, "http://"), CoordinatorConfig: config, Output: logfile}
+		p, e := d.Start(exe, "bootstrap-1", data)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer func() {
+			if e := (NativeFixtureDriver{}).Stop(p); e != nil {
+				t.Errorf("exact fixture cleanup: %v", e)
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		if e = d.Ready(ctx, p, "bootstrap-1"); e == nil {
+			t.Fatal("unrelated HTTP 200 certified an unready actual child")
+		}
+		if alive, err := d.Alive(p); err != nil || !alive {
+			t.Fatalf("check did not exercise live startup child: %v %v", alive, err)
+		}
+		checkLocked(t, data)
+		t.Logf("unrelated health=200 rejected for still-live actual child=%+v; private READY absent; phase=%s", p, j.State().Phase)
 	})
 	for _, tc := range []struct{ name, seed string }{
 		{"nonterminal_run", `INSERT INTO domain_objects(project,kind,id,revision,body) VALUES('fixture','Run','active',1,'{"status":"RUNNING"}')`},
