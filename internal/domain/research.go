@@ -3,6 +3,7 @@ package domain
 import (
 	"database/sql"
 	"errors"
+	"sort"
 	"time"
 )
 
@@ -203,10 +204,15 @@ func (s *Service) researchCoverage(tx *sql.Tx, project string, profile Object, f
 		}
 		end, endErr := time.Parse(time.RFC3339Nano, Str(cursor, "covered_until"))
 		success, successErr := time.Parse(time.RFC3339Nano, Str(cursor, "last_success_at"))
+		type coveredInterval struct {
+			from, to time.Time
+			ids      map[string]bool
+		}
+		intervals := []coveredInterval{}
 		for _, window := range windows {
 			start, startErr := time.Parse(time.RFC3339Nano, window[0])
 			stop, stopErr := time.Parse(time.RFC3339Nano, window[1])
-			if endErr != nil || successErr != nil || startErr != nil || stopErr != nil || start.After(from) || stop.Before(to) || end.Before(stop) {
+			if endErr != nil || successErr != nil || startErr != nil || stopErr != nil || !start.Before(stop) || !start.Before(to) || !stop.After(from) || end.Before(stop) {
 				continue
 			}
 			ids := map[string]bool{}
@@ -222,9 +228,29 @@ func (s *Service) researchCoverage(tx *sql.Tx, project string, profile Object, f
 				return nil, e
 			}
 			if final {
-				c["status"], c["observed_from"], c["observed_to"], c["record_count"], c["gap_reason"] = "COMPLETE", window[0], window[1], len(ids), nil
-				break
+				intervals = append(intervals, coveredInterval{start, stop, ids})
 			}
+		}
+		sort.Slice(intervals, func(i, j int) bool { return intervals[i].from.Before(intervals[j].from) })
+		coveredTo := from
+		ids := map[string]bool{}
+		for _, interval := range intervals {
+			if interval.from.After(coveredTo) {
+				break // Neither max(covered_until) nor a later page fills this gap.
+			}
+			if interval.to.After(coveredTo) {
+				coveredTo = interval.to
+			}
+			for id := range interval.ids {
+				ids[id] = true
+			}
+		}
+		if coveredTo.After(from) {
+			c["observed_from"], c["observed_to"], c["record_count"] = from.UTC().Format(time.RFC3339Nano), coveredTo.UTC().Format(time.RFC3339Nano), len(ids)
+			c["gap_reason"] = "verified contiguous source intervals do not cover the full cycle"
+		}
+		if !coveredTo.Before(to) {
+			c["status"], c["gap_reason"] = "COMPLETE", nil
 		}
 		if c["status"] != "COMPLETE" && kind == "X" {
 			c["gap_reason"] = "X visible observations do not prove a complete bounded window"

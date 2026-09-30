@@ -38,7 +38,7 @@ func (s *Service) compileMonitorPlan(tx *sql.Tx, owner Principal, project string
 	err = tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='NoProgressRecord' AND json_extract(body,'$.key_hash')=?", project, key).Scan(&raw)
 	var progress Object
 	if err == sql.ErrNoRows {
-		progress = Merge(Base(project), Object{"origin_problem_id": origin, "candidate_id": candidate, "input_hash": inputHash, "key_hash": key, "same_failure_count": 0, "no_progress_iterations": 0, "best_accepted_artifact_ref": nil, "last_effective_progress_at": nil, "resume_conditions": Empty(), "status": "ACTIVE"})
+		progress = Merge(Base(project), Object{"origin_problem_id": origin, "candidate_id": candidate, "input_hash": inputHash, "key_hash": key, "same_failure_count": 0, "no_progress_iterations": 0, "best_accepted_artifact_ref": nil, "last_effective_progress_at": nil, "resume_conditions": []any{"Current verified new evidence or an independently confirmed restored resource is required after deferral."}, "status": "ACTIVE"})
 		err = s.put(tx, "NoProgressRecord", progress)
 	} else if err == nil {
 		progress, err = Decode([]byte(raw))
@@ -128,8 +128,22 @@ func (s *Service) monitorSnapshot(tx *sql.Tx, project, goalID string, active boo
 	if _, err = intentPrincipal(tx, project, Str(receipt, "verifier_principal_id"), "VERIFIER"); err != nil {
 		return nil, nil, err
 	}
-	if err = retentionIndependent(tx, task, receipt); err != nil {
+	verifierRoot, err := authorityRoot(tx, Str(receipt, "verifier_principal_id"))
+	if err != nil {
 		return nil, nil, err
+	}
+	subject, _ := receipt["subject_ref"].(map[string]any)
+	if subject == nil || subject["entity_type"] != "Goal" || subject["id"] != planGoal["id"] || len(Arr(receipt, "executor_principal_ids")) == 0 {
+		return nil, nil, Fail(422, "GATE_FAILED", "monitor needs its bound independent planning Goal receipt")
+	}
+	for _, id := range Arr(receipt, "executor_principal_ids") {
+		root, e := authorityRoot(tx, id.(string))
+		if e != nil {
+			return nil, nil, e
+		}
+		if root == "" || root == verifierRoot {
+			return nil, nil, Fail(403, "FORBIDDEN", "monitor proposal verifier shares execution authority")
+		}
 	}
 	value, err := s.artifactJSON(tx, project, briefRef)
 	if err != nil {
