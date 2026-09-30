@@ -3,7 +3,8 @@ param(
     [ValidateSet('Plan', 'Install', 'Uninstall')][string]$Action = 'Plan',
     [Parameter(Mandatory = $true)][string]$Binary,
     [Parameter(Mandatory = $true)][ValidatePattern('^[a-fA-F0-9]{64}$')][string]$ExpectedSHA256,
-    [string]$ReaderSID = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    [string]$ReaderSID = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+    [string]$ProjectRoot = (Split-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) -Parent)
 )
 $ErrorActionPreference = 'Stop'
 $serviceName = 'ResearchOSVerifierCanary'
@@ -12,6 +13,10 @@ $installedBinary = Join-Path $installRoot 'broker.exe'
 $dataRoot = Join-Path $installRoot 'data'
 $manifestPath = Join-Path $installRoot 'installation.json'
 $sourceBinary = (Resolve-Path -LiteralPath $Binary).ProviderPath
+$ProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot).ProviderPath
+$projectIdentity = Get-Content -LiteralPath (Join-Path $ProjectRoot 'execution/project_identity.json') -Raw | ConvertFrom-Json
+if ($projectIdentity.project_id -ne 'aede0678-7308-43dc-b9f2-cfe3d90cfdfb') { throw 'PROJECT_IDENTITY_MISMATCH' }
+$credentialPath = Join-Path $ProjectRoot '.local/secrets/typesafe.dpapi'
 if ((Get-FileHash -LiteralPath $sourceBinary -Algorithm SHA256).Hash -ne $ExpectedSHA256) { throw 'BINARY_HASH_MISMATCH' }
 if ($ReaderSID -notmatch '^S-1-5-21-[0-9]+-[0-9]+-[0-9]+-[0-9]+$') { throw 'LOCAL_USER_SID_REQUIRED' }
 [void][Security.Principal.SecurityIdentifier]::new($ReaderSID)
@@ -27,16 +32,18 @@ if (-not $serviceSID) { throw 'SERVICE_SID_LOOKUP_FAILED' }
 $binaryCommand = '"' + $installedBinary + '" --service --reader-sid ' + $ReaderSID
 $plan = [ordered]@{
     schema = 'researchos.verifier-canary-install.v1'; action = $Action
-    scope = 'SYNTHETIC_CANARY_ONLY'; formal_G04 = 'BLOCKED'; formal_A08 = 'BLOCKED'
+    scope = 'CANARY_AND_FROZEN_EVALUATOR_PREPARATION'; formal_G04 = 'BLOCKED'; formal_A08 = 'BLOCKED'
     service = $serviceName; account = "NT SERVICE\$serviceName"; service_sid = $serviceSID
     reader_sid = $ReaderSID; install_root = $installRoot; binary_sha256 = $ExpectedSHA256.ToLowerInvariant()
     binary_command = $binaryCommand; start_mode = 'Manual'; elevation_required = ($Action -ne 'Plan')
-    changes = @('Create only this new service and fixed product directory', 'Administrator-owned immutable binary and install manifest', 'Service-owned private synthetic input/label/detail/log', 'Local named pipe exposes only fixed aggregate counts', 'No provider credentials, network calls, formal data or qualification')
+    credential_ref = '.local/secrets/typesafe.dpapi'; credential_delivery = 'Current-user DPAPI to service-user DPAPI through admin-only pipe; plaintext only in process memory'
+    calls_started_by_install = $false; frozen_request_budget = 30; maximum_mode = 'ADVISORY'
+    changes = @('Create only this new service and fixed product directory', 'Administrator-owned immutable binary and install manifest', 'Service-owned private input/label/detail/log and one-run marker', 'Local public pipe exposes only fixed commands and terminal aggregate counts', 'One-time credential configuration does not generate holdout or start provider calls')
 }
 if ($Action -eq 'Plan') { $plan | ConvertTo-Json -Depth 5; return }
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'ELEVATION_REQUIRED: request the user-approved final UAC step; this script does not elevate itself' }
-if (-not $PSCmdlet.ShouldProcess($installRoot, "$Action $serviceName synthetic service")) { return }
+if (-not $PSCmdlet.ShouldProcess($installRoot, "$Action $serviceName frozen evaluator service")) { return }
 
 function Assert-PlainPath([string]$Path) {
     $item = Get-Item -LiteralPath $Path -Force
@@ -52,6 +59,7 @@ function Set-ExactACL([string]$Path, [string]$SDDL) {
     if (-not (Get-Acl -LiteralPath $Path).AreAccessRulesProtected) { throw 'ACL_NOT_PROTECTED' }
 }
 if ($Action -eq 'Install') {
+    if ($identity.User.Value -ne $ReaderSID) { throw 'ELEVATE_THE_SAME_DPAPI_USER_REQUIRED' }
     if ((Get-Service -Name $serviceName -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath $installRoot)) { throw 'EXISTING_SERVICE_OR_DIRECTORY_REFUSED' }
     Assert-PlainPath ([IO.Path]::GetDirectoryName($installRoot))
     Add-Type -TypeDefinition @'
@@ -81,12 +89,36 @@ public static class ResearchOSInstallDirectory {
     [ResearchOSInstallDirectory]::Create($dataRoot, "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;$serviceSID)")
     $plan | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8
     Set-ExactACL $manifestPath "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;$serviceSID)(A;;GR;;;$ReaderSID)"
-    [void](Invoke-ServiceTool @('create', $serviceName, 'binPath=', $binaryCommand, 'type=', 'own', 'start=', 'demand', 'obj=', "NT SERVICE\$serviceName", 'DisplayName=', 'ResearchOS Verifier Canary (synthetic only)'))
+    [void](Invoke-ServiceTool @('create', $serviceName, 'binPath=', $binaryCommand, 'type=', 'own', 'start=', 'demand', 'obj=', "NT SERVICE\$serviceName", 'DisplayName=', 'ResearchOS Verifier (frozen evaluator)'))
     # Current developer can query config/status, never start/stop/change the service.
     [void](Invoke-ServiceTool @('sdset', $serviceName, "D:P(A;;0xF01FF;;;SY)(A;;0xF01FF;;;BA)(A;;CCLC;;;$ReaderSID)"))
     [void](Invoke-ServiceTool @('privs', $serviceName, 'SeChangeNotifyPrivilege'))
     [void](Invoke-ServiceTool @('start', $serviceName))
     (Get-Service -Name $serviceName).WaitForStatus('Running', [TimeSpan]::FromSeconds(15))
+    # This is the only credential read. It occurs after explicit elevated Install,
+    # in the same DPAPI user, and feeds only the immutable installed helper stdin.
+    $secured = $null; $bstr = [IntPtr]::Zero; $credentialBytes = $null; $helper = $null
+    try {
+        $secured = Get-Content -LiteralPath $credentialPath -Raw | ConvertTo-SecureString
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secured)
+        $credentialBytes = [Text.Encoding]::UTF8.GetBytes([Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr))
+        if ($credentialBytes.Length -eq 0 -or $credentialBytes.Length -gt 4096) { throw 'CREDENTIAL_LENGTH_INVALID' }
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $installedBinary; $startInfo.Arguments = '--configure-from-stdin'
+        $startInfo.UseShellExecute = $false; $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true; $startInfo.RedirectStandardOutput = $true; $startInfo.RedirectStandardError = $true
+        $helper = [Diagnostics.Process]::Start($startInfo)
+        $helper.StandardInput.BaseStream.Write($credentialBytes, 0, $credentialBytes.Length)
+        $helper.StandardInput.Close()
+        if (-not $helper.WaitForExit(10000)) { $helper.Kill(); throw 'CREDENTIAL_HANDOFF_TIMEOUT' }
+        $configured = $helper.StandardOutput.ReadToEnd() | ConvertFrom-Json
+        if ($helper.ExitCode -ne 0 -or $configured.configured -ne $true -or $configured.started -ne $false) { throw 'CREDENTIAL_HANDOFF_FAILED' }
+    } finally {
+        if ($credentialBytes) { [Array]::Clear($credentialBytes,0,$credentialBytes.Length) }
+        if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+        if ($secured) { $secured.Dispose() }
+        if ($helper) { $helper.Dispose() }
+    }
     $plan | ConvertTo-Json -Depth 5
     return
 }
