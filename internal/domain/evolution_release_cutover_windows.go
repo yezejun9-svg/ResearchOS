@@ -93,56 +93,45 @@ func chainCutoverValidation(prior func(*sql.DB) error, a supervisor.ReleaseAdmis
 // RestoreEvolutionCutover only receives an already held original-root OS lease.
 // It publishes a new inactive root, preserving the failed database untouched.
 func RestoreEvolutionCutover(ctx context.Context, state supervisor.ReleaseState, lease *rt.DataRootLease, contractsDir, privateRoot string) (string, error) {
+	result, err := RestoreEvolutionCutoverContext(ctx, state, lease, contractsDir, privateRoot)
+	return result.Destination, err
+}
+
+// RestoreEvolutionCutoverContext restores and fences a copy; it does not grant
+// permission to start that copy or reconcile historical release operations.
+func RestoreEvolutionCutoverContext(ctx context.Context, state supervisor.ReleaseState, lease *rt.DataRootLease, contractsDir, privateRoot string) (supervisor.ReleaseRestoreResult, error) {
+	var result supervisor.ReleaseRestoreResult
 	b := state.Cutover
 	a := state.AdmissionBundle
 	if b == nil || a == nil || lease == nil || !lease.Held() || lease.Root() != state.Data || b.Root != state.Data || b.Operation != state.Operation || b.Epoch != state.Epoch || b.Database != filepath.Join(b.Root, "researchos.sqlite") {
-		return "", errors.New("offline cutover lease or binding unavailable")
+		return result, errors.New("offline cutover lease or binding unavailable")
 	}
 	hostRoot := filepath.Dir(b.Root)
 	releaseRoot := filepath.Join(hostRoot, "release-state")
 	if b.Directory != filepath.Join(releaseRoot, "cutovers", b.Operation) || b.KeyPath != filepath.Join(releaseRoot, "keys", b.Operation+"-cutover.key") {
-		return "", errors.New("cutover storage locator changed")
+		return result, errors.New("cutover storage locator changed")
 	}
 	c, e := LoadContracts(contractsDir)
 	if e != nil {
-		return "", e
+		return result, e
 	}
 	p, e := protectedstore.OpenCanary(privateRoot)
 	if e != nil {
-		return "", e
+		return result, e
 	}
 	defer p.Close()
 	var purpose Object
 	if e = json.Unmarshal(b.Purpose, &purpose); e != nil {
-		return "", e
+		return result, e
 	}
 	if Str(purpose, "kind") != "R2_FIXTURE_QUIESCED_CUTOVER" || Str(purpose, "root") != b.Root || Str(purpose, "database") != b.Database || Str(purpose, "operation") != b.Operation || Str(purpose, "admission_hash") != state.Admission {
-		return "", errors.New("cutover purpose binding changed")
+		return result, errors.New("cutover purpose binding changed")
 	}
 	count, e := Num(purpose, "protected_reference_versions")
 	if e != nil {
-		return "", e
+		return result, e
 	}
 	g := &releaseBackupGuard{ctx: ctx, s: &Service{Contracts: c, Protected: p}, project: a.Project, candidate: a.CandidateID, proof: "sha256:" + a.HoldoutProofSHA256, references: Str(purpose, "protected_reference_digest"), count: int(count)}
 	policy := &backupPolicy{format: releaseFixtureBackupFormat, databaseName: "researchos.sqlite", purpose: purpose, validate: chainCutoverValidation(g.refresh, *a, state), allowProtected: g.artifact}
-	key, e := os.ReadFile(b.KeyPath)
-	if e != nil {
-		return "", e
-	}
-	manifest, _, e := readBackupPolicy(b.Directory, key, policy)
-	if e != nil {
-		return "", e
-	}
-	if strings.TrimPrefix(Digest(Bytes(manifest)), "sha256:") != b.ManifestSHA256 {
-		return "", errors.New("cutover manifest hash changed")
-	}
-	destination := filepath.Join(hostRoot, "restored-"+state.Operation+"-"+ID())
-	report, e := restoreBackupPolicy(ctx, b.Directory, destination, RestoreOptions{Key: key, Contracts: c, SupportedMigrations: b.Migrations}, policy)
-	if e != nil {
-		return "", e
-	}
-	if report.Status != "RESTORED_RECONCILIATION_REQUIRED" {
-		return "", errors.New("cutover restore not complete")
-	}
-	return destination, nil
+	return restoreEvolutionCutoverContext(ctx, state, lease, c, policy)
 }

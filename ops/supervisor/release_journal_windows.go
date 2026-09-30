@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -19,26 +20,27 @@ import (
 // ReleaseState is mechanical deployment state. It is never a domain acceptance
 // receipt and is not writable by the candidate in a production installation.
 type ReleaseState struct {
-	Epoch           uint64            `json:"epoch"`
-	Operation       string            `json:"operation"`
-	Phase           string            `json:"phase"`
-	Active          string            `json:"active"`
-	ActivePath      string            `json:"active_path"`
-	Candidate       string            `json:"candidate,omitempty"`
-	CandidatePath   string            `json:"candidate_path,omitempty"`
-	LastGood        string            `json:"last_known_good"`
-	LastGoodPath    string            `json:"last_known_good_path"`
-	Data            string            `json:"data"`
-	Backup          string            `json:"backup,omitempty"`
-	Cutover         *ReleaseCutover   `json:"cutover,omitempty"`
-	Admission       string            `json:"admission,omitempty"`
-	AdmissionBundle *ReleaseAdmission `json:"admission_bundle,omitempty"`
-	DrainReceipt    string            `json:"drain_receipt,omitempty"`
-	DrainNonce      string            `json:"drain_nonce,omitempty"`
-	PID             uint32            `json:"pid,omitempty"`
-	CreatedNS       int64             `json:"created_ns,omitempty"`
-	ImageSHA256     string            `json:"image_sha256,omitempty"`
-	Frozen          []string          `json:"frozen,omitempty"`
+	Epoch           uint64                `json:"epoch"`
+	Operation       string                `json:"operation"`
+	Phase           string                `json:"phase"`
+	Active          string                `json:"active"`
+	ActivePath      string                `json:"active_path"`
+	Candidate       string                `json:"candidate,omitempty"`
+	CandidatePath   string                `json:"candidate_path,omitempty"`
+	LastGood        string                `json:"last_known_good"`
+	LastGoodPath    string                `json:"last_known_good_path"`
+	Data            string                `json:"data"`
+	Backup          string                `json:"backup,omitempty"`
+	Cutover         *ReleaseCutover       `json:"cutover,omitempty"`
+	Admission       string                `json:"admission,omitempty"`
+	AdmissionBundle *ReleaseAdmission     `json:"admission_bundle,omitempty"`
+	DrainReceipt    string                `json:"drain_receipt,omitempty"`
+	DrainNonce      string                `json:"drain_nonce,omitempty"`
+	PID             uint32                `json:"pid,omitempty"`
+	CreatedNS       int64                 `json:"created_ns,omitempty"`
+	ImageSHA256     string                `json:"image_sha256,omitempty"`
+	Frozen          []string              `json:"frozen,omitempty"`
+	RestoreContext  *ReleaseRestoreResult `json:"restore_context,omitempty"`
 }
 
 type releaseEntry struct {
@@ -72,6 +74,11 @@ func validDigest(v string) bool {
 }
 
 func validReleaseState(s ReleaseState) error {
+	if s.RestoreContext != nil {
+		if err := validRestoreResult(s, *s.RestoreContext); err != nil {
+			return err
+		}
+	}
 	if b := s.Cutover; b != nil {
 		if s.AdmissionBundle == nil || b.Operation != s.Operation || b.Epoch != s.Epoch || !validDigest(b.ManifestSHA256) || !filepath.IsAbs(b.Root) || b.Database != filepath.Join(b.Root, "researchos.sqlite") || len(b.Migrations) == 0 || len(b.Purpose) == 0 {
 			return errors.New("cutover snapshot binding invalid")
@@ -183,6 +190,9 @@ func (j *ReleaseJournal) load() error {
 		if j.last.Sequence != 0 && row.State.Epoch < j.last.State.Epoch {
 			return errors.New("release epoch regressed")
 		}
+		if err := restoreContextTransition(j.last.State, row.State); err != nil {
+			return err
+		}
 		previous, j.last = j.last, row
 	}
 	view, e := os.ReadFile(filepath.Join(j.root, "active.json"))
@@ -212,6 +222,9 @@ func (j *ReleaseJournal) Append(s ReleaseState) error {
 	if j.last.Sequence != 0 && s.Epoch < j.last.State.Epoch {
 		return errors.New("release epoch regressed")
 	}
+	if err := restoreContextTransition(j.last.State, s); err != nil {
+		return err
+	}
 	row := releaseEntry{Sequence: j.last.Sequence + 1, Previous: j.last.Hash, State: s}
 	row.Hash = entryHash(row)
 	b, _ := json.Marshal(row)
@@ -230,6 +243,198 @@ func (j *ReleaseJournal) Append(s ReleaseState) error {
 	}
 	j.last = row
 	return j.writeDescriptor(row)
+}
+
+func restoreContextTransition(previous, next ReleaseState) error {
+	if previous.RestoreContext != nil && (next.Operation != previous.Operation || !reflect.DeepEqual(next.RestoreContext, previous.RestoreContext)) {
+		return errors.New("restore context is immutable; recovery authorization required")
+	}
+	return nil
+}
+
+// RestoreContextPaths uses one deterministic destination per cutover. A lost
+// restore acknowledgement must never manufacture a second recovery point.
+func RestoreContextPaths(s ReleaseState) (directory, destination string, err error) {
+	b := s.Cutover
+	if b == nil || s.AdmissionBundle == nil || !validDigest(s.Operation) || b.Operation != s.Operation || b.Epoch != s.Epoch || !filepath.IsAbs(b.Root) || b.Database != filepath.Join(b.Root, "researchos.sqlite") {
+		return "", "", errors.New("restore context cutover binding unavailable")
+	}
+	host := filepath.Dir(b.Root)
+	return filepath.Join(host, "release-state", "recoveries", s.Operation), filepath.Join(host, "restored-"+s.Operation), nil
+}
+
+func validRestoreResult(s ReleaseState, r ReleaseRestoreResult) error {
+	dir, dest, err := RestoreContextPaths(s)
+	if err != nil {
+		return err
+	}
+	if r.Operation != s.Operation || r.Epoch != s.Epoch || r.SourceRoot != s.Cutover.Root || r.Destination != dest || r.ContextPath != filepath.Join(dir, "context.json") || !validDigest(r.ContextSHA256) || r.ManifestSHA256 != s.Cutover.ManifestSHA256 || !validDigest(r.ManifestSHA256) || s.Data != r.SourceRoot {
+		return errors.New("restore context result binding changed")
+	}
+	if s.RestoreContext != nil && (s.Phase != "RECOVERING" || s.PID != 0 || s.CreatedNS != 0 || s.ImageSHA256 != "") {
+		return errors.New("restore context cannot authorize an active release slot")
+	}
+	return nil
+}
+
+// ObserveRestorePath reuses Windows handle identity. Resolving the opened path
+// also rejects parent junction aliases; metadata alone never grants authority.
+func ObserveRestorePath(path string, directory bool) (RestorePathIdentity, error) {
+	var result RestorePathIdentity
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return result, errors.New("plain absolute recovery path required")
+	}
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return result, err
+	}
+	h, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		return result, err
+	}
+	defer windows.CloseHandle(h)
+	var info windows.ByHandleFileInformation
+	if err = windows.GetFileInformationByHandle(h, &info); err != nil {
+		return result, err
+	}
+	if (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
+		return result, errors.New("recovery path kind changed")
+	}
+	buffer := make([]uint16, 32768)
+	n, err := windows.GetFinalPathNameByHandle(h, &buffer[0], uint32(len(buffer)), 0)
+	if err != nil || n == 0 || n >= uint32(len(buffer)) {
+		return result, errors.New("recovery native path resolution failed")
+	}
+	resolved := windows.UTF16ToString(buffer[:n])
+	if strings.HasPrefix(resolved, `\\?\UNC\`) {
+		resolved = `\\` + strings.TrimPrefix(resolved, `\\?\UNC\`)
+	} else {
+		resolved = strings.TrimPrefix(resolved, `\\?\`)
+	}
+	if !strings.EqualFold(filepath.Clean(resolved), path) {
+		return result, errors.New("recovery path alias rejected")
+	}
+	return RestorePathIdentity{Path: path, FileID: fmt.Sprintf("%08x:%08x:%08x", info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow), Directory: directory}, nil
+}
+
+func restorePathUnchanged(want RestorePathIdentity) error {
+	got, err := ObserveRestorePath(want.Path, want.Directory)
+	if err != nil || got != want {
+		return errors.New("recovery native file identity changed")
+	}
+	return nil
+}
+
+// RestoreFileDigest verifies the identity around a read-only file hash. It is
+// used while the source root is leased and before the restored writer starts.
+func RestoreFileDigest(want RestorePathIdentity) (string, error) {
+	if want.Directory {
+		return "", errors.New("recovery file required")
+	}
+	if err := restorePathUnchanged(want); err != nil {
+		return "", err
+	}
+	f, err := os.Open(want.Path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	var info windows.ByHandleFileInformation
+	if err = windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil || fmt.Sprintf("%08x:%08x:%08x", info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow) != want.FileID {
+		return "", errors.New("recovery hash handle identity changed")
+	}
+	h := sha256.New()
+	if _, err = io.Copy(h, f); err != nil {
+		return "", err
+	}
+	if err = restorePathUnchanged(want); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// ValidateReleaseRestoreResult verifies immutable bytes and native identities,
+// not a current actor, business gain, generation qualification or OS isolation.
+func ValidateReleaseRestoreResult(s ReleaseState, result ReleaseRestoreResult) (ReleaseRestoreContext, error) {
+	var c ReleaseRestoreContext
+	if err := validRestoreResult(s, result); err != nil {
+		return c, err
+	}
+	raw, err := os.ReadFile(result.ContextPath)
+	if err != nil || ReleaseBytesDigest(raw) != result.ContextSHA256 {
+		return c, errors.New("restore context missing or changed")
+	}
+	if err = json.Unmarshal(raw, &c); err != nil {
+		return c, err
+	}
+	a, b := s.AdmissionBundle, s.Cutover
+	if c.Format != ReleaseRestoreContextFormat || c.Status != RecoveryAuthorizationBlocked || c.Operation != s.Operation || c.Project != a.Project || c.Candidate != a.CandidateID || c.AdmissionSHA256 != s.Admission || releaseHash(*a) != s.Admission || c.ManifestSHA256 != b.ManifestSHA256 || c.PurposeSHA256 != ReleaseBytesDigest(b.Purpose) || c.SnapshotEpoch != a.ExpectedEpoch || c.HostEpoch != s.Epoch || c.SnapshotEpoch+1 != c.HostEpoch {
+		return c, errors.New("restore context lineage changed")
+	}
+	if c.SourceRoot.Path != b.Root || !c.SourceRoot.Directory || c.SourceDatabase.Path != b.Database || c.DestinationRoot.Path != result.Destination || !c.DestinationRoot.Directory || c.DestinationDatabase.Path != filepath.Join(result.Destination, "researchos.sqlite") || c.Report.Path != filepath.Join(result.Destination, "restore-report.json") {
+		return c, errors.New("restore context location changed")
+	}
+	for _, p := range []RestorePathIdentity{c.SourceRoot, c.SourceDatabase, c.DestinationRoot, c.DestinationDatabase, c.Report} {
+		if err = restorePathUnchanged(p); err != nil {
+			return c, err
+		}
+	}
+	for _, file := range []struct {
+		path   RestorePathIdentity
+		digest string
+	}{{c.SourceDatabase, c.SourceDatabaseSHA256}, {c.DestinationDatabase, c.DestinationDatabaseSHA256}, {c.Report, c.ReportSHA256}} {
+		digest, e := RestoreFileDigest(file.path)
+		if e != nil || !validDigest(file.digest) || digest != file.digest {
+			return c, errors.New("restore context file bytes changed")
+		}
+	}
+	if !validDigest(c.BeforeRowsSHA256) || !validDigest(c.AfterRowsSHA256) || len(c.AllowedDelta) == 0 {
+		return c, errors.New("restore context recovery delta absent")
+	}
+	previousTable := ""
+	for _, delta := range c.AllowedDelta {
+		if delta.Table <= previousTable || !validDigest(delta.BeforeSHA256) || !validDigest(delta.AfterSHA256) || delta.BeforeSHA256 == delta.AfterSHA256 || delta.BeforeRows < 0 || delta.AfterRows < 0 {
+			return c, errors.New("restore context recovery delta invalid")
+		}
+		switch delta.Table {
+		case "auth_credentials", "retrieval_roots", "backup_restore_barriers", "evolution_slots":
+		default:
+			return c, errors.New("restore context recovery delta outside allowed tables")
+		}
+		previousTable = delta.Table
+	}
+	reportRaw, err := os.ReadFile(c.Report.Path)
+	if err != nil || ReleaseBytesDigest(reportRaw) != c.ReportSHA256 {
+		return c, errors.New("restore report bytes changed")
+	}
+	var report struct {
+		Status string          `json:"status"`
+		Before json.RawMessage `json:"before"`
+		After  json.RawMessage `json:"after"`
+	}
+	if json.Unmarshal(reportRaw, &report) != nil || report.Status != "RESTORED_RECONCILIATION_REQUIRED" || releaseHash(report.Before) != releaseHash(c.BeforeInventory) || releaseHash(report.After) != releaseHash(c.AfterInventory) {
+		return c, errors.New("restore report inventory binding changed")
+	}
+	return c, nil
+}
+
+// BindRestoreContext is idempotent for the same context only. It deliberately
+// keeps Data at the source root: the restored copy has no recovery authority.
+func (j *ReleaseJournal) BindRestoreContext(result ReleaseRestoreResult) error {
+	s := j.State()
+	if _, err := ValidateReleaseRestoreResult(s, result); err != nil {
+		return err
+	}
+	if s.RestoreContext != nil {
+		if *s.RestoreContext != result {
+			return errors.New("restore context already bound differently")
+		}
+		return nil
+	}
+	s.RestoreContext = &result
+	s.Phase = "RECOVERING"
+	clearProcess(&s)
+	return j.Append(s)
 }
 
 func (j *ReleaseJournal) writeDescriptor(row releaseEntry) error {

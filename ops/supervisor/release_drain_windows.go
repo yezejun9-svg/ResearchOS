@@ -61,6 +61,63 @@ type ReleaseCutover struct {
 	Migrations     []int           `json:"migrations"`
 }
 
+// These types describe a restored, fenced copy. They grant no release or
+// reconciliation authority and are not messages accepted by the control pipe.
+type RestorePathIdentity struct {
+	Path      string `json:"path"`
+	FileID    string `json:"file_id"`
+	Directory bool   `json:"directory"`
+}
+
+type RestoreTableDelta struct {
+	Table        string `json:"table"`
+	BeforeSHA256 string `json:"before_sha256"`
+	AfterSHA256  string `json:"after_sha256"`
+	BeforeRows   int    `json:"before_rows"`
+	AfterRows    int    `json:"after_rows"`
+}
+
+type ReleaseRestoreContext struct {
+	Format                    string              `json:"format"`
+	Status                    string              `json:"status"`
+	Operation                 string              `json:"operation"`
+	Project                   string              `json:"project"`
+	Candidate                 string              `json:"candidate"`
+	AdmissionSHA256           string              `json:"admission_sha256"`
+	ManifestSHA256            string              `json:"manifest_sha256"`
+	PurposeSHA256             string              `json:"purpose_sha256"`
+	SnapshotEpoch             uint64              `json:"snapshot_epoch"`
+	HostEpoch                 uint64              `json:"host_epoch"`
+	SourceRoot                RestorePathIdentity `json:"source_root"`
+	SourceDatabase            RestorePathIdentity `json:"source_database"`
+	DestinationRoot           RestorePathIdentity `json:"destination_root"`
+	DestinationDatabase       RestorePathIdentity `json:"destination_database"`
+	SourceDatabaseSHA256      string              `json:"source_database_sha256"`
+	DestinationDatabaseSHA256 string              `json:"destination_database_sha256"`
+	Report                    RestorePathIdentity `json:"report"`
+	ReportSHA256              string              `json:"report_sha256"`
+	BeforeInventory           json.RawMessage     `json:"before_inventory"`
+	AfterInventory            json.RawMessage     `json:"after_inventory"`
+	BeforeRowsSHA256          string              `json:"before_rows_sha256"`
+	AfterRowsSHA256           string              `json:"after_rows_sha256"`
+	AllowedDelta              []RestoreTableDelta `json:"allowed_delta"`
+}
+
+// The journal stores a small, immutable reference to the host-owned context.
+// The context contains inventories, never protected bodies or credentials.
+type ReleaseRestoreResult struct {
+	Operation      string `json:"operation"`
+	Epoch          uint64 `json:"epoch"`
+	SourceRoot     string `json:"source_root"`
+	Destination    string `json:"destination"`
+	ContextPath    string `json:"context_path"`
+	ContextSHA256  string `json:"context_sha256"`
+	ManifestSHA256 string `json:"manifest_sha256"`
+}
+
+const ReleaseRestoreContextFormat = "R2_RESTORE_CONTEXT_FENCE_V1"
+const RecoveryAuthorizationBlocked = "BLOCKED_RECOVERY_AUTHORIZATION"
+
 type DrainReadiness struct {
 	Process         ProcessIdentity `json:"process"`
 	Listener        string          `json:"listener"`

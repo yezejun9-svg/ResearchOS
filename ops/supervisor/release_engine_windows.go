@@ -251,13 +251,21 @@ func (e *ReleaseEngine) RollbackFixture(ctx context.Context, operation string) (
 		}
 		clearProcess(&s)
 	}
-	if err := e.barrier.Compatible(ctx, s); err != nil {
+	compatibilityErr := e.barrier.Compatible(ctx, s)
+	if _, actual := e.driver.(*ControlFixtureDriver); actual {
+		current := e.journal.State()
+		if current.Operation != s.Operation || current.Epoch != s.Epoch {
+			return current, errors.New("restore changed journal operation or epoch")
+		}
+		// Compatibility may have durably bound a fenced restore context. Never
+		// overwrite it with the pre-restore local state, including on errors.
+		s = current
+		clearProcess(&s) // The stop/exit observation above already completed.
+	}
+	if compatibilityErr != nil {
 		s.Phase = "RECOVERING"
 		_ = e.journal.Append(s)
-		return s, err
-	}
-	if _, actual := e.driver.(*ControlFixtureDriver); actual {
-		s.Data = e.journal.State().Data
+		return s, compatibilityErr
 	}
 	_, digest, err := exactImage(s.LastGoodPath)
 	if err != nil || digest != s.LastGood {
