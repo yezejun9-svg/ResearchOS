@@ -253,6 +253,9 @@ func init() {
 	}
 }
 func operationOwner(id string) string {
+	if workbenchOperations[id] {
+		return "W13"
+	}
 	if strings.Contains(id, "ResearchCycle") {
 		return "W08"
 	}
