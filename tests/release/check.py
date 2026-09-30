@@ -89,19 +89,44 @@ def run(archive: Path, fixture: bool):
                 if port in (32736, 79136):
                     raise AssertionError("reserved fixture port selected")
                 data = Path(temporary) / "data"
+                other = Path(temporary) / "other-data"
                 start = root / "scripts/start.ps1"
                 stop = root / "scripts/stop.ps1"
+                original_identity = None
                 try:
                     result = ps(start, "-DataDir", data, "-Listen", f"127.0.0.1:{port}", "-Fresh")
                     checks.append(require(result.returncode == 0, "fresh-fixture-start", (result.stderr + result.stdout)[-700:]))
                     with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=5) as response:
                         checks.append(require(response.status == 200, "loopback-health"))
                     checks.append(require((data / "researchos.sqlite").is_file(), "external-fresh-db"))
+                    identity_file = data / "fixture-control.pid"
+                    original_identity = identity_file.read_bytes()
+                    first = json.loads(original_identity)
+                    checks.append(require(first["data_dir"] == str(data) and first["created_utc_ticks"] > 0, "instance-identity-record"))
+                    with socket.socket() as probe:
+                        probe.bind(("127.0.0.1", 0))
+                        other_port = probe.getsockname()[1]
+                    result = ps(start, "-DataDir", other, "-Listen", f"127.0.0.1:{other_port}", "-Fresh")
+                    checks.append(require(result.returncode == 0, "second-fixture-start", (result.stderr + result.stdout)[-700:]))
+                    second = json.loads((other / "fixture-control.pid").read_bytes())
+                    wrong = dict(first, pid=second["pid"])
+                    identity_file.write_text(json.dumps(wrong), encoding="utf-8")
+                    checks.append(require(ps(stop, "-DataDir", data).returncode != 0, "wrong-instance-stop-rejected"))
+                    checks.append(require(all(urllib.request.urlopen(f"http://127.0.0.1:{p}/healthz", timeout=5).status == 200 for p in (port, other_port)), "both-instances-survive-wrong-record"))
+                    wrong = dict(first, created_utc_ticks=1)
+                    identity_file.write_text(json.dumps(wrong), encoding="utf-8")
+                    checks.append(require(ps(stop, "-DataDir", data).returncode != 0, "wrong-creation-stop-rejected"))
                 finally:
+                    if original_identity is not None:
+                        (data / "fixture-control.pid").write_bytes(original_identity)
                     if (data / "fixture-control.pid").exists():
                         stopped = ps(stop, "-DataDir", data)
                         checks.append(require(stopped.returncode == 0, "fixture-stop"))
+                    if (other / "fixture-control.pid").exists():
+                        stopped = ps(stop, "-DataDir", other)
+                        checks.append(require(stopped.returncode == 0, "second-fixture-stop"))
                 checks.append(require((data / "researchos.sqlite").is_file(), "data-preserved"))
+                checks.append(require((other / "researchos.sqlite").is_file(), "second-data-preserved"))
             sys.dont_write_bytecode = True
             sys.path.insert(0, str(root))
             from execution.command_dispatcher.dispatch import execute

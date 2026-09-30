@@ -16,12 +16,30 @@ if ((Test-Path -LiteralPath $data) -and $Fresh -and @(Get-ChildItem -LiteralPath
 New-Item -ItemType Directory -Force -Path $data | Out-Null
 $pidFile = Join-Path $data 'fixture-control.pid'
 if (Test-Path -LiteralPath $pidFile) { throw 'fixture PID file already exists' }
+function PathHash([string]$path) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($path.ToUpperInvariant()))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+$instance = [guid]::NewGuid().ToString('N')
+$dataHash = PathHash $data
+$rootHash = PathHash $root
+$identityArgs = "-- researchos-fixture-$instance data-$dataHash root-$rootHash"
 $env:RESEARCHOS_DATA_DIR = $data
 $env:RESEARCHOS_WEB_DIR = Join-Path $root 'web/dist'
 $env:RESEARCHOS_LISTEN = $Listen
 $control = Join-Path $root 'bin/control.exe'
-$process = Start-Process -FilePath $control -WorkingDirectory $root -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $data 'control.stdout.log') -RedirectStandardError (Join-Path $data 'control.stderr.log')
-$process.Id | Set-Content -LiteralPath $pidFile
+$process = Start-Process -FilePath $control -ArgumentList $identityArgs -WorkingDirectory $root -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $data 'control.stdout.log') -RedirectStandardError (Join-Path $data 'control.stderr.log')
+try {
+    $native = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)"
+    if (-not $native -or -not $native.CommandLine.Contains($identityArgs) -or -not [string]::Equals($native.ExecutablePath, $control, [StringComparison]::OrdinalIgnoreCase)) { throw 'fixture process identity unavailable' }
+    $created = $process.StartTime.ToUniversalTime().Ticks
+    @{ schema = 'researchos.fixture-process.v1'; pid = $process.Id; created_utc_ticks = $created; instance = $instance; data_dir = $data; release_root = $root; listen = $Listen } | ConvertTo-Json -Compress | Set-Content -LiteralPath $pidFile -NoNewline
+} catch {
+    if (-not $process.HasExited) { $process.Kill() }
+    Remove-Item -LiteralPath $pidFile -ErrorAction SilentlyContinue
+    throw
+}
 $healthy = $false
 for ($i = 0; $i -lt 40; $i++) {
     Start-Sleep -Milliseconds 250
@@ -32,7 +50,7 @@ for ($i = 0; $i -lt 40; $i++) {
     } catch { }
 }
 if (-not $healthy) {
-    if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+    if (-not $process.HasExited) { $process.Kill() }
     Remove-Item -LiteralPath $pidFile -ErrorAction SilentlyContinue
     throw 'fixture control did not become healthy; inspect DataDir logs'
 }
