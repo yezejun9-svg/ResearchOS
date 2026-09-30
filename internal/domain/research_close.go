@@ -1,6 +1,88 @@
 package domain
 
-import "database/sql"
+import (
+	"database/sql"
+	"sort"
+)
+
+func (s *Service) researchExperimentProgressKey(tx *sql.Tx, project string, x Object) (string, error) {
+	roles := []any{}
+	for _, refs := range [][]any{{x["candidate_ref"]}, Arr(x, "baseline_refs"), Arr(x, "input_refs")} {
+		hashes := []string{}
+		for _, raw := range refs {
+			ref := raw.(map[string]any)
+			if err := s.effective(tx, project, ref); err != nil {
+				return "", err
+			}
+			// Executable pairs use sealed artifacts. Unsupported domain-object semantics
+			// cannot establish new progress merely by acquiring another ID or revision.
+			if ref["entity_type"] != "Artifact" {
+				return "", nil
+			}
+			artifact, err := version(tx, project, ref)
+			if err != nil {
+				return "", err
+			}
+			hashes = append(hashes, Str(artifact, "content_hash"))
+		}
+		sort.Strings(hashes)
+		roles = append(roles, hashes)
+	}
+	// Hypothesis prose, sample values and all run/cycle/object IDs are deliberately
+	// absent: a repeated improvement of identical content is still the same gain.
+	return Hash([]any{"accepted-improvement", roles, x["metrics"], x["measurement_mode"]}), nil
+}
+
+func (s *Service) researchProgressKeys(tx *sql.Tx, project string, facts Object) ([]any, error) {
+	keys := Empty()
+	for _, raw := range Arr(facts, "candidates") {
+		candidate := raw.(map[string]any)
+		review, _ := candidate["review"].(map[string]any)
+		if review == nil {
+			continue
+		}
+		support, _ := review["support"].(map[string]any)
+		if support == nil || support["origin_relation"] != "CONFIRMED" {
+			continue
+		}
+		for _, rootID := range Arr(support, "independent_root_ids") {
+			root, err := load(tx, project, "Evidence", rootID.(string))
+			if err != nil {
+				return nil, err
+			}
+			snapshot, _ := root["snapshot_artifact_ref"].(map[string]any)
+			if snapshot == nil {
+				continue
+			}
+			if err = s.effective(tx, project, snapshot); err != nil {
+				return nil, err
+			}
+			keys = mergeUnique(keys, []any{Hash([]any{"reviewed-origin", root["canonical_url"], root["upstream_revision"], snapshot["content_hash"]})})
+		}
+	}
+	for _, raw := range Arr(facts, "experiments") {
+		item := raw.(map[string]any)
+		if item["outcome"] != "IMPROVED" || item["acceptance_ref"] == nil {
+			continue
+		}
+		ref := item["experiment_ref"].(map[string]any)
+		x, err := version(tx, project, ref)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = s.experimentAcceptance(tx, project, x, Str(x, "acceptance_id")); err != nil {
+			return nil, err
+		}
+		key, err := s.researchExperimentProgressKey(tx, project, x)
+		if err != nil {
+			return nil, err
+		}
+		if key != "" {
+			keys = mergeUnique(keys, []any{key})
+		}
+	}
+	return keys, nil
+}
 
 func researchCycleSettled(tx *sql.Tx, project, cycle string) error {
 	rows, err := tx.Query("SELECT r.body FROM domain_objects r JOIN research_cycle_work w ON w.project=r.project AND w.task=json_extract(r.body,'$.task_id') WHERE r.project=? AND r.kind='Run' AND w.cycle=?", project, cycle)
@@ -38,7 +120,7 @@ func researchCycleSettled(tx *sql.Tx, project, cycle string) error {
 }
 
 func (s *Service) closeReportedResearchCycle(tx *sql.Tx, owner Principal, project string, meta, cycle, task Object) error {
-	receipt, err := s.researchAcceptedTask(tx, project, task)
+	_, err := s.researchAcceptedTask(tx, project, task)
 	if err != nil {
 		return err
 	}
@@ -70,9 +152,6 @@ func (s *Service) closeReportedResearchCycle(tx *sql.Tx, owner Principal, projec
 	if err != nil {
 		return err
 	}
-	if err = s.recordResearchIteration(tx, project, meta, task, receipt, facts); err != nil {
-		return err
-	}
 	return s.event(tx, project, "ResearchCycle", cycle, owner.ID, ID(), "PROJECT_UPDATED")
 }
 
@@ -90,10 +169,32 @@ func (s *Service) recordResearchIteration(tx *sql.Tx, project string, meta, task
 	if err != nil {
 		return err
 	}
-	// Discovery count is not research improvement. Stage reviews/experiments must
-	// supply independently current new evidence before a later iteration resumes.
-	if _, err = tx.Exec("INSERT INTO resource_progress_runs(project,run,record,body) VALUES(?,?,?,?)", project, task["active_run_id"], n["id"], string(Bytes(Object{"cycle_id": facts["cycle_id"], "report_acceptance_ref": Ref(receipt, "AcceptanceReceipt"), "cycle_outcome": facts["cycle_outcome"], "at": Now()}))); err != nil {
+	keys, err := s.researchProgressKeys(tx, project, facts)
+	if err != nil {
 		return err
+	}
+	newKeys := Empty()
+	for _, key := range keys {
+		var prior int
+		if err = tx.QueryRow("SELECT count(*) FROM resource_progress_runs WHERE project=? AND record=? AND EXISTS(SELECT 1 FROM json_each(resource_progress_runs.body,'$.progress_keys') WHERE value=?)", project, n["id"], key).Scan(&prior); err != nil {
+			return err
+		}
+		if prior == 0 {
+			newKeys = append(newKeys, key)
+		}
+	}
+	if _, err = tx.Exec("INSERT INTO resource_progress_runs(project,run,record,body) VALUES(?,?,?,?)", project, task["active_run_id"], n["id"], string(Bytes(Object{"cycle_id": facts["cycle_id"], "report_acceptance_ref": Ref(receipt, "AcceptanceReceipt"), "cycle_outcome": facts["cycle_outcome"], "progress_keys": keys, "at": Now()}))); err != nil {
+		return err
+	}
+	if len(newKeys) > 0 {
+		if _, err = tx.Exec("INSERT INTO resource_progress_resumes(id,project,record,body) VALUES(?,?,?,?)", ID(), project, n["id"], string(Bytes(Object{"reason": "Current independently accepted new origin support or measured improvement", "new_progress_keys": newKeys, "prior_counts": Object{"same_failure_count": n["same_failure_count"], "no_progress_iterations": n["no_progress_iterations"]}, "report_acceptance_ref": Ref(receipt, "AcceptanceReceipt"), "at": Now()}))); err != nil {
+			return err
+		}
+		n["no_progress_iterations"], n["same_failure_count"], n["last_effective_progress_at"], n["status"] = 0, 0, Now(), "ACTIVE"
+		if err = bump(n); err != nil {
+			return err
+		}
+		return s.put(tx, "NoProgressRecord", n)
 	}
 	iterations, _ := Num(n, "no_progress_iterations")
 	iterations++

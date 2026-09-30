@@ -115,6 +115,18 @@ func (s *Service) createResearchCycle(tx *sql.Tx, p Principal, project string, b
 	if err = s.put(tx, "ResearchCycle", o); err != nil {
 		return nil, err
 	}
+	var monitorGoal string
+	if err = tx.QueryRow("SELECT compiled_goal FROM intent_plan_bindings WHERE project=? AND monitor_current=1", project).Scan(&monitorGoal); err == nil {
+		meta, plan, e := s.monitorSnapshot(tx, project, monitorGoal, true)
+		if e != nil {
+			return nil, e
+		}
+		if e = bindResearchMonitorCycle(tx, project, o, meta, plan); e != nil {
+			return nil, e
+		}
+	} else if err != sql.ErrNoRows {
+		return nil, err
+	}
 	if err = bump(state); err != nil {
 		return nil, err
 	}
@@ -370,12 +382,52 @@ func (s *Service) closeResearchCycle(tx *sql.Tx, project, id string, b Object) (
 	}
 	coverage := Arr(o, "source_coverage")
 	actual := "CANCELLED"
+	var monitorMeta, reportTask, reportReceipt, reportFacts Object
 	if b["requested_status"] != "CANCELLED" {
 		facts, e := s.researchCycleFacts(tx, project, o)
 		if e != nil {
 			return nil, e
 		}
 		coverage, actual = Arr(facts, "source_coverage"), Str(facts, "cycle_outcome")
+		var bound int
+		if e = tx.QueryRow("SELECT count(*) FROM research_monitor_cycles WHERE project=? AND cycle=?", project, id).Scan(&bound); e != nil {
+			return nil, e
+		}
+		if bound != 0 {
+			var reportID string
+			if e = tx.QueryRow("SELECT task FROM research_cycle_work WHERE project=? AND cycle=? AND stage='delivery'", project, id).Scan(&reportID); e != nil {
+				return nil, Fail(422, "GATE_FAILED", "monitor cycle requires independent report before close")
+			}
+			reportTask, e = load(tx, project, "Task", reportID)
+			if e != nil {
+				return nil, e
+			}
+			monitorMeta, _, e = s.monitorSnapshot(tx, project, Str(reportTask, "goal_id"), true)
+			if e != nil {
+				return nil, e
+			}
+			reportReceipt, e = s.researchAcceptedTask(tx, project, reportTask)
+			if e != nil {
+				return nil, e
+			}
+			outputs := Arr(reportTask, "output_artifact_ids")
+			if len(outputs) != 1 {
+				return nil, Fail(422, "GATE_FAILED", "one accepted cycle report required")
+			}
+			a, e := load(tx, project, "Artifact", outputs[0].(string))
+			if e != nil {
+				return nil, e
+			}
+			body, e := s.artifactJSON(tx, project, Ref(a, "Artifact"))
+			if e != nil {
+				return nil, e
+			}
+			if Hash(body) != Hash(facts) {
+				return nil, Fail(412, "STALE_INPUT", "accepted report differs from current cycle evidence")
+			}
+			o["checkpoint_artifact_id"] = a["id"]
+			reportFacts = facts
+		}
 	}
 	if b["requested_status"] != actual {
 		return nil, Fail(422, "GATE_FAILED", "requested cycle status differs from verified coverage and experiments: "+actual)
@@ -393,6 +445,11 @@ func (s *Service) closeResearchCycle(tx *sql.Tx, project, id string, b Object) (
 	state["active_cycle_id"] = nil
 	if err = s.put(tx, "ProjectState", state); err != nil {
 		return nil, err
+	}
+	if monitorMeta != nil {
+		if err = s.recordResearchIteration(tx, project, monitorMeta, reportTask, reportReceipt, reportFacts); err != nil {
+			return nil, err
+		}
 	}
 	return o, nil
 }

@@ -72,6 +72,9 @@ func (c *RuntimeCoordinator) providerRoute(tx *sql.Tx, route RuntimeCoordinatorR
 			}
 			return provider, nil
 		}
+		if provider.Capability == "EXPERIMENT" {
+			return provider, nil
+		}
 		u, e := url.Parse(provider.Endpoint)
 		if e != nil || u.User != nil || u.Fragment != "" || u.Hostname() == "" || (u.Scheme != "https" && !(u.Scheme == "http" && net.ParseIP(u.Hostname()) != nil && net.ParseIP(u.Hostname()).IsLoopback() && provider.MeasurementMode == "FIXTURE")) {
 			return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "provider endpoint requires bound TLS or local fixture")
@@ -117,6 +120,12 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		}
 	}
 	request := Object{"route": provider.ID, "capability": provider.Capability, "credential_revision": provider.CredentialRevision, "payload": payload}
+	if provider.Capability == "EXPERIMENT" {
+		if _, _, e = c.researchExperimentGate(tx, route.ProjectID, task, run, frame, payload); e != nil {
+			tx.Rollback()
+			return nil, e
+		}
+	}
 	operation, basis := "RESERVE", "UPPER_BOUND"
 	var money any = provider.UpperBound
 	if provider.UpperBound == nil {
@@ -137,6 +146,9 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		return Object{"sequence": frame.Sequence, "key": frame.Key, "state": intent["state"], "payload": receipt["payload"]}, nil
 	}
 	if intent["state"] != "PREPARED" {
+		if provider.Capability == "EXPERIMENT" {
+			return c.reconcileResearchExperimentEffect(ctx, route.ProjectID, runID, epoch, frame, intent)
+		}
 		return nil, Fail(409, "STATE_CONFLICT", "effect outcome unknown; retry prohibited")
 	}
 	tx, run, dispatch, e = c.dispatchGate(ctx, route, runID, lease, epoch)
@@ -164,6 +176,9 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 	c.boundary("effect_started", intent)
 	if provider.Capability == "SOURCE" {
 		return c.brokerResearchSource(ctx, route, provider, runID, lease, epoch, frame, payload, intent)
+	}
+	if provider.Capability == "EXPERIMENT" {
+		return c.brokerResearchExperiment(ctx, route, runID, lease, epoch, frame, payload, intent)
 	}
 	body := Object{"key": frame.Key, "epoch": epoch, "run_id": runID, "capability": provider.Capability, "payload": payload}
 	req, e := http.NewRequestWithContext(ctx, "POST", provider.Endpoint, bytes.NewReader(Bytes(body)))

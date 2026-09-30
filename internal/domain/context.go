@@ -310,6 +310,28 @@ func (s *Service) createContext(tx *sql.Tx, p Principal, project string, b Objec
 		}
 		summary += planningPrompt(req)
 		if authorized, _ := monitorAuthorization(Object{"requirement": req}); authorized {
+			rows, err := tx.Query("SELECT body FROM domain_objects WHERE project=? AND kind='Experiment' AND json_extract(body,'$.status')='REGISTERED' ORDER BY id", project)
+			if err != nil {
+				return nil, err
+			}
+			for rows.Next() {
+				var raw string
+				if err = rows.Scan(&raw); err != nil {
+					rows.Close()
+					return nil, err
+				}
+				x, e := Decode([]byte(raw))
+				if e != nil {
+					rows.Close()
+					return nil, e
+				}
+				refs = append(refs, Ref(x, "Experiment"))
+			}
+			err = rows.Err()
+			rows.Close()
+			if err != nil {
+				return nil, err
+			}
 			policy, err := load(tx, project, "RunPolicy", Str(profile, "run_policy_id"))
 			if err != nil {
 				return nil, err

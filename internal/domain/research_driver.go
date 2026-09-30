@@ -2,6 +2,7 @@ package domain
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -63,7 +64,15 @@ func (s *Service) materializeResearchWork(tx *sql.Tx, owner Principal, project s
 	if command == "" {
 		return nil, Fail(422, "GATE_FAILED", "unsupported research stage")
 	}
-	task, err := s.createTask(tx, project, Object{"goal_id": goal["id"], "title": "研究阶段：" + stage, "task_type": "research_" + stage, "stage": stage, "dependency_task_ids": deps, "requirement_refs": goal["requirement_refs"], "input_refs": refs, "acceptance_contract": researchContract(command), "origin_problem_id": Arr(goal, "problem_ids")[0], "candidate_id": "work-" + key[:32], "stop_policy": Object{"wall_time_seconds": plan.WallTimeSeconds, "max_attempts": 2, "max_parallel_runs": 1, "stop_conditions": []any{"input drift", "work bound exhausted", "unknown effect", "Owner pause or cancel"}}})
+	contract := researchContract(command)
+	if stage == "experiment" {
+		x, err := load(tx, project, "Experiment", Str(params, "experiment_id"))
+		if err != nil {
+			return nil, err
+		}
+		contract = x["acceptance_contract"].(map[string]any)
+	}
+	task, err := s.createTask(tx, project, Object{"goal_id": goal["id"], "title": "研究阶段：" + stage, "task_type": "research_" + stage, "stage": stage, "dependency_task_ids": deps, "requirement_refs": goal["requirement_refs"], "input_refs": refs, "acceptance_contract": contract, "origin_problem_id": Arr(goal, "problem_ids")[0], "candidate_id": "work-" + key[:32], "stop_policy": Object{"wall_time_seconds": plan.WallTimeSeconds, "max_attempts": 2, "max_parallel_runs": 1, "stop_conditions": []any{"input drift", "work bound exhausted", "unknown effect", "Owner pause or cancel"}}})
 	if err != nil {
 		return nil, err
 	}
@@ -99,6 +108,41 @@ func nullableText(value string) any {
 	return value
 }
 
+func researchStageCapacity(tx *sql.Tx, project, cycle string, plan *MonitorPlan) (bool, error) {
+	var count int
+	err := tx.QueryRow("SELECT count(*) FROM research_cycle_work WHERE project=? AND cycle=?", project, cycle).Scan(&count)
+	return count < plan.MaxTasks-1, err // The final immutable plan slot belongs to delivery.
+}
+
+func bindResearchMonitorCycle(tx *sql.Tx, project string, cycle, meta Object, plan *MonitorPlan) error {
+	goal := meta["goal"].(map[string]any)
+	var existingGoal, existingPlan string
+	err := tx.QueryRow("SELECT goal,plan_ref FROM research_monitor_cycles WHERE project=? AND cycle=?", project, cycle["id"]).Scan(&existingGoal, &existingPlan)
+	if err == nil {
+		if existingGoal != Str(goal, "id") || existingPlan != string(Bytes(meta["brief_ref"])) {
+			return Fail(412, "STALE_INPUT", "cycle belongs to another accepted monitor plan")
+		}
+		return nil
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	if Hash(cycle["profile_ref"]) != Hash(plan.ProfileRef) {
+		return Fail(412, "STALE_INPUT", "cycle profile differs from accepted monitor plan")
+	}
+	from, to, err := parseCycleWindow(Str(cycle, "window_from"), Str(cycle, "window_to"))
+	if err != nil {
+		return err
+	}
+	// A pre-existing manual cycle can be adopted only within the approved initial
+	// lookback. Scheduled coalescing has already been bounded by createResearchCycle.
+	if cycle["trigger"] != "SCHEDULE" && to.Sub(from) > time.Duration(plan.FirstLookbackSeconds)*time.Second {
+		return Fail(422, "GATE_FAILED", "manual cycle exceeds accepted monitor window")
+	}
+	_, err = tx.Exec("INSERT INTO research_monitor_cycles(project,cycle,goal,plan_ref,created_at) VALUES(?,?,?,?,?)", project, cycle["id"], goal["id"], string(Bytes(meta["brief_ref"])), Now())
+	return err
+}
+
 // One bounded domain step; the existing coordinator owns the only polling loop.
 func (s *Service) advanceResearchProject(tx *sql.Tx, scheduler Principal, project string, now time.Time) error {
 	var goalID string
@@ -118,6 +162,40 @@ func (s *Service) advanceResearchProject(tx *sql.Tx, scheduler Principal, projec
 	}
 	meta, plan, err := s.monitorSnapshot(tx, project, goalID, true)
 	if err != nil {
+		var raw string
+		if e := tx.QueryRow("SELECT brief_ref FROM intent_plan_bindings WHERE project=? AND compiled_goal=? AND monitor_current=1", project, goalID).Scan(&raw); e != nil {
+			return e
+		}
+		ref, e := Decode([]byte(raw))
+		if e != nil {
+			return e
+		}
+		// Cancellation must read the immutable historical approval even after its
+		// profile inputs become stale. It grants no authority to run new work.
+		artifact, e := version(tx, project, ref)
+		if e != nil {
+			return e
+		}
+		var approval []byte
+		if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, artifact["storage_key"]).Scan(&approval); e != nil {
+			return e
+		}
+		if Digest(approval) != Str(artifact, "content_hash") {
+			return Fail(422, "CONTENT_HASH_MISMATCH", "historical monitor approval changed")
+		}
+		brief, e := parseGoalBrief(approval)
+		if e != nil {
+			return e
+		}
+		profile, e := singleton(tx, project, "ProjectProfile")
+		if e != nil {
+			return e
+		}
+		if brief.Monitor != nil && Hash(brief.Monitor.ProfileRef) != Hash(Ref(profile, "ProjectProfile")) {
+			cancelled := Merge(Object{}, goal)
+			cancelled["status"] = "CANCELLED"
+			return s.holdResearchMonitor(tx, scheduler, project, cancelled, "Monitor profile changed; prior="+string(Bytes(brief.Monitor.ProfileRef))+" current="+string(Bytes(Ref(profile, "ProjectProfile")))+". Original results retained; renewed Owner plan required.")
+		}
 		return s.holdResearchMonitor(tx, scheduler, project, goal)
 	}
 	progress, err := load(tx, project, "NoProgressRecord", Str(meta, "progress_record_id"))
@@ -128,6 +206,9 @@ func (s *Service) advanceResearchProject(tx *sql.Tx, scheduler Principal, projec
 		return s.holdResearchMonitor(tx, scheduler, project, goal)
 	}
 	owner := meta["owner_principal"].(Principal)
+	if err = s.resumeResearchMonitor(tx, owner, project, goal); err != nil {
+		return err
+	}
 	state, err := singleton(tx, project, "ProjectState")
 	if err != nil {
 		return err
@@ -178,10 +259,13 @@ func (s *Service) advanceResearchProject(tx *sql.Tx, scheduler Principal, projec
 			return err
 		}
 	}
+	if err = bindResearchMonitorCycle(tx, project, cycle, meta, plan); err != nil {
+		return err
+	}
 	return s.advanceResearchStages(tx, owner, project, meta, plan, cycle)
 }
 
-func (s *Service) holdResearchMonitor(tx *sql.Tx, p Principal, project string, goal Object) error {
+func (s *Service) holdResearchMonitor(tx *sql.Tx, p Principal, project string, goal Object, reason ...string) error {
 	for _, raw := range Arr(goal, "task_ids") {
 		task, err := load(tx, project, "Task", raw.(string))
 		if err != nil {
@@ -190,12 +274,12 @@ func (s *Service) holdResearchMonitor(tx *sql.Tx, p Principal, project string, g
 		if task["status"] == "ACCEPTED" || task["status"] == "CANCELLED" || task["status"] == "DEFERRED_NO_PROGRESS" || task["status"] == "NEEDS_REVALIDATION" {
 			continue
 		}
-		var reason string
-		err = tx.QueryRow("SELECT reason FROM orchestration_task_controls WHERE project=? AND task=?", project, task["id"]).Scan(&reason)
-		if err == nil {
+		var reason, control string
+		err = tx.QueryRow("SELECT reason,action FROM orchestration_task_controls WHERE project=? AND task=?", project, task["id"]).Scan(&reason, &control)
+		if err == nil && (goal["status"] != "CANCELLED" || control == "CANCEL") {
 			continue
 		}
-		if err != sql.ErrNoRows {
+		if err != nil && err != sql.ErrNoRows {
 			return err
 		}
 		action := "PAUSE"
@@ -216,8 +300,23 @@ func (s *Service) holdResearchMonitor(tx *sql.Tx, p Principal, project string, g
 			return err
 		}
 		if active := Str(state, "active_cycle_id"); active != "" {
-			cycle, err := s.closeResearchCycle(tx, project, active, Object{"requested_status": "CANCELLED", "outcome_summary": "Owner cancelled monitor; original results and unresolved effects retained."})
+			var boundGoal string
+			if err = tx.QueryRow("SELECT goal FROM research_monitor_cycles WHERE project=? AND cycle=?", project, active).Scan(&boundGoal); err != nil && err != sql.ErrNoRows {
+				return err
+			}
+			if boundGoal != Str(goal, "id") {
+				return nil
+			}
+			summary := "Owner cancelled monitor; original results and unresolved effects retained."
+			if len(reason) > 0 {
+				summary = reason[0]
+			}
+			cycle, err := s.closeResearchCycle(tx, project, active, Object{"requested_status": "CANCELLED", "outcome_summary": summary})
 			if err != nil {
+				var fault *Fault
+				if errors.As(err, &fault) && fault.Status == 409 {
+					return nil
+				} // Commit cancellation requests while reconciliation retains ownership.
 				return err
 			}
 			if err = s.event(tx, project, "ResearchCycle", cycle, p.ID, ID(), "PROJECT_UPDATED"); err != nil {
@@ -226,6 +325,53 @@ func (s *Service) holdResearchMonitor(tx *sql.Tx, p Principal, project string, g
 		}
 		_, err = tx.Exec("UPDATE intent_plan_bindings SET monitor_current=0 WHERE project=? AND compiled_goal=? AND monitor_current=1", project, goal["id"])
 		return err
+	}
+	return nil
+}
+
+func (s *Service) resumeResearchMonitor(tx *sql.Tx, p Principal, project string, goal Object) error {
+	for _, raw := range Arr(goal, "task_ids") {
+		var reason, action string
+		err := tx.QueryRow("SELECT reason,action FROM orchestration_task_controls WHERE project=? AND task=?", project, raw).Scan(&reason, &action)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if reason != "MONITOR_LIFECYCLE_HOLD" || action != "PAUSE" {
+			continue
+		}
+		task, err := load(tx, project, "Task", raw.(string))
+		if err != nil {
+			return err
+		}
+		if task["status"] != "BLOCKED" {
+			continue
+		}
+		if id := Str(task, "active_run_id"); id != "" {
+			run, e := load(tx, project, "Run", id)
+			if e != nil {
+				return e
+			}
+			if !runTerminal(run) {
+				continue
+			}
+			if e = effectsReconciled(tx, project, id); e != nil {
+				continue
+			}
+		}
+		task, err = s.orchestrateTask(tx, project, task, Object{"action": "RESUME"})
+		if err != nil {
+			var fault *Fault
+			if errors.As(err, &fault) && fault.Status < 500 {
+				continue
+			}
+			return err
+		}
+		if err = s.event(tx, project, "Task", task, p.ID, ID(), "TASK_CHANGED"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -290,6 +436,15 @@ func (s *Service) advanceResearchStages(tx *sql.Tx, owner Principal, project str
 		if pages >= plan.PagesPerSource && exists == 0 {
 			continue
 		}
+		if exists == 0 {
+			capacity, e := researchStageCapacity(tx, project, Str(cycle, "id"), plan)
+			if e != nil {
+				return e
+			}
+			if !capacity {
+				continue
+			}
+		}
 		task, err := s.materializeResearchWork(tx, owner, project, meta, plan, cycle, "discovery", key, params, Empty(), Empty())
 		if err != nil {
 			return err
@@ -313,7 +468,11 @@ func (s *Service) advanceResearchStages(tx *sql.Tx, owner Principal, project str
 	if err != nil {
 		return err
 	}
-	if !readyForReport || !candidatesReady {
+	experimentsReady, err := s.advanceResearchExperiments(tx, owner, project, meta, plan, cycle)
+	if err != nil {
+		return err
+	}
+	if !readyForReport || !candidatesReady || !experimentsReady {
 		return nil
 	}
 	key := stringsDigest(Hash([]any{"delivery", cycle["id"], meta["brief_ref"]}))

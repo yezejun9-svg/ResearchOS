@@ -165,6 +165,19 @@ func (s *Service) advanceResearchCandidates(tx *sql.Tx, owner Principal, project
 		}
 		params := Object{"evidence_id": id}
 		key := stringsDigest(Hash([]any{"verification", meta["brief_ref"], Ref(ev, "Evidence")}))
+		var existing int
+		if err = tx.QueryRow("SELECT count(*) FROM research_cycle_work WHERE project=? AND cycle=? AND logical_key=?", project, cycle["id"], key).Scan(&existing); err != nil {
+			return false, err
+		}
+		if existing == 0 {
+			capacity, e := researchStageCapacity(tx, project, Str(cycle, "id"), plan)
+			if e != nil {
+				return false, e
+			}
+			if !capacity {
+				continue
+			}
+		}
 		sourceTask, err := researchCandidateSourceTask(tx, project, &researchWork{Cycle: Str(cycle, "id"), EvidenceID: id})
 		if err != nil {
 			return false, err
@@ -183,6 +196,18 @@ func (s *Service) advanceResearchCandidates(tx *sql.Tx, owner Principal, project
 			return false, err
 		}
 		key = stringsDigest(Hash([]any{"review", meta["brief_ref"], Ref(ev, "Evidence")}))
+		if err = tx.QueryRow("SELECT count(*) FROM research_cycle_work WHERE project=? AND cycle=? AND logical_key=?", project, cycle["id"], key).Scan(&existing); err != nil {
+			return false, err
+		}
+		if existing == 0 {
+			capacity, e := researchStageCapacity(tx, project, Str(cycle, "id"), plan)
+			if e != nil {
+				return false, e
+			}
+			if !capacity {
+				continue
+			}
+		}
 		review, err := s.materializeResearchWork(tx, owner, project, meta, plan, cycle, "review", key, params, []any{verification["id"]}, []any{Ref(ev, "Evidence"), ev["snapshot_artifact_ref"]})
 		if err != nil {
 			return false, err

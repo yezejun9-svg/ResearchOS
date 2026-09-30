@@ -26,6 +26,28 @@ END;
 CREATE TRIGGER research_monitor_no_delete BEFORE DELETE ON intent_plan_bindings
 BEGIN SELECT RAISE(ABORT,'durable intent binding'); END;
 
+-- Permanent authorization relation, including cycles with no stage Tasks yet.
+CREATE TABLE research_monitor_cycles (
+ project TEXT NOT NULL,
+ cycle TEXT NOT NULL,
+ goal TEXT NOT NULL,
+ plan_ref TEXT NOT NULL CHECK(json_valid(plan_ref) AND json_type(plan_ref)='object'),
+ created_at TEXT NOT NULL,
+ PRIMARY KEY(project,cycle)
+);
+CREATE TRIGGER research_monitor_cycle_insert BEFORE INSERT ON research_monitor_cycles BEGIN
+ SELECT CASE WHEN EXISTS(SELECT 1 FROM research_monitor_cycles WHERE project=NEW.project AND cycle=NEW.cycle)
+ THEN RAISE(ABORT,'monitor cycle cannot be replaced') END;
+ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM domain_objects WHERE project=NEW.project AND kind='ResearchCycle' AND id=NEW.cycle)
+ OR NOT EXISTS(SELECT 1 FROM domain_objects WHERE project=NEW.project AND kind='Goal' AND id=NEW.goal)
+ OR NOT EXISTS(SELECT 1 FROM intent_plan_bindings WHERE project=NEW.project AND compiled_goal=NEW.goal AND plan_kind='MONITOR' AND monitor_current=1 AND accepted_revision IS NOT NULL AND acceptance_ref IS NOT NULL AND brief_ref=NEW.plan_ref)
+ THEN RAISE(ABORT,'monitor cycle needs accepted same-project plan') END;
+END;
+CREATE TRIGGER research_monitor_cycle_update BEFORE UPDATE ON research_monitor_cycles
+BEGIN SELECT RAISE(ABORT,'immutable monitor cycle authorization'); END;
+CREATE TRIGGER research_monitor_cycle_delete BEFORE DELETE ON research_monitor_cycles
+BEGIN SELECT RAISE(ABORT,'durable monitor cycle authorization'); END;
+
 CREATE TABLE research_cycle_work (
  project TEXT NOT NULL,
  cycle TEXT NOT NULL,
