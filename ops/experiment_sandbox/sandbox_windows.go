@@ -31,7 +31,7 @@ type Receipt struct {
 	Directory       string   `json:"cwd"`
 	Profile         string   `json:"profile"`
 	PID             uint32   `json:"pid"`
-	Created         int64    `json:"process_created_ns"`
+	Created         int64    `json:"process_created_ns,string"`
 	Job             string   `json:"job"`
 	StreamsDrained  bool     `json:"streams_drained"`
 	CleanupComplete bool     `json:"cleanup_complete"`

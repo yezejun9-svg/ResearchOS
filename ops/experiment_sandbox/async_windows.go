@@ -18,7 +18,7 @@ const MaxStreamBytes = 4 * 1024 * 1024
 // BeforeResume must durably bind it to the admitted dispatch before returning.
 type Identity struct {
 	PID     uint32 `json:"pid"`
-	Created int64  `json:"process_created_ns"`
+	Created int64  `json:"process_created_ns,string"`
 	Job     string `json:"job"`
 	SID     string `json:"appcontainer_sid"`
 	Profile string `json:"profile"`
