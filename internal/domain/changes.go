@@ -39,9 +39,11 @@ func (s *Service) artifactJSON(tx *sql.Tx, project string, r Object) (any, error
 	return wrapped["value"], nil
 }
 func (s *Service) recordDecision(tx *sql.Tx, p Principal, project string, b Object) (Object, error) {
-	if b["mode"] == "BOUNDED_AUTO" || len(Arr(b, "signals")) > 0 || b["qualification_id"] != nil {
-		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "model signals and automatic qualification require W11")
+	prepared, err := s.prepareDecision(tx, p, project, b)
+	if err != nil {
+		return nil, err
 	}
+	b = prepared
 	found := false
 	for _, v := range Arr(b, "options") {
 		if v == b["selected"] {
