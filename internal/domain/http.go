@@ -282,6 +282,9 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		result, e = s.createEvidence(tx, project, b)
 		kind = "Evidence"
 		status = 201
+	case "verifyEvidence":
+		result, e = s.verifyEvidence(tx, p, project, id, b)
+		kind = "Evidence"
 	case "searchEvidence":
 		result, e = s.searchEvidence(tx, p, project, b)
 	case "advanceSourceCursor":
