@@ -31,6 +31,7 @@ def save(path, value):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['fixture', 'live'])
+    parser.add_argument('--receipt-subdir', choices=['alias-repair'])
     args = parser.parse_args()
     task, check, case = (os.getenv(k, '') for k in ['RESEARCHOS_TASK_ID', 'RESEARCHOS_CHECK_ID', 'RESEARCHOS_CASE_ID'])
     if task != 'W18' or bool(check) == bool(case) or check and check not in ['W18-G01', 'W18-G02'] or case and case != 'A12':
@@ -49,7 +50,10 @@ def main():
     if not expected or len(expected) != len(set(expected)):
         raise RuntimeError('nonempty unique frozen assertion inventory required')
     run_id = str(uuid.uuid4())
-    out = ROOT / 'execution/receipts/W18' / run_id
+    out = ROOT / 'execution/receipts/W18'
+    if args.receipt_subdir:
+        out = out / args.receipt_subdir
+    out = out / run_id
     out.mkdir(parents=True)
     env = {k: v for k, v in os.environ.items() if not k.startswith('W18_')}
     env['RESEARCHOS_GO'] = go

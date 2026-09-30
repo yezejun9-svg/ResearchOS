@@ -7,3 +7,5 @@
 原生恢复覆盖双项目、ContextBundle、非零费用预留、SourceCursor/source_pages、验收、待处理通知、事件与产物；W13 通知生产行为不是本任务接受范围，使用符合 schema 的持久化通知输入。恢复后用现有接受依赖门重新判断 receipt，继续原 task/run/checkpoint，先对账 UNKNOWN 副作用和原进程，内部事件重复消费不增加逻辑数。
 
 当前原生演练并未进行 Windows 重启/隔夜（W19），未运行外部模型（W05/W12），未取得 W17 受限产物备份资格。自动启动迁移拦截器需根 owner 合入 `ops/restore/guard-proposal.patch` 才覆盖现有 Service.New。执行者只提供 `GLOBAL_EVIDENCE_V1_CANDIDATE`，独立 Verifier 签发最终门。
+
+别名恢复追加 6 个真实注册路径断言：./、Windows 大小写、混合分隔符各有同内容成功和异内容拒绝。通过 RegisterLocalRoot/CaptureLocalSnapshot 建立快照；成功后保留原始路径与产物，冲突返回 RESTORE_SOURCE_CONFLICT 且目标不发布，两者均核对源数据与加密备份包未改变。恢复仅复用本次创建、文件身份匹配且 hash/bytes 一致的普通文件。总清单为 32 个断言；修复回执可用 --receipt-subdir alias-repair 单独归档。
