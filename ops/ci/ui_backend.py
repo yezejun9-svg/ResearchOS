@@ -59,7 +59,7 @@ def main():
         'go_version': subprocess.check_output([go, 'version'], cwd=ROOT, text=True).strip(),
         'python_version': platform.python_version(), 'source_manifest': manifest,
         'implementation_model': 'gpt-6-astra', 'reasoning_effort': 'high',
-        'executor_identity': 'codex:/root/resources', 'verifier_identity': None,
+        'executor_identity': os.getenv('RESEARCHOS_EXECUTOR_ID', 'local:operator'), 'verifier_identity': None,
         'environment': 'real loopback HTTP and local SQLite; explicit deterministic fixtures',
         'expected_assertion_ids': expected,
         'limitations': ['No browser screenshots or interactions in this suite', 'No mobile/remote-device qualification', 'W05 live gate remains blocked', 'VERIFYING states and invalidation/old-event faults are explicitly identified fixture setup'],

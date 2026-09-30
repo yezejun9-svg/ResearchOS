@@ -22,12 +22,14 @@ func TestW12DuplicateCallbacks(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	duplicateRejected := 0
+	replaysConfirmed := 0
+	artifactsBefore, eventsBefore := countKind(t, f.db, "Artifact"), countKind(t, f.db, "EventEnvelope")
 	for range 2 {
-		if _, e = f.s.captureSourcePage(context.Background(), f.token, f.project, current, config, from, to, 20, sourceFixtureAdapter{page}); e != nil {
-			duplicateRejected++
+		if replay, replayErr := f.s.captureSourcePage(context.Background(), f.token, f.project, current, config, from, to, 20, sourceFixtureAdapter{page}); replayErr == nil && replay.Manifest["id"] == captured.Manifest["id"] && Hash(replay.Evidence) == Hash(captured.Evidence) {
+			replaysConfirmed++
 		}
 	}
+	unchanged := artifactsBefore == countKind(t, f.db, "Artifact") && eventsBefore == countKind(t, f.db, "EventEnvelope")
 	advance := Object{"opaque_cursor": nil, "covered_until": to.Format(time.RFC3339Nano), "last_success_at": Now(), "retry_after": nil, "pending_window_from": nil, "pending_window_to": nil, "last_cycle_id": nil}
 	advanced := f.expect(200, "PUT", f.path("/source-cursors/"+Str(cursor, "id")), ID(), testTag(cursor), advance)
 	staleAdvance := MergeCopy(advance, Object{"covered_until": from.Format(time.RFC3339Nano)})
@@ -58,6 +60,6 @@ func TestW12DuplicateCallbacks(t *testing.T) {
 	var acceptances int
 	g.db.QueryRow("SELECT count(*) FROM domain_objects WHERE kind='AcceptanceReceipt' AND json_extract(body,'$.subject_ref.id')=?", r.task["id"]).Scan(&acceptances)
 	milestones := countKind(t, g.db, "MilestoneRelease")
-	resourcesAssert(t, "C11-03", []any{1, 2, 409, true, 1, 0, []int{200, 409, 409}, []int{201, 201, 201}}, []any{evidenceCount, duplicateRejected, regress, advanced["covered_until"] == advance["covered_until"], acceptances, milestones, codes, acceptanceCodes}, Object{"adapter_mode": "FIXTURE_NOT_LIVE", "source_snapshot": captured.RawArtifact, "cursor_before": cursor, "cursor_after": advanced, "acceptance": acceptance, "callback_boundary": "official reportRun and AcceptanceService; local experiment output fixture"})
+	resourcesAssert(t, "C11-03", []any{1, 2, 409, true, 1, 0, []int{200, 409, 409}, []int{201, 201, 201}, true}, []any{evidenceCount, replaysConfirmed, regress, advanced["covered_until"] == advance["covered_until"], acceptances, milestones, codes, acceptanceCodes, unchanged}, Object{"adapter_mode": "FIXTURE_NOT_LIVE", "source_snapshot": captured.RawArtifact, "cursor_before": cursor, "cursor_after": advanced, "acceptance": acceptance, "source_replay_semantics": "same sealed manifest and evidence; no new artifacts or events", "callback_boundary": "official reportRun and AcceptanceService; local experiment output fixture"})
 	resourceSnapshot(g, "callback-replay-after.json")
 }
