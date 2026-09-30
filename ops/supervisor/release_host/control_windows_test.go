@@ -111,7 +111,7 @@ func TestPersistentActualControlHostClosedQualification(t *testing.T) {
 		t.Fatal("new child original handle changed")
 	}
 	defer func() {
-		if wait, _ := windows.WaitForSingleObject(h, 0); wait == windows.WAIT_TIMEOUT {
+		if wait, _ := windows.WaitForSingleObject(h, 0); wait == uint32(windows.WAIT_TIMEOUT) {
 			_ = windows.TerminateProcess(h, 1)
 			_, _ = windows.WaitForSingleObject(h, 5000)
 		}
