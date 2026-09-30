@@ -4,6 +4,7 @@ import tokens from '../../../spec/v2.0/ui/design-tokens.json'
 import { createApi, classify, etagOf, itemsOf } from './api'
 import { useQueries, useProjectEvents } from './hooks'
 import { Screen } from './screens'
+import { PairingGate, useDeviceSession } from './Pairing'
 import './style.css'
 
 export const stages = [['discovery', '发现'], ['verification', '核验'], ['experiment', '实验'], ['review', '评审'], ['delivery', '交付'], ['follow_up', '跟踪']]
@@ -84,6 +85,7 @@ function AuthGate({ onToken }) {
 
 function App() {
   const [token, setToken] = useState('')
+  const deviceSession = useDeviceSession(setToken)
   const [theme, setTheme] = useState(() => localStorage.getItem('researchos.theme') === 'dark' ? 'dark' : 'light')
   const [route, navigate] = useRoute()
   const [drawer, setDrawer] = useState(null)
@@ -144,6 +146,7 @@ function App() {
     if (kind === 'experiment') return `/p/${projectId}/experiments`
     return `/p/${projectId}/${kind}`
   }
+  if (!token && (location.pathname === '/pair' || deviceSession.error || location.hostname.endsWith('.trycloudflare.com'))) return <PairingGate sessionError={deviceSession.error} onSession={session => { deviceSession.accept(session); navigate(`/p/${session.device.project_ids[0]}`) }}/>
   if (!token) return <AuthGate onToken={setToken}/>
   return <>
     <header className="topbar" inert={!!drawer}><button className="icon-button menu-button" aria-label="打开导航" onClick={e => openDrawer('nav', e)}><Icon name="menu"/></button><Link to="/" navigate={navigate} className="brand"><span className="brandmark">R</span><span>ResearchOS</span></Link><span className="top-context">研究工作台</span><span className="top-spacer"/><span className={`connection-dot ${events.online ? '' : 'offline-dot'}`}/><span className="connection-text">{events.online ? '已连接' : '连接中断'}</span>{projectId && <button className="theme-button" aria-label={`打开通知，${unread} 条未读`} onClick={e => openDrawer('notice', e)}>通知{unread ? ` ${unread}` : ''}</button>}<button className="theme-button" onClick={() => setTheme(t => t === 'light' ? 'dark' : 'light')} aria-label={`切换为${theme === 'light' ? '深色' : '浅色'}主题`}>{theme === 'light' ? '深色' : '浅色'}</button><button className="icon-button progress-button" aria-label="打开阶段进度" onClick={e => openDrawer('rail', e)}><Icon name="cycle"/></button></header>
