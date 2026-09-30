@@ -5,7 +5,7 @@
 ## 已实现范围
 
 - 正式 migration `0014_remote_access.sql` 和原合同六个设备 API。256 bit 一次性令牌、30–300 秒期限、默认 READER、非空明确项目列表。设备管理仅发起配对的本地 OWNER 可用。
-- 访问令牌 10 分钟；刷新凭据 24 小时且一次轮换，旧 access 在轮换时失效。每次认证读取设备/Owner 当前撤销状态，设备项目权限与发起者当前项目权限求交；paired OWNER 仍无全局管理、再配对、创建项目和 VERIFIER_ONLY 权限。
+- 访问令牌 15 分钟；刷新凭据 24 小时且一次轮换，旧 access 在轮换时失效。同 key 合法重放在有限缓存期内返回原结果；已消费 refresh 用不同 key 重放会撤销该设备的整个凭据族。每次认证读取设备/Owner 当前撤销状态，设备项目权限与发起者当前项目权限求交；paired OWNER 仍无全局管理、再配对、创建项目和 VERIFIER_ONLY 权限。
 - 凭据、refresh 和 challenge 仅保存 SHA-256 验证材料。秘密响应在 handler 内 AES-GCM 加密缓存至多 5 分钟；重启或过期后拒绝重发。DB 保留不可逆消费/重放指纹；普通授权/撤销响应可幂等重放 7 天。审计仅含主体/操作/对象标识，不记录输入正文、令牌、cookie、标签或 reason。
 - 当前手机会话只存在页面内存，支持页面存活期间离线恢复/自动续期；刷新或关闭页面需重新配对。没有 cookie 鉴权或 localStorage/sessionStorage 凭据。
 - 本机 SSE 每 250 ms 重新认证，撤销测试实测约 250 ms 断开。Quick Tunnel 不支持 SSE，因此 gateway 声明 `events=poll`，手机按既有 listEvents/snapshot 进行两秒增量轮询；写入不会因重连自动重发。官方限制：[Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)。这只是临时跨网试用路径，不作为持久远程部署。
