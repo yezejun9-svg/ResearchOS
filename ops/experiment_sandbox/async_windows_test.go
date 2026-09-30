@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/windows"
 	"researchos.local/research-os/internal/canonical"
 )
 
@@ -45,6 +46,35 @@ func TestRuntimeSandboxIdentityJSONExact(t *testing.T) {
 		var receipt Receipt
 		if err = json.Unmarshal(canon, &receipt); err != nil || receipt.Created != created {
 			t.Fatalf("typed receipt roundtrip: %+v %v", receipt, err)
+		}
+	}
+}
+
+func TestRuntimeSandboxStartCancellationCleanup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var id Identity
+	var chunks atomic.Int32
+	p, err := Start(ctx, runtimeSandboxCommand(t, "wait"), StartOptions{BeforeResume: func(identity Identity) error { id = identity; cancel(); return nil }, OnStream: func(StreamChunk) error { chunks.Add(1); return nil }})
+	if p != nil || !errors.Is(err, context.Canceled) || id.PID == 0 || chunks.Load() != 0 {
+		t.Fatalf("startup cancellation boundary: process=%v err=%v identity=%+v chunks=%d", p, err, id, chunks.Load())
+	}
+	h, e := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, id.PID)
+	if errors.Is(e, windows.ERROR_INVALID_PARAMETER) {
+		return
+	}
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer windows.CloseHandle(h)
+	var created, exit, kernel, user windows.Filetime
+	if e = windows.GetProcessTimes(h, &created, &exit, &kernel, &user); e != nil {
+		t.Fatal(e)
+	}
+	if created.Nanoseconds() == id.Created {
+		state, e := windows.WaitForSingleObject(h, 0)
+		if e != nil || state != windows.WAIT_OBJECT_0 {
+			t.Fatalf("Start returned before its process stopped: state=%d err=%v", state, e)
 		}
 	}
 }

@@ -80,6 +80,9 @@ func Start(ctx context.Context, c Command, options StartOptions) (*Process, erro
 		return p, nil
 	case <-ctx.Done():
 		cancel()
+		// The caller receives no Process handle on startup failure. Keep this
+		// boundary until termination, stream closure and staging cleanup finish.
+		<-p.done
 		return nil, ctx.Err()
 	}
 }
