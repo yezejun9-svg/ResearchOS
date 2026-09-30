@@ -75,12 +75,20 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		return
 	}
 	var prepared *preparedAcceptance
+	var qualificationProof *preparedQualification
 	var preparationError error
 	if op.ID == "recordAcceptance" {
 		if input, err := Decode(raw); err == nil && s.Contracts.Validate(op.Request, input) == nil {
 			if ref, ok := input["subject_ref"].(map[string]any); ok && (ref["entity_type"] == "Task" || ref["entity_type"] == "Goal") {
 				prepared, preparationError = s.prepareTaskAcceptance(r.Context(), strings.TrimPrefix(auth, "Bearer "), r.PathValue("project_id"), input)
+			} else if ok && ref["entity_type"] == "Qualification" {
+				qualificationProof, preparationError = s.prepareQualification(r.Context(), strings.TrimPrefix(auth, "Bearer "), r.PathValue("project_id"), Str(ref, "id"))
 			}
+		}
+	}
+	if op.ID == "recordQualificationResult" {
+		if input, err := Decode(raw); err == nil && s.Contracts.Validate(op.Request, input) == nil {
+			qualificationProof, preparationError = s.prepareQualification(r.Context(), strings.TrimPrefix(auth, "Bearer "), r.PathValue("project_id"), r.PathValue("object_id"))
 		}
 	}
 	tx, e := s.DB.BeginTx(r.Context(), nil)
@@ -299,11 +307,24 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 			} else {
 				result, e = s.acceptTask(tx, p, project, b, prepared, cid)
 			}
+		} else if b["subject_ref"].(map[string]any)["entity_type"] == "Qualification" {
+			if preparationError != nil {
+				e = preparationError
+			} else {
+				result, e = s.acceptQualification(tx, p, project, b, qualificationProof)
+			}
 		} else {
 			result, e = s.acceptChange(tx, p, project, b)
 		}
 		kind = "AcceptanceReceipt"
 		status = 201
+	case "recordQualificationResult":
+		if preparationError != nil {
+			e = preparationError
+		} else {
+			result, e = s.recordQualificationResult(tx, p, project, id, b, qualificationProof)
+		}
+		kind = "Qualification"
 	case "actOnGoal":
 		result, e = s.actGoal(tx, project, id, b)
 		kind = "Goal"

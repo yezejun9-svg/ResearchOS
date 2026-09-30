@@ -80,15 +80,17 @@ func (s *Service) RegisterProtectedArtifact(ctx context.Context, token, project,
 	if !descriptor.Valid() || descriptor.Project != project || descriptor.Ticket != ticket || descriptor.MeasurementMode != b["measurement_mode"] {
 		return nil, Fail(422, "GATE_FAILED", "protected descriptor binding mismatch")
 	}
-	raw, e := s.Protected.Read(ctx, descriptor)
-	if e != nil {
-		return nil, protectedFailure(e)
+	if _, frozen := s.Protected.(*protectedstore.FrozenProvider); !frozen || descriptor.MeasurementMode != "LIVE" {
+		raw, e := s.Protected.Read(ctx, descriptor)
+		if e != nil {
+			return nil, protectedFailure(e)
+		}
+		if Digest(raw) != descriptor.Hash || int64(len(raw)) != descriptor.Size {
+			return nil, protectedFailure(protectedstore.ErrIntegrity)
+		}
 	}
-	if Digest(raw) != descriptor.Hash || int64(len(raw)) != descriptor.Size {
-		return nil, protectedFailure(protectedstore.ErrIntegrity)
-	}
-	// No raw bytes are persisted by the control plane, including on error.
-	raw = nil
+	// The concrete LIVE provider verifies bytes in its independent service and
+	// never exports them to this host. Canary providers retain the raw check.
 	if e = s.protectedReady(ctx, descriptor.MeasurementMode); e != nil {
 		return nil, e
 	}
