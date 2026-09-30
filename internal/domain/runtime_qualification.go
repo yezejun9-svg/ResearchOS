@@ -280,6 +280,24 @@ func (s *Service) beginRuntimeQualification(tx *sql.Tx, p Principal, project, ta
 	if e != nil {
 		return nil, "", e
 	}
+	_, profileArtifact, e := s.currentRuntimeBinding(tx, project, rt)
+	if e != nil {
+		return nil, "", e
+	}
+	profileBody, e := runtimeProfileBody(tx, project, profileArtifact)
+	if e != nil {
+		return nil, "", e
+	}
+	if profileBody["sandbox"] == runtimeSandboxProfile {
+		currentTask := result["task"].(map[string]any)
+		admission, err := s.bootstrapRuntimeAdmission(tx, project, currentTask, r, rt)
+		if err != nil {
+			return nil, "", err
+		}
+		if err = s.prepareRuntimeDispatch(tx, project, currentTask, r, admission); err != nil {
+			return nil, "", err
+		}
+	}
 	return r, Str(result, "lease_token"), nil
 }
 

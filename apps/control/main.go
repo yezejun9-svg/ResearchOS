@@ -35,6 +35,7 @@ func main() {
 	developmentFile := flag.String("development-file", "evaluation/development/jev-v2/dataset.json", "hash-pinned public development corpus")
 	provision := flag.String("provision-principal", "", "trusted local administration: principal JSON to provision")
 	issue := flag.String("issue-credential", "", "trusted local administration: existing principal ID")
+	coordinatorFile := flag.String("runtime-coordinator-config", "", "private host configuration for the single runtime coordinator")
 	flag.Parse()
 	adminActions := 0
 	for _, active := range []bool{*bootstrapOwner, *importSpec != "", *importJev != "", *provision != "", *issue != ""} {
@@ -130,6 +131,33 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	if *coordinatorFile != "" {
+		raw, e := os.ReadFile(*coordinatorFile)
+		if e != nil {
+			log.Fatal("runtime coordinator configuration unavailable")
+		}
+		var config domain.RuntimeCoordinatorConfig
+		if e = json.Unmarshal(raw, &config); e != nil {
+			log.Fatal("runtime coordinator configuration invalid")
+		}
+		if config.DataRoot == "" {
+			config.DataRoot = dataDir
+		}
+		if config.APIURL == "" {
+			config.APIURL = "http://" + listen
+		}
+		coordinator, e := service.NewRuntimeCoordinator(ctx, config)
+		if e != nil {
+			log.Fatalf("runtime coordinator unavailable: %v", e)
+		}
+		defer coordinator.Close()
+		go func() {
+			if e := coordinator.Serve(ctx, func(e error) { log.Printf("runtime coordinator operation stopped: %v", e) }); e != nil {
+				log.Printf("runtime coordinator stopped: %v", e)
+				stop()
+			}
+		}()
+	}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -67,6 +67,9 @@ func (s *Service) createRuntimeRun(tx *sql.Tx, project string, task Object, runt
 // ObserveRuntime is only called by the trusted worker bridge. There is no HTTP write endpoint.
 // An old epoch observation is retained for reconciliation but cannot change current Run state.
 func (s *Service) ObserveRuntime(ctx context.Context, project, runID string, epoch int64, observation Object) error {
+	return s.observeRuntime(ctx, project, runID, epoch, observation, false)
+}
+func (s *Service) observeRuntime(ctx context.Context, project, runID string, epoch int64, observation Object, coordinator bool) error {
 	if epoch < 1 {
 		return Fail(400, "INVALID_REQUEST", "invalid epoch")
 	}
@@ -86,6 +89,26 @@ func (s *Service) ObserveRuntime(ctx context.Context, project, runID string, epo
 	}
 	if spec["task_id"] != r["task_id"] {
 		return Fail(422, "GATE_FAILED", "observation task mismatch")
+	}
+	dispatch, de := runtimeDispatch(tx, project, runID, epoch)
+	if de != nil && de != sql.ErrNoRows {
+		return de
+	}
+	if de == nil {
+		if !coordinator {
+			return Fail(403, "FORBIDDEN", "native dispatch observation requires bound coordinator")
+		}
+		sequence, se := Num(observation, "observation_sequence")
+		prior, _ := Num(dispatch, "observation_sequence")
+		if se != nil || sequence < 1 || observation["dispatch_key"] != dispatch["dispatch_key"] || observation["manifest_hash"] != dispatch["manifest_hash"] || observation["worker"] != dispatch["worker"] || Hash(observation["identity"]) != Hash(dispatch["identity"]) || len(dispatch["identity"].(map[string]any)) == 0 || sequence < prior || (sequence == prior && Hash(observation) != dispatch["observation_hash"]) {
+			return Fail(422, "GATE_FAILED", "observation differs from durable native dispatch identity")
+		}
+		if observation["children_stopped"] != true || observation["streams_drained"] != true || observation["cleanup_complete"] != true || Str(observation, "ended") == "" {
+			return Fail(422, "GATE_FAILED", "observation is not a drained terminal fact")
+		}
+		if _, e = tx.Exec("UPDATE runtime_dispatches SET state='OBSERVED',observation_sequence=?,observation_hash=?,updated_at=? WHERE project=? AND run=? AND epoch=?", sequence, Hash(observation), Now(), project, runID, epoch); e != nil {
+			return e
+		}
 	}
 	_, e = tx.Exec("INSERT OR IGNORE INTO runtime_observations(project,run,epoch,receipt_hash,body,observed_at) VALUES(?,?,?,?,?,?)", project, runID, epoch, Hash(observation), string(Bytes(observation)), Now())
 	if e != nil {
@@ -128,6 +151,15 @@ func runtimeLease(tx *sql.Tx, p Principal, project string, r, b Object) error {
 	return nil
 }
 func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, b Object, op, cid string) (Object, string, int, error) {
+	return s.runtimeOperationMode(tx, p, project, id, b, op, cid, false)
+}
+
+// recoveryFacts is only set by local journal ingestion after exact epoch and
+// native proof checks. It never bypasses a lease for execution or heartbeat.
+func (s *Service) runtimeOperationMode(tx *sql.Tx, p Principal, project, id string, b Object, op, cid string, recoveryFacts bool) (Object, string, int, error) {
+	if recoveryFacts && op != "reportRun" && op != "acknowledgeRunCancellation" {
+		return nil, "", 0, Fail(403, "FORBIDDEN", "recovery can import terminal facts only")
+	}
 	if op == "registerRuntime" {
 		r := Merge(Base(project), b)
 		Merge(r, Object{"status": "REGISTERED", "qualification_ids": Empty(), "health_checked_at": nil, "supports_resume": false, "resume_evidence_ref": nil})
@@ -141,7 +173,7 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 	if e != nil {
 		return nil, "", 0, e
 	}
-	if op != "cancelRun" && op != "reconcileRun" {
+	if op != "cancelRun" && op != "reconcileRun" && !recoveryFacts {
 		if e = runtimeLease(tx, p, project, r, b); e != nil {
 			return nil, "", 0, e
 		}
@@ -151,6 +183,9 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 	}
 	switch op {
 	case "heartbeatRun":
+		if e = s.currentDispatchedRun(tx, project, r, "heartbeat"); e != nil {
+			return nil, "", 0, e
+		}
 		if r["status"] == "CANCEL_REQUESTED" || r["status"] == "RECONCILING" || r["status"] == "LOST" {
 			return nil, "", 0, Fail(409, "STATE_CONFLICT", "run requires reconciliation")
 		}
@@ -178,6 +213,9 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 		r["status"] = "CANCEL_REQUESTED"
 		r["cancel_requested_at"] = Now()
 	case "reportRun":
+		if e = s.currentDispatchedRun(tx, project, r, "report"); e != nil {
+			return nil, "", 0, e
+		}
 		o, err := runtimeObservation(tx, project, r)
 		if err != nil {
 			return nil, "", 0, err
@@ -377,6 +415,9 @@ func (s *Service) runtimeUpload(tx *sql.Tx, p Principal, project string, b []byt
 	if e != nil {
 		return nil, e
 	}
+	if e = s.currentDispatchedRun(tx, project, r, "upload"); e != nil {
+		return nil, e
+	}
 	o, e := s.upload(tx, p, project, b)
 	if e != nil {
 		return nil, e
@@ -390,6 +431,9 @@ func (s *Service) runtimeSeal(tx *sql.Tx, p Principal, project string, b Object)
 		return nil, e
 	}
 	if e = validExecutorRun(tx, p, project, r); e != nil {
+		return nil, e
+	}
+	if e = s.currentDispatchedRun(tx, project, r, "seal"); e != nil {
 		return nil, e
 	}
 	var count int
