@@ -2,6 +2,7 @@ package domain
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func resourceEvidence(t *testing.T, name string, value any) {
@@ -53,6 +55,7 @@ func resourceHTTP(f *fixture) {
 	evidenceName := "http-" + ID() + ".json"
 	var mu sync.Mutex
 	events := Empty()
+	readiness := Empty()
 	handler := f.s.Handler()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, e := io.ReadAll(r.Body)
@@ -79,8 +82,35 @@ func resourceHTTP(f *fixture) {
 		server.Close()
 		mu.Lock()
 		defer mu.Unlock()
-		resourceEvidence(f.t, evidenceName, Object{"transport": "REAL_LOOPBACK_HTTP", "base_url": server.URL, "exchanges": events})
+		resourceEvidence(f.t, evidenceName, Object{"transport": "REAL_LOOPBACK_HTTP", "base_url": server.URL, "readiness": readiness, "exchanges": events})
 	})
+	// Establish the local listener before any business request. Only transport
+	// failures of this read-only probe retry; a business mutation is never retried.
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		probe, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/__researchos_fixture_readiness__", nil)
+		response, err := server.Client().Do(probe)
+		entry := Object{"attempt": attempt + 1, "status": nil, "error": nil}
+		if err == nil {
+			entry["status"] = response.StatusCode
+			_, err = io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+		}
+		cancel()
+		if err != nil {
+			entry["error"] = err.Error()
+		}
+		readiness = append(readiness, entry)
+		if err == nil {
+			if response.StatusCode != 404 {
+				f.t.Fatalf("unexpected fixture readiness response: %d", response.StatusCode)
+			}
+			break
+		}
+		if attempt == 2 {
+			f.t.Fatalf("fixture listener unavailable after three read-only probes: %v", err)
+		}
+	}
 	f.h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req, e := http.NewRequest(r.Method, server.URL+r.URL.RequestURI(), r.Body)
 		if e != nil {
