@@ -217,11 +217,11 @@ func TestW07HTTPSourceEvidenceAndDurableEmptyWindow(t *testing.T) {
 	if e != nil || len(pending) != eventsBefore+1 {
 		t.Fatal("capture outbox missing", len(pending), e)
 	}
-	if _, e = f.s.captureSourcePage(context.Background(), token, f.project, current, config, from, to, 20, sourceFixtureAdapter{page}); e == nil {
-		t.Fatal("duplicate page checkpoint accepted")
+	if replay, replayErr := f.s.captureSourcePage(context.Background(), token, f.project, current, config, from, to, 20, sourceFixtureAdapter{page}); replayErr != nil || replay.Manifest["id"] != got.Manifest["id"] {
+		t.Fatal("identical page did not replay its sealed manifest", replayErr)
 	}
 	if countKind(t, f.db, "EventEnvelope") != eventsBefore+1 || countKind(t, f.db, "Artifact") != artifactsBefore+2 {
-		t.Fatal("failed capture left artifacts or events")
+		t.Fatal("replayed capture duplicated artifacts or events")
 	}
 	advance["last_success_at"] = Now()
 	var advanced Object

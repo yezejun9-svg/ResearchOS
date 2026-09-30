@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"researchos.local/research-os/adapters/sources"
+	"sort"
 	"strings"
 	"time"
 )
@@ -167,7 +168,7 @@ func (s *Service) advanceSourceCursor(tx *sql.Tx, project, id string, b Object) 
 		if e != nil {
 			return nil, Fail(422, "GATE_FAILED", "page success time required")
 		}
-		final, e := s.verifySourcePageChain(tx, project, cursor, from, to, last, Str(b, "opaque_cursor"))
+		final, e := s.verifySourcePageChain(tx, project, cursor, from, to, last, Str(b, "opaque_cursor"), nil)
 		if e != nil {
 			return nil, e
 		}
@@ -189,7 +190,7 @@ func (s *Service) advanceSourceCursor(tx *sql.Tx, project, id string, b Object) 
 	return cursor, s.put(tx, "SourceCursor", cursor)
 }
 
-func (s *Service) verifySourcePageChain(tx *sql.Tx, project string, cursor Object, from, to string, success time.Time, wantNext string) (bool, error) {
+func (s *Service) verifySourcePageChain(tx *sql.Tx, project string, cursor Object, from, to string, success time.Time, wantNext string, items map[string]bool) (bool, error) {
 	next := ""
 	seen := map[string]bool{}
 	oldNext := Str(cursor, "opaque_cursor")
@@ -222,6 +223,9 @@ func (s *Service) verifySourcePageChain(tx *sql.Tx, project string, cursor Objec
 		if e != nil || artifact["validity"] != "CURRENT" || artifact["measurement_mode"] != "LIVE" || artifact["evidence_kind"] != "OBSERVED" {
 			return false, Fail(422, "GATE_FAILED", "raw source page snapshot missing")
 		}
+		if e = s.requireCurrentArtifactBody(tx, project, artifact); e != nil {
+			return false, e
+		}
 		var ids []string
 		if e = json.Unmarshal([]byte(refsRaw), &ids); e != nil {
 			return false, Fail(422, "GATE_FAILED", "invalid page item references")
@@ -238,6 +242,12 @@ func (s *Service) verifySourcePageChain(tx *sql.Tx, project string, cursor Objec
 			snap, e := load(tx, project, "Artifact", Str(ref, "id"))
 			if e != nil || snap["validity"] != "CURRENT" || snap["content_hash"] != ref["content_hash"] {
 				return false, Fail(422, "GATE_FAILED", "source item snapshot invalid")
+			}
+			if e = s.requireCurrentArtifactBody(tx, project, snap); e != nil {
+				return false, e
+			}
+			if items != nil {
+				items[id] = true
 			}
 		}
 		if complete == 1 {
@@ -439,6 +449,7 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 	}
 	result.RawArtifact = raw
 	refs := []string{}
+	seenEvidence := map[string]bool{}
 	for _, item := range page.Items {
 		if item.SourceID != config["source_id"] || item.CanonicalURL == "" || item.UpstreamID == "" || len(item.Body) == 0 || item.MediaType == "" || item.PublishedAt.IsZero() || item.PublishedAt.Before(q.From) || !item.PublishedAt.Before(q.To) {
 			return SourceCapture{}, Fail(422, "GATE_FAILED", "source item is incomplete or outside window")
@@ -459,10 +470,24 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 			revision = item.UpstreamRevision
 		}
 		body := Object{"claim": "Public source item at " + item.CanonicalURL, "stance": "CONTEXT", "evidence_kind": "OBSERVED", "source_kind": config["kind"], "canonical_url": item.CanonicalURL, "publisher": author, "upstream_revision": revision, "published_at": item.PublishedAt.UTC().Format(time.RFC3339Nano), "modified_at": modified, "retrieved_at": Now(), "time_status": "KNOWN", "snapshot_artifact_ref": Ref(snapshot, "Artifact"), "locator": item.Locator, "independence_key": Hash(item.CanonicalURL), "origin_evidence_id": nil, "discovery_urls": Empty(), "license_status": "UNKNOWN", "license_expression": nil}
-		ev, e := s.createEvidence(tx, project, body)
+		var ev Object
+		var existing string
+		e = tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='Evidence' AND json_extract(body,'$.canonical_url')=? AND coalesce(json_extract(body,'$.upstream_revision'),'')=? AND json_extract(body,'$.snapshot_artifact_ref.content_hash')=?", project, item.CanonicalURL, item.UpstreamRevision, snapshot["content_hash"]).Scan(&existing)
+		if e == nil {
+			ev, e = Decode([]byte(existing))
+			if e == nil && (ev["validity"] != "CURRENT" || ev["evidence_kind"] != "OBSERVED" || ev["source_kind"] != config["kind"] || Hash(ev["snapshot_artifact_ref"]) != Hash(Ref(snapshot, "Artifact"))) {
+				e = Fail(409, "STATE_CONFLICT", "existing source evidence is not a current matching snapshot")
+			}
+		} else if errors.Is(e, sql.ErrNoRows) {
+			ev, e = s.createEvidence(tx, project, body)
+		}
 		if e != nil {
 			return SourceCapture{}, e
 		}
+		if seenEvidence[Str(ev, "id")] {
+			continue
+		}
+		seenEvidence[Str(ev, "id")] = true
 		result.Evidence = append(result.Evidence, ev)
 		refs = append(refs, Str(ev, "id"))
 	}
@@ -472,12 +497,49 @@ func (s *Service) captureSourcePage(ctx context.Context, token, project string, 
 		if !page.Complete && page.NextCursor == "" {
 			return SourceCapture{}, Fail(422, "GATE_FAILED", "incomplete page lacks resumable provider cursor")
 		}
-		encoded, _ := json.Marshal(refs)
+		sort.Strings(refs)
+		unique := refs[:0]
+		for _, id := range refs {
+			if len(unique) == 0 || unique[len(unique)-1] != id {
+				unique = append(unique, id)
+			}
+		}
+		encoded, _ := json.Marshal(unique)
 		complete := 0
 		if page.Complete {
 			complete = 1
 		}
-		_, e = tx.Exec("INSERT INTO source_pages(project,cursor_id,source_id,query_hash,window_from,window_to,page_cursor_in,page_cursor_out,raw_artifact_id,item_refs_json,complete,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", project, cursor["id"], config["source_id"], cursor["query_hash"], q.From.Format(time.RFC3339Nano), q.To.Format(time.RFC3339Nano), pageCursor, page.NextCursor, raw["id"], string(encoded), complete, Now())
+		var oldSource, oldQuery, oldNext, oldRaw, oldRefs string
+		var oldComplete int
+		e = tx.QueryRow("SELECT source_id,query_hash,page_cursor_out,raw_artifact_id,item_refs_json,complete FROM source_pages WHERE project=? AND cursor_id=? AND window_from=? AND window_to=? AND page_cursor_in=?", project, cursor["id"], q.From.Format(time.RFC3339Nano), q.To.Format(time.RFC3339Nano), pageCursor).Scan(&oldSource, &oldQuery, &oldNext, &oldRaw, &oldRefs, &oldComplete)
+		if e == nil {
+			var oldIDs []string
+			if e = json.Unmarshal([]byte(oldRefs), &oldIDs); e != nil {
+				return SourceCapture{}, e
+			}
+			sort.Strings(oldIDs)
+			if oldSource != config["source_id"] || oldQuery != cursor["query_hash"] || oldNext != page.NextCursor || oldRaw != raw["id"] || oldComplete != complete || Hash(oldIDs) != Hash(unique) {
+				return SourceCapture{}, Fail(409, "STATE_CONFLICT", "source page checkpoint differs from the sealed page")
+			}
+			var priorManifest string
+			e = tx.QueryRow(`SELECT body FROM (SELECT a.body,
+				CASE WHEN json_valid(CAST(u.bytes AS TEXT)) THEN CAST(u.bytes AS TEXT) ELSE '{}' END AS doc
+				FROM domain_objects a JOIN uploaded_content u ON u.project=a.project AND u.storage_key=json_extract(a.body,'$.storage_key')
+				WHERE a.project=? AND a.kind='Artifact' AND json_extract(a.body,'$.kind')='MANIFEST' AND u.sealed=1)
+				WHERE json_extract(doc,'$.source_id')=? AND json_extract(doc,'$.query_hash')=? AND json_extract(doc,'$.window_from')=?
+				AND json_extract(doc,'$.window_to')=? AND json_extract(doc,'$.page_cursor_in')=?
+				AND json_extract(doc,'$.raw_artifact_ref.id')=? LIMIT 1`, project, oldSource, oldQuery, q.From.Format(time.RFC3339Nano), q.To.Format(time.RFC3339Nano), pageCursor, oldRaw).Scan(&priorManifest)
+			if e != nil {
+				return SourceCapture{}, e
+			}
+			result.Manifest, e = Decode([]byte(priorManifest))
+			if e == nil {
+				e = s.effective(tx, project, Ref(result.Manifest, "Artifact"))
+			}
+			return result, e // The deferred rollback preserves exact replay idempotence.
+		} else if errors.Is(e, sql.ErrNoRows) {
+			_, e = tx.Exec("INSERT INTO source_pages(project,cursor_id,source_id,query_hash,window_from,window_to,page_cursor_in,page_cursor_out,raw_artifact_id,item_refs_json,complete,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", project, cursor["id"], config["source_id"], cursor["query_hash"], q.From.Format(time.RFC3339Nano), q.To.Format(time.RFC3339Nano), pageCursor, page.NextCursor, raw["id"], string(encoded), complete, Now())
+		}
 		if e != nil {
 			return SourceCapture{}, e
 		}
@@ -562,6 +624,38 @@ func (s *Service) persistSourceRetry(ctx context.Context, token, project string,
 }
 
 func (s *Service) sealSourceBytes(tx *sql.Tx, p Principal, project string, cursor Object, body []byte, media string, raw Object) (Object, error) {
+	// Capture provenance belongs to each immutable page/manifest. Canonical bytes
+	// keep their first provenance when a later trusted fetch observes them again.
+	var prior string
+	err := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.kind')='SOURCE_SNAPSHOT' AND json_extract(body,'$.content_hash')=?", project, Digest(body)).Scan(&prior)
+	if err == nil {
+		a, e := Decode([]byte(prior))
+		if e != nil {
+			return nil, e
+		}
+		captured, e := capturedSourceArtifact(tx, project, a)
+		if e != nil {
+			return nil, e
+		}
+		if captured || (raw != nil && raw["id"] == a["id"]) {
+			if a["validity"] != "CURRENT" || a["evidence_kind"] != "OBSERVED" || a["measurement_mode"] != "LIVE" || a["access_class"] != "PROJECT" || a["media_type"] != media || !s.visible(tx, p, project, a) {
+				return nil, Fail(409, "STATE_CONFLICT", "source snapshot reuse requires current compatible visible content")
+			}
+			if e = s.effective(tx, project, Ref(a, "Artifact")); e != nil {
+				return nil, e
+			}
+			var sealed []byte
+			if e = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, a["storage_key"]).Scan(&sealed); e != nil {
+				return nil, e
+			}
+			if Digest(sealed) != Digest(body) {
+				return nil, Fail(422, "CONTENT_HASH_MISMATCH", "canonical source bytes changed")
+			}
+			return a, nil
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
 	u, e := s.upload(tx, p, project, body)
 	if e != nil {
 		return nil, e
@@ -571,4 +665,70 @@ func (s *Service) sealSourceBytes(tx *sql.Tx, p Principal, project string, curso
 		sourceRefs = []any{Ref(raw, "Artifact")}
 	}
 	return s.seal(tx, p, project, Object{"run_id": nil, "kind": "SOURCE_SNAPSHOT", "evidence_kind": "OBSERVED", "measurement_mode": "LIVE", "content_hash": u["content_hash"], "storage_key": u["storage_key"], "media_type": media, "byte_size": len(body), "input_refs": []any{Ref(cursor, "SourceCursor")}, "source_refs": sourceRefs, "produced_by": p.ID, "access_class": "PROJECT"})
+}
+
+func capturedSourceArtifact(tx *sql.Tx, project string, artifact Object) (bool, error) {
+	refs := Arr(artifact, "input_refs")
+	if (artifact["kind"] != "SOURCE_SNAPSHOT" || artifact["evidence_kind"] != "OBSERVED") && (artifact["kind"] != "MANIFEST" || artifact["evidence_kind"] != "GENERATED") || artifact["measurement_mode"] != "LIVE" || len(refs) != 1 {
+		return false, nil
+	}
+	ref, ok := refs[0].(map[string]any)
+	if !ok || ref["entity_type"] != "SourceCursor" {
+		return false, nil
+	}
+	cursor, err := version(tx, project, ref)
+	if err != nil {
+		return false, err
+	}
+	var sealed []byte
+	if err = tx.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", project, artifact["storage_key"]).Scan(&sealed); err != nil {
+		return false, err
+	}
+	if Digest(sealed) != artifact["content_hash"] {
+		return false, Fail(422, "CONTENT_HASH_MISMATCH", "captured source bytes changed")
+	}
+	if artifact["kind"] == "MANIFEST" {
+		manifest, e := Decode(sealed)
+		if e != nil || manifest["source_id"] != cursor["source_id"] || manifest["query_hash"] != cursor["query_hash"] || Hash(artifact["source_refs"]) != Hash(append([]any{manifest["raw_artifact_ref"]}, Arr(manifest, "evidence_refs")...)) {
+			return false, nil
+		}
+		var rawID, next, itemJSON string
+		var complete int
+		e = tx.QueryRow("SELECT raw_artifact_id,page_cursor_out,item_refs_json,complete FROM source_pages WHERE project=? AND cursor_id=? AND source_id=? AND query_hash=? AND window_from=? AND window_to=? AND page_cursor_in=?", project, cursor["id"], cursor["source_id"], cursor["query_hash"], manifest["window_from"], manifest["window_to"], manifest["page_cursor_in"]).Scan(&rawID, &next, &itemJSON, &complete)
+		if errors.Is(e, sql.ErrNoRows) {
+			return false, nil
+		}
+		if e != nil {
+			return false, e
+		}
+		rawRef, _ := manifest["raw_artifact_ref"].(map[string]any)
+		if rawRef["entity_type"] != "Artifact" || rawRef["id"] != rawID || manifest["page_cursor_out"] != next || manifest["complete"] != (complete == 1) {
+			return false, nil
+		}
+		var ids []string
+		if e = json.Unmarshal([]byte(itemJSON), &ids); e != nil {
+			return false, e
+		}
+		want := []string{}
+		for _, v := range Arr(manifest, "evidence_refs") {
+			r, ok := v.(map[string]any)
+			if !ok || r["entity_type"] != "Evidence" {
+				return false, nil
+			}
+			want = append(want, Str(r, "id"))
+		}
+		sort.Strings(ids)
+		sort.Strings(want)
+		return Hash(ids) == Hash(want), nil
+	}
+	var count int
+	revision, err := Num(artifact, "revision")
+	if err != nil {
+		return false, err
+	}
+	err = tx.QueryRow(`SELECT count(*) FROM source_pages p WHERE p.project=? AND p.cursor_id=? AND p.source_id=? AND p.query_hash=? AND
+		(p.raw_artifact_id=? OR EXISTS (SELECT 1 FROM json_each(p.item_refs_json) ids JOIN domain_objects e ON e.project=p.project AND e.kind='Evidence' AND e.id=ids.value
+		WHERE json_extract(e.body,'$.snapshot_artifact_ref.id')=? AND json_extract(e.body,'$.snapshot_artifact_ref.content_hash')=? AND json_extract(e.body,'$.snapshot_artifact_ref.revision')=?))`,
+		project, cursor["id"], cursor["source_id"], cursor["query_hash"], artifact["id"], artifact["id"], artifact["content_hash"], revision).Scan(&count)
+	return count > 0, err
 }

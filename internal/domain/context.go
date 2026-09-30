@@ -118,6 +118,15 @@ func semanticReferences(kind string, o Object) []Object {
 }
 func (s *Service) effectiveInputs(tx *sql.Tx, project, kind string, o Object, seen map[string]bool) error {
 	for _, ref := range semanticReferences(kind, o) {
+		if kind == "Artifact" && ref["entity_type"] == "SourceCursor" {
+			captured, e := capturedSourceArtifact(tx, project, o)
+			if e != nil {
+				return e
+			}
+			if captured && Hash(Arr(o, "input_refs")[0]) == Hash(ref) {
+				continue // Sealed source pages retain their capture cursor as history.
+			}
+		}
 		if e := s.effectiveGraph(tx, project, ref, seen); e != nil {
 			return e
 		}

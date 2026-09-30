@@ -2,7 +2,6 @@ package domain
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"time"
 )
@@ -184,19 +183,50 @@ func (s *Service) researchCoverage(tx *sql.Tx, project string, profile Object, f
 			}
 		}
 		// Only W07's durable raw page chain can prove a covered window.
-		var refs string
-		err = tx.QueryRow("SELECT item_refs_json FROM source_pages WHERE project=? AND cursor_id=? AND query_hash=? AND window_from<=? AND window_to>=? AND complete=1 ORDER BY window_from DESC LIMIT 1", project, cursor["id"], cursor["query_hash"], c["requested_from"], c["requested_to"]).Scan(&refs)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		rows, err := tx.Query("SELECT DISTINCT window_from,window_to FROM source_pages WHERE project=? AND cursor_id=? AND query_hash=? AND complete=1", project, cursor["id"], cursor["query_hash"])
+		if err != nil {
 			return nil, err
 		}
-		end, _ := time.Parse(time.RFC3339Nano, Str(cursor, "covered_until"))
-		if err == nil && !end.Before(to) && cursor["last_success_at"] != nil {
-			var ids []string
-			if e := json.Unmarshal([]byte(refs), &ids); e != nil {
+		var windows [][2]string
+		for rows.Next() {
+			var window [2]string
+			if err = rows.Scan(&window[0], &window[1]); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			windows = append(windows, window)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		end, endErr := time.Parse(time.RFC3339Nano, Str(cursor, "covered_until"))
+		success, successErr := time.Parse(time.RFC3339Nano, Str(cursor, "last_success_at"))
+		for _, window := range windows {
+			start, startErr := time.Parse(time.RFC3339Nano, window[0])
+			stop, stopErr := time.Parse(time.RFC3339Nano, window[1])
+			if endErr != nil || successErr != nil || startErr != nil || stopErr != nil || start.After(from) || stop.Before(to) || end.Before(stop) {
+				continue
+			}
+			ids := map[string]bool{}
+			// A newer pending window does not change a previously sealed chain.
+			sealedCursor := Merge(Object{}, cursor)
+			sealedCursor["opaque_cursor"] = nil
+			final, e := s.verifySourcePageChain(tx, project, sealedCursor, window[0], window[1], success, "", ids)
+			if e != nil {
+				var fault *Fault
+				if errors.As(e, &fault) && fault.Status < 500 {
+					continue
+				}
 				return nil, e
 			}
-			c["status"], c["observed_from"], c["observed_to"], c["record_count"], c["gap_reason"] = "COMPLETE", c["requested_from"], c["requested_to"], len(ids), nil
-		} else if kind == "X" {
+			if final {
+				c["status"], c["observed_from"], c["observed_to"], c["record_count"], c["gap_reason"] = "COMPLETE", window[0], window[1], len(ids), nil
+				break
+			}
+		}
+		if c["status"] != "COMPLETE" && kind == "X" {
 			c["gap_reason"] = "X visible observations do not prove a complete bounded window"
 		}
 		out = append(out, c)
@@ -219,6 +249,15 @@ func (s *Service) checkpointResearchCycle(tx *sql.Tx, project, id string, b Obje
 	}
 	if o["status"] != "RUNNING" {
 		return nil, Fail(409, "STATE_CONFLICT", "cycle is not running")
+	}
+	required := map[any]bool{}
+	for _, experiment := range Arr(b, "required_experiment_ids") {
+		required[experiment] = true
+	}
+	for _, experiment := range Arr(o, "required_experiment_ids") {
+		if !required[experiment] {
+			return nil, Fail(422, "GATE_FAILED", "required experiments cannot be removed from an active cycle")
+		}
 	}
 	profile, err := version(tx, project, o["profile_ref"].(map[string]any))
 	if err != nil {
@@ -334,11 +373,19 @@ func (s *Service) closeResearchCycle(tx *sql.Tx, project, id string, b Object) (
 		if err != nil {
 			return nil, err
 		}
-		if x["cycle_id"] != id || (x["status"] != "COMPLETED" && x["status"] != "INCONCLUSIVE") || x["acceptance_id"] == nil {
+		if x["cycle_id"] != id || x["status"] != "COMPLETED" || x["acceptance_id"] == nil {
 			complete = false
-		} else {
-			progress = true
+			continue
 		}
+		if _, err = s.experimentAcceptance(tx, project, x, Str(x, "acceptance_id")); err != nil {
+			var fault *Fault
+			if !errors.As(err, &fault) || fault.Status >= 500 {
+				return nil, err
+			}
+			complete = false
+			continue
+		}
+		progress = true
 	}
 	for _, raw := range Arr(o, "candidate_evidence_ids") {
 		var count int
