@@ -199,7 +199,7 @@ func main() {
 		log.Fatalf("private drain capability unavailable: %v", err)
 	}
 	if boot != nil {
-		d := &controlDrain{gate: gate, service: service, coordinator: coordinator, pipe: boot.Pipe, root: dataDir, key: boot.Key, peer: boot.Peer, stop: stop}
+		d := &controlDrain{gate: gate, service: service, coordinator: coordinator, lease: lease, listener: listener, startup: boot, pipe: boot.Pipe, root: dataDir, key: boot.Key, peer: boot.Peer, stop: stop}
 		go func() {
 			defer close(drainDone)
 			d.Serve(ctx, func(e error) { log.Printf("private drain stopped: %v", e) })
