@@ -30,7 +30,7 @@ def main():
     report = {'status': 'RUNNING', 'scope': 'DEVELOPMENT_ONLY_BROWSER', 'checks': [], 'http': [],
               'limitations': ['390px Chromium browser emulates a phone; no physical device', 'Polling transport metadata supplied by browser route fixture; gateway boundary tested separately', 'No public tunnel started; actual TLS and cross-network A10/A11 remain NOT_RUN', 'No formal holdout accessed; C22 complete host/filesystem boundary is not asserted'],
               'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()}
-    sources = [*sorted((ROOT / 'apps/web/src').glob('*')), *sorted((ROOT / 'internal/domain').glob('remote_*.go')), Path(__file__)]
+    sources = [*sorted((ROOT / 'apps/web/src').glob('*')), *sorted((ROOT / 'internal/domain').glob('*.go')), *sorted((ROOT / 'migrations/sqlite').glob('*.sql')), ROOT / 'internal/api/server.go', ROOT / 'apps/control/main.go', ROOT / 'spec/v2.0/contracts/domain.schema.json', ROOT / 'spec/v2.0/contracts/openapi.json', ROOT / 'contracts/operation_coverage.json', Path(__file__)]
     report['source_hashes'] = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources if p.is_file()}
     temp = Path(tempfile.mkdtemp(prefix='researchos-w17-browser-'))
     server = None
