@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"researchos.local/research-os/internal/domain"
@@ -15,7 +16,7 @@ import (
 
 // This process is only used against the temporary W13 browser fixture database.
 func main() {
-	if len(os.Args) < 2 || os.Getenv("RESEARCHOS_TASK_ID") != "W13" {
+	if len(os.Args) < 2 || os.Getenv("RESEARCHOS_TASK_ID") != "W13" || !strings.HasPrefix(filepath.Base(filepath.Dir(os.Getenv("RESEARCHOS_DATA_DIR"))), "researchos-w13-ui-") {
 		log.Fatal("W13 project id required")
 	}
 	db, err := store.Open(filepath.Join(os.Getenv("RESEARCHOS_DATA_DIR"), "researchos.sqlite"))
@@ -34,6 +35,32 @@ func main() {
 				log.Fatal("runtime id required")
 			}
 			err = service.RegisterOrchestrationFixture(context.Background(), os.Args[1], os.Args[3])
+		case "artifact-metadata":
+			var artifacts []domain.Object
+			if err = json.NewDecoder(os.Stdin).Decode(&artifacts); err != nil {
+				log.Fatal(err)
+			}
+			tx, beginErr := db.Begin()
+			if beginErr != nil {
+				log.Fatal(beginErr)
+			}
+			defer tx.Rollback()
+			for _, artifact := range artifacts {
+				if artifact["project_id"] != os.Args[1] || (artifact["validity"] != "STALE" && !(artifact["access_class"] == "VERIFIER_ONLY" && strings.HasPrefix(domain.Str(artifact, "storage_key"), "unbound-w13-"))) {
+					log.Fatal("classification fixture only")
+				}
+				if err = service.Contracts.Validate("Artifact", artifact); err != nil {
+					log.Fatal(err)
+				}
+				body := string(domain.Bytes(artifact))
+				if _, err = tx.Exec("INSERT INTO domain_objects(project,kind,id,revision,body,content_hash) VALUES(?,'Artifact',?,?,?,?) ON CONFLICT(project,kind,id) DO UPDATE SET revision=excluded.revision,body=excluded.body", os.Args[1], artifact["id"], artifact["revision"], body, artifact["content_hash"]); err != nil {
+					log.Fatal(err)
+				}
+				if _, err = tx.Exec("INSERT INTO domain_versions(project,kind,id,revision,body,content_hash) VALUES(?,'Artifact',?,?,?,?)", os.Args[1], artifact["id"], artifact["revision"], body, artifact["content_hash"]); err != nil {
+					log.Fatal(err)
+				}
+			}
+			err = tx.Commit()
 		case "verifying":
 			// C18 transient-state fixture only: real reported Tasks and Runs
 			// remain intact; no acceptance or product authority is fabricated.
