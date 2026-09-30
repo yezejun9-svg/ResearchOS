@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,12 +52,11 @@ func exactImage(path string) (string, string, error) {
 	if e != nil || !info.Mode().IsRegular() || info.Size() > 128*1024*1024 {
 		return "", "", errors.New("bounded regular executable required")
 	}
-	b, e := os.ReadFile(actual)
-	if e != nil {
+	hash := sha256.New()
+	if _, e = io.Copy(hash, f); e != nil {
 		return "", "", e
 	}
-	sum := sha256.Sum256(b)
-	return actual, hex.EncodeToString(sum[:]), nil
+	return actual, hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func processCreated(pid uint32) (int64, bool, error) {
