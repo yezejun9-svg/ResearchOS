@@ -271,6 +271,9 @@ func operationOwner(id string) string {
 	if runtimeOperations[id] {
 		return "W05"
 	}
+	if decisionOperations[id] {
+		return "W11"
+	}
 	if contextOperations[id] {
 		return "W04"
 	}
