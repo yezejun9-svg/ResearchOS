@@ -266,6 +266,8 @@ func validateEvolutionControlBundle(ctx context.Context, bundle evolution.Contro
 		return fmt.Errorf("CONTROL_PROJECTION_CREDENTIAL_IDENTITY")
 	}
 	kinds := map[string]bool{"ProjectProfile": true, "ProjectState": true, "BudgetPolicy": true, "RunPolicy": true, "AcceptancePolicy": true, "ResearchCycle": true, "SourceCursor": true}
+	versionsPresent := map[string]bool{}
+	runningCycle := false
 	for _, table := range []string{"domain_objects", "domain_versions"} {
 		for _, row := range rows[table] {
 			if !kinds[Str(row, "kind")] || row["project"] != bundle.Binding.ProjectID && !(row["project"] == "" && (row["kind"] == "BudgetPolicy" || row["kind"] == "RunPolicy")) {
@@ -282,6 +284,30 @@ func validateEvolutionControlBundle(ctx context.Context, bundle evolution.Contro
 					}
 				}
 			}
+			if row["kind"] == "ResearchCycle" {
+				if row["id"] != bundle.Binding.CycleID || body["checkpoint_artifact_id"] != nil {
+					return fmt.Errorf("CONTROL_PROJECTION_CYCLE_SCOPE")
+				}
+				for _, field := range []string{"candidate_evidence_ids", "required_experiment_ids", "decision_ids", "follow_up_task_ids"} {
+					if len(Arr(body, field)) != 0 {
+						return fmt.Errorf("CONTROL_PROJECTION_COMPLEX_CYCLE")
+					}
+				}
+				if table == "domain_objects" {
+					runningCycle = body["status"] == "RUNNING"
+				}
+			}
+			if table == "domain_versions" {
+				versionsPresent[Hash([]any{row["project"], row["kind"], row["id"], row["revision"]})] = true
+			}
+		}
+	}
+	if !runningCycle {
+		return fmt.Errorf("CONTROL_PROJECTION_RUNNING_CYCLE")
+	}
+	for _, row := range rows["domain_refs"] {
+		if !versionsPresent[Hash([]any{row["project"], row["kind"], row["id"], row["revision"]})] || !versionsPresent[Hash([]any{row["target_project"], row["target_kind"], row["target_id"], row["target_revision"]})] {
+			return fmt.Errorf("CONTROL_PROJECTION_REFERENCE_SCOPE")
 		}
 	}
 	return ctx.Err()

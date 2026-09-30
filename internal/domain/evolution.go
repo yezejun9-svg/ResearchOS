@@ -198,9 +198,19 @@ func (s *Service) RegisterEvolutionBuild(ctx context.Context, project string, ar
 	if e != nil {
 		return e
 	}
-	h, e := evolutionHost(tx, project)
-	if e != nil {
+	// Legacy calculator builds may be registered before their fixture host.
+	// A present host selects the profile; missing metadata never selects control.
+	var hostRaw string
+	h := Object{}
+	e = tx.QueryRow("SELECT body FROM evolution_hosts WHERE project=?", project).Scan(&hostRaw)
+	if e != nil && e != sql.ErrNoRows {
 		return e
+	}
+	if e == nil {
+		h, e = Decode([]byte(hostRaw))
+		if e != nil {
+			return e
+		}
 	}
 	if controlHost(h) {
 		if !controlBuildManifest(m) {
