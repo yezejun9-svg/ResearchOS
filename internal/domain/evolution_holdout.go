@@ -97,32 +97,8 @@ func decodeEvolutionHoldout(inputsRaw, labelsRaw []byte) (evolution.HoldoutInput
 // A historical verifier ID cannot outlive its current restricted grant or
 // acquire authority through the candidate author/release actor's identity.
 func (s *Service) evolutionHoldoutVerifierCurrent(tx *sql.Tx, project string, x Object, verifierID string) error {
-	var rolesRaw string
-	if err := tx.QueryRow("SELECT roles FROM auth_principals WHERE id=? AND revoked=0", verifierID).Scan(&rolesRaw); err != nil {
-		return Fail(403, "FORBIDDEN", "private holdout verifier no longer active")
-	}
-	p := Principal{ID: verifierID}
-	if err := json.Unmarshal([]byte(rolesRaw), &p.Roles); err != nil {
-		return err
-	}
-	rows, err := tx.Query("SELECT project,task,run,restricted FROM auth_grants WHERE principal=?", verifierID)
+	p, err := evolutionCurrentPrincipal(tx, verifierID)
 	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var g Grant
-		if err = rows.Scan(&g.ProjectID, &g.TaskID, &g.RunID, &g.Restricted); err != nil {
-			rows.Close()
-			return err
-		}
-		p.Grants = append(p.Grants, g)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return err
-	}
-	if err = constrainRemotePrincipal(tx, &p); err != nil {
 		return err
 	}
 	if !protectedAllowed(p, project) {
