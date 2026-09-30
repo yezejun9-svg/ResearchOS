@@ -28,6 +28,8 @@ path. It accepts only `summary-v1` on one local, remote-rejecting named pipe.
 Pipe rights exclude `FILE_CREATE_PIPE_INSTANCE`; first-instance protection fails
 closed if another server already owns the name. The client binds the pipe server
 PID to the running SCM service with the expected account before and after reading.
+The probe has a 3-second overall deadline; native overlapped I/O and Go's Windows
+poller also enforce that deadline on request/read/ack, including a silent server.
 Only `SafeSummary` fixed enums/counts leave the service; every request rechecks the
 four private files, so tampering changes the response to BLOCKED. Invalid commands
 receive no body. There are no arbitrary file, process, proxy or model interfaces.
