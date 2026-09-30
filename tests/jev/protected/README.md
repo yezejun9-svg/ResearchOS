@@ -29,8 +29,9 @@ Ordinary list/event/search/context consumers do not receive private bodies or
 opaque tickets. Public sealing rejects protected ancestry. Protected context
 materialization and backup remain refused rather than copying private bytes to
 ordinary output directories. `SafeSummary` accepts only aggregate counts and
-fixed enums; it grants no publication/declassification authority and is not yet
-connected to a protected evaluator or public publication endpoint.
+fixed enums; it grants no publication/declassification authority. The separate
+frozen evaluator preparation is documented in DEPLOYMENT.md; its actual service
+installation and formal run require independent live verification.
 
 ## Frozen canary execution
 
