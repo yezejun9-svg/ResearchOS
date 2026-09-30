@@ -42,6 +42,25 @@ type BackupManifest struct {
 	KeyPolicy         string       `json:"key_policy"`
 	CachePolicy       string       `json:"cache_policy"`
 	MAC               string       `json:"mac"`
+	Purpose           Object       `json:"purpose,omitempty"`
+}
+
+// Internal policies are available only to the bounded local upgrade coordinator.
+// Public backup/export/restore retain the ordinary format and protection guard.
+type backupPolicy struct {
+	format         string
+	purpose        Object
+	allowProtected func(*sql.DB, Object) error
+	validate       func(*sql.DB) error
+	beforeRecovery func(*sql.DB) error
+	afterRecovery  func(*sql.DB) error
+}
+
+func backupFormat(policy *backupPolicy) string {
+	if policy != nil {
+		return policy.format
+	}
+	return "RESEARCHOS_BACKUP_V1"
 }
 
 func backupCipher(key []byte) (cipher.AEAD, error) {
@@ -242,6 +261,14 @@ func backupInventory(db *sql.DB) (Object, error) {
 	return inventory, nil
 }
 func backupIntegrity(db *sql.DB) error {
+	return backupIntegrityPolicy(db, nil)
+}
+func backupIntegrityPolicy(db *sql.DB, policy *backupPolicy) error {
+	if policy != nil && policy.validate != nil {
+		if e := policy.validate(db); e != nil {
+			return e
+		}
+	}
 	var result string
 	if e := db.QueryRow("PRAGMA integrity_check").Scan(&result); e != nil {
 		return e
@@ -269,7 +296,13 @@ func backupIntegrity(db *sql.DB) error {
 	}
 	for _, o := range arts {
 		if o["access_class"] != "PROJECT" {
-			return fmt.Errorf("PROTECTED_BACKUP_REQUIRES_W17")
+			if policy == nil || policy.allowProtected == nil {
+				return fmt.Errorf("PROTECTED_BACKUP_REQUIRES_W17")
+			}
+			if e = policy.allowProtected(db, o); e != nil {
+				return e
+			}
+			continue
 		}
 		var raw []byte
 		var hash string
@@ -297,7 +330,13 @@ func backupIntegrity(db *sql.DB) error {
 // sealed BLOBs in the same consistency window. Files are derived ONLY from that
 // closed snapshot. Publication happens after all hashes and the manifest pass.
 func (s *Service) CreateBackup(ctx context.Context, destination string, key []byte) (BackupManifest, error) {
-	m := BackupManifest{Format: "RESEARCHOS_BACKUP_V1", ID: ID(), Started: Now(), KeyPolicy: "AES-256-GCM; key stored separately; credentials require fresh provisioning after restore", CachePolicy: "SQLite FTS cache included; external worker/context workspaces excluded and rebuilt from sealed content"}
+	return s.createBackupPolicy(ctx, destination, key, nil)
+}
+func (s *Service) createBackupPolicy(ctx context.Context, destination string, key []byte, policy *backupPolicy) (BackupManifest, error) {
+	m := BackupManifest{Format: backupFormat(policy), ID: ID(), Started: Now(), KeyPolicy: "AES-256-GCM; key stored separately; credentials require fresh provisioning after restore", CachePolicy: "SQLite FTS cache included; external worker/context workspaces excluded and rebuilt from sealed content"}
+	if policy != nil {
+		m.Purpose = policy.purpose
+	}
 	a, e := backupCipher(key)
 	if e != nil {
 		return m, e
@@ -317,7 +356,7 @@ func (s *Service) CreateBackup(ctx context.Context, destination string, key []by
 		return m, e
 	}
 	defer db.Close()
-	if e = backupIntegrity(db); e != nil {
+	if e = backupIntegrityPolicy(db, policy); e != nil {
 		return m, e
 	}
 	if m.Migrations, e = backupMigrations(db); e != nil {
@@ -355,11 +394,13 @@ func (s *Service) CreateBackup(ctx context.Context, destination string, key []by
 	if e != nil {
 		return m, e
 	}
-	objects, e := backupPortable(db)
-	if e != nil {
-		return m, e
+	if policy == nil {
+		objects, e := backupPortable(db)
+		if e != nil {
+			return m, e
+		}
+		files["portable.json"] = Bytes(Object{"format": "RESEARCHOS_PORTABLE_V1", "objects": objects, "authority": "state.sqlite; portable objects preserve IDs, revisions, source relationships and receipt hashes"})
 	}
-	files["portable.json"] = Bytes(Object{"format": "RESEARCHOS_PORTABLE_V1", "objects": objects, "authority": "state.sqlite; portable objects preserve IDs, revisions, source relationships and receipt hashes"})
 	if _, e = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); e != nil {
 		return m, e
 	}
@@ -400,6 +441,9 @@ func (s *Service) CreateBackup(ctx context.Context, destination string, key []by
 }
 
 func readBackup(directory string, key []byte) (BackupManifest, map[string][]byte, error) {
+	return readBackupPolicy(directory, key, nil)
+}
+func readBackupPolicy(directory string, key []byte, policy *backupPolicy) (BackupManifest, map[string][]byte, error) {
 	var m BackupManifest
 	a, e := backupCipher(key)
 	if e != nil {
@@ -412,8 +456,11 @@ func readBackup(directory string, key []byte) (BackupManifest, map[string][]byte
 	if e = json.Unmarshal(raw, &m); e != nil {
 		return m, nil, e
 	}
-	if m.Format != "RESEARCHOS_BACKUP_V1" || !hmac.Equal([]byte(m.MAC), []byte(backupMAC(m, key))) {
+	if m.Format != backupFormat(policy) || !hmac.Equal([]byte(m.MAC), []byte(backupMAC(m, key))) {
 		return m, nil, fmt.Errorf("BACKUP_MANIFEST_INVALID")
+	}
+	if policy != nil && Hash(m.Purpose) != Hash(policy.purpose) {
+		return m, nil, fmt.Errorf("BACKUP_PURPOSE_MISMATCH")
 	}
 	files := map[string][]byte{}
 	for _, f := range m.Files {
@@ -433,8 +480,11 @@ func readBackup(directory string, key []byte) (BackupManifest, map[string][]byte
 		}
 		files[f.Name] = raw
 	}
-	if files["state.sqlite"] == nil || files["portable.json"] == nil {
+	if files["state.sqlite"] == nil || (policy == nil && files["portable.json"] == nil) {
 		return m, nil, fmt.Errorf("BACKUP_REQUIRED_FILE_MISSING")
+	}
+	if policy != nil && files["portable.json"] != nil {
+		return m, nil, fmt.Errorf("UPGRADE_PORTABLE_EXPORT_PROHIBITED")
 	}
 	return m, files, nil
 }
@@ -460,6 +510,9 @@ type RestoreReport struct {
 }
 
 func RestoreBackup(ctx context.Context, directory, destination string, opt RestoreOptions) (RestoreReport, error) {
+	return restoreBackupPolicy(ctx, directory, destination, opt, nil)
+}
+func restoreBackupPolicy(ctx context.Context, directory, destination string, opt RestoreOptions, policy *backupPolicy) (RestoreReport, error) {
 	start := time.Now()
 	r := RestoreReport{Started: Now(), Status: "FAILED"}
 	if opt.Contracts == nil || len(opt.SupportedMigrations) == 0 {
@@ -468,7 +521,7 @@ func RestoreBackup(ctx context.Context, directory, destination string, opt Resto
 	if opt.Irreversible {
 		return r, fmt.Errorf("IRREVERSIBLE_MIGRATION_MAINTENANCE_REQUIRED")
 	}
-	m, files, e := readBackup(directory, opt.Key)
+	m, files, e := readBackupPolicy(directory, opt.Key, policy)
 	if e != nil {
 		return r, e
 	}
@@ -489,7 +542,7 @@ func RestoreBackup(ctx context.Context, directory, destination string, opt Resto
 		return r, e
 	}
 	defer db.Close()
-	if e = backupIntegrity(db); e != nil {
+	if e = backupIntegrityPolicy(db, policy); e != nil {
 		return r, e
 	}
 	actual, e := backupMigrations(db)
@@ -564,6 +617,11 @@ func RestoreBackup(ctx context.Context, directory, destination string, opt Resto
 		return r, e
 	}
 	svc := &Service{DB: db, Contracts: opt.Contracts}
+	if policy != nil && policy.beforeRecovery != nil {
+		if e = policy.beforeRecovery(db); e != nil {
+			return r, e
+		}
+	}
 	if e = svc.backupRelocateSources(stage, destination); e != nil {
 		return r, e
 	}
@@ -583,8 +641,16 @@ func RestoreBackup(ctx context.Context, directory, destination string, opt Resto
 	if e = svc.backupPublishSourcePaths(stage, destination); e != nil {
 		return r, e
 	}
-	if e = backupIntegrity(db); e != nil {
+	if e = backupIntegrityPolicy(db, policy); e != nil {
 		return r, e
+	}
+	if policy != nil {
+		if policy.afterRecovery != nil {
+			if e = policy.afterRecovery(db); e != nil {
+				return r, e
+			}
+		}
+		r.Recovery["local_upgrade"] = policy.purpose
 	}
 	r.After, e = backupInventory(db)
 	if e != nil {
