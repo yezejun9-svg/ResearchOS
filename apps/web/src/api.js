@@ -26,6 +26,7 @@ function pathFor(pattern, params) {
 
 export function createApi(getToken) {
   let principalId = null
+  let deviceRole = null
   async function call(operation, { params = {}, query, body, signal, etag, key, raw = false } = {}) {
     const spec = operations[operation]
     if (!spec) throw new Error(`未知操作 ${operation}`)
@@ -44,6 +45,7 @@ export function createApi(getToken) {
     try {
       const response = await fetch(url, { method: spec.method, headers, body: body == null ? undefined : body instanceof Blob ? body : JSON.stringify(body), signal: controller.signal, cache: 'no-store' })
       principalId = response.headers.get('X-ResearchOS-Principal-ID') || principalId
+      deviceRole = response.headers.get('X-ResearchOS-Device-Role') || deviceRole
       if (!response.ok) {
         let detail
         try { detail = await response.json() } catch (error) { if (controller.signal.aborted) throw error; detail = null }
@@ -116,7 +118,7 @@ export function createApi(getToken) {
       reader.releaseLock()
     }
   }
-  return { call, stream, principalId: () => principalId }
+  return { call, stream, principalId: () => principalId, deviceRole: () => deviceRole }
 }
 
 export function classify(error) {
