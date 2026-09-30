@@ -44,28 +44,30 @@ type BridgeRequest struct {
 }
 
 type BridgeJournal struct {
-	Version          int              `json:"version"`
-	Manifest         json.RawMessage  `json:"manifest"`
-	ManifestHash     string           `json:"manifest_hash"`
-	DispatchKey      string           `json:"dispatch_key"`
-	Worker           string           `json:"worker"`
-	Revision         string           `json:"adapter_revision"`
-	Identity         sandbox.Identity `json:"identity"`
-	State            string           `json:"state"`
-	Reason           string           `json:"reason"`
-	Started          string           `json:"started"`
-	Ended            string           `json:"ended"`
-	Sequence         int64            `json:"observation_sequence"`
-	Frames           int64            `json:"frames"`
-	Acknowledged     int64            `json:"acknowledged"`
-	ContextReady     bool             `json:"context_ready"`
-	InputHash        string           `json:"input_hash"`
-	ProtocolComplete bool             `json:"protocol_complete"`
-	Cancelled        bool             `json:"cancelled"`
-	Receipt          sandbox.Receipt  `json:"sandbox_receipt"`
-	Artifacts        []Artifact       `json:"artifacts"`
-	StdoutHash       string           `json:"stdout_hash"`
-	StderrHash       string           `json:"stderr_hash"`
+	Version            int              `json:"version"`
+	Manifest           json.RawMessage  `json:"manifest"`
+	ManifestHash       string           `json:"manifest_hash"`
+	DispatchKey        string           `json:"dispatch_key"`
+	Worker             string           `json:"worker"`
+	Revision           string           `json:"adapter_revision"`
+	Identity           sandbox.Identity `json:"identity"`
+	State              string           `json:"state"`
+	Reason             string           `json:"reason"`
+	Started            string           `json:"started"`
+	Ended              string           `json:"ended"`
+	Sequence           int64            `json:"observation_sequence"`
+	Frames             int64            `json:"frames"`
+	Acknowledged       int64            `json:"acknowledged"`
+	ContextReady       bool             `json:"context_ready"`
+	CheckpointSequence int64            `json:"checkpoint_sequence"`
+	Paused             bool             `json:"paused"`
+	InputHash          string           `json:"input_hash"`
+	ProtocolComplete   bool             `json:"protocol_complete"`
+	Cancelled          bool             `json:"cancelled"`
+	Receipt            sandbox.Receipt  `json:"sandbox_receipt"`
+	Artifacts          []Artifact       `json:"artifacts"`
+	StdoutHash         string           `json:"stdout_hash"`
+	StderrHash         string           `json:"stderr_hash"`
 }
 
 type Bridge struct {
@@ -306,10 +308,16 @@ func (w *Bridge) consume(chunk sandbox.StreamChunk) error {
 			return errors.New("protocol frame size invalid")
 		}
 		var frame BridgeFrame
+		if _, e := canonical.JSON(line); e != nil {
+			return errors.New("invalid canonical JSON protocol line")
+		}
 		decoder := json.NewDecoder(bytes.NewReader(line))
 		decoder.DisallowUnknownFields()
 		if e := decoder.Decode(&frame); e != nil {
 			return errors.New("invalid typed protocol")
+		}
+		if e := decoder.Decode(new(any)); e != io.EOF {
+			return errors.New("one complete JSON object per protocol line required")
 		}
 		if frame.Sequence != w.journal.Frames+1 || w.journal.ProtocolComplete {
 			return errors.New("protocol sequence or terminal ordering invalid")
@@ -322,7 +330,21 @@ func (w *Bridge) consume(chunk sandbox.StreamChunk) error {
 			}
 			w.journal.ContextReady = true
 		case "effect.request", "checkpoint":
+			if !w.journal.ContextReady {
+				return errors.New("context acknowledgement required before work")
+			}
+			if frame.Type == "checkpoint" {
+				w.journal.CheckpointSequence = frame.Sequence
+			}
+		case "turn.paused":
+			if !w.journal.ContextReady || w.journal.CheckpointSequence == 0 || w.journal.Acknowledged < w.journal.CheckpointSequence {
+				return errors.New("durably acknowledged checkpoint required before pause")
+			}
+			w.journal.Paused, w.journal.ProtocolComplete = true, true
 		case "turn.completed":
+			if !w.journal.ContextReady {
+				return errors.New("context acknowledgement required before completion")
+			}
 			w.journal.ProtocolComplete = true
 		default:
 			return errors.New("unknown protocol frame")
@@ -380,8 +402,10 @@ func (w *Bridge) wait(ctx context.Context, profile map[string]any) {
 	}
 	if err != nil || !receipt.Stopped || !receipt.StreamsDrained || !receipt.OutputCopied || !receipt.CleanupComplete {
 		w.journal.State = "UNKNOWN"
-	} else if receipt.ExitCode != 0 || receipt.TimedOut || w.journal.Cancelled || !w.journal.ProtocolComplete {
+	} else if receipt.ExitCode != 0 || receipt.TimedOut || w.journal.Cancelled || !w.journal.ProtocolComplete || !w.journal.ContextReady {
 		w.journal.State = "FAILED"
+	} else if w.journal.Paused {
+		w.journal.State = "PAUSED"
 	} else {
 		w.journal.State = "EXITED"
 	}
@@ -527,7 +551,7 @@ func (j BridgeJournal) Observation() (map[string]any, error) {
 	if j.Cancelled && j.Receipt.Stopped && j.Receipt.StreamsDrained {
 		state = "CANCELLED"
 	}
-	return map[string]any{"spec": spec, "dispatch_key": j.DispatchKey, "manifest_hash": j.ManifestHash, "worker": j.Worker, "identity": map[string]any{"pid": j.Identity.PID, "process_created_ns": strconv.FormatInt(j.Identity.Created, 10), "job": j.Identity.Job, "appcontainer_sid": j.Identity.SID, "profile": j.Identity.Profile}, "observation_sequence": j.Sequence, "state": state, "reason": j.Reason, "children_stopped": j.Receipt.Stopped, "queue_empty": j.Acknowledged == j.Frames, "streams_drained": j.Receipt.StreamsDrained, "cleanup_complete": j.Receipt.CleanupComplete, "exit_code": j.Receipt.ExitCode, "ended": j.Ended, "protocol": map[string]any{"settled": state == "SETTLED" && j.ProtocolComplete && j.Receipt.StreamsDrained, "frames": j.Frames, "acknowledged": j.Acknowledged}, "artifacts": j.Artifacts, "stdout_hash": j.StdoutHash, "stderr_hash": j.StderrHash}, nil
+	return map[string]any{"spec": spec, "dispatch_key": j.DispatchKey, "manifest_hash": j.ManifestHash, "worker": j.Worker, "identity": map[string]any{"pid": j.Identity.PID, "process_created_ns": strconv.FormatInt(j.Identity.Created, 10), "job": j.Identity.Job, "appcontainer_sid": j.Identity.SID, "profile": j.Identity.Profile, "staging_directory": j.Identity.StagingDirectory}, "observation_sequence": j.Sequence, "state": state, "reason": j.Reason, "children_stopped": j.Receipt.Stopped, "queue_empty": j.Acknowledged == j.Frames, "streams_drained": j.Receipt.StreamsDrained, "cleanup_complete": j.Receipt.CleanupComplete, "exit_code": j.Receipt.ExitCode, "ended": j.Ended, "protocol": map[string]any{"settled": state == "SETTLED" && j.ProtocolComplete && j.Receipt.StreamsDrained, "frames": j.Frames, "acknowledged": j.Acknowledged}, "artifacts": j.Artifacts, "stdout_hash": j.StdoutHash, "stderr_hash": j.StderrHash}, nil
 }
 
 // ReadBridgeTerminal checks the trusted directory and raw hashes. It never
@@ -665,6 +689,21 @@ func ReconcileBridge(directory, manifestHash string) (BridgeJournal, error) {
 			}
 			j.State = "UNKNOWN"
 			j.Reason = "orphan terminated; missing terminal stream/cleanup evidence"
+			j.Sequence++
+			if e = save(filepath.Join(directory, "bridge.json"), j); e != nil {
+				lock.Close()
+				return j, e
+			}
+		}
+		if !j.Receipt.CleanupComplete {
+			if e = sandbox.CleanupAbandoned(j.Identity); e != nil {
+				lock.Close()
+				return j, e
+			}
+			j.Receipt.CleanupComplete = true
+			j.Receipt.Stopped = true
+			j.State = "UNKNOWN"
+			j.Reason = "old sandbox stopped and cleaned; terminal stream facts remain unknown"
 			j.Sequence++
 			if e = save(filepath.Join(directory, "bridge.json"), j); e != nil {
 				lock.Close()

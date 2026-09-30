@@ -110,6 +110,7 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 	if e = tx.Commit(); e != nil {
 		return nil, e
 	}
+	c.boundary("effect_prepared", intent)
 	if intent["state"] == "CONFIRMED" || intent["state"] == "NOT_APPLIED" {
 		receipt, _ := intent["receipt"].(map[string]any)
 		return Object{"sequence": frame.Sequence, "key": frame.Key, "state": intent["state"], "payload": receipt["payload"]}, nil
@@ -133,6 +134,7 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 	if e = tx.Commit(); e != nil {
 		return nil, e
 	}
+	c.boundary("effect_started", intent)
 	body := Object{"key": frame.Key, "epoch": epoch, "run_id": runID, "capability": provider.Capability, "payload": payload}
 	req, e := http.NewRequestWithContext(ctx, "POST", provider.Endpoint, bytes.NewReader(Bytes(body)))
 	if e != nil {
@@ -147,6 +149,9 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("provider redirect denied") }}
 	defer client.CloseIdleConnections()
 	response, e := client.Do(req)
+	if e == nil {
+		c.boundary("provider_responded", intent)
+	}
 	unknown := func(reason string) (Object, error) {
 		c.service.ObserveEffect(context.Background(), route.ProjectID, runID, frame.Key, "UNKNOWN", Object{"dispatch_key": dispatch["dispatch_key"], "epoch": epoch, "reason": reason})
 		return nil, Fail(409, "STATE_CONFLICT", "provider outcome UNKNOWN; query provider before recovery")
@@ -176,6 +181,7 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 	if e = writeRuntimeFact(filepath.Join(bridge.Directory(), "effect-"+strings.TrimPrefix(Digest([]byte(frame.Key)), "sha256:")+".json"), Bytes(fact)); e != nil {
 		return unknown("provider receipt persistence failed")
 	}
+	c.boundary("effect_receipt_durable", intent)
 	if e = c.ingestEffectFact(context.Background(), fact); e != nil {
 		return nil, e
 	}
