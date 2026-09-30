@@ -21,7 +21,7 @@ func newConfigPipe(serviceSID string) (windows.Handle, error) {
 	return newConfigPipeNamed(configPipe, serviceSID)
 }
 func newConfigPipeNamed(pipeName, serviceSID string) (windows.Handle, error) {
-	sd, e := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + serviceSID + ")(A;;0x100003;;;BA)(A;;0x100003;;;SY)")
+	sd, e := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + serviceSID + ")(A;;" + pipeClientACL + ";;;BA)(A;;" + pipeClientACL + ";;;SY)")
 	if e != nil {
 		return 0, ErrBoundary
 	}

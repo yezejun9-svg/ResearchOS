@@ -21,6 +21,10 @@ const CanaryServiceName = "ResearchOSVerifierCanary"
 const canaryPipe = `\\.\pipe\ResearchOSVerifierCanary-v1`
 const pipeClientRights = windows.FILE_READ_DATA | windows.FILE_WRITE_DATA | windows.SYNCHRONIZE
 
+// Windows also checks FILE_READ_ATTRIBUTES when opening the client endpoint.
+// Do not grant FILE_CREATE_PIPE_INSTANCE (0x4) through generic write access.
+const pipeClientACL = "0x100083"
+
 var brokerFiles = []string{"input.canary", "label.canary", "detail.canary", "log.canary"}
 
 // CanaryInstallRoot is fixed, not accepted from an IPC request or environment.
@@ -103,7 +107,7 @@ func (s *canaryService) Execute(_ []string, requests <-chan svc.ChangeRequest, c
 	}
 	// Explicit data read/write permissions avoid FILE_CREATE_PIPE_INSTANCE. A
 	// different server instance cannot be created with the reader's pipe rights.
-	sd, e := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + boundary.OwnerSID + ")(A;;0x100003;;;" + s.readerSID + ")")
+	sd, e := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + boundary.OwnerSID + ")(A;;" + pipeClientACL + ";;;" + s.readerSID + ")")
 	if e != nil {
 		return true, 3
 	}

@@ -14,9 +14,28 @@ $receiptRoot = [IO.Path]::GetFullPath($ReceiptDirectory)
 
 Add-Type -TypeDefinition @'
 using System;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 public static class ResearchOSCanaryProbe {
+  [StructLayout(LayoutKind.Sequential)] struct Config { public uint type, start, error; public IntPtr binary, group; public uint tag; public IntPtr dependencies, account, display; }
+  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr OpenSCManagerW(string machine, string database, uint rights);
+  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr OpenServiceW(IntPtr manager, string name, uint rights);
+  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool QueryServiceConfigW(IntPtr service, IntPtr buffer, uint size, out uint needed);
+  [DllImport("advapi32.dll")] static extern bool CloseServiceHandle(IntPtr handle);
+  public static string ServiceAccount(string name) {
+    var manager=OpenSCManagerW(null,null,1); if(manager==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+    try {
+      var service=OpenServiceW(manager,name,1); if(service==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+      try {
+        uint needed; QueryServiceConfigW(service,IntPtr.Zero,0,out needed);
+        if(needed==0) throw new Win32Exception(Marshal.GetLastWin32Error());
+        var buffer=Marshal.AllocHGlobal((int)needed);
+        try { if(!QueryServiceConfigW(service,buffer,needed,out needed)) throw new Win32Exception(Marshal.GetLastWin32Error()); return Marshal.PtrToStringUni(Marshal.PtrToStructure<Config>(buffer).account); }
+        finally { Marshal.FreeHGlobal(buffer); }
+      } finally { CloseServiceHandle(service); }
+    } finally { CloseServiceHandle(manager); }
+  }
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
   public static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
   public static int Access(string path, uint rights) {
@@ -32,7 +51,7 @@ function Assert-Canary([string]$ID, $Expected, $Actual) {
     $rows.Add([ordered]@{ assertion_id=$ID; expected=$Expected; actual=$Actual; status=$(if($match){'PASS'}else{'FAIL'}); scope='INSTALLED_SYNTHETIC_CANARY' })
 }
 $service = Get-CimInstance Win32_Service -Filter "Name='ResearchOSVerifierCanary'"
-Assert-Canary 'SERVICE-VIRTUAL-ACCOUNT' 'NT SERVICE\ResearchOSVerifierCanary' $service.StartName
+Assert-Canary 'SERVICE-VIRTUAL-ACCOUNT' 'NT SERVICE\ResearchOSVerifierCanary' ([ResearchOSCanaryProbe]::ServiceAccount('ResearchOSVerifierCanary'))
 Assert-Canary 'SERVICE-RUNNING' 'Running' $service.State
 $response = & $binary --probe 2>&1
 $probeExit = $LASTEXITCODE
@@ -48,7 +67,7 @@ foreach ($name in @('input.canary','label.canary','detail.canary','log.canary'))
     $private = Join-Path $root "data\private\$name"
     # ACCESS_DENIED (5), never FILE_NOT_FOUND (2), is required. Successful opens
     # do not read, truncate, or modify bytes, even when the boundary is wrong.
-    Assert-Canary "PRIVATE-READ-$name" 5 ([ResearchOSCanaryProbe]::Access($private, 0x80000000))
+    Assert-Canary "PRIVATE-READ-$name" 5 ([ResearchOSCanaryProbe]::Access($private, 2147483648))
     Assert-Canary "PRIVATE-WRITE-$name" 5 ([ResearchOSCanaryProbe]::Access($private, 0x40000000))
 }
 Assert-Canary 'BINARY-WRITE-DENIED' 5 ([ResearchOSCanaryProbe]::Access($binary, 0x40000000))

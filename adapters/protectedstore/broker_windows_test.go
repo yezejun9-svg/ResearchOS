@@ -44,6 +44,41 @@ func TestCanaryServiceRejectsInteractive(t *testing.T) {
 	fmt.Println("BROKER_ASSERTION INTERACTIVE_SERVICE_REFUSED PASS CANARY_ONLY")
 }
 
+func TestCanaryExplicitReaderRights(t *testing.T) {
+	user, e := windows.GetCurrentProcessToken().GetTokenUser()
+	if e != nil {
+		t.Fatal(e)
+	}
+	name := fmt.Sprintf(`\\.\pipe\ResearchOSExplicitReader-%d-%d`, os.Getpid(), time.Now().UnixNano())
+	// A service SID owns the full-access ACE, so the current reader cannot
+	// accidentally succeed via the full-access identity used by other fixtures.
+	sd, e := windows.SecurityDescriptorFromString("D:P(A;;FA;;;S-1-5-80-2827915021-3673354303-1056739677-2648886565-40618300)(A;;" + pipeClientACL + ";;;" + user.User.Sid.String() + ")")
+	if e != nil {
+		t.Fatal(e)
+	}
+	sa := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}
+	mode := uint32(windows.PIPE_TYPE_MESSAGE | windows.PIPE_READMODE_MESSAGE | windows.PIPE_NOWAIT | windows.PIPE_REJECT_REMOTE_CLIENTS)
+	h, e := windows.CreateNamedPipe(windows.StringToUTF16Ptr(name), windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_FIRST_PIPE_INSTANCE, mode, 2, 4096, 64, 0, &sa)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer windows.CloseHandle(h)
+	client, e := windows.CreateFile(windows.StringToUTF16Ptr(name), pipeClientRights, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED|windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
+	if e != nil {
+		t.Fatal("explicit reader could not open client endpoint", e)
+	}
+	windows.CloseHandle(client)
+	second, e := windows.CreateNamedPipe(windows.StringToUTF16Ptr(name), windows.PIPE_ACCESS_DUPLEX, mode, 2, 4096, 64, 0, &sa)
+	if e == nil {
+		windows.CloseHandle(second)
+		t.Fatal("reader could create a server instance")
+	}
+	if e != windows.ERROR_ACCESS_DENIED {
+		t.Fatal("instance refusal was not the access boundary", e)
+	}
+	fmt.Println("BROKER_ASSERTION EXPLICIT_READER_OPENS_WITHOUT_SERVER_AUTHORITY PASS CANARY_ONLY")
+}
+
 func TestCanaryProbeUnresponsiveServer(t *testing.T) {
 	name := fmt.Sprintf(`\\.\pipe\ResearchOSCanarySilentTest-%d-%d`, os.Getpid(), time.Now().UnixNano())
 	h, e := windows.CreateNamedPipe(windows.StringToUTF16Ptr(name), windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_FIRST_PIPE_INSTANCE, windows.PIPE_TYPE_MESSAGE|windows.PIPE_READMODE_MESSAGE|windows.PIPE_NOWAIT|windows.PIPE_REJECT_REMOTE_CLIENTS, 1, 4096, 64, 0, nil)
