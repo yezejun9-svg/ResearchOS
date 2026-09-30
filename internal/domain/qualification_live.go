@@ -176,7 +176,51 @@ func (s *Service) acceptQualification(tx *sql.Tx, p Principal, project string, b
 	}
 	o := Object{"id": ID(), "project_id": project, "revision": 1, "created_at": Now(), "subject_ref": r, "run_id": nil, "contract_hash": qualificationContract(q), "input_refs": []any{q["dataset_artifact_ref"], q["holdout_artifact_ref"]}, "artifact_refs": []any{Ref(evidence, "Artifact")}, "checks": checks, "verdict": "PASS", "verifier_principal_id": p.ID, "executor_principal_ids": authors, "independence_basis": "DETERMINISTIC_SERVICE", "blocking_conflict_ids": Empty(), "qualification_ids": Empty(), "policy_revision": state["policy_revision"], "measurement_mode": "LIVE", "reason": "Completed protected evaluation accepted as evidence; the model has no automatic qualification."}
 	o["receipt_hash"] = Receipt(o)
+	if e = qualificationReceiptBinding(q, o, authors, p.ID, state["policy_revision"], o["artifact_refs"]); e != nil {
+		return nil, e
+	}
 	return o, s.put(tx, "AcceptanceReceipt", o)
+}
+
+// The live writer and offline upgrade use the same evidence semantics. Callers
+// supply the exact accepted DRAFT, its actual input authors and policy snapshot.
+// This validates preserved evidence; it does not issue verification authority.
+func qualificationReceiptBinding(q, receipt Object, authors []any, verifier string, policy, testRefs any) error {
+	if q["status"] != "DRAFT" || receipt["project_id"] != q["project_id"] || Hash(receipt["revision"]) != Hash(1) ||
+		receipt["verdict"] != "PASS" || receipt["receipt_hash"] != Receipt(receipt) || receipt["contract_hash"] != qualificationContract(q) ||
+		Hash(receipt["subject_ref"]) != Hash(Ref(q, "Qualification")) || verifier == "" || receipt["verifier_principal_id"] != verifier ||
+		receipt["measurement_mode"] != "LIVE" || Hash(receipt["policy_revision"]) != Hash(policy) || receipt["run_id"] != nil ||
+		Hash(testRefs) != Hash(receipt["artifact_refs"]) || len(Arr(receipt, "artifact_refs")) != 1 ||
+		Hash(receipt["input_refs"]) != Hash([]any{q["dataset_artifact_ref"], q["holdout_artifact_ref"]}) ||
+		len(authors) == 0 || Hash(receipt["executor_principal_ids"]) != Hash(authors) || receipt["independence_basis"] != "DETERMINISTIC_SERVICE" ||
+		len(Arr(receipt, "blocking_conflict_ids")) != 0 || len(Arr(receipt, "qualification_ids")) != 0 {
+		return Fail(422, "GATE_FAILED", "independent evaluation acceptance does not bind this result")
+	}
+	for _, author := range authors {
+		if author == "" || author == verifier {
+			return Fail(422, "GATE_FAILED", "evaluation input registrar cannot independently accept it")
+		}
+	}
+	checks := Arr(receipt, "checks")
+	if len(checks) != len(qualificationChecks) {
+		return Fail(422, "GATE_FAILED", "all frozen qualification checks required")
+	}
+	seen := map[string]bool{}
+	for _, value := range checks {
+		check, ok := value.(map[string]any)
+		if !ok {
+			return Fail(422, "GATE_FAILED", "invalid qualification check")
+		}
+		id, known := Str(check, "check_id"), false
+		for _, expected := range qualificationChecks {
+			known = known || id == expected
+		}
+		if !known || seen[id] || check["status"] != "PASS" || check["command_key"] != "test.jev.live" || Hash(check["exit_code"]) != Hash(0) || Hash(check["evidence_refs"]) != Hash(receipt["artifact_refs"]) {
+			return Fail(422, "GATE_FAILED", "qualification check differs from frozen evidence")
+		}
+		seen[id] = true
+	}
+	return nil
 }
 
 func (s *Service) recordQualificationResult(tx *sql.Tx, p Principal, project, id string, b Object, proof *preparedQualification) (Object, error) {
@@ -184,7 +228,7 @@ func (s *Service) recordQualificationResult(tx *sql.Tx, p Principal, project, id
 	if e != nil {
 		return nil, e
 	}
-	counts, _, e := s.qualificationBinding(tx, p, project, q, proof)
+	counts, authors, e := s.qualificationBinding(tx, p, project, q, proof)
 	if e != nil {
 		return nil, e
 	}
@@ -196,8 +240,8 @@ func (s *Service) recordQualificationResult(tx *sql.Tx, p Principal, project, id
 	if e != nil {
 		return nil, e
 	}
-	if receipt["verdict"] != "PASS" || receipt["receipt_hash"] != Receipt(receipt) || receipt["contract_hash"] != qualificationContract(q) || Hash(receipt["subject_ref"]) != Hash(Ref(q, "Qualification")) || receipt["verifier_principal_id"] != p.ID || receipt["measurement_mode"] != "LIVE" || Hash(receipt["policy_revision"]) != Hash(state["policy_revision"]) || Hash(b["test_receipt_refs"]) != Hash(receipt["artifact_refs"]) || len(Arr(receipt, "artifact_refs")) != 1 {
-		return nil, Fail(422, "GATE_FAILED", "independent evaluation acceptance does not bind this result")
+	if e = qualificationReceiptBinding(q, receipt, authors, p.ID, state["policy_revision"], b["test_receipt_refs"]); e != nil {
+		return nil, e
 	}
 	value, e := s.artifactJSON(tx, project, Arr(receipt, "artifact_refs")[0].(map[string]any))
 	if e != nil {

@@ -5,12 +5,14 @@ package domain
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"researchos.local/research-os/adapters/protectedstore"
 	"researchos.local/research-os/internal/store"
@@ -516,6 +518,7 @@ func upgradeQualifications(db *sql.DB, summary protectedstore.SafeSummary) error
 		return e
 	}
 	for _, q := range qualifications {
+		authors := map[string]bool{}
 		f := summary.Frozen
 		if q["label_basis"] != "OBJECTIVE" || q["thresholds_hash"] != QualificationThresholdsHash() || q["thresholds_frozen_at"] != f.FrozenAt || q["maximum_mode"] != "ADVISORY" || (q["status"] != "DRAFT" && q["status"] != "FAILED") {
 			return fmt.Errorf("UPGRADE_QUALIFICATION_BINDING")
@@ -538,6 +541,7 @@ func upgradeQualifications(db *sql.DB, summary protectedstore.SafeSummary) error
 			if err != nil {
 				return err
 			}
+			authors[Str(artifact, "produced_by")] = true
 			if name == "dataset_artifact_ref" {
 				if artifact["access_class"] != "PROJECT" || artifact["content_hash"] != frozenDevelopmentDatasetHash {
 					return fmt.Errorf("UPGRADE_QUALIFICATION_DEVELOPMENT")
@@ -560,21 +564,61 @@ func upgradeQualifications(db *sql.DB, summary protectedstore.SafeSummary) error
 			return e
 		}
 		receipt, err := Decode([]byte(raw))
-		if err != nil || receipt["receipt_hash"] != Receipt(receipt) || receipt["verdict"] != "PASS" || receipt["measurement_mode"] != "LIVE" || receipt["contract_hash"] != qualificationContract(q) || Hash(q["test_receipt_refs"]) != Hash(receipt["artifact_refs"]) || len(Arr(receipt, "artifact_refs")) != 1 {
+		if err != nil {
 			return fmt.Errorf("UPGRADE_QUALIFICATION_ACCEPTANCE")
 		}
-		for _, executor := range Arr(receipt, "executor_principal_ids") {
-			if executor == receipt["verifier_principal_id"] {
-				return fmt.Errorf("UPGRADE_QUALIFICATION_INDEPENDENCE")
-			}
+		subject, ok := receipt["subject_ref"].(map[string]any)
+		if !ok || subject["id"] != q["id"] {
+			return fmt.Errorf("UPGRADE_QUALIFICATION_SUBJECT")
+		}
+		draft, err := upgradeVersion(db, Str(q, "project_id"), "Qualification", subject)
+		if err != nil || draft["status"] != "DRAFT" || draft["project_id"] != q["project_id"] || qualificationContract(draft) != qualificationContract(q) {
+			return fmt.Errorf("UPGRADE_QUALIFICATION_SUBJECT")
+		}
+		// recordQualificationResult only transitions this exact DRAFT once. Do
+		// not compare the receipt to the later FAILED object or a current Ref.
+		expected := copyObject(draft)
+		for _, field := range []string{"status", "maximum_mode", "jev_called", "critical_false_accept_count", "false_accept_rate", "false_reject_rate", "abstain_rate", "test_receipt_refs", "acceptance_id"} {
+			expected[field] = q[field]
+		}
+		if bump(expected) != nil {
+			return fmt.Errorf("UPGRADE_QUALIFICATION_SUBJECT")
+		}
+		expected["updated_at"] = q["updated_at"]
+		if Hash(expected) != Hash(q) {
+			return fmt.Errorf("UPGRADE_QUALIFICATION_SUBJECT")
+		}
+		policy, err := upgradeAcceptancePolicy(db, Str(q, "project_id"), receipt)
+		if err != nil {
+			return err
+		}
+		authorIDs := make([]string, 0, len(authors))
+		for id := range authors {
+			authorIDs = append(authorIDs, id)
+		}
+		sort.Strings(authorIDs)
+		actualAuthors := Empty()
+		for _, id := range authorIDs {
+			actualAuthors = append(actualAuthors, id)
+		}
+		if qualificationReceiptBinding(draft, receipt, actualAuthors, Str(receipt, "verifier_principal_id"), policy, q["test_receipt_refs"]) != nil {
+			return fmt.Errorf("UPGRADE_QUALIFICATION_ACCEPTANCE")
 		}
 		ref, ok := Arr(receipt, "artifact_refs")[0].(map[string]any)
 		if !ok {
 			return fmt.Errorf("UPGRADE_QUALIFICATION_SUMMARY")
 		}
 		artifact, err := upgradeVersion(db, Str(q, "project_id"), "Artifact", ref)
-		if err != nil || artifact["access_class"] != "PROJECT" {
+		if err != nil || artifact["access_class"] != "PROJECT" || artifact["measurement_mode"] != "LIVE" || artifact["evidence_kind"] != "OBSERVED" || artifact["kind"] != "REPORT" || artifact["run_id"] != nil || artifact["produced_by"] != receipt["verifier_principal_id"] {
 			return fmt.Errorf("UPGRADE_QUALIFICATION_SUMMARY")
+		}
+		// Preserved registration semantics, not a currently usable credential.
+		var roles string
+		var granted int
+		principal := Principal{ID: Str(receipt, "verifier_principal_id")}
+		if db.QueryRow("SELECT roles FROM auth_principals WHERE id=?", principal.ID).Scan(&roles) != nil || json.Unmarshal([]byte(roles), &principal.Roles) != nil || !principal.HasRole("VERIFIER") ||
+			db.QueryRow("SELECT count(*) FROM auth_grants WHERE principal=? AND project=? AND task='' AND run='' AND restricted=1", principal.ID, q["project_id"]).Scan(&granted) != nil || granted != 1 {
+			return fmt.Errorf("UPGRADE_QUALIFICATION_INDEPENDENCE")
 		}
 		var public []byte
 		if e = db.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", q["project_id"], artifact["storage_key"]).Scan(&public); e != nil {
@@ -586,6 +630,42 @@ func upgradeQualifications(db *sql.DB, summary protectedstore.SafeSummary) error
 		}
 	}
 	return nil
+}
+
+// Resolve the policy in force when the immutable receipt was written, never
+// the current policy, which can legitimately change after qualification.
+func upgradeAcceptancePolicy(db *sql.DB, project string, receipt Object) (any, error) {
+	accepted, e := time.Parse(time.RFC3339Nano, Str(receipt, "created_at"))
+	if e != nil {
+		return nil, fmt.Errorf("UPGRADE_QUALIFICATION_POLICY")
+	}
+	rows, e := db.Query("SELECT body FROM domain_versions WHERE project=? AND kind='ProjectState' ORDER BY revision DESC", project)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		if e = rows.Scan(&raw); e != nil {
+			return nil, e
+		}
+		state, err := Decode([]byte(raw))
+		if err != nil {
+			return nil, err
+		}
+		stamp := Str(state, "updated_at")
+		if stamp == "" {
+			stamp = Str(state, "created_at")
+		}
+		when, err := time.Parse(time.RFC3339Nano, stamp)
+		if err != nil {
+			return nil, fmt.Errorf("UPGRADE_QUALIFICATION_POLICY")
+		}
+		if !when.After(accepted) {
+			return state["policy_revision"], nil
+		}
+	}
+	return nil, fmt.Errorf("UPGRADE_QUALIFICATION_POLICY")
 }
 
 // Only hashes/counts escape this in-memory control-plane inventory. Protected
