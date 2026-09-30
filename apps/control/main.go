@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"researchos.local/research-os/adapters/protectedstore"
 	"researchos.local/research-os/internal/api"
 	"researchos.local/research-os/internal/domain"
 	"researchos.local/research-os/internal/store"
@@ -30,10 +31,12 @@ func main() {
 	credentialFile := flag.String("credential-file", "", "private local output path")
 	importSpec := flag.String("import-spec", "", "import a pinned specification directory as the initial ResearchOS goal")
 	manifestHash := flag.String("manifest-sha256", "", "trusted sha256 digest of the complete package manifest")
+	importJev := flag.String("import-jev", "", "register the completed frozen evaluation in this project; independent acceptance remains required")
+	developmentFile := flag.String("development-file", "evaluation/development/jev-v2/dataset.json", "hash-pinned public development corpus")
 	flag.Parse()
 	dataDir := setting("RESEARCHOS_DATA_DIR", filepath.Join(".local", "data"))
 	webDir := setting("RESEARCHOS_WEB_DIR", filepath.Join("apps", "web", "dist"))
-	if _, err := os.Stat(filepath.Join(webDir, "index.html")); err != nil && !*bootstrapOwner && *importSpec == "" {
+	if _, err := os.Stat(filepath.Join(webDir, "index.html")); err != nil && !*bootstrapOwner && *importSpec == "" && *importJev == "" {
 		log.Fatalf("web build unavailable: %v", err)
 	}
 	db, err := store.Open(filepath.Join(dataDir, "researchos.sqlite"))
@@ -48,6 +51,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("domain unavailable: %v", err)
 	}
+	service.Protected = &protectedstore.FrozenProvider{}
 	if *bootstrapOwner {
 		if *credentialFile == "" {
 			log.Fatal("credential-file required")
@@ -55,6 +59,26 @@ func main() {
 		if err = bootstrap(service, *credentialFile); err != nil {
 			log.Fatalf("Owner bootstrap failed: %v", err)
 		}
+		return
+	}
+	if *importJev != "" {
+		raw, e := os.ReadFile(*credentialFile)
+		if e != nil {
+			log.Fatal("private credential file required")
+		}
+		credential, e := domain.Decode(raw)
+		if e != nil {
+			log.Fatal("invalid credential file")
+		}
+		development, e := os.ReadFile(*developmentFile)
+		if e != nil {
+			log.Fatal("public development corpus unavailable")
+		}
+		result, e := service.ImportFrozenQualifications(context.Background(), domain.Str(credential, "token"), *importJev, development)
+		if e != nil {
+			log.Fatalf("evaluation registration failed: %v", e)
+		}
+		json.NewEncoder(os.Stdout).Encode(result)
 		return
 	}
 	if *importSpec != "" {
