@@ -146,6 +146,13 @@ func (s *Service) RegisterProtectedArtifact(ctx context.Context, token, project,
 	if e = s.put(tx, "Artifact", artifact); e != nil {
 		return nil, e
 	}
+	for _, field := range []string{"input_refs", "source_refs"} {
+		for _, ref := range Arr(b, field) {
+			if _, e = s.impactLink(tx, project, Object{"from_ref": Ref(artifact, "Artifact"), "to_ref": ref, "relation": "DERIVED_FROM", "basis": "DETERMINISTIC", "evidence_refs": Empty()}); e != nil {
+				return nil, e
+			}
+		}
+	}
 	if e = s.event(tx, project, "Artifact", artifact, p.ID, ID(), "PROJECT_UPDATED"); e != nil {
 		return nil, e
 	}
