@@ -33,10 +33,21 @@ func main() {
 	manifestHash := flag.String("manifest-sha256", "", "trusted sha256 digest of the complete package manifest")
 	importJev := flag.String("import-jev", "", "register the completed frozen evaluation in this project; independent acceptance remains required")
 	developmentFile := flag.String("development-file", "evaluation/development/jev-v2/dataset.json", "hash-pinned public development corpus")
+	provision := flag.String("provision-principal", "", "trusted local administration: principal JSON to provision")
+	issue := flag.String("issue-credential", "", "trusted local administration: existing principal ID")
 	flag.Parse()
+	adminActions := 0
+	for _, active := range []bool{*bootstrapOwner, *importSpec != "", *importJev != "", *provision != "", *issue != ""} {
+		if active {
+			adminActions++
+		}
+	}
+	if adminActions > 1 {
+		log.Fatal("choose one local administrative action")
+	}
 	dataDir := setting("RESEARCHOS_DATA_DIR", filepath.Join(".local", "data"))
 	webDir := setting("RESEARCHOS_WEB_DIR", filepath.Join("apps", "web", "dist"))
-	if _, err := os.Stat(filepath.Join(webDir, "index.html")); err != nil && !*bootstrapOwner && *importSpec == "" && *importJev == "" {
+	if _, err := os.Stat(filepath.Join(webDir, "index.html")); err != nil && adminActions == 0 {
 		log.Fatalf("web build unavailable: %v", err)
 	}
 	db, err := store.Open(filepath.Join(dataDir, "researchos.sqlite"))
@@ -52,6 +63,12 @@ func main() {
 		log.Fatalf("domain unavailable: %v", err)
 	}
 	service.Protected = &protectedstore.FrozenProvider{}
+	if *provision != "" || *issue != "" {
+		if e := adminCredential(service, *provision, *issue, *credentialFile); e != nil {
+			log.Fatalf("local credential administration failed: %v", e)
+		}
+		return
+	}
 	if *bootstrapOwner {
 		if *credentialFile == "" {
 			log.Fatal("credential-file required")
