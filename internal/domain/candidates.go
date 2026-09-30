@@ -97,6 +97,9 @@ func (s *Service) ReviewResearchCandidate(ctx context.Context, token, project, c
 			if experiment["cycle_id"] != cycleID || experiment["status"] != "COMPLETED" || experiment["outcome"] != "IMPROVED" || experiment["acceptance_id"] == nil {
 				return nil, Fail(422, "GATE_FAILED", "adoption recommendation requires independently accepted improvement")
 			}
+			if _, e = s.experimentAcceptance(tx, project, experiment, Str(experiment, "acceptance_id")); e != nil {
+				return nil, e
+			}
 		}
 	}
 	review := Object{"project_id": project, "cycle_id": cycleID, "evidence_id": evidenceID, "profile_revision": profile["revision"],
