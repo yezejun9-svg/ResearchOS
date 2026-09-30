@@ -12,6 +12,13 @@ with tempfile.TemporaryDirectory(prefix='researchos-audit-check-') as directory:
     sample.write_bytes(b'{"actual":true}')
     frozen = {'raw.json': audit.digest(sample)}
     audit.check_hashes(root, frozen)
+    assert audit.hashed_bytes(root, 'raw.json', frozen) == sample.read_bytes()
+    try:
+        audit.hashed_bytes(root, 'raw.json', {'unrelated.json': frozen['raw.json']})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('unlisted consumed evidence accepted')
     sample.write_bytes(b'{"actual":false}')
     for inventory in (frozen, {}, {'missing': frozen['raw.json']}, {str(root.parent / 'outside'): frozen['raw.json']}):
         try:
