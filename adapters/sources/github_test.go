@@ -13,13 +13,42 @@ import (
 
 type blockedTransport struct{}
 
+// Match the domain fixture startup rule: discard unreachable listeners before
+// exposing a URL. Only the reserved readiness endpoint may be retried.
+func sourceFixtureServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	for attempt := 0; attempt < 3; attempt++ {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/__researchos_fixture_ready__" {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			handler.ServeHTTP(w, r)
+		}))
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/__researchos_fixture_ready__", nil)
+		response, err := server.Client().Do(request)
+		cancel()
+		if response != nil {
+			response.Body.Close()
+		}
+		if err == nil && response.StatusCode == http.StatusNoContent {
+			return server
+		}
+		server.Close()
+		t.Logf("fixture listener %d failed before business IO: %v", attempt+1, err)
+	}
+	t.Fatal("fixture HTTP unavailable on three fresh listeners")
+	return nil
+}
+
 func (blockedTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, context.DeadlineExceeded
 }
 
 func TestW07GitHubReleaseBodyAndCommit(t *testing.T) {
 	const sha = "0123456789abcdef0123456789abcdef01234567"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/repos/paperclipai/paperclip/releases":
 			if r.URL.Query().Get("page") == "1" {
@@ -56,7 +85,7 @@ func TestW07GitHubReleaseBodyAndCommit(t *testing.T) {
 }
 
 func TestW07GitHubRateLimitAndUnsafeQuery(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Retry-After", "60"); w.WriteHeader(429) }))
+	server := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Retry-After", "60"); w.WriteHeader(429) }))
 	defer server.Close()
 	from := time.Now().UTC().Add(-time.Hour)
 	to := time.Now().UTC().Add(time.Hour)
@@ -93,7 +122,7 @@ func TestW07GitHubFaultsDoNotCompleteWindow(t *testing.T) {
 		{"detail_not_found", release, "", 404, "", "NOT_FOUND"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if strings.HasSuffix(r.URL.Path, "/releases") {
 					if tc.link != "" {
 						w.Header().Set("Link", tc.link)
@@ -126,9 +155,9 @@ func TestW07GitHubFaultsDoNotCompleteWindow(t *testing.T) {
 
 func TestW07GitHubRejectsForeignRedirectBeforeRequest(t *testing.T) {
 	foreignHits := 0
-	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { foreignHits++; fmt.Fprint(w, `[]`) }))
+	foreign := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { foreignHits++; fmt.Fprint(w, `[]`) }))
 	defer foreign.Close()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, foreign.URL+"/elsewhere", http.StatusFound)
 	}))
 	defer server.Close()
@@ -144,7 +173,7 @@ func TestW07GitHubEmptyAuthAndTimeoutAreDistinct(t *testing.T) {
 	from, _ := time.Parse(time.RFC3339, "2026-09-28T00:00:00Z")
 	to, _ := time.Parse(time.RFC3339, "2026-09-30T00:00:00Z")
 	q := Query{SourceID: "g", Text: "repo:owner/repo", From: from, To: to, Limit: 1}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("page") == "1" {
 			fmt.Fprint(w, "[]")
 		}
@@ -160,7 +189,7 @@ func TestW07GitHubEmptyAuthAndTimeoutAreDistinct(t *testing.T) {
 	if !errors.Is(e, context.DeadlineExceeded) || p.Failure != "TIMEOUT_OR_NETWORK" || p.Complete {
 		t.Fatalf("timeout lost: %+v %v", p, e)
 	}
-	unauthorized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401) }))
+	unauthorized := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401) }))
 	defer unauthorized.Close()
 	a.BaseURL = unauthorized.URL
 	a.Client = unauthorized.Client()
@@ -175,7 +204,7 @@ func TestW07GitHubCursorKeepsPageSizeAndRejectsNull(t *testing.T) {
 	from, _ := time.Parse(time.RFC3339, "2026-09-28T00:00:00Z")
 	to, _ := time.Parse(time.RFC3339, "2026-09-30T00:00:00Z")
 	requestCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
 		if r.URL.Query().Get("page") == "1" {
 			w.Header().Set("Link", `<https://api.github.com/next>; rel="next"`)

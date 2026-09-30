@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -37,7 +36,7 @@ func validFixturePDF() []byte {
 
 func TestW07ArxivFullPDFAndVersion(t *testing.T) {
 	pdf := validFixturePDF()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/query":
 			if r.URL.Query().Get("id_list") != "2304.03442v2" {
@@ -69,7 +68,7 @@ func TestW07ArxivFullPDFAndVersion(t *testing.T) {
 }
 
 func TestW07ArxivMetadataCannotPassForFullText(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/query" {
 			fmt.Fprint(w, `<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/2304.03442v2</id><published>2023-04-07T00:00:00Z</published><updated>2023-07-01T00:00:00Z</updated><author><name>Author</name></author></entry></feed>`)
 			return
@@ -88,7 +87,7 @@ func TestW07ArxivMetadataCannotPassForFullText(t *testing.T) {
 }
 
 func TestW07ArxivChunkedPDFPrefixCannotPass(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/query" {
 			fmt.Fprint(w, `<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/2304.03442v2</id><published>2023-04-07T00:00:00Z</published><updated>2023-07-01T00:00:00Z</updated><author><name>Author</name></author></entry></feed>`)
 			return
@@ -108,9 +107,9 @@ func TestW07ArxivChunkedPDFPrefixCannotPass(t *testing.T) {
 
 func TestW07ArxivRejectsForeignRedirectBeforeRequest(t *testing.T) {
 	foreignHits := 0
-	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { foreignHits++; w.Write(validFixturePDF()) }))
+	foreign := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { foreignHits++; w.Write(validFixturePDF()) }))
 	defer foreign.Close()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/query" {
 			fmt.Fprint(w, `<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/2304.03442v2</id><published>2023-04-07T00:00:00Z</published><updated>2023-07-01T00:00:00Z</updated><author><name>Author</name></author></entry></feed>`)
 			return
@@ -142,7 +141,7 @@ func TestW07ArxivErrorPageIsNotValidEmptyFeed(t *testing.T) {
 		{"valid_empty", `<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"><opensearch:totalResults>0</opensearch:totalResults></feed>`, "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := sourceFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != "/api/query" {
 					t.Fatal("unexpected PDF request for empty/error feed")
 				}
