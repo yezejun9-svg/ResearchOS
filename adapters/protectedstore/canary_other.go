@@ -7,6 +7,7 @@ import "context"
 type CanaryStore struct{}
 
 func NewCanary(string) (*CanaryStore, error)                    { return nil, ErrUnavailable }
+func OpenCanary(string) (*CanaryStore, error)                   { return nil, ErrUnavailable }
 func (*CanaryStore) Close() error                               { return nil }
 func (*CanaryStore) Boundary(context.Context) (Boundary, error) { return Boundary{}, ErrUnavailable }
 func (*CanaryStore) Ready(context.Context, string) error        { return ErrUnavailable }
