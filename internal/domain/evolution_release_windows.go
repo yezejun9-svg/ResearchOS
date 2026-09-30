@@ -70,6 +70,20 @@ func (b releaseFixtureBarrier) Drain(ctx context.Context, p supervisor.ProcessId
 	if e := b.Ready(ctx, p, operation); e != nil {
 		return "", e
 	}
+	raw, e := os.ReadFile(releaseAdmissionPath(b.h, operation))
+	if e != nil {
+		return "", e
+	}
+	var sealed supervisor.ReleaseAdmission
+	if e = json.Unmarshal(raw, &sealed); e != nil {
+		return "", e
+	}
+	if sealed.Operation != operation {
+		return "", errors.New("drain admission changed")
+	}
+	if e = b.s.releaseAdmissionCurrent(ctx, sealed); e != nil {
+		return "", e
+	}
 	var active, unknown int
 	if e := b.s.DB.QueryRowContext(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Run' AND json_extract(body,'$.status') IN ('QUEUED','STARTING','RUNNING','CANCEL_REQUESTED','RECONCILING','LOST')`).Scan(&active); e != nil {
 		return "", e
@@ -112,11 +126,132 @@ func releaseFixtureVerifier(s *Service, h Object) supervisor.AdmissionVerifier {
 		if releasePlainDigest(frozen) != releasePlainDigest(a) || frozen.Project == "" || frozen.CandidateID == "" {
 			return errors.New("supervisor sealed admission differs")
 		}
+		if e = s.releaseAdmissionCurrent(context.Background(), a); e != nil {
+			return e
+		}
 		if e = s.verifyReleaseAuthorityBackup(context.Background(), h, a.Project, a.CandidateID, a.Operation, "sha256:"+a.HoldoutProofSHA256, a.BackupReceiptSHA256); e != nil {
+			return e
+		}
+		if e = s.releaseAdmissionCurrent(context.Background(), a); e != nil {
 			return e
 		}
 		return nil
 	}
+}
+
+func evolutionCurrentPrincipal(tx *sql.Tx, id string) (Principal, error) {
+	p := Principal{ID: id}
+	var roles string
+	if e := tx.QueryRow("SELECT roles FROM auth_principals WHERE id=? AND revoked=0", id).Scan(&roles); e != nil {
+		return p, Fail(403, "FORBIDDEN", "release evidence principal no longer active")
+	}
+	if e := json.Unmarshal([]byte(roles), &p.Roles); e != nil {
+		return p, e
+	}
+	rows, e := tx.Query("SELECT project,task,run,restricted FROM auth_grants WHERE principal=?", id)
+	if e != nil {
+		return p, e
+	}
+	for rows.Next() {
+		var g Grant
+		if e = rows.Scan(&g.ProjectID, &g.TaskID, &g.RunID, &g.Restricted); e != nil {
+			rows.Close()
+			return p, e
+		}
+		p.Grants = append(p.Grants, g)
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return p, e
+	}
+	if e = constrainRemotePrincipal(tx, &p); e != nil {
+		return p, e
+	}
+	return p, nil
+}
+
+func (s *Service) releaseActorsCurrent(tx *sql.Tx, project string, x, h, accepted Object) error {
+	verifierID := Str(accepted, "verifier_principal_id")
+	verifier, e := evolutionCurrentPrincipal(tx, verifierID)
+	if e != nil {
+		return e
+	}
+	if !verifier.HasRole("VERIFIER") || !verifier.Allowed(project, "", "", false) {
+		return Fail(403, "FORBIDDEN", "regression verifier current grant required")
+	}
+	releaseID := Str(h, "release_principal")
+	release, e := evolutionCurrentPrincipal(tx, releaseID)
+	if e != nil {
+		return e
+	}
+	if !release.HasRole("RELEASE_SERVICE") || !release.Allowed(project, "", "", false) || release.DeviceID != "" {
+		return Fail(403, "FORBIDDEN", "registered local release actor current grant required")
+	}
+	var authorID string
+	if e = tx.QueryRow("SELECT creator FROM evolution_candidates WHERE project=? AND candidate=?", project, x["id"]).Scan(&authorID); e != nil {
+		return e
+	}
+	authorRoot, e := authorityRoot(tx, authorID)
+	if e != nil {
+		return e
+	}
+	verifierRoot, e := authorityRoot(tx, verifierID)
+	if e != nil {
+		return e
+	}
+	releaseRoot, e := authorityRoot(tx, releaseID)
+	if e != nil {
+		return e
+	}
+	if authorRoot == verifierRoot || authorRoot == releaseRoot || verifierRoot == releaseRoot {
+		return Fail(403, "FORBIDDEN", "release actor, author and regression verifier must be independent")
+	}
+	return nil
+}
+
+// This callback is used by both PrepareFixture and SwitchFixture. It reads
+// current domain state, not merely the historical sealed admission or ledger.
+func (s *Service) releaseAdmissionCurrent(ctx context.Context, a supervisor.ReleaseAdmission) error {
+	tx, e := s.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	x, e := load(tx, a.Project, "SystemCandidate", a.CandidateID)
+	if e != nil {
+		return e
+	}
+	if x["status"] != "EVALUATING" || x["regression_acceptance_id"] != a.AcceptanceID {
+		return errors.New("candidate or regression acceptance changed before release effect")
+	}
+	h, e := s.evolutionCurrent(tx, a.Project, x)
+	if e != nil {
+		return e
+	}
+	if h["release_mechanism"] != releaseFixtureMechanism || h["os_service_qualified"] != false {
+		return errors.New("fixture host changed")
+	}
+	o, e := readReleaseOperationTx(tx, a.Project, a.Operation)
+	if e != nil {
+		return e
+	}
+	if o.Candidate != a.CandidateID || o.Action != "START_CANARY" || o.Epoch != a.ExpectedEpoch || o.Admission != releasePlainDigest(a) || (o.Status != "PREPARED" && o.Status != "DISPATCHED") {
+		return errors.New("release operation changed before effect")
+	}
+	record, e := s.evolutionAccepted(tx, a.Project, x, "REGRESSION", a.AcceptanceID)
+	if e != nil {
+		return e
+	}
+	request := Object{"regression_acceptance_id": a.AcceptanceID, "observation_deadline": a.ExpiresUTC.Format(time.RFC3339Nano)}
+	expected, e := s.releaseAdmissionInputs(tx, a.Project, x, h, request, record, a.ExpectedEpoch, a.BackupReceiptSHA256)
+	if e != nil {
+		return e
+	}
+	if releasePlainDigest(expected) != releasePlainDigest(a) {
+		return errors.New("current release admission differs")
+	}
+	return nil
 }
 
 func (s *Service) releaseFixtureEngine(h Object, j *supervisor.ReleaseJournal) (*supervisor.ReleaseEngine, error) {
@@ -174,6 +309,9 @@ func (s *Service) releaseAdmissionInputs(tx *sql.Tx, project string, x, h, b, re
 	acceptanceID := Str(b, "regression_acceptance_id")
 	accepted, e := load(tx, project, "AcceptanceReceipt", acceptanceID)
 	if e != nil {
+		return a, e
+	}
+	if e = s.releaseActorsCurrent(tx, project, x, h, accepted); e != nil {
 		return a, e
 	}
 	if record["improved"] != true || record["required_passed"] != true || record["holdout_summary"] == nil || record["holdout_proof_hash"] == nil {
@@ -337,6 +475,12 @@ type releaseOperation struct {
 func readReleaseOperation(db *sql.DB, project, operation string) (releaseOperation, error) {
 	var o releaseOperation
 	e := db.QueryRow(`SELECT project,candidate,action,operation_id,expected_epoch,admission_hash,effect_key,status,receipt_digest,projection_revision FROM evolution_release_operations WHERE project=? AND operation_id=?`, project, operation).Scan(&o.Project, &o.Candidate, &o.Action, &o.ID, &o.Epoch, &o.Admission, &o.EffectKey, &o.Status, &o.Receipt, &o.Revision)
+	return o, e
+}
+
+func readReleaseOperationTx(tx *sql.Tx, project, operation string) (releaseOperation, error) {
+	var o releaseOperation
+	e := tx.QueryRow(`SELECT project,candidate,action,operation_id,expected_epoch,admission_hash,effect_key,status,receipt_digest,projection_revision FROM evolution_release_operations WHERE project=? AND operation_id=?`, project, operation).Scan(&o.Project, &o.Candidate, &o.Action, &o.ID, &o.Epoch, &o.Admission, &o.EffectKey, &o.Status, &o.Receipt, &o.Revision)
 	return o, e
 }
 
