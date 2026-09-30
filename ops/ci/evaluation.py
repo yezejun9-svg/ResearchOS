@@ -2,9 +2,9 @@
 import argparse, datetime, hashlib, json, os, platform, subprocess, sys, time, uuid
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
-PROTOCOL=['PF-%02d'%i for i in range(1,13)]+['C21-COUNTS','C21-ZERO']+['C21-TAMPER-'+x for x in ('config','dataset','candidate','baseline','rubric','unknown','raw')]+['C21-STABLE','C21-VALID','C21-REGRESSION','C21-HIGH-SCORE','C21-EXIT','C21-COUNT-TAMPER']
+PROTOCOL=['PF-%02d'%i for i in range(1,13)]+['C21-COUNTS','C21-ZERO']+['C21-TAMPER-'+x for x in ('config','dataset','candidate','baseline','rubric','unknown','raw')]+['C21-STABLE','C21-VALID','C21-REGRESSION','C21-HIGH-SCORE','C21-EXIT','C21-COUNT-TAMPER']+['C21-REJECT-'+x for x in ('LAUNDERED-DUPLICATE','LAUNDERED-UNKNOWN','RAW-ROWS-MISMATCH','REPORT-ROWS-MISMATCH','AMBIGUOUS-JSON')]
 DOMAIN=[a+'-'+s for s in ('positive','negative','null','inconclusive','stable') for a in ('A07-HASH','A07-REGISTER-FIRST','A07-POSTHOC','A07-VERIFIED','A07-NO-RECEIPT','A07-METRIC-FORGE','A07-OUTCOME','A07-RECOMPUTE')]
-SANDBOX=['SANDBOX-HOST-CONTROL']+[a for mode in ('baseline','candidate') for a in ['SANDBOX-EXIT-'+mode]+['SANDBOX-'+mode+'-'+k for k in ('read_denied','write_denied','input_write_denied','network_denied','external_denied')]+['SANDBOX-RECOMPUTE-'+mode]]+['SANDBOX-TIMEOUT','SANDBOX-OBSERVED-EGRESS','SANDBOX-STABLE-UNCHANGED']
+SANDBOX=['SANDBOX-HOST-CONTROL']+[a for mode in ('baseline','candidate') for a in ['SANDBOX-EXIT-'+mode]+['SANDBOX-'+mode+'-'+k for k in ('read_denied','write_denied','input_write_denied','network_denied','external_denied')]+['SANDBOX-RECOMPUTE-'+mode]]+['SANDBOX-TIMEOUT','SANDBOX-OBSERVED-EGRESS','SANDBOX-STABLE-UNCHANGED']+['SANDBOX-REJECT-'+x for x in ('equal','output-ancestor','output-descendant')]
 def digest(p):return 'sha256:'+hashlib.sha256(p.read_bytes()).hexdigest()
 def now():return datetime.datetime.now(datetime.timezone.utc).isoformat()
 def main(family='evaluation'):
@@ -13,8 +13,8 @@ def main(family='evaluation'):
  allowed={'evaluation':{'W10-G03','C21'},'experiments':{'W10-G01','W10-G02','A07'}}[family];selector=check or case
  if task!='W10' or bool(check)==bool(case) or selector not in allowed:p.error('exactly one known W10 check/case selector is required')
  if (args.mode=='live')!=(selector=='W10-G02'):p.error('live mode is only W10-G02; fixture does not establish live qualification')
- if selector=='W10-G02':packages=['./ops/experiment_sandbox'];names=['TestNativeSandbox'];expected=SANDBOX
- elif family=='evaluation':packages=['./adapters/evaluation','./ops/experiment_sandbox'];names=['TestProtocol','TestNativeSandbox'];expected=PROTOCOL+SANDBOX
+ if selector=='W10-G02':packages=['./ops/experiment_sandbox'];names=['TestNativeSandbox','TestSandboxRootOverlap'];expected=SANDBOX
+ elif family=='evaluation':packages=['./adapters/evaluation','./ops/experiment_sandbox'];names=['TestProtocol','TestRawIntegrity','TestNativeSandbox','TestSandboxRootOverlap'];expected=PROTOCOL+SANDBOX
  else:packages=['./internal/domain'];names=['TestW10Experiment'];expected=DOMAIN
  if len(expected)!=len(set(expected)) or not expected:raise RuntimeError('empty/duplicate expectation')
  go=os.getenv('RESEARCHOS_GO','');

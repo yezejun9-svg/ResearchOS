@@ -74,7 +74,7 @@ func TestProtocol(t *testing.T) {
 	m, rows, expected := fixture(t)
 	zero := 0
 	raw := Bytes(rows)
-	r, e := Normalize(m, m, rows, raw, Digest(raw), &zero, 1)
+	r, e := Normalize(m, m, raw, Digest(raw), &zero, 1)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -88,7 +88,7 @@ func TestProtocol(t *testing.T) {
 	check(t, "C21-COUNTS", Object{"expected_count": 12, "observed_count": 11, "pass_count": 5, "fail_count": 4, "error_count": 1, "abstain_count": 1, "missing_count": 1, "duplicate_count": 1}, r["counts"])
 	empty := m
 	empty.Expected = nil
-	_, e = Normalize(empty, empty, nil, []byte("[]"), Digest([]byte("[]")), &zero, 0)
+	_, e = Normalize(empty, empty, []byte("[]"), Digest([]byte("[]")), &zero, 0)
 	check(t, "C21-ZERO", true, e != nil)
 	for _, field := range []string{"config", "dataset", "candidate", "baseline", "rubric", "unknown", "raw"} {
 		changed := m
@@ -112,7 +112,7 @@ func TestProtocol(t *testing.T) {
 		case "raw":
 			wantRaw = Digest([]byte("wrong"))
 		}
-		bad, e := Normalize(m, changed, x, Bytes(x), wantRaw, &zero, 1)
+		bad, e := Normalize(m, changed, Bytes(x), wantRaw, &zero, 1)
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -124,24 +124,24 @@ func TestProtocol(t *testing.T) {
 	for _, id := range m.Expected {
 		stable = append(stable, Result{CaseID: id, Verdict: "PASS", Hard: &hard, Reason: "stable deterministic decision"})
 	}
-	sr, _ := Normalize(m, m, stable, Bytes(stable), Digest(Bytes(stable)), &zero, 1)
+	sr, _ := Normalize(m, m, Bytes(stable), Digest(Bytes(stable)), &zero, 1)
 	check(t, "C21-STABLE", 12, sr["counts"].(Object)["pass_count"])
-	check(t, "C21-VALID", true, Validate(m, sr) == nil)
+	check(t, "C21-VALID", true, Validate(m, sr, Bytes(stable), Digest(Bytes(stable))) == nil)
 	stable[0].Verdict = "FAIL"
-	regressed, _ := Normalize(m, m, stable, Bytes(stable), Digest(Bytes(stable)), &zero, 1)
+	regressed, _ := Normalize(m, m, Bytes(stable), Digest(Bytes(stable)), &zero, 1)
 	check(t, "C21-REGRESSION", []any{"COMPLETE", 1}, []any{regressed["integrity_status"], regressed["counts"].(Object)["fail_count"]})
 	stable[0].Verdict = "PASS"
 	no := false
 	stable[0].Hard = &no
 	score := 0.99
 	stable[0].Score = &score
-	high, _ := Normalize(m, m, stable, Bytes(stable), Digest(Bytes(stable)), &zero, 1)
+	high, _ := Normalize(m, m, Bytes(stable), Digest(Bytes(stable)), &zero, 1)
 	check(t, "C21-HIGH-SCORE", "FAIL", high["results"].([]Result)[0].Verdict)
 	exit := 7
-	badExit, _ := Normalize(m, m, stable, Bytes(stable), Digest(Bytes(stable)), &exit, 1)
+	badExit, _ := Normalize(m, m, Bytes(stable), Digest(Bytes(stable)), &exit, 1)
 	check(t, "C21-EXIT", 7, *badExit["exit_code"].(*int))
 	sr["counts"].(Object)["pass_count"] = 0
-	check(t, "C21-COUNT-TAMPER", true, Validate(m, sr) != nil)
+	check(t, "C21-COUNT-TAMPER", true, Validate(m, sr, Bytes(stable), Digest(Bytes(stable))) != nil)
 	if dir := os.Getenv("W10_EVIDENCE_DIR"); dir != "" {
 		for name, v := range map[string]any{"protocol-report": r, "regressed-report": regressed, "high-score-report": high, "error-exit-report": badExit, "manifest": m, "raw-results": rows} {
 			if e = os.WriteFile(filepath.Join(dir, name+".json"), Bytes(v), 0600); e != nil {
@@ -149,4 +149,43 @@ func TestProtocol(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestRawIntegrity(t *testing.T) {
+	m, rawRows, _ := fixture(t)
+	raw := Bytes(rawRows)
+	zero := 0
+	report, e := Normalize(m, m, raw, Digest(raw), &zero, 1)
+	if e != nil {
+		t.Fatal(e)
+	}
+	report["integrity_status"] = "COMPLETE"
+	report["counts"].(Object)["duplicate_count"] = 0
+	check(t, "C21-REJECT-LAUNDERED-DUPLICATE", true, Validate(m, report, raw, Digest(raw)) != nil)
+	hard := true
+	complete := []Result{}
+	for _, id := range m.Expected {
+		complete = append(complete, Result{CaseID: id, Verdict: "PASS", Hard: &hard, Reason: "fixed"})
+	}
+	complete = append(complete, Result{CaseID: "unknown", Verdict: "PASS", Hard: &hard, Reason: "unknown"})
+	raw = Bytes(complete)
+	report, e = Normalize(m, m, raw, Digest(raw), &zero, 1)
+	if e != nil {
+		t.Fatal(e)
+	}
+	report["integrity_status"] = "COMPLETE"
+	check(t, "C21-REJECT-LAUNDERED-UNKNOWN", true, Validate(m, report, raw, Digest(raw)) != nil)
+	complete = complete[:len(complete)-1]
+	raw = Bytes(complete)
+	report, e = Normalize(m, m, raw, Digest(raw), &zero, 1)
+	if e != nil {
+		t.Fatal(e)
+	}
+	originalHash := Digest(raw)
+	complete[0].Verdict = "ERROR"
+	changed := Bytes(complete)
+	check(t, "C21-REJECT-RAW-ROWS-MISMATCH", true, Validate(m, report, changed, originalHash) != nil)
+	check(t, "C21-REJECT-REPORT-ROWS-MISMATCH", true, Validate(m, report, changed, Digest(changed)) != nil)
+	_, e = Normalize(m, m, []byte(`[{"case_id":"x","case_id":"y"}]`), Digest([]byte(`[{"case_id":"x","case_id":"y"}]`)), &zero, 1)
+	check(t, "C21-REJECT-AMBIGUOUS-JSON", true, e != nil)
 }
