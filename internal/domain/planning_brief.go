@@ -161,6 +161,10 @@ func (s *Service) planningOwner(tx *sql.Tx, project, actor string) (Principal, e
 	if e = rows.Err(); e != nil {
 		return p, e
 	}
+	rows.Close()
+	if e = constrainRemotePrincipal(tx, &p); e != nil {
+		return p, e
+	}
 	if !p.HasRole("OWNER") || !p.Allowed(project, "", "", false) {
 		return p, Fail(403, "FORBIDDEN", "original intent Owner grant no longer current")
 	}
