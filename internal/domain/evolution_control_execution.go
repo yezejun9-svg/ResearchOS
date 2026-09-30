@@ -39,6 +39,13 @@ func (s *Service) evaluateEvolutionRegression(ctx context.Context, project strin
 		return evolutionRegressionOutcome{}, err
 	}
 	defer tx.Rollback()
+	origin, err := s.controlCurrentGate(tx, h, x)
+	if err != nil {
+		return evolutionRegressionOutcome{}, err
+	}
+	if origin != nil {
+		record["current_control_origin"] = origin
+	}
 	bundle, suite, err := s.controlHostInputs(tx, project, h)
 	if err != nil {
 		return evolutionRegressionOutcome{}, err
@@ -63,6 +70,16 @@ func (s *Service) evaluateEvolutionRegression(ctx context.Context, project strin
 }
 
 func (s *Service) controlRecordValid(tx *sql.Tx, project string, x, h, r Object) error {
+	origin, currentErr := s.controlCurrentGate(tx, h, x)
+	if currentErr != nil {
+		return currentErr
+	}
+	if origin != nil {
+		stored, ok := r["current_control_origin"].(map[string]any)
+		if !ok || !controlSameExcept(origin, stored, "delta_hash") {
+			return fmt.Errorf("CONTROL_CURRENT_RECORD_ORIGIN")
+		}
+	}
 	if r["phase"] != "REGRESSION" || r["evaluation_profile"] != evolution.ControlProfile || r["pair"] != nil {
 		return Fail(422, "GATE_FAILED", "control execution cannot use calculator proof")
 	}

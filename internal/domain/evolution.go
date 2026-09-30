@@ -150,6 +150,9 @@ func (s *Service) registerEvolutionFixtureProfile(ctx context.Context, project, 
 		h["evaluation_profile"], h["protocol"], h["snapshot_ref"], h["stable_source_hash"] = evolution.ControlProfile, evolution.ControlProtocol, control.SnapshotRef, control.StableSourceHash
 		h["control_binding"], h["public_suite_hash"] = bundle.Binding, Digest(b)
 		h["policy_hash"] = Digest(evolution.Bytes(evolution.ControlPolicy(bundle.Binding, Digest(b))))
+		if control.Current != nil {
+			h["current_control"] = control.Current
+		}
 	}
 	if releaseMechanism {
 		h["release_mechanism"] = "R2_NATIVE_FIXTURE"

@@ -15,6 +15,7 @@ import (
 type controlHostRegistration struct {
 	SnapshotRef      Object
 	StableSourceHash string
+	Current          Object
 }
 
 // RegisterEvolutionControlFixture is a fresh host registration, never an update

@@ -59,6 +59,9 @@ func (s *Service) evaluateControlHoldout(ctx context.Context, project string, x 
 	if err != nil {
 		return nil, nil, err
 	}
+	if _, err = s.controlCurrentGate(tx, h, x); err != nil {
+		return nil, nil, err
+	}
 	bundle, inputs, labels, err := s.controlHoldoutInputs(tx, project, x, h, inputsRaw, labelsRaw)
 	if err != nil {
 		return nil, nil, err
