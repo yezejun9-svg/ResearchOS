@@ -289,6 +289,9 @@ func operationOwner(id string) string {
 	if strings.Contains(id, "Evidence") || strings.Contains(id, "SourceCursor") {
 		return "W07"
 	}
+	if strings.Contains(id, "Skill") {
+		return "W15"
+	}
 	if implemented[id] {
 		return "W03"
 	}
