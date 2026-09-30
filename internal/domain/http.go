@@ -257,6 +257,16 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 	case "actOnRequirement":
 		result, e = s.actRequirement(tx, project, id, b)
 		kind = "Requirement"
+	case "createExperiment":
+		result, e = s.createExperiment(tx, project, b)
+		kind = "Experiment"
+		status = 201
+	case "registerExperiment":
+		result, e = s.registerExperiment(tx, project, id, b)
+		kind = "Experiment"
+	case "recordExperimentResult":
+		result, e = s.recordExperimentResult(tx, project, id, b)
+		kind = "Experiment"
 	case "createGoal":
 		result, e = s.createGoal(tx, project, b)
 		kind = "Goal"

@@ -1,0 +1,15 @@
+# W10 evaluation development slice
+
+Status: DEVELOPMENT_ONLY / EXECUTION_REPORTED. W05 live runtime and W06-G03 remain blocked by RQ-W05-CLI-POLICY-001; no Jev qualification or formal holdout exists here. W17 owns the independent OS holdout boundary.
+
+`createExperiment`, `registerExperiment`, `recordExperimentResult` use the existing HTTP transaction, If-Match, idempotency, project permission and outbox paths. Registered plan fields are immutable in SQLite. A new rubric needs a new experiment. `BindExperimentTask` binds an existing task before claim; W12 can resolve its experiment budget from `experiment_tasks`. `BeginExperiment` accepts an existing QUEUED Run and enforces frozen inputs, registration time, attempt and parallel limits. These are local scheduler hooks, not a second scheduler or public endpoint.
+
+`experiments.paired-mean-v1` is the narrow deterministic verification command. The frozen check expected JSON contains unique `expected_case_ids`. Each metric preserves those IDs and paired baseline/candidate decimal arrays; unknown measurements stay null. Means use exact rational accumulation and eight decimal places. The existing independent AcceptanceService recomputes means/outcome from a sealed artifact. The Experiment result operation requires the current accepted Task receipt, matching policy/input/output/contract/run bindings, and exact result bytes. A verified negative/null observation does not imply adoption.
+
+`adapters/evaluation` reconciles each expected ID once, preserves ERROR/ABSTAIN/MISSING and duplicate counts, rejects unknown IDs/version/hash/count mismatches, and never lets a score override hard gates. EvaluationReport is evidence only. Summary copies allowlisted structured fields, not case content. Protocol fixtures are not Jev evidence.
+
+`ops/experiment_sandbox` creates a fresh Windows AppContainer SID without capabilities and starts a bounded Job Object with one process and 256 MiB process memory. Only caller-owned input/output staging roots receive grants; input is read/execute and output is writable. System platform files and the OS-created AppContainer storage retain Windows grants. Temporary stdout/stderr handles are the only inherited handles. The process receives no user credentials. Real OS probes test host private-file read/write denial, input write denial, external socket denial, loopback zero arrivals, and timeout termination. This does not qualify formal holdout isolation.
+
+Promptfoo qualification is in `qualification/evaluation`; version 0.123.1 from source baseline 822caba35e9fda7a5f300721477efe7c9194865a, MIT. Product dependencies are unchanged. Qualification is still in progress; no engine PASS is asserted by the initial development slice.
+
+Run selectors through `ops/ci/experiments.py --mode fixture` with task W10/check W10-G01, or `ops/ci/evaluation.py --mode fixture` with W10/check W10-G03. Exact check/case selection is mandatory, unknown selectors fail, and zero/missing/duplicate assertions fail. W10-G02 currently measures the native sandbox pair only; full domain-to-native integration is pending and it is not stage acceptance.
