@@ -103,6 +103,7 @@ def main():
     require(rejected['experiment_id'] == candidate['experiment_id'] == experiment['id'] and experiment['outcome'] == 'NO_IMPROVEMENT' and execution['improved'] is False, 'experiment binding changed')
     for key, field in [('stable_artifact_ref', 'baseline_hash'), ('candidate_artifact_ref', 'candidate_hash')]:
         require(rejected[key] == candidate[key] and candidate[key]['content_hash'] == execution[field], 'sealed build identity changed')
+    require(locator['stable_build_sha256'] == execution['baseline_hash'] and locator['candidate_build_sha256'] == execution['candidate_hash'], 'protected proof build locator changed')
     require(regression['acceptance']['verdict'] == 'PASS' and rejected['regression_acceptance_id'] == regression['acceptance']['id'], 'rejection lacks exact accepted regression')
     require(benefit['frozen_case_count'] >= 2 and benefit['baseline_correct'] == benefit['candidate_correct'] and benefit['outcome_gain'] is False and benefit['new_score'] > benefit['old_score'] and benefit['new_rubric'] != benefit['old_rubric'], 'score-only benefit was misstated')
     require(conclusion['quality_improved'] is False and conclusion['project_closed'] is False and conclusion['experiment_outcome'] == benefit['experiment_outcome'] == 'NO_IMPROVEMENT' and conclusion['real_world_gain'] == 'NOT_ESTABLISHED', 'final quality or project closure claim changed')
