@@ -33,6 +33,7 @@ type ReleaseState struct {
 	Admission       string            `json:"admission,omitempty"`
 	AdmissionBundle *ReleaseAdmission `json:"admission_bundle,omitempty"`
 	DrainReceipt    string            `json:"drain_receipt,omitempty"`
+	DrainNonce      string            `json:"drain_nonce,omitempty"`
 	PID             uint32            `json:"pid,omitempty"`
 	CreatedNS       int64             `json:"created_ns,omitempty"`
 	ImageSHA256     string            `json:"image_sha256,omitempty"`
@@ -91,6 +92,9 @@ func validReleaseState(s ReleaseState) error {
 	if s.DrainReceipt != "" && !validDigest(s.DrainReceipt) {
 		return errors.New("invalid drain receipt")
 	}
+	if s.DrainNonce != "" && !validDigest(s.DrainNonce) {
+		return errors.New("invalid drain nonce")
+	}
 	if s.ImageSHA256 != "" && !validDigest(s.ImageSHA256) {
 		return errors.New("invalid process image digest")
 	}
@@ -100,7 +104,7 @@ func validReleaseState(s ReleaseState) error {
 		}
 	}
 	switch s.Phase {
-	case "STARTING", "STABLE", "PREPARED", "DRAINED", "SWITCHED", "CANARY", "ROLLBACK_PREPARED", "RECOVERING", "ROLLED_BACK":
+	case "STARTING", "STABLE", "PREPARED", "DRAIN_UNKNOWN", "DRAINED", "EXIT_UNKNOWN", "SWITCHED", "CANARY", "ROLLBACK_PREPARED", "RECOVERING", "ROLLED_BACK":
 	default:
 		return errors.New("unknown release phase")
 	}

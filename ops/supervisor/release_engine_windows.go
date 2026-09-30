@@ -172,15 +172,16 @@ func (e *ReleaseEngine) SwitchFixture(ctx context.Context, operation string) (Re
 	}
 	proof, err := e.barrier.Drain(ctx, processIn(s), operation)
 	if err != nil || !validDigest(proof) {
-		return s, errors.New("stable drain receipt absent")
+		return e.journal.State(), errors.New("stable drain receipt absent")
 	}
+	s.DrainNonce = e.journal.State().DrainNonce
 	s.DrainReceipt = proof
 	s.Phase = "DRAINED"
 	if err = e.journal.Append(s); err != nil {
 		return s, err
 	}
 	if err = e.driver.Stop(processIn(s)); err != nil {
-		return s, err
+		return e.journal.State(), err
 	}
 	alive, err := e.driver.Alive(processIn(s))
 	if err != nil || alive {
@@ -277,7 +278,7 @@ func (e *ReleaseEngine) Reconcile() (ReleaseState, error) {
 	if e.journal.Sequence() == 0 {
 		return s, nil
 	}
-	if s.Phase == "STARTING" || s.Phase == "SWITCHED" || s.Phase == "DRAINED" || s.Phase == "ROLLBACK_PREPARED" || s.Phase == "RECOVERING" {
+	if s.Phase == "STARTING" || s.Phase == "SWITCHED" || s.Phase == "DRAIN_UNKNOWN" || s.Phase == "EXIT_UNKNOWN" || s.Phase == "DRAINED" || s.Phase == "ROLLBACK_PREPARED" || s.Phase == "RECOVERING" {
 		return s, errors.New("uncertain release side effect; manual reconciliation required")
 	}
 	if s.PID == 0 {
