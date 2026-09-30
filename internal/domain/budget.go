@@ -52,6 +52,18 @@ func (s *Service) resourcePolicyTarget(tx *sql.Tx, project, id, op string, b Obj
 }
 
 func (s *Service) resourceOperation(tx *sql.Tx, p Principal, project, id string, b Object, op string) (Object, string, int, error) {
+	if op == "advanceNoProgress" {
+		o, e := s.advanceNoProgress(tx, p, project, id, b)
+		return o, "NoProgressRecord", 200, e
+	}
+	if op == "createResourceRequest" {
+		o, e := s.createResourceRequest(tx, project, b)
+		return o, "ResourceRequest", 201, e
+	}
+	if op == "resolveResourceRequest" {
+		o, e := s.resolveResourceRequest(tx, p, project, id, b)
+		return o, "ResourceRequest", 200, e
+	}
 	if op == "appendBudgetLedger" {
 		o, e := s.appendBudget(tx, project, b)
 		return o, "BudgetLedgerEntry", 201, e
@@ -74,6 +86,9 @@ func (s *Service) resourceOperation(tx *sql.Tx, p Principal, project, id string,
 		if e = bump(o); e == nil {
 			e = s.put(tx, kind, o)
 		}
+		if e == nil {
+			e = s.resourcePolicyChanged(tx, p, project)
+		}
 	}
 	return o, kind, 200, e
 }
@@ -85,8 +100,11 @@ func moneyAmount(v any) (*big.Rat, error) {
 	if !ok {
 		return nil, Fail(422, "GATE_FAILED", "money required")
 	}
+	if len(Str(m, "amount")) > 4096 {
+		return nil, Fail(422, "GATE_FAILED", "decimal amount too large")
+	}
 	n, ok := new(big.Rat).SetString(Str(m, "amount"))
-	if !ok || n.Sign() < 0 || len(Str(m, "amount")) > 4096 {
+	if !ok || n.Sign() < 0 {
 		return nil, Fail(422, "GATE_FAILED", "nonnegative decimal amount required")
 	}
 	return n, nil
@@ -106,6 +124,47 @@ func budgetChain(tx *sql.Tx, project, id string) ([]Object, error) {
 		}
 		if e != nil {
 			return nil, e
+		}
+		effective, e := time.Parse(time.RFC3339Nano, Str(o, "effective_from"))
+		if e != nil {
+			return nil, e
+		}
+		if effective.After(time.Now()) {
+			rows, e := tx.Query("SELECT body FROM domain_versions WHERE project=? AND kind='BudgetPolicy' AND id=? ORDER BY revision DESC", Str(o, "project_id"), id)
+			if e != nil {
+				return nil, e
+			}
+			var active Object
+			for rows.Next() {
+				var raw string
+				if e = rows.Scan(&raw); e != nil {
+					rows.Close()
+					return nil, e
+				}
+				v, e := Decode([]byte(raw))
+				if e != nil {
+					rows.Close()
+					return nil, e
+				}
+				at, e := time.Parse(time.RFC3339Nano, Str(v, "effective_from"))
+				if e != nil {
+					rows.Close()
+					return nil, e
+				}
+				if !at.After(time.Now()) {
+					active = v
+					break
+				}
+			}
+			e = rows.Err()
+			rows.Close()
+			if e != nil {
+				return nil, e
+			}
+			if active == nil {
+				return nil, Fail(422, "GATE_FAILED", "no budget policy is effective yet")
+			}
+			o = active
 		}
 		out = append(out, o)
 		id = Str(o, "parent_policy_id")
@@ -129,6 +188,7 @@ func policyWindow(p Object, at time.Time) (time.Time, error) {
 }
 
 // Exposure is derived from immutable ledger entries, never a second balance.
+// ponytail: scans retained ledger rows; add a rebuildable indexed projection if measured ledger size requires it.
 // Settled requests replace reservations; UNKNOWN remains an unresolved liability.
 func budgetExposure(tx *sql.Tx, p Object, currency string) (*big.Rat, bool, error) {
 	rows, e := tx.Query("SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid")
@@ -160,7 +220,7 @@ func budgetExposure(tx *sql.Tx, p Object, currency string) (*big.Rat, bool, erro
 	}
 	groups := map[string][]Object{}
 	for _, o := range entries {
-		chain, e := budgetChain(tx, Str(o, "project_id"), Str(o, "policy_id"))
+		chain, _, e := runBudgetScopes(tx, Str(o, "project_id"), Str(o, "run_id"))
 		if e != nil {
 			return nil, false, e
 		}
@@ -208,6 +268,9 @@ func budgetExposure(tx *sql.Tx, p Object, currency string) (*big.Rat, bool, erro
 }
 
 func (s *Service) appendBudget(tx *sql.Tx, project string, b Object) (Object, error) {
+	if e := s.Contracts.Validate("CostEntryRequest", b); e != nil {
+		return nil, Fail(400, "INVALID_REQUEST", "invalid ledger request")
+	}
 	var prior string
 	e := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_event_id')=?", project, b["provider_event_id"]).Scan(&prior)
 	if e == nil {
@@ -231,22 +294,13 @@ func (s *Service) appendBudget(tx *sql.Tx, project string, b Object) (Object, er
 	if e != nil {
 		return nil, e
 	}
-	task, e := load(tx, project, "Task", Str(run, "task_id"))
+	chain, leaves, e := runBudgetScopes(tx, project, Str(run, "id"))
 	if e != nil {
 		return nil, e
 	}
-	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
-	if e != nil {
-		return nil, e
-	}
-	// A caller cannot select an unrelated or less restrictive scope.
-	leaf := Str(goal, "budget_policy_id")
-	if b["policy_id"] != leaf {
-		return nil, Fail(422, "GATE_FAILED", "ledger requires run goal budget scope")
-	}
-	chain, e := budgetChain(tx, project, leaf)
-	if e != nil {
-		return nil, e
+	leaf := Str(b, "policy_id")
+	if !leaves[leaf] {
+		return nil, Fail(422, "GATE_FAILED", "ledger requires a run-bound budget scope")
 	}
 	op := Str(b, "operation")
 	basis := Str(b, "cost_basis")
@@ -264,6 +318,17 @@ func (s *Service) appendBudget(tx *sql.Tx, project string, b Object) (Object, er
 		return nil, e
 	}
 	if op == "RESERVE" || op == "UNKNOWN" && count == 0 {
+		task, e := load(tx, project, "Task", Str(run, "task_id"))
+		if e != nil {
+			return nil, e
+		}
+		goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+		if e != nil {
+			return nil, e
+		}
+		if goal["status"] != "ACTIVE" || task["active_run_id"] != run["id"] {
+			return nil, Fail(409, "STATE_CONFLICT", "paused or superseded run cannot create liabilities")
+		}
 		if runTerminal(run) || run["status"] == "CANCEL_REQUESTED" {
 			return nil, Fail(409, "STATE_CONFLICT", "new liability forbidden after stop")
 		}
@@ -284,7 +349,13 @@ func (s *Service) appendBudget(tx *sql.Tx, project string, b Object) (Object, er
 			if p["mode"] != "CAPPED" {
 				continue
 			}
-			if op == "UNKNOWN" || p["enforcement"] == "STRICT" && basis != "UPPER_BOUND" {
+			if op == "UNKNOWN" {
+				if p["enforcement"] == "STRICT" || p["unknown_cost_action"] == "BLOCK" {
+					return nil, Fail(422, "GATE_FAILED", "bounded cost cannot be established")
+				}
+				continue
+			}
+			if p["enforcement"] == "STRICT" && basis != "UPPER_BOUND" {
 				return nil, Fail(422, "GATE_FAILED", "bounded cost cannot be established")
 			}
 			cap := p["cap"].(map[string]any)
@@ -296,7 +367,7 @@ func (s *Service) appendBudget(tx *sql.Tx, project string, b Object) (Object, er
 			if e != nil {
 				return nil, e
 			}
-			if unknown {
+			if unknown && (p["enforcement"] == "STRICT" || p["unknown_cost_action"] == "BLOCK") {
 				return nil, Fail(422, "GATE_FAILED", "unresolved cost prevents bounded admission")
 			}
 			n, _ := moneyAmount(money)

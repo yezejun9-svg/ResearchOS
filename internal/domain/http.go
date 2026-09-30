@@ -85,6 +85,12 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		return
 	}
 	defer tx.Rollback()
+	if resourceOperations[op.ID] && op.Method != "GET" {
+		if e = resourceWriteLock(tx); e != nil {
+			s.writeError(w, cid, e)
+			return
+		}
+	}
 	p, e := authenticate(tx, strings.TrimPrefix(auth, "Bearer "))
 	if e != nil {
 		s.writeError(w, cid, e)
@@ -362,7 +368,7 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		s.writeError(w, cid, Fail(403, "FORBIDDEN", "result references restricted content"))
 		return
 	}
-	if write && kind != "" && project != "" || op.ID == "createProject" {
+	if write && kind != "" && (project != "" || op.ID == "createProject") {
 		ep := project
 		if op.ID == "createProject" {
 			ep = Str(result, "project_id")
@@ -376,6 +382,12 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		}
 		if op.ID == "recordDecision" {
 			eventType = "DECISION_RECORDED"
+		}
+		if kind == "ResourceRequest" {
+			eventType = "RESOURCE_REQUESTED"
+		}
+		if kind == "BudgetPolicy" || kind == "RunPolicy" {
+			eventType = "POLICY_CHANGED"
 		}
 		if kind == "Run" {
 			eventType = "RUN_CHANGED"

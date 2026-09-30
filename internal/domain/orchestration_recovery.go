@@ -71,6 +71,9 @@ func (s *Service) taskFailed(tx *sql.Tx, project string, t Object, reason string
 	if e != nil {
 		return e
 	}
+	if _, e = tx.Exec("INSERT INTO resource_progress_runs(project,run,record,body) VALUES(?,?,?,?)", project, t["active_run_id"], n["id"], string(Bytes(Object{"reason": reason, "at": Now()}))); e != nil {
+		return e
+	}
 	if _, e = tx.Exec("INSERT INTO orchestration_failures(project,key_hash,reason_hash,count) VALUES(?,?,?,1) ON CONFLICT(project,key_hash,reason_hash) DO UPDATE SET count=count+1", project, n["key_hash"], Digest([]byte(reason))); e != nil {
 		return e
 	}
@@ -82,11 +85,7 @@ func (s *Service) taskFailed(tx *sql.Tx, project string, t Object, reason string
 	iterations++
 	n["same_failure_count"] = count
 	n["no_progress_iterations"] = iterations
-	profile, e := singleton(tx, project, "ProjectProfile")
-	if e != nil {
-		return e
-	}
-	policy, e := load(tx, project, "RunPolicy", Str(profile, "run_policy_id"))
+	policy, e := s.effectiveRetryPolicy(tx, project)
 	if e != nil {
 		return e
 	}
