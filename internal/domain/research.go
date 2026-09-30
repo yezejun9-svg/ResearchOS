@@ -64,7 +64,9 @@ func (s *Service) createResearchCycle(tx *sql.Tx, p Principal, project string, b
 	if err != nil {
 		return nil, err
 	}
-	if profile["revision"] != b["profile_revision"] {
+	profileRevision, _ := Num(profile, "revision")
+	requestedRevision, _ := Num(b, "profile_revision")
+	if profileRevision != requestedRevision {
 		return nil, Fail(412, "STALE_REVISION", "project profile changed")
 	}
 	from, to, err := parseCycleWindow(Str(b, "window_from"), Str(b, "window_to"))
@@ -79,7 +81,7 @@ func (s *Service) createResearchCycle(tx *sql.Tx, p Principal, project string, b
 	lookback, _ := Num(policy, "first_lookback_seconds")
 	if b["trigger"] == "SCHEDULE" {
 		var previous string
-		err = tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='ResearchCycle' ORDER BY created_at DESC LIMIT 1", project).Scan(&previous)
+		err = tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='ResearchCycle' ORDER BY json_extract(body,'$.created_at') DESC LIMIT 1", project).Scan(&previous)
 		if err == nil {
 			last, e := Decode([]byte(previous))
 			if e != nil {
