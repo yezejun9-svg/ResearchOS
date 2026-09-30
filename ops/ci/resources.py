@@ -18,7 +18,7 @@ GROUPS = {
     'C13': ['TestW12Budget', 'TestW12CrashAndResume', 'TestW12ConcurrencyAndQueue', 'TestW12ProgressAndLimits'],
     'C14': ['TestW12Budget', 'TestW12BudgetSettlementChain', 'TestW12BudgetConnections', 'TestW12BudgetPrecisionAndModes', 'TestW12PreparedEffectFences', 'TestW12CancelRetainsAccounting', 'TestW12ExperimentBudgetScopes'],
     'C15': ['TestW12ResourceRoutes', 'TestW12SessionIdentity'],
-    'C16': ['TestW12ProgressAndLimits'],
+    'C16': ['TestW12ProgressAndLimits', 'TestW12RetentionGates', 'TestW12RetentionInvalidation'],
 }
 
 
@@ -81,9 +81,10 @@ def main(command_key='test.resources'):
         stdout, stderr, code = e.stdout or b'', e.stderr or b'', 124
     (out / 'stdout.txt').write_bytes(stdout)
     (out / 'stderr.txt').write_bytes(stderr)
-    rows, malformed = [], False
+    rows, raw_assertions, malformed = [], [], False
     for number, line in enumerate(stdout.decode('utf-8', errors='replace').splitlines(), 1):
         if line.startswith('W12_ASSERTION '):
+            raw_assertions.append(line[len('W12_ASSERTION '):])
             try:
                 row = json.loads(line[len('W12_ASSERTION '):])
                 if not all(k in row for k in ['assertion_id', 'expected', 'actual', 'status', 'evidence']):
@@ -93,6 +94,7 @@ def main(command_key='test.resources'):
             except ValueError:
                 malformed = True
     ids = [r.get('assertion_id') for r in rows]
+    (out / 'assertions.jsonl').write_text('\n'.join(raw_assertions) + ('\n' if raw_assertions else ''), encoding='utf-8')
     passed = code == 0 and not malformed and len(ids) == len(expected) and set(ids) == set(expected) and all(r['status'] == 'PASS' for r in rows)
     index = {str(p.relative_to(out)).replace('\\', '/'): digest(p) for p in out.rglob('*') if p.is_file()}
     report = {'task_id': task, 'check_id': check, 'case_id': case, 'run_id': run_id, 'status': 'PASS' if passed else 'FAIL', 'executor_status': 'EXECUTION_REPORTED', 'exit_code': code, 'assertion_ids': ids, 'expected_assertion_ids': sorted(expected), 'assertions': rows, 'missing': sorted(set(expected) - set(ids)), 'malformed': malformed, 'raw_evidence_hashes': index, 'ended_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'independent_acceptance': 'NOT_REQUESTED', 'scope': 'DEVELOPMENT_ONLY', 'live_qualification': 'BLOCKED', 'blocked_gate': 'W12-G02 / RQ-W05-CLI-POLICY-001'}

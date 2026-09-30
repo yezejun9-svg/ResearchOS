@@ -270,6 +270,9 @@ func (s *Service) acceptTask(tx *sql.Tx, p Principal, project string, b Object, 
 		return nil, e
 	}
 	if a.verdict == "PASS" {
+		if e = s.retainAcceptedResult(tx, project, t); e != nil {
+			return nil, e
+		}
 		if e = s.releaseSuccessors(tx, p, project, t, cid); e != nil {
 			return nil, e
 		}
