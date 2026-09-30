@@ -264,7 +264,7 @@ def build(root: Path, output: Path, lock_path: Path):
     go = checked_tool(lock, "go")
     node = checked_tool(lock, "node")
     npm = checked_tool(lock, "npm_cli")
-    env = dict(os.environ, GOTOOLCHAIN="local", GOENV="off", GOPROXY="off", GOSUMDB="off", CGO_ENABLED="0", GOWORK="off", GOFLAGS="-mod=mod", NODE_OPTIONS="")
+    env = dict(os.environ, GOTOOLCHAIN="local", GOENV="off", GOPROXY="off", GOSUMDB="off", CGO_ENABLED="0", GOWORK="off", GOFLAGS="-mod=readonly", NODE_OPTIONS="")
     for name, tool, argv in (("go", go, [go, "version"]), ("node", node, [node, "--version"]),
                              ("npm_cli", npm, [node, npm, "--version"])):
         if run(argv, root, env).strip() != lock["tools"][name]["version_output"]:
