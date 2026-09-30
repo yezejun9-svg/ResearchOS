@@ -101,7 +101,7 @@ def main():
         'blocked_gate': 'W05 live qualification / final W13 dependencies',
     }
     save(out / 'report.json', report)
-    print(json.dumps({'backend_status': report['backend_status'], 'assertions': len(rows), 'receipt': str(out / 'report.json'), 'formal_cases': report['formal_cases']}))
+    print(json.dumps({'status': report['backend_status'], 'backend_status': report['backend_status'], 'assertions': len(rows), 'assertion_ids': ids, 'receipt': str(out / 'report.json'), 'formal_cases': report['formal_cases']}))
     return 0 if passed else 1
 
 
