@@ -271,60 +271,9 @@ func (s *Service) recordExperimentResult(tx *sql.Tx, project, id string, b Objec
 	if Hash(x["run_ids"]) != Hash(b["run_ids"]) {
 		return nil, Fail(422, "GATE_FAILED", "all runs must be retained")
 	}
-	receipt, e := load(tx, project, "AcceptanceReceipt", Str(b, "acceptance_id"))
+	receipt, e := s.experimentAcceptance(tx, project, x, Str(b, "acceptance_id"))
 	if e != nil {
 		return nil, e
-	}
-	if receipt["verdict"] != "PASS" || receipt["receipt_hash"] != Receipt(receipt) || receipt["measurement_mode"] != x["measurement_mode"] {
-		return nil, Fail(422, "GATE_FAILED", "valid independent receipt required")
-	}
-	ref := receipt["subject_ref"].(map[string]any)
-	if ref["entity_type"] != "Task" {
-		return nil, Fail(422, "GATE_FAILED", "result verification task required")
-	}
-	t, e := load(tx, project, "Task", Str(ref, "id"))
-	if e != nil {
-		return nil, e
-	}
-	if t["status"] != "ACCEPTED" || t["acceptance_id"] != receipt["id"] || Hash(t["acceptance_contract"]) != Hash(x["acceptance_contract"]) {
-		return nil, Fail(422, "GATE_FAILED", "frozen experiment verification contract required")
-	}
-	if e = s.acceptedTaskBinding(tx, project, t); e != nil {
-		return nil, e
-	}
-	state, e := singleton(tx, project, "ProjectState")
-	if e != nil {
-		return nil, e
-	}
-	if Hash(receipt["policy_revision"]) != Hash(state["policy_revision"]) {
-		return nil, Fail(412, "STALE_INPUT", "policy changed")
-	}
-	root, e := authorityRoot(tx, Str(receipt, "verifier_principal_id"))
-	if e != nil {
-		return nil, e
-	}
-	found := false
-	for _, v := range Arr(x, "run_ids") {
-		r, e := load(tx, project, "Run", v.(string))
-		if e != nil {
-			return nil, e
-		}
-		author, e := authorityRoot(tx, Str(r, "executor_principal_id"))
-		if e != nil {
-			return nil, e
-		}
-		if author == root {
-			return nil, Fail(403, "FORBIDDEN", "experiment executor cannot accept results")
-		}
-		if r["id"] == receipt["run_id"] {
-			found = true
-		}
-		if r["status"] != "SETTLED" {
-			return nil, Fail(422, "GATE_FAILED", "framework run failure is not candidate no improvement")
-		}
-	}
-	if !found {
-		return nil, Fail(422, "GATE_FAILED", "receipt run not part of experiment")
 	}
 	// The independently checked sealed JSON is the observation source, never caller-supplied metrics.
 
@@ -390,4 +339,73 @@ func (s *Service) recordExperimentResult(tx *sql.Tx, project, id string, b Objec
 		x["status"] = "INCONCLUSIVE"
 	}
 	return x, s.put(tx, "Experiment", x)
+}
+
+// Recheck the current acceptance graph whenever experimental results are used.
+func (s *Service) experimentAcceptance(tx *sql.Tx, project string, x Object, acceptanceID string) (Object, error) {
+	if e := s.experimentCurrent(tx, project, x); e != nil {
+		return nil, e
+	}
+	receipt, e := load(tx, project, "AcceptanceReceipt", acceptanceID)
+	if e != nil {
+		return nil, e
+	}
+	if receipt["verdict"] != "PASS" || receipt["receipt_hash"] != Receipt(receipt) || receipt["measurement_mode"] != x["measurement_mode"] {
+		return nil, Fail(422, "GATE_FAILED", "valid independent receipt required")
+	}
+	ref := receipt["subject_ref"].(map[string]any)
+	if ref["entity_type"] != "Task" {
+		return nil, Fail(422, "GATE_FAILED", "result verification task required")
+	}
+	t, e := load(tx, project, "Task", Str(ref, "id"))
+	if e != nil {
+		return nil, e
+	}
+	if t["status"] != "ACCEPTED" || t["acceptance_id"] != receipt["id"] || Hash(t["acceptance_contract"]) != Hash(x["acceptance_contract"]) {
+		return nil, Fail(422, "GATE_FAILED", "frozen experiment verification contract required")
+	}
+	if e = s.acceptedTaskBinding(tx, project, t); e != nil {
+		return nil, e
+	}
+	if e = s.taskContext(tx, project, t); e != nil {
+		return nil, e
+	}
+	if e = retentionIndependent(tx, t, receipt); e != nil {
+		return nil, e
+	}
+	state, e := singleton(tx, project, "ProjectState")
+	if e != nil {
+		return nil, e
+	}
+	if Hash(receipt["policy_revision"]) != Hash(state["policy_revision"]) {
+		return nil, Fail(412, "STALE_INPUT", "policy changed")
+	}
+	root, e := authorityRoot(tx, Str(receipt, "verifier_principal_id"))
+	if e != nil {
+		return nil, e
+	}
+	found := false
+	for _, v := range Arr(x, "run_ids") {
+		r, e := load(tx, project, "Run", v.(string))
+		if e != nil {
+			return nil, e
+		}
+		author, e := authorityRoot(tx, Str(r, "executor_principal_id"))
+		if e != nil {
+			return nil, e
+		}
+		if author == root {
+			return nil, Fail(403, "FORBIDDEN", "experiment executor cannot accept results")
+		}
+		if r["id"] == receipt["run_id"] {
+			found = true
+		}
+		if r["status"] != "SETTLED" {
+			return nil, Fail(422, "GATE_FAILED", "framework run failure is not candidate no improvement")
+		}
+	}
+	if !found {
+		return nil, Fail(422, "GATE_FAILED", "receipt run not part of experiment")
+	}
+	return receipt, nil
 }

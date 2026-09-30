@@ -15,14 +15,19 @@ TEST_IDS = {
     "C06": {"TestW08C06MissingXContinuesSources", "TestW08C06RateLimitedXCoalesces"},
     "W08-G02": {"TestW08G02SixHourAndMissedTicks", "TestW08C06RateLimitedXCoalesces"},
 }
-TEST_IDS["W08-G01"] = set().union(*TEST_IDS.values())
+TEST_IDS["W08-G01"] = set().union(*TEST_IDS.values()) | {"TestW08RequiredGates", "TestW08CoverageGates"}
 ASSERTIONS = {
     "C05": {"C05-EXPERIMENT", "C05-01", "C05-02", "C05-03", "C05-03-REVISIT", "C05-02-NO-ADOPT", "C05-02-NO-FALSE-ADOPT", "C05-01-PAGES"},
     "C06": {"C06-01", "C06-02-X", "C06-02-NO-FALSE-COMPLETE", "C06-02", "C06-03-REQUEST", "C06-03-DEDUP", "C06-03-RETRY-AFTER", "C06-03-RETRY", "C06-02-429", "W08-G02-COALESCE", "W08-G02-ONE-ACTIVE"},
     "W08-G02": {"W08-G02-FIRST-LOOKBACK", "W08-G02-MISSED-WINDOW", "W08-G02-MISSED-COALESCED", "W08-G02-COALESCE", "W08-G02-ONE-ACTIVE", "C06-02-429", "C06-03-RETRY", "C06-03-RETRY-AFTER"},
 }
-ASSERTIONS["W08-G01"] = set().union(*ASSERTIONS.values())
-SOURCES = ["internal/domain/research.go", "internal/domain/candidates.go", "internal/domain/research_test.go", "migrations/sqlite/0013_research_cycles.sql", "ops/ci/research.py"]
+ASSERTIONS["W08-G01"] = set().union(*ASSERTIONS.values()) | {
+    "W08-REQUIRED-REMOVE", *["W08-REQUIRED-" + x for x in ("registered", "remove", "inconclusive", "stale", "stable", "regressed")],
+    *["W08-COVERAGE-" + x for x in ("fraction-gap", "multipage", "duplicate", "replay", "NO-FALSE-COMPLETE")],
+    "W08-SOURCE-REPLAY", "W08-SOURCE-PAGE-CONFLICT",
+    *["W08-SOURCE-GUARD-" + x for x in ("CURRENT", "UNPROVEN", "STALE", "REVOKED", "BAD_HASH", "BAD_REVISION")],
+}
+SOURCES = ["internal/domain/research.go", "internal/domain/candidates.go", "internal/domain/research_test.go", "internal/domain/research_gates_test.go", "internal/domain/sources.go", "internal/domain/context.go", "internal/domain/experiments.go", "migrations/sqlite/0013_research_cycles.sql", "ops/ci/research.py"]
 
 
 def sha(path):
