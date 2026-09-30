@@ -31,8 +31,8 @@ def main() -> int:
     if task != 'W15' or (check, case) not in (('W15-G01', ''), ('', 'A09')) or args.mode not in (None, 'fixture'):
         parser.error('W15 requires exactly W15-G01 or A09 in fixture mode; W15-G02 remains BLOCKED')
     expected_map = json.loads(EXPECTED_PATH.read_text(encoding='utf-8'))
-    selected = 'TestW15SkillLifecycleFixture'
-    expected = expected_map[selected]
+    selected = list(expected_map)
+    expected = [a for name in selected for a in expected_map[name]]
     if not expected or len(expected) != len(set(expected)):
         raise RuntimeError('nonempty, unique frozen assertion inventory required')
     go = Path(os.getenv('RESEARCHOS_GO') or ROOT / '.local/tools/go1.27.1/go/bin/go.exe')
@@ -41,7 +41,7 @@ def main() -> int:
     run_id = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8]
     out = ROOT / 'execution/receipts/W15/fixture' / run_id
     out.mkdir(parents=True, exist_ok=False)
-    command = [str(go), 'test', '-json', '-count=1', '-timeout=3m', '-run', '^' + selected + '$', './internal/domain']
+    command = [str(go), 'test', '-json', '-count=1', '-timeout=3m', '-run', '^(?:' + '|'.join(selected) + ')$', './internal/domain']
     patterns = ('internal/domain/*.go', 'internal/store/*.go', 'adapters/knowledge/*.go',
                 'evaluation/skills/*.go', 'migrations/sqlite/*.sql', 'spec/v2.0/contracts/*.json',
                 'tests/skills/*', 'go.mod', 'go.sum', 'contracts/operation_coverage.json')
@@ -51,7 +51,7 @@ def main() -> int:
         'schema': 'GLOBAL_EVIDENCE_V1_CANDIDATE', 'task_id': task, 'check_id': check or None,
         'case_id': case or None, 'run_id': run_id, 'started_at': dt.datetime.now(dt.timezone.utc).isoformat(),
         'environment_mode': 'FIXTURE', 'executor_identity': os.getenv('RESEARCHOS_EXECUTOR_ID', 'codex:/root/skills_lifecycle'),
-        'verifier_identity': None, 'command_key': 'test.skills', 'registry_state': 'UNBOUND_PROPOSAL',
+        'verifier_identity': None, 'command_key': 'test.skills', 'registry_state': 'BOUND',
         'command_registry_proposal': 'tests/skills/command_registry_proposal.json',
         'command_registry_revision': digest(ROOT / 'execution/commands.json'), 'argv': command, 'cwd': str(ROOT),
         'git_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
@@ -78,7 +78,7 @@ def main() -> int:
         try:
             event = json.loads(line)
             events.append(event)
-            if event.get('Test') == selected and event.get('Action') == 'output':
+            if event.get('Test') in selected and event.get('Action') == 'output':
                 output = event.get('Output', '')
                 if output.startswith('W15_ASSERTION '):
                     row = json.loads(output[len('W15_ASSERTION '):])
@@ -89,7 +89,7 @@ def main() -> int:
         except (ValueError, TypeError):
             malformed = True
     ids = [r.get('assertion_id') for r in rows]
-    test_passed = any(e.get('Action') == 'pass' and e.get('Test') == selected for e in events)
+    test_passed = all(any(e.get('Action') == 'pass' and e.get('Test') == name for e in events) for name in selected)
     drift = [p for p, h in sources.items() if digest(ROOT / p) != h]
     passed = (code == 0 and test_passed and not malformed and not drift and ids == expected
               and all(r['status'] == 'PASS' and r['expected'] == r['actual'] for r in rows))
@@ -104,7 +104,7 @@ def main() -> int:
               'product_live_qualification': 'BLOCKED_W15_G02_W14_REAL_INPUT_W05_POLICY',
               'ended_at': dt.datetime.now(dt.timezone.utc).isoformat()}
     save(out / 'report.json', report)
-    print(json.dumps({'status': report['status'], 'assertions': len(rows), 'receipt': str(out / 'report.json')}, ensure_ascii=False))
+    print(json.dumps({'status': report['status'], 'assertions': len(rows), 'assertion_ids': ids, 'receipt': str(out / 'report.json')}, ensure_ascii=False))
     return 0 if passed else 1
 
 
