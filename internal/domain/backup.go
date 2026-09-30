@@ -49,6 +49,7 @@ type BackupManifest struct {
 // Public backup/export/restore retain the ordinary format and protection guard.
 type backupPolicy struct {
 	format         string
+	databaseName   string
 	purpose        Object
 	allowProtected func(*sql.DB, Object) error
 	validate       func(*sql.DB) error
@@ -534,10 +535,17 @@ func restoreBackupPolicy(ctx context.Context, directory, destination string, opt
 		return r, e
 	}
 	defer backupDiscard(stage)
-	if e = backupWrite(filepath.Join(stage, "state.sqlite"), files["state.sqlite"]); e != nil {
+	databaseName := "state.sqlite"
+	if policy != nil && policy.databaseName != "" {
+		if filepath.Base(policy.databaseName) != policy.databaseName || strings.ContainsAny(policy.databaseName, "/\\:") {
+			return r, fmt.Errorf("RESTORE_DATABASE_NAME_INVALID")
+		}
+		databaseName = policy.databaseName
+	}
+	if e = backupWrite(filepath.Join(stage, databaseName), files["state.sqlite"]); e != nil {
 		return r, e
 	}
-	db, e := store.Open(filepath.Join(stage, "state.sqlite"))
+	db, e := store.Open(filepath.Join(stage, databaseName))
 	if e != nil {
 		return r, e
 	}
