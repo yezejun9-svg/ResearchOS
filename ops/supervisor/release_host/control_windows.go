@@ -89,6 +89,11 @@ func controlCommand(ctx context.Context, c command, root string, j *supervisor.R
 	switch c.Action {
 	case "status":
 		return engine.Reconcile()
+	case "current":
+		if state.Phase != "STABLE" {
+			return nil, errors.New("current control proof requires stable host")
+		}
+		return d.Private(ctx, "CURRENT_CONTROL", supervisor.ReleasePrivateMessage{Request: c.Request, Snapshot: &state})
 	case "seal":
 		if state.Phase != "STABLE" {
 			return nil, errors.New("stable host required to seal")
