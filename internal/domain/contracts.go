@@ -253,6 +253,9 @@ func init() {
 	}
 }
 func operationOwner(id string) string {
+	if strings.Contains(id, "ResearchCycle") {
+		return "W08"
+	}
 	if resourceOperations[id] {
 		return "W12"
 	}

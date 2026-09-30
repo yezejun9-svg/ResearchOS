@@ -354,6 +354,8 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 			result, kind, status, e = s.runtimeOperation(tx, p, project, id, b, op.ID, cid)
 		} else if resourceOperations[op.ID] {
 			result, kind, status, e = s.resourceOperation(tx, p, project, id, b, op.ID)
+		} else if researchOperations[op.ID] {
+			result, kind, status, e = s.researchOperation(tx, p, project, id, b, op.ID)
 		} else if contextOperations[op.ID] {
 			result, kind, status, e = s.contextOperation(tx, p, project, id, b, op.ID)
 		} else {
