@@ -39,21 +39,22 @@ type StartOptions struct {
 }
 
 type Process struct {
-	mu      sync.Mutex
-	writeMu sync.Mutex
-	stdin   *os.File
-	cancel  context.CancelFunc
-	done    chan struct{}
-	ready   chan error
-	receipt Receipt
-	err     error
+	mu        sync.Mutex
+	writeGate chan struct{}
+	stopped   <-chan struct{}
+	stdin     *os.File
+	cancel    context.CancelFunc
+	done      chan struct{}
+	ready     chan error
+	receipt   Receipt
+	err       error
 }
 
 // Start returns after suspended identity persistence and ResumeThread succeed.
 // It owns process termination, stream draining and staging cleanup until Wait.
 func Start(ctx context.Context, c Command, options StartOptions) (*Process, error) {
 	child, cancel := context.WithCancel(ctx)
-	p := &Process{cancel: cancel, done: make(chan struct{}), ready: make(chan error, 1)}
+	p := &Process{cancel: cancel, done: make(chan struct{}), ready: make(chan error, 1), writeGate: make(chan struct{}, 1), stopped: child.Done()}
 	go func() {
 		r, err := runSandbox(child, c, options, p)
 		p.mu.Lock()
@@ -87,16 +88,36 @@ func (p *Process) Write(ctx context.Context, frame []byte) error {
 	if len(frame) == 0 || len(frame) > 64*1024 {
 		return errors.New("bounded protocol frame required")
 	}
-	p.writeMu.Lock()
-	defer p.writeMu.Unlock()
+	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := bounded.Err(); err != nil {
+		return err
+	}
+	select {
+	case p.writeGate <- struct{}{}:
+	case <-bounded.Done():
+		return bounded.Err()
+	case <-p.stopped:
+		return errors.New("process input closed")
+	case <-p.done:
+		return errors.New("process completed")
+	}
+	defer func() { <-p.writeGate }()
+	if err := bounded.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-p.stopped:
+		return errors.New("process input closed")
+	default:
+	}
+	frame = append([]byte(nil), frame...)
 	p.mu.Lock()
 	f := p.stdin
 	p.mu.Unlock()
 	if f == nil {
 		return errors.New("process input closed")
 	}
-	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	// Windows anonymous pipes are synchronous and reject SetWriteDeadline.
 	// On timeout cancel the Job, which closes the child's read handle and
 	// releases this one pending write; never continue the protocol afterwards.
@@ -114,6 +135,8 @@ func (p *Process) Write(ctx context.Context, frame []byte) error {
 	case <-bounded.Done():
 		p.cancel()
 		return bounded.Err()
+	case <-p.stopped:
+		return errors.New("process input closed")
 	}
 }
 
