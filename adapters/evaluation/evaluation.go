@@ -2,12 +2,14 @@
 package evaluation
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"researchos.local/research-os/internal/canonical"
 	"time"
 )
 
@@ -75,12 +77,26 @@ func (m Manifest) Validate() error {
 }
 
 // Normalize preserves one row per expected ID. Unknown/duplicate rows remain in the hashed raw export.
-func Normalize(m Manifest, observed Manifest, raw []Result, rawExport []byte, rawHash string, exit *int, duration int64) (Object, error) {
+func Normalize(m Manifest, observed Manifest, rawExport []byte, rawHash string, exit *int, duration int64) (Object, error) {
 	if e := m.Validate(); e != nil {
 		return nil, e
 	}
 	if duration < 0 {
 		return nil, errors.New("negative duration")
+	}
+
+	strict, e := canonical.JSON(rawExport)
+	if e != nil {
+		return nil, fmt.Errorf("raw export JSON: %w", e)
+	}
+	var raw []Result
+	decoder := json.NewDecoder(bytes.NewReader(strict))
+	decoder.DisallowUnknownFields()
+	if e = decoder.Decode(&raw); e != nil {
+		return nil, fmt.Errorf("raw result contract: %w", e)
+	}
+	if raw == nil {
+		return nil, errors.New("raw result array required")
 	}
 	counts := Object{"expected_count": len(m.Expected), "observed_count": 0, "pass_count": 0, "fail_count": 0, "error_count": 0, "abstain_count": 0, "missing_count": 0, "duplicate_count": 0}
 	status := "COMPLETE"
@@ -139,7 +155,7 @@ func Normalize(m Manifest, observed Manifest, raw []Result, rawExport []byte, ra
 }
 
 // Validate is a verifier-side recheck of serialized reports against the frozen manifest.
-func Validate(m Manifest, report Object) error {
+func Validate(m Manifest, report Object, rawExport []byte, rawHash string) error {
 	b := Bytes(report)
 	var parsed struct {
 		Manifest
@@ -152,7 +168,7 @@ func Validate(m Manifest, report Object) error {
 	if e := json.Unmarshal(b, &parsed); e != nil {
 		return e
 	}
-	normalized, e := Normalize(m, parsed.Manifest, parsed.Results, b, Digest(b), parsed.Exit, parsed.Duration)
+	normalized, e := Normalize(m, parsed.Manifest, rawExport, rawHash, parsed.Exit, parsed.Duration)
 	if e != nil {
 		return e
 	}

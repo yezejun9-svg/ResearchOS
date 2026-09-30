@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -105,16 +106,29 @@ func TestNativeSandbox(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer listener.Close()
+	var connections atomic.Int32
+	accepted := make(chan struct{}, 8)
+	go func() {
+		for {
+			c, e := listener.Accept()
+			if e != nil {
+				return
+			}
+			connections.Add(1)
+			c.Close()
+			accepted <- struct{}{}
+		}
+	}()
 	host, e := net.Dial("tcp", listener.Addr().String())
 	if e != nil {
 		t.Fatal(e)
 	}
 	host.Close()
-	control, e := listener.Accept()
-	if e != nil {
-		t.Fatal(e)
+	select {
+	case <-accepted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("host control was not observed")
 	}
-	control.Close()
 	assertion(t, "SANDBOX-HOST-CONTROL", true, e == nil)
 	for _, mode := range []string{"baseline", "candidate", "timeout"} {
 		dest := filepath.Join(output, mode+".json")
@@ -153,15 +167,32 @@ func TestNativeSandbox(t *testing.T) {
 		}
 		assertion(t, "SANDBOX-RECOMPUTE-"+mode, want, result["sum"])
 	}
-	listener.(*net.TCPListener).SetDeadline(time.Now().Add(100 * time.Millisecond))
-	unexpected, networkErr := listener.Accept()
-	if unexpected != nil {
-		unexpected.Close()
-	}
-	assertion(t, "SANDBOX-OBSERVED-EGRESS", true, networkErr != nil)
+	assertion(t, "SANDBOX-OBSERVED-EGRESS", int32(1), connections.Load())
 	b, e := os.ReadFile(canary)
 	assertion(t, "SANDBOX-STABLE-UNCHANGED", "stable", string(b))
 	if e != nil {
 		t.Fatal(e)
+	}
+}
+
+func TestSandboxRootOverlap(t *testing.T) {
+	root := t.TempDir()
+	input := filepath.Join(root, "input")
+	os.Mkdir(input, 0700)
+	executable, _ := os.Executable()
+	b, _ := os.ReadFile(executable)
+	path := filepath.Join(input, "child.exe")
+	os.WriteFile(path, b, 0700)
+	for _, mode := range []string{"equal", "output-ancestor", "output-descendant"} {
+		output := input
+		if mode == "output-ancestor" {
+			output = root
+		}
+		if mode == "output-descendant" {
+			output = filepath.Join(input, "output")
+			os.Mkdir(output, 0700)
+		}
+		r, e := Run(context.Background(), Command{Executable: path, InputDirectory: input, OutputDirectory: output, Timeout: time.Second})
+		assertion(t, "SANDBOX-REJECT-"+mode, true, e != nil && r.PID == 0 && r.SID == "")
 	}
 }
