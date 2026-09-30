@@ -35,6 +35,7 @@ def demo():
                 "os": ["linux"], "cpu": ["x64"]},
             "node_modules/required-missing": {"version": "2.0.0", "license": "MIT"},
             "node_modules/mismatch": {"version": "1.0.0", "license": "MIT"},
+            "node_modules/unverified": {"version": "1.0.0", "license": "MIT"},
         }
         lock = root / "apps/web/package-lock.json"
         lock.parent.mkdir(parents=True)
@@ -45,6 +46,9 @@ def demo():
             "name": "@rolldown/binding-win32-x64-msvc", "version": "1.2.11", "license": "MIT"})
         package(root, "mismatch", {"name": "mismatch", "version": "2.0.0", "license": "Apache-2.0"},
                 (("LICENSE", b"wrong-version license"),))
+        unverified = root / "apps/web/node_modules/unverified"
+        unverified.mkdir(parents=True)
+        (unverified / "LICENSE").write_bytes(b"unverified license")
 
         files = {}
         modules, gaps = npm_licenses(root, files)
@@ -67,6 +71,13 @@ def demo():
         assert mismatch["declared_license"] == "MIT"
         assert mismatch["license_texts"] == []
         assert any("required-missing" in gap for gap in gaps)
+
+        unverified = by_name["unverified"]
+        assert unverified["installation_status"] == "VERSION_UNVERIFIED"
+        assert unverified["license_declaration_source"] == "package-lock.json"
+        assert "installed_version" not in unverified
+        assert unverified["license_texts"] == []
+        assert any("unverified" in gap and "metadata unavailable" in gap for gap in gaps)
 
 
 if __name__ == "__main__":
