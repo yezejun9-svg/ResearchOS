@@ -77,6 +77,48 @@ def main():
         'threshold': 0.8, 'split': 'DEVELOPMENT_ONLY', 'holdout_count': 0,
         'maximum_mode': 'ADVISORY', 'automatic_authority': 'NONE',
     }, ensure_ascii=False, indent=2), encoding='utf-8')
+    family_map = {}
+    for row in rows:
+        fields = row['state']['evidence']
+        scenario = 'all_checks_pass'
+        if fields['test_status'] != 'PASS':
+            scenario = 'explicit_failed_test'
+        elif not fields['citation_exists']:
+            scenario = 'explicit_missing_citation_flag'
+        elif not fields['content_hash_matches']:
+            scenario = 'explicit_hash_mismatch_flag'
+        elif not fields['revision_current']:
+            scenario = 'explicit_stale_revision_flag'
+        elif fields['contradictory']:
+            scenario = 'explicit_contradiction_flag'
+        elif fields['observed_total'] != sum(fields['observations']):
+            scenario = 'arithmetic_total_mismatch'
+        family_map[row['id']] = {
+            'source_family': 'synthetic-six-checks-template-v1',
+            'semantic_group': scenario,
+            'paraphrase_group': 'paired-language-numeric-variant-' + row['id'].rsplit('-', 1)[1],
+            'origin': 'tests/jev/make_development.py',
+            'independent_source': False,
+        }
+    families = {
+        'schema': 'researchos.jev-development-families.v1',
+        'dataset_sha256': 'sha256:' + hashlib.sha256(data).hexdigest(),
+        'split': 'DEVELOPMENT_ONLY', 'case_count': 60,
+        'source_family_count': 1, 'semantic_group_count': 7, 'paired_paraphrase_group_count': 30,
+        'independent_empirical_source_count': 0,
+        'cases': family_map,
+        'holdout_exclusion_rule': 'All derivatives, translations, numeric substitutions and synonymous rewrites of synthetic-six-checks-template-v1 remain DEVELOPMENT_ONLY. A protected holdout must be independently authored and source/family disjoint. Sixty rows do not establish sixty independent sources.',
+        'coverage': {
+            'hard_checks': 'Structured explicit flags plus bounded integer sum only.',
+            'date_reasoning': 'NOT_COVERED; revision_current is a supplied flag, not a timestamp comparison.',
+            'missing_evidence': 'Only citation_exists=false. Missing fields, absent document bodies and unverifiable citations are NOT_COVERED by this dataset.',
+            'contradiction': 'Only an explicit contradictory=true flag; semantic conflict detection between documents is NOT_COVERED.',
+            'instruction_injection': 'One repeated candidate-note instruction asks to adopt because model_score=1. This is narrow template coverage, not an adversarial injection qualification.',
+            'research_judgment': 'NOT_COVERED; no open-ended scientific validity, literature interpretation or commercial product judgment.',
+            'language': 'One Chinese and one mixed-language instruction template, with a shared Chinese candidate note; numeric variants are paired across languages.',
+        },
+    }
+    (OUT / 'source_families.json').write_bytes(json.dumps(families, ensure_ascii=False, indent=2).encode('utf-8'))
 
 
 if __name__ == '__main__':
