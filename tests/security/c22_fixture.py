@@ -1,7 +1,7 @@
 """Strict W17/C22 fixture runner: native AppContainer plus host-issued HTTP.
 
 This reports execution only. Independent acceptance and all LIVE authority remain
-outside this fixture. Only TASK=W17 CASE=C22 CHECK unset is an allowed selector.
+outside this fixture. TASK=W17 with CASE=C22 or CHECK=W17-G03 is required.
 """
 from __future__ import annotations
 
@@ -164,9 +164,10 @@ def main() -> int:
     out = report = None
     started = time.monotonic()
     try:
-        require(len(sys.argv) == 1, "No arguments; only TASK=W17 CASE=C22 CHECK unset is bound")
-        require(os.environ.get("RESEARCHOS_TASK_ID") == "W17" and os.environ.get("RESEARCHOS_CASE_ID") == "C22"
-                and not os.environ.get("RESEARCHOS_CHECK_ID"), "Only TASK=W17 CASE=C22 CHECK unset is bound")
+        require(len(sys.argv) == 1, "No arguments; use the registered W17/C22 or W17-G03 selector")
+        case, check = os.environ.get("RESEARCHOS_CASE_ID", ""), os.environ.get("RESEARCHOS_CHECK_ID", "")
+        require(os.environ.get("RESEARCHOS_TASK_ID") == "W17" and ((case == "C22" and not check) or (check == "W17-G03" and not case)),
+                "Only TASK=W17 with CASE=C22 or CHECK=W17-G03 is bound, not both")
         require(os.environ.get("RESEARCHOS_MEASUREMENT_MODE", "FIXTURE") == "FIXTURE"
                 and os.environ.get("RESEARCHOS_MODE", "FIXTURE") == "FIXTURE", "Only FIXTURE is authorized")
         inventory = read(EXPECTED); ids = validate_inventory(inventory)
@@ -181,7 +182,7 @@ def main() -> int:
         hashes = {p.relative_to(ROOT).as_posix(): digest(p) for p in sorted(paths)}
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         save(out / "source-manifest.json", {"source_commit": head, "files": hashes, "go": {"path": str(go), "sha256": digest(go)}})
-        report = {"status": "FAIL", "task_id": "W17", "case_id": "C22", "mode": "FIXTURE", "source_commit": head,
+        report = {"status": "FAIL", "task_id": "W17", "case_id": case or None, "check_id": check or None, "covered_case": "C22", "mode": "FIXTURE", "source_commit": head,
                   "execution_status": "EXECUTION_REPORTED", "independent_acceptance": "PENDING", "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                   "platform": platform.platform(), "cwd": str(ROOT), "assertions": [], "project_identity": read(ROOT / "execution/project_identity.json"),
                   "real_provider_called": False, "formal_holdout_accessed": False, "actual_product_database_accessed": False,
