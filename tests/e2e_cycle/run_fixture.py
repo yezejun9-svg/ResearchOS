@@ -23,6 +23,8 @@ def digest(path: Path) -> str:
 def main() -> int:
     if os.environ.get('RESEARCHOS_TASK_ID') != 'W14':
         raise SystemExit('RESEARCHOS_TASK_ID=W14 required')
+    if os.environ.get('RESEARCHOS_CHECK_ID', '') not in ('', 'W14-G01') or os.environ.get('RESEARCHOS_CASE_ID'):
+        raise SystemExit('Only W14-G01 fixture is bound; live G02/A13 remain unbound')
     locked = json.loads((ROOT / 'execution/toolchains/locked.json').read_text(encoding='utf-8'))
     go = Path(os.environ.get('RESEARCHOS_GO', locked['tools']['go']['path']))
     if not go.is_file():

@@ -67,6 +67,10 @@ class Admission:
 
     def pin(self, name, expected):
         raw = safe_path(self.root, name).read_bytes()
+        if name in self.verified:
+            if digest(raw) != expected or self.verified[name]["sha256"] != expected:
+                raise ValueError("repeated evidence hash mismatch: " + name)
+            return raw
         self.check("HASH:" + name, expected, digest(raw), [name])
         self.verified[name] = dict(sha256=digest(raw), bytes=len(raw))
         return raw
