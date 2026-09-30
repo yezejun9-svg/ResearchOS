@@ -75,7 +75,7 @@ def main(command_key='test.evolution'):
     env.update(GOTOOLCHAIN='local', GOENV='off', GOFLAGS='-mod=readonly', RESEARCHOS_GO=go, W16_EVIDENCE_DIR=str(out))
     protected_root = None
     if 'C20' in cases:
-        common = Path(subprocess.check_output(['git', 'rev-parse', '--git-common-dir'], cwd=ROOT, text=True).strip())
+        common = Path(subprocess.check_output(['git', 'rev-parse', '--git-common-dir'], cwd=ROOT, text=True, encoding='utf-8').strip())
         if not common.is_absolute():
             common = ROOT / common
         protected_parent = common.resolve().parent.parent / 'verifier-evidence' / 'W16' / 'c20'
@@ -88,7 +88,7 @@ def main(command_key='test.evolution'):
     files = sorted({p for pattern in ('internal/domain/*.go', 'migrations/sqlite/*.sql', 'ops/supervisor/*.go', 'ops/canary/fixture/*.go', 'evaluation/evolution/*.go', 'ops/experiment_sandbox/*.go', 'ops/ci/evolution.py', 'tests/evolution/*', 'go.mod', 'go.sum', 'spec/v2.0/contracts/*.json') for p in ROOT.glob(pattern) if p.is_file()})
     before = {
         'run_receipt': {'task_id': task, 'check_id': check or None, 'case_id': case or None, 'run_id': out.name, 'started_at': now(), 'environment_mode': 'FIXTURE_WITH_NATIVE_APPCONTAINER', 'os': platform.platform(), 'architecture': platform.machine(), 'timezone': time.tzname, 'executor_identity': os.getenv('RESEARCHOS_EXECUTOR_ID', 'codex:/root/experiments'), 'independent_verifier_identity': None},
-        'version_manifest': {'code_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(), 'dirty': subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True), 'files': {str(p.relative_to(ROOT)): digest(p) for p in files}, 'model': 'NONE; public deterministic executable', 'suite_revision': 'public-system-regression-v1', 'formal_holdout': 'NOT_RUN', 'private_fixture_store': str(protected_root) if protected_root else None},
+        'version_manifest': {'code_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True, encoding='utf-8').strip(), 'dirty': subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT, text=True, encoding='utf-8').strip(), 'files': {str(p.relative_to(ROOT)): digest(p) for p in files}, 'model': 'NONE; public deterministic executable', 'suite_revision': 'public-system-regression-v1', 'formal_holdout': 'NOT_RUN', 'private_fixture_store': str(protected_root) if protected_root else None},
         'command_receipt': {'command_key': command_key, 'argv': cmd, 'cwd': str(ROOT), 'environment_names': sorted(env), 'requested_mode': args.mode, 'resolved_mode': 'fixture'},
         'expected_assertion_ids': expected, 'scope': 'W16_G02_FIXTURE_ONLY', 'execution_status': 'EXECUTION_REPORTED',
         'acceptance_receipt': {'status': 'NOT_REQUESTED', 'verifier_identity': None},
