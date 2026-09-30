@@ -31,6 +31,16 @@ type CanaryStore struct {
 // directory or changes ACLs on user-created data. The current-user SID is not an
 // independent verifier identity; LIVE operations always remain unavailable.
 func NewCanary(root string) (*CanaryStore, error) {
+	return openCanary(root, true)
+}
+
+// OpenCanary reopens only an existing directory with the exact current-identity
+// boundary. It does not repair permissions or take ownership of existing data.
+func OpenCanary(root string) (*CanaryStore, error) {
+	return openCanary(root, false)
+}
+
+func openCanary(root string, create bool) (*CanaryStore, error) {
 	if !filepath.IsAbs(root) || strings.HasPrefix(root, `\\`) || filepath.Clean(root) != root {
 		return nil, ErrBoundary
 	}
@@ -75,8 +85,10 @@ func NewCanary(root string) (*CanaryStore, error) {
 	if e != nil {
 		return nil, ErrBoundary
 	}
-	if e = windows.CreateDirectory(name, &sa); e != nil {
-		return nil, ErrBoundary
+	if create {
+		if e = windows.CreateDirectory(name, &sa); e != nil {
+			return nil, ErrBoundary
+		}
 	}
 	h, e := openDirectory(root)
 	if e != nil {
