@@ -138,7 +138,7 @@ func TestPersistentActualControlHostClosedQualification(t *testing.T) {
 		t.Fatalf("persistent host lost slot: %+v", status)
 	}
 	denied := call(command{Action: "seal", Project: "unregistered", Candidate: "no-business-proof", Request: json.RawMessage(`{"action":"START_CANARY"}`)})
-	if denied.Error == "" || denied.State.Phase != "STABLE" || denied.State.PID != child.PID {
+	if denied.Error != "ACTUAL_CONTROL_BEHAVIOR_PROOF_UNAVAILABLE" || denied.State.Phase != "STABLE" || denied.State.PID != child.PID {
 		t.Fatalf("qualification gate opened: %+v", denied)
 	}
 	stopped := call(command{Action: "stop"})
