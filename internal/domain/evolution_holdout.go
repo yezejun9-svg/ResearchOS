@@ -93,6 +93,64 @@ func decodeEvolutionHoldout(inputsRaw, labelsRaw []byte) (evolution.HoldoutInput
 	return inputs, labels, evolution.ValidateHoldout(inputs, labels)
 }
 
+// The frozen verifier identity is rechecked at every proof binding and use.
+// A historical verifier ID cannot outlive its current restricted grant or
+// acquire authority through the candidate author/release actor's identity.
+func (s *Service) evolutionHoldoutVerifierCurrent(tx *sql.Tx, project string, x Object, verifierID string) error {
+	var rolesRaw string
+	if err := tx.QueryRow("SELECT roles FROM auth_principals WHERE id=? AND revoked=0", verifierID).Scan(&rolesRaw); err != nil {
+		return Fail(403, "FORBIDDEN", "private holdout verifier no longer active")
+	}
+	p := Principal{ID: verifierID}
+	if err := json.Unmarshal([]byte(rolesRaw), &p.Roles); err != nil {
+		return err
+	}
+	rows, err := tx.Query("SELECT project,task,run,restricted FROM auth_grants WHERE principal=?", verifierID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var g Grant
+		if err = rows.Scan(&g.ProjectID, &g.TaskID, &g.RunID, &g.Restricted); err != nil {
+			rows.Close()
+			return err
+		}
+		p.Grants = append(p.Grants, g)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if !protectedAllowed(p, project) {
+		return Fail(403, "FORBIDDEN", "restricted private holdout verifier grant required")
+	}
+	var author string
+	if err = tx.QueryRow("SELECT creator FROM evolution_candidates WHERE project=? AND candidate=?", project, x["id"]).Scan(&author); err != nil {
+		return err
+	}
+	h, err := s.evolutionCurrent(tx, project, x)
+	if err != nil {
+		return err
+	}
+	verifierRoot, err := authorityRoot(tx, verifierID)
+	if err != nil {
+		return err
+	}
+	authorRoot, err := authorityRoot(tx, author)
+	if err != nil {
+		return err
+	}
+	releaseRoot, err := authorityRoot(tx, Str(h, "release_principal"))
+	if err != nil {
+		return err
+	}
+	if verifierRoot == authorRoot || verifierRoot == releaseRoot {
+		return Fail(403, "FORBIDDEN", "private holdout verifier is not independent")
+	}
+	return nil
+}
+
 // RegisterEvolutionHoldoutFixture freezes independently labeled private inputs
 // for exactly one candidate. It is a trusted local host method with no HTTP
 // route; normal C09/C10/C12 development candidates remain unchanged.
@@ -116,24 +174,8 @@ func (s *Service) RegisterEvolutionHoldoutFixture(ctx context.Context, token, pr
 	if x["status"] != "EVALUATING" {
 		return Fail(409, "STATE_CONFLICT", "freeze private holdout before regression")
 	}
-	h, err := s.evolutionCurrent(tx, project, x)
-	if err != nil {
+	if err = s.evolutionHoldoutVerifierCurrent(tx, project, x, p.ID); err != nil {
 		return err
-	}
-	var author string
-	if err = tx.QueryRow("SELECT creator FROM evolution_candidates WHERE project=? AND candidate=?", project, candidate).Scan(&author); err != nil {
-		return err
-	}
-	authorRoot, err := authorityRoot(tx, author)
-	if err != nil {
-		return err
-	}
-	verifierRoot, err := authorityRoot(tx, p.ID)
-	if err != nil {
-		return err
-	}
-	if authorRoot == verifierRoot || p.ID == h["release_principal"] {
-		return Fail(403, "FORBIDDEN", "candidate author or release actor cannot freeze own holdout")
 	}
 	_, exists, err := evolutionHoldoutEntry(tx, project, candidate, "HOLDOUT_FROZEN")
 	if err != nil {
@@ -194,6 +236,9 @@ func (s *Service) EvaluateEvolutionHoldoutFixture(ctx context.Context, token, pr
 	}
 	if frozen["verifier_id"] != p.ID || frozen["plan_hash"] != Hash(evolutionPlan(x)) {
 		return nil, Fail(403, "FORBIDDEN", "private holdout verifier or plan changed")
+	}
+	if err = s.evolutionHoldoutVerifierCurrent(tx, project, x, p.ID); err != nil {
+		return nil, err
 	}
 	_, evaluated, err := evolutionHoldoutEntry(tx, project, candidate, "HOLDOUT_EVALUATED")
 	if err != nil {
@@ -256,6 +301,9 @@ func (s *Service) EvaluateEvolutionHoldoutFixture(ctx context.Context, token, pr
 	if err != nil || Hash(evolutionPlan(current)) != Hash(evolutionPlan(x)) || current["status"] != "EVALUATING" {
 		return nil, Fail(422, "GATE_FAILED", "candidate changed during private evaluation")
 	}
+	if err = s.evolutionHoldoutVerifierCurrent(tx, project, current, p.ID); err != nil {
+		return nil, err
+	}
 	_, evaluated, err = evolutionHoldoutEntry(tx, project, candidate, "HOLDOUT_EVALUATED")
 	if err != nil || evaluated {
 		return nil, Fail(409, "STATE_CONFLICT", "private evaluation already bound")
@@ -289,6 +337,9 @@ func (s *Service) evolutionHoldoutVerdict(ctx context.Context, tx *sql.Tx, proje
 	}
 	if frozen["revision"] != evolution.HoldoutRevision || frozen["model_revision"] != "NONE" || frozen["plan_hash"] != Hash(evolutionPlan(x)) || frozen["stable_hash"] != x["stable_artifact_ref"].(map[string]any)["content_hash"] || frozen["candidate_hash"] != x["candidate_artifact_ref"].(map[string]any)["content_hash"] || frozen["public_suite_hash"] != Digest(evolution.Bytes(evolution.Suite())) || frozen["policy_hash"] != Digest(evolution.Bytes(evolution.Policy())) || evaluated["plan_hash"] != frozen["plan_hash"] || evaluated["verifier_id"] != frozen["verifier_id"] {
 		return nil, "", Fail(422, "GATE_FAILED", "private holdout version or candidate binding changed")
+	}
+	if err = s.evolutionHoldoutVerifierCurrent(tx, project, x, Str(frozen, "verifier_id")); err != nil {
+		return nil, "", err
 	}
 	_, inputsRaw, err := s.evolutionPrivateBytes(ctx, tx, project, frozen["input_ref"].(map[string]any))
 	if err != nil {
