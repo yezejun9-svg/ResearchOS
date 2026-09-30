@@ -222,18 +222,41 @@ def npm_licenses(root: Path, files: dict[str, bytes]):
         if not path:
             continue
         item = {"name": path.removeprefix("node_modules/"), "version": data.get("version", "UNKNOWN"),
-                "integrity": data.get("integrity", "UNKNOWN")}
+                "integrity": data.get("integrity", "UNKNOWN"), "optional": bool(data.get("optional")),
+                "os": data.get("os", []), "cpu": data.get("cpu", []),
+                "declared_license": data.get("license", "UNKNOWN"), "license_texts": []}
         directory = root / "apps/web" / path
-        choices = sorted(p for p in directory.glob("LICENSE*") if p.is_file())
-        if not choices:
-            item["license"] = "UNKNOWN"
-            gaps.append(f"npm {item['name']}: license file unavailable")
+        if not directory.is_dir():
+            item["installation_status"] = "OPTIONAL_NOT_INSTALLED" if item["optional"] else "REQUIRED_NOT_INSTALLED"
+            if not item["optional"]:
+                gaps.append(f"npm {item['name']}: required package not installed")
+            modules.append(item)
+            continue
+
+        item["installation_status"] = "INSTALLED"
+        package_json = directory / "package.json"
+        if package_json.is_file():
+            metadata = json.loads(package_json.read_text(encoding="utf-8"))
+            item["installed_version"] = metadata.get("version", "UNKNOWN")
+            if item["installed_version"] != item["version"]:
+                item["installation_status"] = "VERSION_MISMATCH"
+                item["license_declaration_source"] = "package-lock.json"
+                gaps.append(f"npm {item['name']}: installed version does not match lock")
+                modules.append(item)
+                continue
+            item["declared_license"] = metadata.get("license", item["declared_license"])
+            item["license_declaration_source"] = "package.json"
         else:
-            raw = choices[0].read_bytes()
-            target = f"licenses/npm/{len(modules):03d}.txt"
+            item["license_declaration_source"] = "package-lock.json"
+        choices = sorted(p for p in directory.iterdir() if p.is_file() and
+                         p.name.upper().startswith(("LICENSE", "THIRD-PARTY-LICENSE")))
+        for doc_index, source in enumerate(choices):
+            raw = source.read_bytes()
+            target = f"licenses/npm/{len(modules):03d}-{doc_index:02d}.txt"
             files[target] = raw
-            item["license_file"] = target
-            item["license_sha256"] = digest(raw)
+            item["license_texts"].append({"source_file": source.name, "file": target, "sha256": digest(raw)})
+        if not item["license_texts"]:
+            gaps.append(f"npm {item['name']}: license text unavailable")
         modules.append(item)
     return modules, gaps
 
