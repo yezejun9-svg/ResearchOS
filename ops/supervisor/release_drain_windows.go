@@ -23,15 +23,42 @@ import (
 const drainPipePrefix = `\\.\pipe\researchos-r2-fixture-`
 
 type DrainFrame struct {
-	Kind      string          `json:"kind"`
-	Operation string          `json:"operation"`
-	Epoch     uint64          `json:"epoch"`
-	Root      string          `json:"root"`
-	Nonce     string          `json:"nonce"`
-	Receipt   string          `json:"receipt,omitempty"`
-	State     string          `json:"state,omitempty"`
-	MAC       string          `json:"mac"`
-	Readiness *DrainReadiness `json:"readiness,omitempty"`
+	Kind      string                 `json:"kind"`
+	Operation string                 `json:"operation"`
+	Epoch     uint64                 `json:"epoch"`
+	Root      string                 `json:"root"`
+	Nonce     string                 `json:"nonce"`
+	Receipt   string                 `json:"receipt,omitempty"`
+	State     string                 `json:"state,omitempty"`
+	MAC       string                 `json:"mac"`
+	Readiness *DrainReadiness        `json:"readiness,omitempty"`
+	Release   *ReleasePrivateMessage `json:"release,omitempty"`
+}
+
+// ReleasePrivateMessage is carried only on the inherited, peer-checked pipe.
+// FIXTURE actions are not a public API or an authorization flag.
+type ReleasePrivateMessage struct {
+	Project     string            `json:"project,omitempty"`
+	Candidate   string            `json:"candidate,omitempty"`
+	Request     json.RawMessage   `json:"request,omitempty"`
+	Snapshot    *ReleaseState     `json:"snapshot,omitempty"`
+	Admission   *ReleaseAdmission `json:"admission,omitempty"`
+	Cutover     *ReleaseCutover   `json:"cutover,omitempty"`
+	Observation *ReleaseReceipt   `json:"observation,omitempty"`
+	Result      json.RawMessage   `json:"result,omitempty"`
+	Error       string            `json:"error,omitempty"`
+}
+
+type ReleaseCutover struct {
+	Operation      string          `json:"operation"`
+	Epoch          uint64          `json:"epoch"`
+	Root           string          `json:"root"`
+	Database       string          `json:"database"`
+	Directory      string          `json:"directory"`
+	KeyPath        string          `json:"key_path"`
+	ManifestSHA256 string          `json:"manifest_sha256"`
+	Purpose        json.RawMessage `json:"purpose"`
+	Migrations     []int           `json:"migrations"`
 }
 
 type DrainReadiness struct {

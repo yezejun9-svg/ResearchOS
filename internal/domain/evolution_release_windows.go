@@ -338,6 +338,9 @@ func (s *Service) releaseAdmissionInputs(tx *sql.Tx, project string, x, h, b, re
 // It seals the independently accepted exact candidate before public HTTP
 // START_CANARY records its intent. Production needs a distinct OS verifier.
 func (s *Service) SealEvolutionReleaseFixture(ctx context.Context, project, candidate string, request Object) (supervisor.ReleaseAdmission, error) {
+	return s.sealEvolutionReleaseFixture(ctx, project, candidate, request, nil)
+}
+func (s *Service) sealEvolutionReleaseFixture(ctx context.Context, project, candidate string, request Object, observed *supervisor.ReleaseState) (supervisor.ReleaseAdmission, error) {
 	var zero supervisor.ReleaseAdmission
 	tx, e := s.DB.BeginTx(ctx, nil)
 	if e != nil {
@@ -366,13 +369,18 @@ func (s *Service) SealEvolutionReleaseFixture(ctx context.Context, project, cand
 	if e = tx.Rollback(); e != nil && !errors.Is(e, sql.ErrTxDone) {
 		return zero, e
 	}
-	j, e := supervisor.OpenReleaseJournal(releaseStateRoot(h))
-	if e != nil {
-		return zero, e
+	var state supervisor.ReleaseState
+	if observed != nil {
+		state = *observed
+	} else {
+		j, err := supervisor.OpenReleaseJournal(releaseStateRoot(h))
+		if err != nil {
+			return zero, err
+		}
+		state = j.State()
+		_ = j.Close()
 	}
-	state := j.State()
-	_ = j.Close()
-	if state.Epoch != epoch || state.Active != releaseArtifactDigest(x["stable_artifact_ref"].(map[string]any)["content_hash"]) || state.Phase != "STABLE" {
+	if state.Epoch != epoch || state.Active != releaseArtifactDigest(x["stable_artifact_ref"].(map[string]any)["content_hash"]) || state.Phase != "STABLE" || (observed != nil && state.Data != releaseFixtureData(h)) {
 		return zero, errors.New("fixture supervisor slot differs from frozen stable")
 	}
 	operation := releaseOperationID(project, candidate, Str(request, "regression_acceptance_id"), epoch)

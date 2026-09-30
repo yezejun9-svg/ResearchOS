@@ -29,13 +29,14 @@ const drainHandleEnv = "RESEARCHOS_DRAIN_BOOTSTRAP_HANDLE"
 // The environment contains a handle number, never a key or authority flag.
 // This proves same-user fixture mechanics, not an SCM security boundary.
 type DrainBootstrap struct {
-	Pipe     string
-	Root     string
-	Key      []byte
-	Peer     ProcessIdentity
-	Token    string
-	Epoch    uint64
-	Listener string
+	Pipe         string
+	Root         string
+	Key          []byte
+	Peer         ProcessIdentity
+	Token        string
+	Epoch        uint64
+	Listener     string
+	FixtureStore string
 }
 
 func ReadInheritedDrainBootstrap(root string) (*DrainBootstrap, error) {
@@ -77,6 +78,8 @@ type ControlFixtureDriver struct {
 	Journal                                    *ReleaseJournal
 	WorkDir, WebDir, Listen, CoordinatorConfig string
 	Output                                     io.Writer
+	FixtureStore                               string
+	Restore                                    func(context.Context, ReleaseState, *rt.DataRootLease) (string, error)
 	boot                                       *DrainBootstrap
 	process                                    ProcessIdentity
 	frame                                      DrainFrame
@@ -110,6 +113,7 @@ func (d *ControlFixtureDriver) Start(image, token, data string) (ProcessIdentity
 		return ProcessIdentity{}, e
 	}
 	boot := &DrainBootstrap{Pipe: name, Root: filepath.Clean(data), Key: make([]byte, 32), Peer: peer, Token: token, Epoch: s.Epoch, Listener: d.Listen}
+	boot.FixtureStore = d.FixtureStore
 	if _, e = rand.Read(boot.Key); e != nil {
 		return ProcessIdentity{}, e
 	}
@@ -193,10 +197,11 @@ func (d *ControlFixtureDriver) read(c *os.File, frame DrainFrame) (DrainFrame, e
 
 func (d *ControlFixtureDriver) Drain(ctx context.Context, p ProcessIdentity, operation string) (string, error) {
 	s := d.Journal.State()
+	previousPhase := s.Phase
 	if ctx.Err() != nil {
 		return "", ctx.Err()
 	}
-	if s.Phase != "PREPARED" || s.Operation != operation || processIn(s) != p {
+	if (s.Phase != "PREPARED" && s.Phase != "ROLLBACK_PREPARED") || s.Operation != operation || processIn(s) != p {
 		return "", errors.New("prepared control binding required")
 	}
 	c, e := d.connection(p)
@@ -223,7 +228,7 @@ func (d *ControlFixtureDriver) Drain(ctx context.Context, p ProcessIdentity, ope
 		return "", e
 	}
 	if r.Kind == "BUSY" && r.State == "STABLE" {
-		s.Phase = "PREPARED"
+		s.Phase = previousPhase
 		if e = d.Journal.Append(s); e != nil {
 			return "", e
 		}
@@ -233,6 +238,17 @@ func (d *ControlFixtureDriver) Drain(ctx context.Context, p ProcessIdentity, ope
 		return "", errors.New("control drain outcome unknown")
 	}
 	d.frame.Receipt = r.Receipt
+	if d.FixtureStore != "" && previousPhase == "PREPARED" {
+		cutover, err := d.Private(ctx, "FIXTURE_CUTOVER", ReleasePrivateMessage{Snapshot: &s, Admission: s.AdmissionBundle})
+		if err != nil || cutover.Cutover == nil {
+			return "", fmt.Errorf("cutover snapshot unavailable: %v", err)
+		}
+		state := d.Journal.State()
+		state.Cutover = cutover.Cutover
+		if err = d.Journal.Append(state); err != nil {
+			return "", err
+		}
+	}
 	return r.Receipt, nil
 }
 
@@ -365,6 +381,87 @@ func (d *ControlFixtureDriver) Ready(ctx context.Context, p ProcessIdentity, tok
 	return errors.New("control readiness unavailable")
 }
 
-func (d *ControlFixtureDriver) Compatible(context.Context, ReleaseState) error {
-	return errors.New("actual control rollback requires a separately qualified restore")
+func (d *ControlFixtureDriver) Compatible(ctx context.Context, s ReleaseState) error {
+	if d.Restore == nil || s.Cutover == nil {
+		return errors.New("actual control rollback requires a separately qualified restore")
+	}
+	lease, err := rt.AcquireDataRootLease(s.Data)
+	if err != nil {
+		return err
+	}
+	defer lease.Close()
+	dest, err := d.Restore(ctx, s, lease)
+	if err != nil {
+		return err
+	}
+	current := d.Journal.State()
+	current.Data = dest
+	clearProcess(&current)
+	return d.Journal.Append(current)
+}
+
+func (d *ControlFixtureDriver) Private(ctx context.Context, kind string, message ReleasePrivateMessage) (ReleasePrivateMessage, error) {
+	var result ReleasePrivateMessage
+	s := d.Journal.State()
+	c, err := d.connection(processIn(s))
+	if err != nil {
+		return result, err
+	}
+	defer c.Close()
+	if end, ok := ctx.Deadline(); ok {
+		if err = c.SetDeadline(end); err != nil {
+			return result, err
+		}
+	}
+	var nonce [32]byte
+	if _, err = rand.Read(nonce[:]); err != nil {
+		return result, err
+	}
+	f := DrainFrame{Kind: kind, Operation: s.Operation, Epoch: s.Epoch, Root: s.Data, Nonce: hex.EncodeToString(nonce[:]), Release: &message}
+	if err = d.send(c, f); err != nil {
+		return result, err
+	}
+	r, err := d.read(c, f)
+	if err != nil {
+		return result, err
+	}
+	if r.Kind != kind || r.Release == nil {
+		return result, errors.New("private release response changed")
+	}
+	if r.Release.Error != "" {
+		return *r.Release, errors.New(r.Release.Error)
+	}
+	return *r.Release, nil
+}
+
+// ShutdownFixture only drains a known live slot owned by this host instance.
+func (d *ControlFixtureDriver) ShutdownFixture(ctx context.Context) error {
+	s := d.Journal.State()
+	if s.Phase != "STABLE" && s.Phase != "CANARY" && s.Phase != "ROLLED_BACK" {
+		return errors.New("shutdown requires an observed active slot")
+	}
+	if d.boot == nil || d.process != processIn(s) {
+		return errors.New("shutdown original inherited capability absent")
+	}
+	s.Phase = "ROLLBACK_PREPARED"
+	if e := d.Journal.Append(s); e != nil {
+		return e
+	}
+	proof, e := d.Drain(ctx, processIn(s), s.Operation)
+	if e != nil {
+		return e
+	}
+	s = d.Journal.State()
+	s.DrainReceipt = proof
+	s.Phase = "DRAINED"
+	if e = d.Journal.Append(s); e != nil {
+		return e
+	}
+	if e = d.Stop(processIn(s)); e != nil {
+		return e
+	}
+	s = d.Journal.State()
+	clearProcess(&s)
+	s.Phase = "STOPPED"
+	return d.Journal.Append(s)
 }
