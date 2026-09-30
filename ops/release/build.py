@@ -247,7 +247,11 @@ def npm_licenses(root: Path, files: dict[str, bytes]):
             item["declared_license"] = metadata.get("license", item["declared_license"])
             item["license_declaration_source"] = "package.json"
         else:
+            item["installation_status"] = "VERSION_UNVERIFIED"
             item["license_declaration_source"] = "package-lock.json"
+            gaps.append(f"npm {item['name']}: installed package metadata unavailable")
+            modules.append(item)
+            continue
         choices = sorted(p for p in directory.iterdir() if p.is_file() and
                          p.name.upper().startswith(("LICENSE", "THIRD-PARTY-LICENSE")))
         for doc_index, source in enumerate(choices):
