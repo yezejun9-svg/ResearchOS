@@ -43,7 +43,8 @@ def main():
     binary.parent.mkdir(parents=True, exist_ok=True)
     run("go-build", [go, "build", "-trimpath", "-o", str(binary), "./apps/control"])
     IDS.append("W02-BUILD-GO")
-    output = run("go-test", [go, "test", "-json", "-count=1", "./..."])
+    # Native Windows process/network checks share OS resources across packages.
+    output = run("go-test", [go, "test", "-p", "1", "-json", "-count=1", "./..."])
     passed = {event.get("Test") for line in output.splitlines()
               if (event := json.loads(line)).get("Action") == "pass" and event.get("Test")}
     if not {"TestJSON", "TestOpenSettings"} <= passed:
