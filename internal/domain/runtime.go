@@ -194,7 +194,11 @@ func (s *Service) runtimeOperation(tx *sql.Tx, p Principal, project, id string, 
 		r["heartbeat_at"] = Now()
 		r["lease_expires_at"] = time.Now().UTC().Add(90 * time.Second).Format(time.RFC3339Nano)
 		r["external_run_id"] = b["external_run_id"]
-		r["checkpoint_artifact_id"] = b["checkpoint_artifact_id"]
+		// A fresh session can heartbeat before producing its next checkpoint.
+		// Null reports no new checkpoint; it cannot erase the durable recovery point.
+		if Str(b, "checkpoint_artifact_id") != "" {
+			r["checkpoint_artifact_id"] = b["checkpoint_artifact_id"]
+		}
 		r["status"] = "RUNNING"
 		if r["started_at"] == nil {
 			r["started_at"] = Now()

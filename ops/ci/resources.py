@@ -14,10 +14,10 @@ ROOT = Path(__file__).resolve().parents[2]
 EXPECTED = json.loads((ROOT / 'tests/resources/expected.json').read_text(encoding='utf-8-sig'))
 GROUPS = {
     'W12-G01': list(EXPECTED),
-    'C11': ['TestW12CrashAndResume', 'TestW12DuplicateCallbacks'],
+    'C11': ['TestW12CrashAndResume', 'TestW12DuplicateCallbacks', 'TestW12SessionIdentity'],
     'C13': ['TestW12Budget', 'TestW12CrashAndResume', 'TestW12ConcurrencyAndQueue', 'TestW12ProgressAndLimits'],
     'C14': ['TestW12Budget', 'TestW12BudgetSettlementChain', 'TestW12BudgetConnections', 'TestW12BudgetPrecisionAndModes', 'TestW12PreparedEffectFences', 'TestW12CancelRetainsAccounting'],
-    'C15': ['TestW12ResourceRoutes'],
+    'C15': ['TestW12ResourceRoutes', 'TestW12SessionIdentity'],
     'C16': ['TestW12ProgressAndLimits'],
 }
 
