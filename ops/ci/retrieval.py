@@ -86,6 +86,9 @@ def run(command, evidence, timeout=180):
 
 def main():
     task = os.getenv("RESEARCHOS_TASK_ID", "W09")
+    if task == "W08":
+        import research
+        return research.main("test.research.fixture")
     check = os.getenv("RESEARCHOS_CHECK_ID", "")
     case = os.getenv("RESEARCHOS_CASE_ID", "")
     mode = os.getenv("RESEARCHOS_RETRIEVAL_MODE", "")

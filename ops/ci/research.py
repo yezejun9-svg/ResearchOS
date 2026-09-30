@@ -19,7 +19,7 @@ TEST_IDS["W08-G01"] = set().union(*TEST_IDS.values())
 ASSERTIONS = {
     "C05": {"C05-EXPERIMENT", "C05-01", "C05-02", "C05-03", "C05-03-REVISIT", "C05-02-NO-ADOPT", "C05-02-NO-FALSE-ADOPT", "C05-01-PAGES"},
     "C06": {"C06-01", "C06-02-X", "C06-02-NO-FALSE-COMPLETE", "C06-02", "C06-03-REQUEST", "C06-03-DEDUP", "C06-03-RETRY-AFTER", "C06-03-RETRY", "C06-02-429", "W08-G02-COALESCE", "W08-G02-ONE-ACTIVE"},
-    "W08-G02": {"W08-G02-FIRST-LOOKBACK", "W08-G02-MISSED-WINDOW", "W08-G02-MISSED-COALESCED", "W08-G02-COALESCE", "W08-G02-ONE-ACTIVE"},
+    "W08-G02": {"W08-G02-FIRST-LOOKBACK", "W08-G02-MISSED-WINDOW", "W08-G02-MISSED-COALESCED", "W08-G02-COALESCE", "W08-G02-ONE-ACTIVE", "C06-02-429", "C06-03-RETRY", "C06-03-RETRY-AFTER"},
 }
 ASSERTIONS["W08-G01"] = set().union(*ASSERTIONS.values())
 SOURCES = ["internal/domain/research.go", "internal/domain/candidates.go", "internal/domain/research_test.go", "migrations/sqlite/0013_research_cycles.sql", "ops/ci/research.py"]
@@ -41,13 +41,16 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def main():
+def main(command_key="test.research.fixture"):
     if os.getenv("RESEARCHOS_TASK_ID") != "W08":
         raise ValueError("RESEARCHOS_TASK_ID must be W08")
     check, case = os.getenv("RESEARCHOS_CHECK_ID", ""), os.getenv("RESEARCHOS_CASE_ID", "")
     selected = case or check
     if selected not in TEST_IDS or (case and check):
         raise ValueError("select one of W08-G01, W08-G02, C05, C06")
+    allowed = {"test.research.fixture": TEST_IDS, "test.experiments": {"W08-G01", "C05"}, "test.sources.fixture": {"W08-G01", "C06"}}
+    if selected not in allowed.get(command_key, {}):
+        raise ValueError("command/selector mismatch")
     go = os.getenv("RESEARCHOS_GO") or json.loads((ROOT / "execution/toolchains/locked.json").read_text(encoding="utf-8"))["tools"]["go"]["path"]
     if not Path(go).is_file():
         raise FileNotFoundError("pinned Go executable unavailable")
@@ -58,7 +61,9 @@ def main():
     command = [go, "test", "-count=1", "-json", "-run", "^(?:" + "|".join(re.escape(x) for x in tests) + ")$", "./internal/domain"]
     manifest = {"task_id": "W08", "selector": selected, "scope": "FIXTURE", "cwd": str(ROOT), "head": git("rev-parse", "HEAD"),
                 "branch": git("branch", "--show-current"), "dirty_before": git("status", "--porcelain").splitlines(),
-                "executor_id": os.getenv("RESEARCHOS_EXECUTOR_ID"), "source_hashes": {name: sha(ROOT / name) for name in SOURCES},
+                "executor_id": os.getenv("RESEARCHOS_EXECUTOR_ID"), "command_key": command_key,
+                "registered_command_revision": sha(ROOT / "execution/commands.json"),
+                "source_hashes": {name: sha(ROOT / name) for name in SOURCES},
                 "command": command, "started_at": now()}
     (evidence / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     env = os.environ.copy()
@@ -98,6 +103,7 @@ def main():
                 failures.append("invalid assertion event")
     failures += ["missing test " + x for x in sorted(TEST_IDS[selected] - passes)]
     failures += ["missing assertion " + x for x in sorted(ASSERTIONS[selected] - seen)]
+    failures += ["unexpected assertion " + x for x in sorted(seen - ASSERTIONS[selected])]
     failures += ["failed assertion " + x for x, a in assertions.items() if a.get("status") != "PASS"]
     failures += ["go test exit " + str(code)] if code else []
     snapshots = {p.name: sha(p) for p in sorted(evidence.glob("*-sqlite.json"))}
@@ -107,12 +113,14 @@ def main():
               "status": "PASS" if not failures and seen else "FAIL", "test_ids": sorted(passes),
               "assertion_ids": sorted(seen), "expected_assertion_ids": sorted(ASSERTIONS[selected]),
               "assertion_count": len(seen), "failures": failures,
+              "assertions": [assertions[key] for key in sorted(assertions)],
               "raw": {p.name: sha(p) for p in (stdout, stderr)}, "sqlite_snapshots": snapshots,
               "formal_product_acceptance": "PENDING_INDEPENDENT_REVIEW",
               "limitations": "Sealed local source fixture; no live XBrowser bounded-window proof or production scheduler."}
     (evidence / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(json.dumps({"status": report["status"], "selector": selected, "assertion_count": len(seen),
-                      "failures": failures, "report": str((evidence / "report.json").relative_to(ROOT))}, ensure_ascii=False))
+    print(json.dumps({"status": report["status"], "selector": selected, "scope": "FIXTURE", "assertions": len(seen),
+                      "assertion_ids": sorted(seen), "failures": failures,
+                      "report_reference": str((evidence / "report.json").relative_to(ROOT))}, ensure_ascii=False))
     return 0 if report["status"] == "PASS" else 1
 
 
