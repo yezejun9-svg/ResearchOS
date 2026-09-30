@@ -683,6 +683,16 @@ func (s *Service) ResolveActiveSkill(tx *sql.Tx, project, id string) (Object, er
 	if e = s.skillCurrent(tx, project, o); e != nil {
 		return nil, e
 	}
+	doc, e := s.skillDocument(tx, project, o["content_artifact_ref"].(map[string]any))
+	if e != nil {
+		return nil, e
+	}
+	if e = s.validateSkillSources(tx, project, o, doc); e != nil {
+		return nil, e
+	}
+	if e = s.skillConflictLedgerCurrent(tx, project, o); e != nil {
+		return nil, e
+	}
 	return o, nil
 }
 
