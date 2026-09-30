@@ -3,6 +3,7 @@
 package supervisor
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,21 @@ import (
 	"path/filepath"
 	"time"
 )
+
+// Receipt creation and re-reading share this gate; a caller cannot substitute
+// mere liveness for actual control's private readiness proof.
+func receiptReady(j *ReleaseJournal, d ProcessDriver) error {
+	s := j.State()
+	r, ok := d.(interface {
+		Ready(context.Context, ProcessIdentity, string) error
+	})
+	if !ok {
+		return errors.New("release receipt readiness verifier absent")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return r.Ready(ctx, processIn(s), s.Operation)
+}
 
 type ReleaseReceipt struct {
 	Format          string    `json:"format"`
@@ -40,6 +56,9 @@ func WriteFixtureReceipt(root string, j *ReleaseJournal, d ProcessDriver) (Relea
 	s := j.State()
 	if s.Phase != "CANARY" || s.Operation == "" || s.PID == 0 || s.ImageSHA256 != s.Active {
 		return ReleaseReceipt{}, "", errors.New("active canary process absent")
+	}
+	if e := receiptReady(j, d); e != nil {
+		return ReleaseReceipt{}, "", e
 	}
 	alive, e := d.Alive(processIn(s))
 	if e != nil || !alive {
@@ -86,6 +105,9 @@ func readFixtureReceiptBytes(b []byte, j *ReleaseJournal, d ProcessDriver, opera
 	s := j.State()
 	if r.Format != "R2_NATIVE_FIXTURE_RECEIPT_V1" || r.Operation != operation || s.Operation != operation || s.Phase != "CANARY" || r.Epoch != s.Epoch || r.Sequence != j.Sequence() || r.JournalHash != j.last.Hash || r.ActiveSHA256 != s.Active || r.CandidateSHA256 != s.Candidate || r.LastGoodSHA256 != s.LastGood || r.PID != s.PID || r.CreatedNS != s.CreatedNS || r.ImageSHA256 != s.ImageSHA256 || !r.ProcessAlive {
 		return r, "", errors.New("raw release receipt does not match supervisor journal")
+	}
+	if e := receiptReady(j, d); e != nil {
+		return r, "", e
 	}
 	alive, e := d.Alive(processIn(s))
 	if e != nil || !alive {

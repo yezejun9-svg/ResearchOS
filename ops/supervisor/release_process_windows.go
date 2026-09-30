@@ -3,6 +3,7 @@
 package supervisor
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -33,6 +34,22 @@ type ProcessDriver interface {
 // boundary. Args must bind the operation token and data root in the child.
 type NativeFixtureDriver struct {
 	Args func(token, data string) []string
+}
+
+// The historical marker fixture has no control HTTP/DB startup. Actual control
+// uses ControlFixtureDriver.Ready and must prove its inherited private channel.
+func (d NativeFixtureDriver) Ready(ctx context.Context, p ProcessIdentity, _ string) error {
+	if e := ctx.Err(); e != nil {
+		return e
+	}
+	alive, e := d.Alive(p)
+	if e != nil {
+		return e
+	}
+	if !alive {
+		return errors.New("native fixture process absent")
+	}
+	return nil
 }
 
 func exactImage(path string) (string, string, error) {

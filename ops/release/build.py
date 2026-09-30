@@ -183,7 +183,7 @@ def module_licenses(go: Path, root: Path, env, files: dict[str, bytes]):
     gaps = []
     cache = Path(run([go, "env", "GOMODCACHE"], root, env).strip())
     compiled = {}
-    for binary in ("control", "runtime", "backup"):
+    for binary in ("control", "runtime", "backup", "release_host"):
         with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as temporary:
             temporary.write(files[f"bin/{binary}.exe"])
             path = Path(temporary.name)
@@ -304,7 +304,7 @@ def build(root: Path, output: Path, lock_path: Path):
         raise RuntimeError("web build has no index.html")
     files = collect_sources(root)
     with tempfile.TemporaryDirectory(prefix="researchos-release-build-") as temporary:
-        for name, package in (("control", "./apps/control"), ("runtime", "./ops/runtime"), ("backup", "./ops/backup")):
+        for name, package in (("control", "./apps/control"), ("runtime", "./ops/runtime"), ("backup", "./ops/backup"), ("release_host", "./ops/supervisor/release_host")):
             binary = Path(temporary) / f"{name}.exe"
             run([go, "build", "-trimpath", "-buildvcs=false", "-ldflags=-buildid=", "-o", binary, package], root, env)
             files[f"bin/{name}.exe"] = binary.read_bytes()
@@ -329,8 +329,9 @@ def build(root: Path, output: Path, lock_path: Path):
         "migrations": [{"name": name, "sha256": digest(files[f"migrations/sqlite/{name}"])} for name in migration_names],
         "database": {"fresh_fixture": True, "fresh_fixture_schema": int(migration_names[-1][:4]),
                      "populated_read_write_range": "NOT_QUALIFIED_R1; PREBACKUP_GUARD_APPLIES",
-                     "final_release_schema": "ROOT_TO_PIN_AFTER_RUNTIME_S2", "existing_pinned_upgrade": "schema13-to14-remote-access-v1",
-                     "schema13_to_final_plan": "NOT_IMPLEMENTED"},
+                     "final_release_schema": 20, "existing_pinned_upgrade": "schema13-to14-remote-access-v1",
+                     "schema13_to_final_plan": "schema13-to20-research-runtime-v1",
+                     "schema13_to_final_qualification": "BOUNDED_FIXTURE_MECHANISM_ONLY; ACTUAL_ACTIVATION_BLOCKED"},
         "commands": command_scope,
         "sbom": {"go": go_modules, "npm": npm_modules, "license_gaps": go_gaps + npm_gaps},
         "runtime_profile": {"adapter_versions": "NOT_QUALIFIED_R1", "model_identity": "NOT_OBSERVED",

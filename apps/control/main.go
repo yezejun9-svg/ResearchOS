@@ -86,6 +86,18 @@ func main() {
 		log.Fatalf("domain unavailable: %v", err)
 	}
 	service.Protected = &protectedstore.FrozenProvider{}
+	boot, err := supervisor.ReadInheritedDrainBootstrap(dataDir)
+	if err != nil {
+		log.Fatalf("private drain capability unavailable: %v", err)
+	}
+	if boot != nil && boot.FixtureStore != "" {
+		fixture, e := protectedstore.OpenCanary(boot.FixtureStore)
+		if e != nil {
+			log.Fatalf("private fixture store unavailable: %v", e)
+		}
+		defer fixture.Close()
+		service.Protected = fixture
+	}
 	if *provision != "" || *issue != "" {
 		if e := adminCredential(service, *provision, *issue, *credentialFile); e != nil {
 			log.Fatalf("local credential administration failed: %v", e)
@@ -200,10 +212,6 @@ func main() {
 		close(coordinatorDone)
 	}
 	drainDone := make(chan struct{})
-	boot, err := supervisor.ReadInheritedDrainBootstrap(dataDir)
-	if err != nil {
-		log.Fatalf("private drain capability unavailable: %v", err)
-	}
 	if boot != nil {
 		d := &controlDrain{gate: gate, service: service, coordinator: coordinator, lease: lease, listener: listener, startup: boot, pipe: boot.Pipe, root: dataDir, key: boot.Key, peer: boot.Peer, stop: stop}
 		go func() {

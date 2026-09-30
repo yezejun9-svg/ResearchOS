@@ -175,6 +175,7 @@ func (e *ReleaseEngine) SwitchFixture(ctx context.Context, operation string) (Re
 		return e.journal.State(), errors.New("stable drain receipt absent")
 	}
 	s.DrainNonce = e.journal.State().DrainNonce
+	s.Cutover = e.journal.State().Cutover
 	s.DrainReceipt = proof
 	s.Phase = "DRAINED"
 	if err = e.journal.Append(s); err != nil {
@@ -199,14 +200,17 @@ func (e *ReleaseEngine) SwitchFixture(ctx context.Context, operation string) (Re
 		return s, err
 	}
 	setProcess(&s, p)
-	s.Phase = "CANARY"
+	// Persist the actual launched identity before readiness, without certifying
+	// a usable slot. Recovery must inspect it, never launch this operation again.
+	s.Phase = "RECOVERING"
 	if err = e.journal.Append(s); err != nil {
 		return s, err
 	}
 	if err = e.barrier.Ready(ctx, p, operation); err != nil {
 		return s, err
 	}
-	return s, nil
+	s.Phase = "CANARY"
+	return s, e.journal.Append(s)
 }
 
 // RollbackFixture freezes the failed digest and returns to the exact last good
@@ -226,6 +230,18 @@ func (e *ReleaseEngine) RollbackFixture(ctx context.Context, operation string) (
 		}
 	}
 	if s.PID != 0 {
+		if _, actual := e.driver.(*ControlFixtureDriver); actual {
+			proof, err := e.barrier.Drain(ctx, processIn(s), operation)
+			if err != nil || !validDigest(proof) {
+				return e.journal.State(), errors.New("rollback drain receipt absent")
+			}
+			s.DrainNonce = e.journal.State().DrainNonce
+			s.DrainReceipt = proof
+			s.Phase = "DRAINED"
+			if err = e.journal.Append(s); err != nil {
+				return s, err
+			}
+		}
 		if err := e.driver.Stop(processIn(s)); err != nil {
 			return s, err
 		}
@@ -239,6 +255,9 @@ func (e *ReleaseEngine) RollbackFixture(ctx context.Context, operation string) (
 		s.Phase = "RECOVERING"
 		_ = e.journal.Append(s)
 		return s, err
+	}
+	if _, actual := e.driver.(*ControlFixtureDriver); actual {
+		s.Data = e.journal.State().Data
 	}
 	_, digest, err := exactImage(s.LastGoodPath)
 	if err != nil || digest != s.LastGood {
@@ -258,14 +277,15 @@ func (e *ReleaseEngine) RollbackFixture(ctx context.Context, operation string) (
 		return s, err
 	}
 	setProcess(&s, p)
-	s.Phase = "ROLLED_BACK"
+	s.Phase = "RECOVERING"
 	if err = e.journal.Append(s); err != nil {
 		return s, err
 	}
 	if err = e.barrier.Ready(ctx, p, operation+"-rollback"); err != nil {
 		return s, err
 	}
-	return s, nil
+	s.Phase = "ROLLED_BACK"
+	return s, e.journal.Append(s)
 }
 
 // Reconcile inspects OS state and never replays an uncertain start, stop or
