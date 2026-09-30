@@ -43,7 +43,7 @@ def main():
                         assert response.status == 200 and health == {
                             "status": "ready", "scope": "DEVELOPMENT_ONLY", "database": "sqlite"}
                     break
-                except URLError:
+                except (URLError, TimeoutError):
                     if time.monotonic() > deadline:
                         raise RuntimeError("healthz did not become ready")
                     time.sleep(.1)
