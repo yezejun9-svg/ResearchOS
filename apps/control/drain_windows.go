@@ -182,6 +182,26 @@ func (d *controlDrain) handle(ctx context.Context) error {
 		if d.startup == nil || d.startup.FixtureStore == "" || frame.Release == nil {
 			return errors.New("inherited fixture release capability required")
 		}
+		// The calculator profile cannot qualify this executable. The independent
+		// exact-control profile is not wired yet; close every actual release action
+		// explicitly rather than relying on incidental artifact incompatibility.
+		result := supervisor.ReleasePrivateMessage{Error: "ACTUAL_CONTROL_BEHAVIOR_PROOF_UNAVAILABLE"}
+		reply := d.response(frame.Kind, frame, "", "FIXTURE")
+		reply.Release = &result
+		reply, err := supervisor.DrainFrameSign(d.key, reply)
+		if err != nil {
+			return err
+		}
+		return supervisor.WriteDrainFrame(conn, reply)
+	}
+	return d.handleQualifiedFrame(ctx, conn, frame)
+}
+
+// Kept separate from the closed qualification gate so the future typed profile
+// integration has one shared process/readiness boundary to enter.
+func (d *controlDrain) handleQualifiedFrame(ctx context.Context, conn *os.File, frame supervisor.DrainFrame) error {
+	switch frame.Kind {
+	case "FIXTURE_SEAL", "FIXTURE_CURRENT", "FIXTURE_DISPATCH", "FIXTURE_CUTOVER", "FIXTURE_PROJECT":
 		if frame.Kind == "FIXTURE_CUTOVER" && (d.operation != frame.Operation || d.epoch != frame.Epoch || d.receipt == "") {
 			return errors.New("cutover requires actual quiesced operation")
 		}
@@ -192,6 +212,17 @@ func (d *controlDrain) handle(ctx context.Context) error {
 		snapshot := frame.Release.Snapshot
 		if identityErr != nil || snapshot == nil || snapshot.Epoch != frame.Epoch || snapshot.Operation != frame.Operation || snapshot.Data != frame.Root || snapshot.PID != identity.PID || snapshot.CreatedNS != identity.CreatedNS || snapshot.ImageSHA256 != identity.ImageSHA256 {
 			return errors.New("private host snapshot process binding changed")
+		}
+		if frame.Kind == "FIXTURE_PROJECT" {
+			if d.coordinator != nil && !d.coordinator.StartupReady() {
+				return errors.New("projection control startup incomplete")
+			}
+			d.gate.mu.Lock()
+			available := !d.gate.closing && !d.gate.quiesced
+			d.gate.mu.Unlock()
+			if !available || !d.lease.Held() || d.listener == nil || d.listener.Addr().String() != d.startup.Listener {
+				return errors.New("projection control not ready")
+			}
 		}
 		result, err := d.service.HandleReleaseFixture(ctx, frame.Kind, d.root, *frame.Release)
 		if err != nil {

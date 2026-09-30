@@ -200,14 +200,17 @@ func (e *ReleaseEngine) SwitchFixture(ctx context.Context, operation string) (Re
 		return s, err
 	}
 	setProcess(&s, p)
-	s.Phase = "CANARY"
+	// Persist the actual launched identity before readiness, without certifying
+	// a usable slot. Recovery must inspect it, never launch this operation again.
+	s.Phase = "RECOVERING"
 	if err = e.journal.Append(s); err != nil {
 		return s, err
 	}
 	if err = e.barrier.Ready(ctx, p, operation); err != nil {
 		return s, err
 	}
-	return s, nil
+	s.Phase = "CANARY"
+	return s, e.journal.Append(s)
 }
 
 // RollbackFixture freezes the failed digest and returns to the exact last good
@@ -274,14 +277,15 @@ func (e *ReleaseEngine) RollbackFixture(ctx context.Context, operation string) (
 		return s, err
 	}
 	setProcess(&s, p)
-	s.Phase = "ROLLED_BACK"
+	s.Phase = "RECOVERING"
 	if err = e.journal.Append(s); err != nil {
 		return s, err
 	}
 	if err = e.barrier.Ready(ctx, p, operation+"-rollback"); err != nil {
 		return s, err
 	}
-	return s, nil
+	s.Phase = "ROLLED_BACK"
+	return s, e.journal.Append(s)
 }
 
 // Reconcile inspects OS state and never replays an uncertain start, stop or
