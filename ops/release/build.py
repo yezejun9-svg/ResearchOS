@@ -35,7 +35,7 @@ FROZEN_DIRS = (
     "migrations", "ops", "qualification", "release", "spec", "tests",
     "docs/installation", "execution/command_dispatcher",
 )
-FROZEN_ROOT_FILES = {"go.mod", "go.sum", "go.work", "go.work.sum"}
+FROZEN_ROOT_FILES = {"go.mod", "go.sum", "go.work", "go.work.sum", "execution/toolchains/locked.json"}
 GENERATED_DIRS = {".git", ".local", "node_modules", "dist", "__pycache__"}
 
 
@@ -51,7 +51,7 @@ def frozen_path(relative: str) -> bool:
     parts = Path(relative).parts
     if any(part in GENERATED_DIRS for part in parts):
         return False
-    return relative in FROZEN_ROOT_FILES or any(
+    return relative in FROZEN_ROOT_FILES or relative in SOURCE_FILES or any(
         relative == directory or relative.startswith(directory + "/") for directory in FROZEN_DIRS
     )
 
@@ -95,7 +95,7 @@ def check_frozen_inputs(root: Path, previous=None):
                 if oid != expected[relative]:
                     raise RuntimeError(f"dirty frozen Git input: {relative}")
                 actual.add(relative)
-    for relative in FROZEN_ROOT_FILES:
+    for relative in FROZEN_ROOT_FILES | set(SOURCE_FILES):
         path = root / relative
         if path.exists() or relative in expected:
             if path.is_symlink() or not path.is_file() or relative not in expected:
@@ -264,7 +264,7 @@ def build(root: Path, output: Path, lock_path: Path):
     go = checked_tool(lock, "go")
     node = checked_tool(lock, "node")
     npm = checked_tool(lock, "npm_cli")
-    env = dict(os.environ, GOTOOLCHAIN="local", GOENV="off", GOPROXY="off", GOSUMDB="off", CGO_ENABLED="0", GOWORK="off", GOFLAGS="-mod=readonly", NODE_OPTIONS="")
+    env = dict(os.environ, GOTOOLCHAIN="local", GOENV="off", GOPROXY="off", GOSUMDB="off", CGO_ENABLED="0", GOWORK="off", GOFLAGS="-mod=readonly", GOOS="windows", GOARCH="amd64", NODE_OPTIONS="")
     for name, tool, argv in (("go", go, [go, "version"]), ("node", node, [node, "--version"]),
                              ("npm_cli", npm, [node, npm, "--version"])):
         if run(argv, root, env).strip() != lock["tools"][name]["version_output"]:
