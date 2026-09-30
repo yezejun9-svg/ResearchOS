@@ -24,17 +24,25 @@ $command = '"' + $installed + '" --service --reader-sid ' + $identity.User.Value
 $service = Get-CimInstance Win32_Service -Filter "Name='$name'"
 if ($saved.schema -ne 'researchos.verifier-canary-install.v1' -or $saved.service -ne $name -or $saved.install_root -ne $root -or $saved.reader_sid -ne $identity.User.Value -or $saved.binary_sha256 -ne $oldHash -or $service.StartName -ne "NT SERVICE\$name" -or $service.PathName -ne $command) { throw 'INSTALL_IDENTITY_MISMATCH' }
 if ((Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -ne $oldHash -or (Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash -ne $ExpectedSHA256) { throw 'BINARY_HASH_MISMATCH' }
-if ((Test-Path -LiteralPath $backup) -or (Test-Path -LiteralPath $backupManifest)) { throw 'PRIOR_REPAIR_PRESERVED' }
+$priorBackup = Test-Path -LiteralPath $backup
+$priorManifest = Test-Path -LiteralPath $backupManifest
+if ($priorBackup -or $priorManifest) {
+    if (-not $priorBackup -or -not $priorManifest -or (Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash -ne $oldHash -or (Get-FileHash -LiteralPath $backupManifest -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash) { throw 'PRIOR_REPAIR_DIFFERS_PRESERVED' }
+}
 $binaryACL = Get-Acl -LiteralPath $installed
 if (-not $binaryACL.AreAccessRulesProtected -or $binaryACL.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne 'S-1-5-32-544') { throw 'INSTALLED_BINARY_BOUNDARY_CHANGED' }
 # This one-time repair preserves all private data and the exact previous binary.
 # It does not read labels, reset a run marker, start evaluation, or change any ACL.
-Copy-Item -LiteralPath $installed -Destination $backup
-Set-Acl -LiteralPath $backup -AclObject $binaryACL
-Copy-Item -LiteralPath $manifestPath -Destination $backupManifest
-Set-Acl -LiteralPath $backupManifest -AclObject (Get-Acl -LiteralPath $manifestPath)
+if (-not $priorBackup) {
+    Copy-Item -LiteralPath $installed -Destination $backup
+    Set-Acl -LiteralPath $backup -AclObject $binaryACL
+    Copy-Item -LiteralPath $manifestPath -Destination $backupManifest
+    Set-Acl -LiteralPath $backupManifest -AclObject (Get-Acl -LiteralPath $manifestPath)
+}
+$serviceProcess = if ($service.ProcessId -ne 0) { Get-Process -Id $service.ProcessId } else { $null }
 Stop-Service -Name $name
 (Get-Service -Name $name).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+if ($serviceProcess -and -not $serviceProcess.WaitForExit(15000)) { throw 'SERVICE_PROCESS_EXIT_TIMEOUT_DATA_PRESERVED' }
 try {
     Copy-Item -LiteralPath $Binary -Destination $installed -Force
     Set-Acl -LiteralPath $installed -AclObject $binaryACL
