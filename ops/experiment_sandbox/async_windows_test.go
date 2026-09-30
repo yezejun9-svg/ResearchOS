@@ -16,7 +16,38 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"researchos.local/research-os/internal/canonical"
 )
+
+func TestRuntimeSandboxIdentityJSONExact(t *testing.T) {
+	const created int64 = 1790787239271034300
+	for _, value := range []any{Identity{PID: 123, Created: created}, Receipt{PID: 123, Created: created}} {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		canon, err := canonical.JSON(raw)
+		if err != nil {
+			t.Fatalf("canonical identity: %v %s", err, raw)
+		}
+		var object map[string]any
+		if err = json.Unmarshal(canon, &object); err != nil {
+			t.Fatal(err)
+		}
+		if object["process_created_ns"] != "1790787239271034300" {
+			t.Fatalf("creation identity rounded: %s", canon)
+		}
+		var id Identity
+		if err = json.Unmarshal(canon, &id); err != nil || id.Created != created {
+			t.Fatalf("typed identity roundtrip: %+v %v", id, err)
+		}
+		var receipt Receipt
+		if err = json.Unmarshal(canon, &receipt); err != nil || receipt.Created != created {
+			t.Fatalf("typed receipt roundtrip: %+v %v", receipt, err)
+		}
+	}
+}
 
 func TestRuntimeSandboxChild(t *testing.T) {
 	idx := -1
