@@ -35,7 +35,7 @@ old_lock_hashes = {}
 data_root = ROOT / '.local' / 'data'
 if data_root.exists():
     for p in data_root.rglob('*'):
-        if p.is_file() and ('lock' in p.name.lower() or p.suffix == '.sqlite'):
+        if p.is_file() and ('lock' in p.name.lower() or p.name.endswith(('.sqlite', '.sqlite-wal', '.sqlite-shm'))):
             old_lock_hashes[str(p)] = hashlib.sha256(p.read_bytes()[:65536]).hexdigest()
 
 # A1: build own CLI
@@ -81,7 +81,11 @@ try:
             j = json.loads(r.stdout.strip().splitlines()[-1])
         except Exception:
             pass
-        ok('A7_DOCTOR_HANDSHAKE', r.returncode == 0 and j.get('health') == 'UP' and j.get('client_protocol') == 'researchos-client/2' and j.get('host_pid') == host_proc.pid, j)
+        ns = subprocess.run(['netstat', '-ano', '-p', 'TCP'], capture_output=True, text=True,
+                            encoding='utf-8', errors='replace').stdout or ''
+        listen_pids = {ln.split()[-1] for ln in ns.splitlines() if ':18923' in ln and 'LISTENING' in ln}
+        ok('A7_DOCTOR_HANDSHAKE', r.returncode == 0 and j.get('health') == 'UP' and j.get('client_protocol') == 'researchos-client/2'
+           and str(host_proc.pid) in listen_pids and j.get('host_pid') == host_proc.pid, {'doctor': j, 'netstat_pid': sorted(listen_pids)})
     else:
         out = host_proc.stdout.read() if host_proc.stdout else ''
         notes.append('host boot log tail: ' + (out or '')[-400:])
@@ -98,6 +102,7 @@ try:
                 rep = json.loads(line[len('ROS_DESKTOP_REPORT'):])
         ok('A8_DESKTOP_SHELL_UP', bool(rep) and rep['host_health'] == 'UP' and rep['protocol'] == 'researchos-client/2',
            (rep, (r.stderr or '')[-200:]))
+        notes.append('A8 retries built into shell: hostStatus probes up to 4 times with 400ms backoff and reports error/latency')
     else:
         ok('A8_DESKTOP_SHELL_UP', False, 'electron not installed yet: run apps/desktop npm install step')
 finally:
