@@ -9,8 +9,8 @@ import (
 )
 
 // ClientSession is the v2.4 authoritative index row mapping one client session to
-// this-domain project/goal/task/run plus the upstream worker session log and the
-// event watermark. Business truth remains in the existing tables; this maps to it.
+// this-domain project/goal/task/run plus the upstream worker session log, watermark
+// and lease attribution. Business truth remains in the existing tables.
 type ClientSession struct {
 	ID               string
 	ProjectID        string
@@ -21,22 +21,33 @@ type ClientSession struct {
 	TaskID           *string
 	RunID            *string
 	WriterEpoch      int64
+	WriterClientID   string
+	LeaseExpiresAt   *time.Time
 	EventWatermark   int64
-	UpstreamSession  *string
+	UpstreamSession  string
 	UpstreamLogID    *string
 	UpstreamLogHash  *string
+	WorkspaceRef     *string
+	Title            *string
+	ModelConfigRef   *string
+	CoreBuildID      *string
+	ResumeExplicit   int
 	SealedAt         *time.Time
+	ArchivedAt       *time.Time
 	Protocol         string
 }
 
 var (
 	ErrStaleEpoch      = errors.New("STALE_WRITER_EPOCH")
+	ErrStaleRevision   = errors.New("STALE_REVISION")
 	ErrUnknownProtocol = errors.New("UNKNOWN_PROTOCOL")
 	ErrBadLogHash      = errors.New("BAD_UPSTREAM_LOG_HASH")
 	ErrSealed          = errors.New("SESSION_SEALED")
+	ErrUnknownProject  = errors.New("UNKNOWN_PROJECT")
+	ErrMissingWriter   = errors.New("MISSING_WRITER_ATTRIBUTION")
 )
 
-const clientProtocolV2 = "researchos-client/2"
+const ClientSessionProtocol = "researchos-client/2"
 
 func validLogHash(h *string) bool {
 	if h == nil {
@@ -53,34 +64,73 @@ func validLogHash(h *string) bool {
 	return true
 }
 
-// MapClientSession inserts the mapping inside the caller's transaction so that the
-// business write and the index share one atomic commit.
+// MapClientSession inserts the mapping inside the caller's transaction; the project
+// must already exist in domain_objects (existence checked in the same transaction).
 func MapClientSession(ctx context.Context, tx *sql.Tx, s ClientSession) error {
-	if s.Protocol != clientProtocolV2 {
+	if s.Protocol != ClientSessionProtocol {
 		return ErrUnknownProtocol
 	}
 	if !validLogHash(s.UpstreamLogHash) {
 		return ErrBadLogHash
 	}
+	if s.WriterClientID == "" {
+		return ErrMissingWriter
+	}
+	if s.UpstreamSession == "" {
+		return fmt.Errorf("MISSING_NATIVE_SESSION_REF")
+	}
 	if s.Revision < 1 || s.WriterEpoch < 1 || s.EventWatermark < 0 {
 		return fmt.Errorf("INVALID_SESSION_FIELDS")
 	}
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project' AND id=?`, s.ProjectID).Scan(&n); err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrUnknownProject
+	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO client_sessions
 		(id, project_id, revision, created_at, updated_at, goal_id, task_id, run_id,
-		 writer_epoch, event_watermark, upstream_session_id, upstream_log_hash, upstream_log_id, sealed_at, protocol)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 writer_epoch, writer_client_id, lease_expires_at, event_watermark,
+		 upstream_session_id, upstream_log_hash, upstream_log_id, workspace_ref, title,
+		 model_config_ref, core_build_id, resume_requires_explicit_user, sealed_at, archived_at, protocol)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		s.ID, s.ProjectID, s.Revision, s.CreatedAt.UTC().Format(time.RFC3339Nano), s.UpdatedAt.UTC().Format(time.RFC3339Nano),
-		s.GoalID, s.TaskID, s.RunID, s.WriterEpoch, s.EventWatermark, s.UpstreamSession, s.UpstreamLogHash, s.UpstreamLogID,
-		s.SealedAt, s.Protocol)
+		s.GoalID, s.TaskID, s.RunID, s.WriterEpoch, s.WriterClientID, s.LeaseExpiresAt, s.EventWatermark,
+		s.UpstreamSession, s.UpstreamLogHash, s.UpstreamLogID, s.WorkspaceRef, s.Title,
+		s.ModelConfigRef, s.CoreBuildID, s.ResumeExplicit, s.SealedAt, s.ArchivedAt, s.Protocol)
 	return err
 }
 
-// AdvanceWatermark moves the event watermark forward only, under the current writer epoch.
-func AdvanceWatermark(ctx context.Context, tx *sql.Tx, id string, epoch, watermark int64) error {
+// AdvanceWatermark moves forward only, under the current writer epoch and the caller's
+// expected revision; single-step and multi-step advances are both valid (22 §161).
+func AdvanceWatermark(ctx context.Context, tx *sql.Tx, id string, epoch, expectedRevision, watermark int64) error {
+	var cur int64
+	var sealed sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT event_watermark, sealed_at FROM client_sessions WHERE id=?`, id).Scan(&cur, &sealed)
+	if err != nil {
+		return err
+	}
+	if sealed.Valid {
+		return ErrSealed
+	}
+	if epoch < 1 {
+		return ErrStaleEpoch
+	}
+	var curEpoch, rev int64
+	if err := tx.QueryRowContext(ctx, `SELECT writer_epoch, revision FROM client_sessions WHERE id=?`, id).Scan(&curEpoch, &rev); err != nil {
+		return err
+	}
+	if rev != expectedRevision {
+		return ErrStaleRevision
+	}
+	if epoch != curEpoch {
+		return ErrStaleEpoch
+	}
 	res, err := tx.ExecContext(ctx, `UPDATE client_sessions
 		SET event_watermark=?, revision=revision+1, updated_at=?
-		WHERE id=? AND writer_epoch=? AND event_watermark<? AND sealed_at IS NULL`,
-		watermark, time.Now().UTC().Format(time.RFC3339Nano), id, epoch, watermark-1)
+		WHERE id=? AND writer_epoch=? AND sealed_at IS NULL AND event_watermark < ?`,
+		watermark, time.Now().UTC().Format(time.RFC3339Nano), id, curEpoch, watermark)
 	if err != nil {
 		return err
 	}
@@ -90,9 +140,19 @@ func AdvanceWatermark(ctx context.Context, tx *sql.Tx, id string, epoch, waterma
 	return nil
 }
 
-// HandoffEpoch transfers the single writer: epoch must advance exactly by one and the
-// session must be open. Old epochs stop being writable by construction.
-func HandoffEpoch(ctx context.Context, tx *sql.Tx, id string, fromEpoch int64) (int64, error) {
+// HandoffEpoch transfers the single writer; epoch advances by exactly one.
+func HandoffEpoch(ctx context.Context, tx *sql.Tx, id string, fromEpoch int64, expectedRevision int64) (int64, error) {
+	var curEpoch, rev int64
+	var sealed sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT writer_epoch, revision, sealed_at FROM client_sessions WHERE id=?`, id).Scan(&curEpoch, &rev, &sealed); err != nil {
+		return 0, err
+	}
+	if sealed.Valid {
+		return 0, ErrSealed
+	}
+	if rev != expectedRevision {
+		return 0, ErrStaleRevision
+	}
 	res, err := tx.ExecContext(ctx, `UPDATE client_sessions
 		SET writer_epoch=writer_epoch+1, revision=revision+1, updated_at=?
 		WHERE id=? AND writer_epoch=? AND sealed_at IS NULL`,
@@ -106,8 +166,23 @@ func HandoffEpoch(ctx context.Context, tx *sql.Tx, id string, fromEpoch int64) (
 	return fromEpoch + 1, nil
 }
 
-// Seal marks the session closed; sealed sessions reject further writes.
-func Seal(ctx context.Context, tx *sql.Tx, id string, epoch int64) error {
+// Seal closes the session for writes; sealed sessions report ErrSealed distinctly.
+func Seal(ctx context.Context, tx *sql.Tx, id string, epoch int64, expectedRevision int64) error {
+	var curEpoch, rev int64
+	var sealed sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT writer_epoch, revision, sealed_at FROM client_sessions WHERE id=?`, id).Scan(&curEpoch, &rev, &sealed)
+	if err == sql.ErrNoRows {
+		return ErrSealed
+	}
+	if err != nil {
+		return err
+	}
+	if sealed.Valid {
+		return ErrSealed
+	}
+	if rev != expectedRevision {
+		return ErrStaleRevision
+	}
 	res, err := tx.ExecContext(ctx, `UPDATE client_sessions SET sealed_at=?, revision=revision+1, updated_at=?
 		WHERE id=? AND writer_epoch=? AND sealed_at IS NULL`,
 		time.Now().UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), id, epoch)
@@ -115,7 +190,7 @@ func Seal(ctx context.Context, tx *sql.Tx, id string, epoch int64) error {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
-		return ErrSealed
+		return ErrStaleEpoch
 	}
 	return nil
 }

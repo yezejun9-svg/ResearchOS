@@ -237,6 +237,9 @@ AND NOT EXISTS(SELECT 1 FROM runtime_observations o JOIN backup_restore_barriers
 BEGIN SELECT RAISE(ABORT,'RESTORE_FRESH_RECONCILIATION_REQUIRED'); END;`); e != nil {
 		return nil, e
 	}
+	if e = EnsureClientSessionFence(ctx, tx); e != nil {
+		return nil, e
+	}
 	if _, e = tx.Exec("UPDATE auth_credentials SET revoked=1"); e != nil {
 		return nil, e
 	}
