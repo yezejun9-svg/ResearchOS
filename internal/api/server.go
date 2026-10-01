@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"log"
 	"net/http"
 	"path"
 	"path/filepath"
@@ -31,6 +32,13 @@ func Handler(db *sql.DB, webDir string, service *domain.Service) http.Handler {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ready", "scope": "DEVELOPMENT_ONLY", "database": "sqlite"})
 	})
 	mux.Handle("/v1/", service.Handler())
+	// The typed v2 boundary is served from this process, so the CLI and the Desktop reach the
+	// same command service, the same transaction and the same journal.
+	v2 := newV2Service(db)
+	mux.HandleFunc("POST /v2/command", v2.serve)
+	if v2.loadErr != nil {
+		log.Printf("v2 typed service closed: %v", v2.loadErr)
+	}
 	files := http.FileServer(http.Dir(webDir))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if (r.Method == "GET" || r.Method == "HEAD") && path.Ext(r.URL.Path) == "" && strings.Contains(r.Header.Get("Accept"), "text/html") {
