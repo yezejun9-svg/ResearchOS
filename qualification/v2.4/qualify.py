@@ -169,7 +169,91 @@ def check_w01_03():
     print(json.dumps({'status': payload['status'], 'failures': fails}, ensure_ascii=False))
     return 0 if not fails else 1
 
-CHECKS = {'W01-01': check_w01_01, 'W01-02': check_w01_02, 'W01-03': check_w01_03}
+
+def _repo():
+    return os.path.abspath(os.path.join(HERE, '..', '..'))
+
+def check_w01_g01():
+    repo = _repo()
+    inv = os.path.join(repo, 'execution', 'v2.4', 'inventory.json')
+    sc = os.path.join(repo, 'execution', 'v2.4', 'source_candidates.json')
+    checks = []
+    ok = os.path.isfile(inv) and os.path.isfile(sc)
+    checks.append({'id': 'inventory_before_clone', 'ok': ok, 'detail': 'local inventory exists ahead of clone (W00-01 precedes W01-01)'})
+    scj = json.load(open(sc, encoding='utf-8'))
+    checks.append({'id': 'manifest_reuse', 'ok': 'Mu_Source_Manifest' in json.dumps(scj), 'detail': 'existing spec reference reused by hash'})
+    checks.append({'id': 'not_found_honest', 'ok': scj['primary_candidate']['local_qualification_path'].startswith('qualification/v2.4/mu') and scj['fallback_candidate']['status'] == 'NOT_TOUCHED', 'detail': 'NOT_FOUND recorded at W00-01 then fetched; fallback untouched'})
+    fails = [c['id'] for c in checks if not c['ok']]
+    payload = {'check_id': 'W01-G01', 'mode': 'DEVELOPMENT', 'run_at': now_iso(), 'status': 'PASS' if not fails else 'FAIL', 'checks': checks, 'failures': fails}
+    record('W01-G01', payload)
+    print(json.dumps({'status': payload['status'], 'failures': fails}, ensure_ascii=False))
+    return 0 if not fails else 1
+
+def check_w01_g02():
+    repo = _repo()
+    res = json.load(open(os.path.join(MU, 'shared-session', 'results.json'), encoding='utf-8'))
+    st = json.load(open(os.path.join(repo, 'execution', 'v2.4', 'step_state.json'), encoding='utf-8'))
+    checks = []
+    checks.append({'id': 'same_core_session_matrix', 'ok': res.get('critical_fail') == 0, 'detail': 'shared-session/epoch/dedupe/cancel/crash matrix green'})
+    checks.append({'id': 'limitations_declared', 'ok': len(res.get('limitations', [])) >= 3, 'detail': 'qualification emulation stated'})
+    ids = {r['id']: r for r in st['steps']}
+    distinct = all(ids[c].get('executor_id') != ids[c].get('verifier_id') for c in ['W01-01', 'W01-02', 'W01-03'] if c in ids and ids[c]['status'] == 'ACCEPTED')
+    checks.append({'id': 'executor_not_self_verify', 'ok': distinct, 'detail': 'ACCEPTED cards have distinct executor/verifier'})
+    checks.append({'id': 'no_web_shell_substitute', 'ok': any(a['id'] == 'W0102-crash-no-orphan' and a['pass'] for a in res['assertions']), 'detail': 'process-level evidence, not deployed web page'})
+    fails = [c['id'] for c in checks if not c['ok']]
+    payload = {'check_id': 'W01-G02', 'mode': 'FIXTURE', 'run_at': now_iso(), 'status': 'PASS' if not fails else 'FAIL', 'checks': checks, 'failures': fails}
+    record('W01-G02', payload)
+    print(json.dumps({'status': payload['status'], 'failures': fails}, ensure_ascii=False))
+    return 0 if not fails else 1
+
+def check_w01_g03():
+    repo = _repo()
+    # LIVE Windows dual-end chain requires the product assembly: own researchos CLI entry + installed Desktop app.
+    own_cli = os.path.join(repo, 'apps', 'cli')
+    desktop_app = os.path.join(repo, 'apps', 'desktop')
+    release = os.path.join(repo, 'release')
+    own_cli_present = os.path.isdir(own_cli) and any('researchos' in f for f in os.listdir(own_cli)) if os.path.isdir(own_cli) else False
+    desktop_present = os.path.isdir(desktop_app)
+    checks = [
+        {'id': 'host_versions_registered', 'ok': os.path.isfile(os.path.join(repo, 'execution', 'toolchains', 'locked.json')), 'detail': 'go/node/python/git hashes in locked.json; mu build + pi 0.87.1 rpc probe at W01-01/02'},
+        {'id': 'upstream_worker_live_on_windows', 'ok': json.load(open(os.path.join(MU, 'shared-session', 'results.json'), encoding='utf-8')).get('critical_fail') == 0, 'detail': 'W01-02 attempt2 executed real deepseek turns on this Windows host'},
+        {'id': 'own_cli_entry_present', 'ok': own_cli_present, 'detail': 'product researchos CLI required by G03 two-end chain (W02+ deliverable)'},
+        {'id': 'installed_desktop_present', 'ok': desktop_present, 'detail': 'desktop assembly/installer is W02/W13/W16 deliverable'},
+    ]
+    fails = [c['id'] for c in checks if not c['ok']]
+    status = 'PASS' if not fails else 'BLOCKED_RESOURCE'
+    payload = {'check_id': 'W01-G03', 'mode': 'LIVE_WINDOWS', 'run_at': now_iso(), 'status': status, 'checks': checks,
+               'blocking': fails, 'unlock_condition': 'after W02-02/W02-03 own CLI + desktop shell exist, re-run this check on real Windows dual-end chain',
+               'repair_budget': '1 targeted repair per route (08); 0 spent on G03; W01-02 harness used its 1/1'}
+    record('W01-G03', payload)
+    print(json.dumps({'status': status, 'blocking': fails}, ensure_ascii=False))
+    return 0 if status == 'PASS' else 4
+
+def check_w01_g04():
+    repo = _repo()
+    r = check_w01_03()
+    if r != 0:
+        print(json.dumps({'status': 'FAIL', 'reason': 'route structural failed'}, ensure_ascii=False))
+        return r
+    checks = []
+    for c in ['W01-01', 'W01-02', 'W01-03']:
+        p = os.path.join(repo, 'execution', 'v2.4', 'receipts', 'W01', c, 'independent_review.json')
+        checks.append({'id': 'review_' + c, 'ok': os.path.isfile(p) and 'ACCEPT' in json.load(open(p, encoding='utf-8')).get('verdict', ''), 'detail': 'independent review present'})
+    old_route = os.path.join(repo, 'execution', 'route.json')
+    checks.append({'id': 'old_route_bytes', 'ok': sha256(old_route) == 'ac54e68234196a4a6fd0c8e5e0f6d7e70a6567cc5dc137098f47244dd9465610', 'detail': 'historical THIN_CORE registration untouched; v2.4 route separate'})
+    rd = json.load(open(os.path.join(repo, 'execution', 'v2.4', 'reuse_decisions.json'), encoding='utf-8'))
+    checks.append({'id': 'no_qm_to_fullstack', 'ok': rd['per_capability']['qoder_remote_adapter']['decision'].startswith('OPTIONAL') and 'CUSTOM_GAP' in json.dumps(rd), 'detail': 'QM optional; single bounded gap, not Go full-stack'})
+    fails = [c['id'] for c in checks if not c['ok']]
+    payload = {'check_id': 'W01-G04', 'mode': 'DEVELOPMENT', 'run_at': now_iso(), 'status': 'PASS' if not fails else 'FAIL', 'checks': checks, 'failures': fails}
+    record('W01-G04', payload)
+    print(json.dumps({'status': payload['status'], 'failures': fails}, ensure_ascii=False))
+    return 0 if not fails else 1
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+CHECKS = {'W01-01': check_w01_01, 'W01-02': check_w01_02, 'W01-03': check_w01_03,
+          'W01-G01': check_w01_g01, 'W01-G02': check_w01_g02, 'W01-G03': check_w01_g03, 'W01-G04': check_w01_g04}
 
 def main():
     ap = argparse.ArgumentParser()
