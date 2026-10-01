@@ -4,10 +4,12 @@
 
 ## 唯一执行基线
 
-- `spec/v2.0/`：原实施包逐字节只读快照；不得修改初始状态或验收阈值。
+- `spec/v2.0/`：原实施包逐字节只读快照；保留只读，不得修改初始状态或验收阈值。
+- `spec/v2.4/`：v2.4 实施包逐字节只读快照（manifest 4666920727e189ed91dc84dae919f7ab9e52a2f9c45efd697ecdd790107d3964）；当前任务卡、验收门与施工命名空间 `execution/v2.4/` 以 v2.4 为准；A01/A12 等历史映射见 docs/adr/ADR-next-v24-continuation.md。
 - `execution/project_identity.json`：永久项目身份。`execution/bootstrap_ledger.json`：施工状态，独立于产品业务状态。
 - `execution/receipts/`：实际命令与产物回执；`execution/verifier/`：仅独立 Verifier 写入的施工审查。
-- `execution/checkpoint.json`：续跑入口。按 `spec/v2.0/contracts/tasks.json` DAG，先核对 Git、身份、输入版本及有效回执。
+- v2.4 逐卡循环：每回合在 `spec/v2.4` 内运行 `python tools/task_packet.py next --state <仓库根>/execution/v2.4/step_state.json` 选择当前卡；施工状态、检查点与回执只写 `execution/v2.4/**`；执行者不签自己的接受。
+- `execution/checkpoint.json`：旧版续跑入口。按 `spec/v2.0/contracts/tasks.json` DAG，先核对 Git、身份、输入版本及有效回执。
 - `bootstrap/`：开工导入与验证工具。W02 再由平台 owner 登记实际产品目录和命令。
 - `.local/`：本仓库生成的工具、进程数据与可重建缓存，不入 Git；不得放正式唯一证据。
 
