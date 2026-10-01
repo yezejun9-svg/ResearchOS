@@ -46,7 +46,30 @@ def within(root, relative):
     return path
 
 
-def execute(key, selectors=None, *, root=ROOT):
+def resolve_registry(root, key, spec):
+    legacy = root / 'execution/commands.json'
+    v24 = root / 'execution/v2.4/commands.json'
+    if spec == 'v2.0':
+        return legacy, 'v2.0'
+    if spec == 'v2.4':
+        if not v24.is_file():
+            raise ValueError('V24_REGISTRY_ABSENT')
+        return v24, 'v2.4'
+    if spec != 'auto':
+        raise ValueError('UNKNOWN_SPEC:' + str(spec))
+    if v24.is_file():
+        try:
+            data = read(v24)
+        except (OSError, ValueError):
+            data = {}
+        if key in (data.get('commands') or {}):
+            pointer = root / 'execution/v2.4/current_spec.json'
+            if pointer.is_file():
+                return v24, 'v2.4'
+    return legacy, 'v2.0'
+
+
+def execute(key, selectors=None, *, root=ROOT, spec='auto'):
     selectors = selectors or {}
     invocation = str(uuid.uuid4())
     output = within(root, 'execution/invocations') / invocation
@@ -63,15 +86,17 @@ def execute(key, selectors=None, *, root=ROOT):
         receipt.update(status=status, exit_code=code)
 
     try:
-        registry_path = root / 'execution/commands.json'
+        registry_path, registry_spec = resolve_registry(root, key, spec)
         registry = read(registry_path)
+        receipt['registry_spec'] = registry_spec
         receipt['registered_command_revision'] = sha(registry_path)
         entry = registry['commands'].get(key)
         if not entry or entry['state'] != 'BOUND':
             fail('NOT_IMPLEMENTED', 3)
         elif platform.system() not in entry['platforms']:
             fail('UNSUPPORTED_PLATFORM', 4)
-        elif any(value and value not in entry.get('selectors', {}).get(name, [])
+        elif any(value and '*' not in entry.get('selectors', {}).get(name, [])
+                 and value not in entry.get('selectors', {}).get(name, [])
                  for name, value in selectors.items()):
             fail('NOT_IMPLEMENTED', 3)
         elif any(not os.environ.get(name) for name in entry['required_env']):
@@ -211,8 +236,10 @@ if __name__ == '__main__':
     parser.add_argument('key')
     for name in ('task_id', 'check_id', 'case_id'):
         parser.add_argument('--' + name.replace('_', '-'), default='')
+    parser.add_argument('--spec', default='auto', choices=['auto', 'v2.0', 'v2.4'])
     args = vars(parser.parse_args())
-    result, reference = execute(args.pop('key'), args)
+    spec = args.pop('spec')
+    result, reference = execute(args.pop('key'), args, spec=spec)
     print(json.dumps({'status': result['status'], 'assertions': len(result['assertion_ids']),
                       'invocation_id': result['invocation_id'], 'receipt': str(reference)}, ensure_ascii=False))
     sys.exit(result['exit_code'])
