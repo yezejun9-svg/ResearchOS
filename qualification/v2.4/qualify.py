@@ -262,15 +262,22 @@ def check_w02_01():
     def need(cid, ok, detail=''):
         checks.append({'id': cid, 'ok': bool(ok), 'detail': str(detail)[:200]})
     tracked = [f for f in run_git('ls-files', 'third_party/mu', cwd=repo).splitlines() if f]
-    need('layout-present', len(tracked) == 5083, f'{len(tracked)} tracked files in delivery tree')
+    up_paths = [l.split(' ', 1)[1] for l in run_git('ls-tree', '-r', '--format=%(objectmode) %(path)', MU_COMMIT, cwd=os.path.join(repo, 'qualification', 'v2.4', 'mu')).splitlines()]
+    need('layout-present', set(tracked) == set('third_party/mu/' + p for p in up_paths) and all(os.path.isfile(os.path.join(repo, t)) for t in tracked[:200]), f'tracked==upstream path set ({len(tracked)}), disk sample 200 present')
     gitdir = [r_ for r_, d, fs in os.walk(tp) if '.git' in d]
     gitfile = [os.path.join(r_, '.git') for r_, d, fs in os.walk(tp) if os.path.isfile(os.path.join(r_, '.git'))]
-    gitlinks = [l for l in run_git('ls-files', '-s', 'third_party', cwd=repo).splitlines() if l.startswith('160000')]
+    gitlinks = [l for l in run_git('ls-files', '-s', cwd=repo).splitlines() if l.startswith('160000')]
     need('no-nested-git', not gitdir and not gitfile and not gitlinks, f'dirs={gitdir[:2]} files={gitfile[:2]} gitlinks={gitlinks[:2]}')
     need('no-node_modules', sum(1 for r_, d, fs in os.walk(tp) if 'node_modules' in d) == 0 and not [f for f in tracked if 'node_modules/' in f], 'deps not vendored')
-    up755 = [l for l in run_git('ls-tree', '-r', '--format=%(objectmode) %(path)', MU_COMMIT, cwd=os.path.join(repo, 'qualification', 'v2.4', 'mu')).splitlines() if l.startswith('100755')]
-    idx755 = [l for l in run_git('ls-files', '-s', 'third_party/mu', cwd=repo).splitlines() if l.startswith('100755')]
-    need('modes-match-upstream', len(idx755) == len(up755), f'upstream755={len(up755)} index755={len(idx755)}')
+    up_raw = run_git('ls-tree', '-r', '--format=%(objectmode) %(path)', MU_COMMIT, cwd=os.path.join(repo, 'qualification', 'v2.4', 'mu')).splitlines()
+    up755 = [l for l in up_raw if l.startswith('100755')]
+    idx_modes = {}
+    for l in run_git('ls-files', '-s', 'third_party/mu', cwd=repo).splitlines():
+        meta, _, path = l.partition('\t')
+        idx_modes[path] = meta.partition(' ')[0]
+    up_exec = {'third_party/mu/' + l.split(' ', 1)[1] for l in up_raw if l.startswith('100755 ')}
+    idx_exec = {p for p, m in idx_modes.items() if m == '100755'}
+    need('modes-match-upstream', up_exec == idx_exec, f'exec set diff upstream-only={list(up_exec - idx_exec)[:3]} index-only={list(idx_exec - up_exec)[:3]}')
     man = json.load(open(SPEC_REFS, encoding='utf-8'))
     mism = [e['path'] for e in man['files'] if not (os.path.isfile(os.path.join(tp, *e['path'].split('/'))) and sha256(os.path.join(tp, *e['path'].split('/'))) == e['sha256'])]
     need('commit-declared-equals-tree', not mism, f'spec manifest {len(man["files"])} files vs third_party; mismatch={mism}')
@@ -278,6 +285,17 @@ def check_w02_01():
     need('upstream-structure', os.path.isfile(os.path.join(tp, 'package.json')) and os.path.isdir(os.path.join(tp, 'packages', 'coding-agent')) and os.path.isdir(os.path.join(tp, 'desktop')), 'workspace layout preserved')
     need('tree-manifest', os.path.isfile(os.path.join(repo, 'third_party', 'mu.MANIFEST.json')), 'reproducible full-tree hash list')
     need('vendored-from-record', os.path.isfile(os.path.join(repo, 'third_party', 'VENDORED_FROM.md')), 'source/commit/method')
+    po = json.load(open(os.path.join(repo, 'execution', 'v2.4', 'path_ownership.json'), encoding='utf-8'))
+    owners = []
+    uniform = all(isinstance(v, dict) and isinstance(v.get('paths'), list) and v.get('owner') for v in po['aliases'].values())
+    for v in po['aliases'].values():
+        owners += [(p, v['owner']) for p in v['paths']]
+    dupes = sorted({p for p, o in owners if [x for x in owners if x[0] == p and x[1] != o]})
+    need('ownership-uniform-unique', uniform and not dupes, f'uniform={uniform} dupes={dupes[:3]}')
+    clj = json.load(open(os.path.join(repo, 'execution', 'v2.4', 'component_lock.json'), encoding='utf-8'))
+    reg_locks = set(clj['single_integrator']['locks'])
+    actual_locks = {f for f in run_git('ls-files', 'third_party/mu', cwd=repo).splitlines() if os.path.basename(f).lower() in ('package-lock.json', 'bun.lock', 'bun.lockb', 'yarn.lock', 'pnpm-lock.yaml', 'npm-shrinkwrap.json', 'requirements.lock.txt', 'go.sum') or os.path.basename(f).lower().endswith('.lock')}
+    need('locks-fully-registered', actual_locks <= reg_locks, f'unregistered={sorted(actual_locks - reg_locks)[:3]}')
     for reg in ['component_lock.json', 'path_ownership.json', 'patch_inventory.json']:
         p = os.path.join(repo, 'execution', 'v2.4', reg)
         need('registry-' + reg, os.path.isfile(p) and bool(json.load(open(p, encoding='utf-8')).get('schema_version')), reg)
