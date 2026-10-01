@@ -170,6 +170,9 @@ def check_w01_03():
     return 0 if not fails else 1
 
 
+def run_git(*args, cwd=None):
+    return subprocess.run(['git', *args], cwd=cwd or os.getcwd(), capture_output=True, text=True, encoding='utf-8', errors='replace').stdout
+
 def _repo():
     return os.path.abspath(os.path.join(HERE, '..', '..'))
 
@@ -258,10 +261,16 @@ def check_w02_01():
     checks = []
     def need(cid, ok, detail=''):
         checks.append({'id': cid, 'ok': bool(ok), 'detail': str(detail)[:200]})
-    files = [f for r, d, fs in os.walk(tp) for f in fs]
-    need('layout-present', len(files) > 3000, f'{len(files)} tracked files vendored')
-    need('no-nested-git', all(r_ == tp or True for r_ in []) and sum(1 for r_, d, fs in os.walk(tp) if '.git' in d) == 0, 'no .git dirs')
-    need('no-node_modules', sum(1 for r_, d, fs in os.walk(tp) if 'node_modules' in d) == 0, 'deps not vendored')
+    tracked = [f for f in run_git('ls-files', 'third_party/mu', cwd=repo).splitlines() if f]
+    need('layout-present', len(tracked) == 5083, f'{len(tracked)} tracked files in delivery tree')
+    gitdir = [r_ for r_, d, fs in os.walk(tp) if '.git' in d]
+    gitfile = [os.path.join(r_, '.git') for r_, d, fs in os.walk(tp) if os.path.isfile(os.path.join(r_, '.git'))]
+    gitlinks = [l for l in run_git('ls-files', '-s', 'third_party', cwd=repo).splitlines() if l.startswith('160000')]
+    need('no-nested-git', not gitdir and not gitfile and not gitlinks, f'dirs={gitdir[:2]} files={gitfile[:2]} gitlinks={gitlinks[:2]}')
+    need('no-node_modules', sum(1 for r_, d, fs in os.walk(tp) if 'node_modules' in d) == 0 and not [f for f in tracked if 'node_modules/' in f], 'deps not vendored')
+    up755 = [l for l in run_git('ls-tree', '-r', '--format=%(objectmode) %(path)', MU_COMMIT, cwd=os.path.join(repo, 'qualification', 'v2.4', 'mu')).splitlines() if l.startswith('100755')]
+    idx755 = [l for l in run_git('ls-files', '-s', 'third_party/mu', cwd=repo).splitlines() if l.startswith('100755')]
+    need('modes-match-upstream', len(idx755) == len(up755), f'upstream755={len(up755)} index755={len(idx755)}')
     man = json.load(open(SPEC_REFS, encoding='utf-8'))
     mism = [e['path'] for e in man['files'] if not (os.path.isfile(os.path.join(tp, *e['path'].split('/'))) and sha256(os.path.join(tp, *e['path'].split('/'))) == e['sha256'])]
     need('commit-declared-equals-tree', not mism, f'spec manifest {len(man["files"])} files vs third_party; mismatch={mism}')
