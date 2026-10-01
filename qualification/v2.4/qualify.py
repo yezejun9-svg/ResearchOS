@@ -133,7 +133,43 @@ def check_w01_02():
                       'critical_fail': res.get('critical_fail')}, ensure_ascii=False))
     return 0 if ok else 1
 
-CHECKS = {'W01-01': check_w01_01, 'W01-02': check_w01_02}
+def check_w01_03():
+    """Validate the frozen route decision files structurally against required evidence refs."""
+    repo = os.path.abspath(os.path.join(HERE, '..', '..'))
+    fails = []
+    checks = []
+    def need(name, ok, detail=''):
+        checks.append({'id': name, 'ok': bool(ok), 'detail': str(detail)[:160]})
+        if not ok:
+            fails.append(name)
+    rt_path = os.path.join(repo, 'execution', 'v2.4', 'route.json')
+    rd_path = os.path.join(repo, 'execution', 'v2.4', 'reuse_decisions.json')
+    adr_path = os.path.join(repo, 'docs', 'adr', 'ADR-next-v24-route.md')
+    if not (os.path.isfile(rt_path) and os.path.isfile(rd_path) and os.path.isfile(adr_path)):
+        print(json.dumps({'status': 'FAIL', 'missing': [rt_path, rd_path, adr_path]}, ensure_ascii=False))
+        return 1
+    rt = json.load(open(rt_path, encoding='utf-8'))
+    rd = json.load(open(rd_path, encoding='utf-8'))
+    adr_text = open(adr_path, encoding='utf-8').read()
+    need('route-selected', rt.get('selected_route') == 'MU_FORK', rt.get('selected_route'))
+    need('mu-commit', rt.get('mu', {}).get('commit') == '8dfebe36508ac0c2508735bb866756dab9283e74', rt.get('mu', {}).get('commit'))
+    need('gates-g01-g07-present', all(k in rt.get('gates_g01_g07', {}) for k in ['G0%d' % i for i in range(1, 8)]), list(rt.get('gates_g01_g07', {})))
+    need('jev-not-run-stated', rt.get('jev', {}).get('status') == 'NOT_RUN', rt.get('jev'))
+    need('fallback-not-triggered', rt.get('fallback', {}).get('status') == 'NOT_TRIGGERED', rt.get('fallback', {}).get('status'))
+    need('provisional-no', rt.get('provisional') == 'NO', rt.get('provisional'))
+    need('product-acceptance-not-run', rt.get('product_acceptance') == 'NOT_RUN', rt.get('product_acceptance'))
+    need('adr-hashes-route', rt.get('adr_sha256') == hashlib.sha256(open(adr_path, 'rb').read()).hexdigest(), 'adr hash binding')
+    need('custom-gap-bounded', 'CUSTOM_GAP' in json.dumps(rd) and 'writer_epoch' in json.dumps(rd), 'gap entries')
+    need('reject-and-watch-kept', rd['per_capability']['paperclip']['decision'] == 'REJECT' and rd['per_capability']['judge_jev']['decision'] == 'WATCH', 'negative dispositions preserved')
+    need('adr-no-deletion', ('不删除' in adr_text) or ('零删除' in adr_text), 'rollback preserves assets')
+    payload = {'check_id': 'W01-03', 'run_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+               'status': 'PASS' if not fails else 'FAIL', 'checks': checks, 'failures': fails,
+               'scope': 'ROUTE_DECISION_STRUCTURAL + evidence refs; independent bootstrap review is separate'}
+    record('W01-03', payload)
+    print(json.dumps({'status': payload['status'], 'failures': fails}, ensure_ascii=False))
+    return 0 if not fails else 1
+
+CHECKS = {'W01-01': check_w01_01, 'W01-02': check_w01_02, 'W01-03': check_w01_03}
 
 def main():
     ap = argparse.ArgumentParser()
