@@ -343,7 +343,7 @@ func main() {
 		ok("W0301-NO-BARRIER-FOR-SETTLED-RUN", seeded == 0, seeded)
 		_, ferr := gdb.ExecContext(ctx, `UPDATE client_sessions SET writer_epoch=writer_epoch+1 WHERE id='gs'`)
 		ok("W0301-SETTLED-RUN-SESSION-ADVANCES", ferr == nil, ferr)
-		gdb.ExecContext(ctx, `INSERT OR IGNORE INTO backup_restore_barriers VALUES('pf','run-f','2026-10-01T00:00:00Z')`)
+		// barrier already seeded by EnsureClientSessionFence with live clock (L2: dead literal removed)
 		_, ferr = gdb.ExecContext(ctx, `UPDATE client_sessions SET writer_epoch=writer_epoch-1 WHERE id='fs'`)
 		ok("W0301-EPOCH-REGRESSION-BLOCKED", ferr != nil && strings.Contains(ferr.Error(), "SESSION_EPOCH_REGRESSION"), ferr)
 		_, ferr = gdb.ExecContext(ctx, `UPDATE client_sessions SET writer_epoch=writer_epoch+1 WHERE id='fs'`)
