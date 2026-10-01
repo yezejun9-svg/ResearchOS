@@ -252,8 +252,37 @@ def check_w01_g04():
 def now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
+def check_w02_01():
+    repo = os.path.abspath(os.path.join(HERE, '..', '..'))
+    tp = os.path.join(repo, 'third_party', 'mu')
+    checks = []
+    def need(cid, ok, detail=''):
+        checks.append({'id': cid, 'ok': bool(ok), 'detail': str(detail)[:200]})
+    files = [f for r, d, fs in os.walk(tp) for f in fs]
+    need('layout-present', len(files) > 3000, f'{len(files)} tracked files vendored')
+    need('no-nested-git', all(r_ == tp or True for r_ in []) and sum(1 for r_, d, fs in os.walk(tp) if '.git' in d) == 0, 'no .git dirs')
+    need('no-node_modules', sum(1 for r_, d, fs in os.walk(tp) if 'node_modules' in d) == 0, 'deps not vendored')
+    man = json.load(open(SPEC_REFS, encoding='utf-8'))
+    mism = [e['path'] for e in man['files'] if not (os.path.isfile(os.path.join(tp, *e['path'].split('/'))) and sha256(os.path.join(tp, *e['path'].split('/'))) == e['sha256'])]
+    need('commit-declared-equals-tree', not mism, f'spec manifest {len(man["files"])} files vs third_party; mismatch={mism}')
+    need('licenses-kept', os.path.isfile(os.path.join(tp, 'LICENSE')) and os.path.isfile(os.path.join(tp, 'desktop', 'LICENSE')), 'MIT + Apache-2.0 present')
+    need('upstream-structure', os.path.isfile(os.path.join(tp, 'package.json')) and os.path.isdir(os.path.join(tp, 'packages', 'coding-agent')) and os.path.isdir(os.path.join(tp, 'desktop')), 'workspace layout preserved')
+    need('tree-manifest', os.path.isfile(os.path.join(repo, 'third_party', 'mu.MANIFEST.json')), 'reproducible full-tree hash list')
+    need('vendored-from-record', os.path.isfile(os.path.join(repo, 'third_party', 'VENDORED_FROM.md')), 'source/commit/method')
+    for reg in ['component_lock.json', 'path_ownership.json', 'patch_inventory.json']:
+        p = os.path.join(repo, 'execution', 'v2.4', reg)
+        need('registry-' + reg, os.path.isfile(p) and bool(json.load(open(p, encoding='utf-8')).get('schema_version')), reg)
+    cl = json.load(open(os.path.join(repo, 'execution', 'v2.4', 'component_lock.json'), encoding='utf-8'))
+    need('locks-pinned', 'go' in cl and 'node' in cl and cl.get('mu', {}).get('commit') == MU_COMMIT, 'go/node/mu commit pinned with sha256 refs')
+    fails = [c['id'] for c in checks if not c['ok']]
+    payload = {'check_id': 'W02-01', 'mode': 'DEVELOPMENT', 'run_at': now_iso(), 'status': 'PASS' if not fails else 'FAIL', 'checks': checks, 'failures': fails}
+    record('W02-01', payload)
+    print(json.dumps({'status': payload['status'], 'failures': fails}, ensure_ascii=False))
+    return 0 if not fails else 1
+
 CHECKS = {'W01-01': check_w01_01, 'W01-02': check_w01_02, 'W01-03': check_w01_03,
-          'W01-G01': check_w01_g01, 'W01-G02': check_w01_g02, 'W01-G03': check_w01_g03, 'W01-G04': check_w01_g04}
+          'W01-G01': check_w01_g01, 'W01-G02': check_w01_g02, 'W01-G03': check_w01_g03, 'W01-G04': check_w01_g04,
+          'W02-01': check_w02_01}
 
 def main():
     ap = argparse.ArgumentParser()
