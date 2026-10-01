@@ -119,6 +119,8 @@ func baseSession(id, project string) domain.ClientSession {
 		Protocol: domain.ClientSessionProtocol, ResumeExplicit: 1}
 }
 
+func ptr(s string) *string { return &s }
+
 func copyFile(src, dst string) {
 	b, _ := os.ReadFile(src)
 	os.WriteFile(dst, b, 0600)
@@ -203,9 +205,30 @@ func main() {
 	ok("W0301-NEW-EPOCH-WATERMARK", domain.AdvanceWatermark(ctx, tx, "s1", 2, 4, 6) == nil)
 	ok("W0301-SEAL", domain.Seal(ctx, tx, "s1", 2, 5) == nil)
 	ok("W0301-SEALED-DISTINCT", domain.AdvanceWatermark(ctx, tx, "s1", 2, 6, 9) == domain.ErrSealed)
+	ok("W0301-UNKNOWN-SESSION", domain.AdvanceWatermark(ctx, tx, "ghost", 1, 1, 1) == domain.ErrUnknownSession)
+	ok("W0301-SEAL-UNKNOWN-SESSION", domain.Seal(ctx, tx, "ghost", 1, 1) == domain.ErrUnknownSession)
+	ok("W0301-STALE-WATERMARK-TYPE", domain.AdvanceWatermark(ctx, tx, "s1", 2, 6, 1) == domain.ErrSealed) // sealed checked first
 	tx.Rollback()
 
 	tx2, _ := db.BeginTx(ctx, nil)
+	s9 := baseSession("s9", "p1")
+	exp := time.Now().UTC().Add(2 * time.Hour)
+	arch := time.Now().UTC()
+	s9.LeaseExpiresAt = &exp
+	s9.ArchivedAt = &arch
+	ok("W0301-TIMESTAMP-FIELDS-MAP", domain.MapClientSession(ctx, tx2, s9) == nil)
+	var rawLease, rawArch string
+	tx2.QueryRowContext(ctx, `SELECT lease_expires_at, archived_at FROM client_sessions WHERE id='s9'`).Scan(&rawLease, &rawArch)
+	valid := func(v string) bool {
+		if v == "" {
+			return false
+		}
+		_, err := time.Parse(time.RFC3339Nano, v)
+		return err == nil && strings.Contains(v, "T") && strings.HasSuffix(v, "Z")
+	}
+	ok("W0301-TIMESTAMP-RFC3339-STORED", valid(rawLease) && valid(rawArch), rawLease, rawArch)
+	ok("W0301-SECOND-OPEN-SESSION-OK", domain.MapClientSession(ctx, tx2, baseSession("s-open2", "p1")) == nil)
+	ok("W0301-BACKWARDS-WATERMARK-TYPE", domain.AdvanceWatermark(ctx, tx2, "s9", 1, 1, 0) == domain.ErrStaleWatermark)
 	rs := baseSession("r1", "p1")
 	r := "run-x"
 	rs.RunID = &r
@@ -307,12 +330,39 @@ func main() {
 		fs.RunID = &fr
 		domain.MapClientSession(ctx, tx, fs)
 		tx.Commit()
+		gdb.ExecContext(ctx, `INSERT OR IGNORE INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('pf','Run','run-f',1,'{"status":"RUNNING","lease_epoch":1}',0)`)
+		gdb.ExecContext(ctx, `INSERT OR IGNORE INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('pf','Run','run-g',1,'{"status":"SETTLED","lease_epoch":1}',0)`)
+		gs := baseSession("gs", "pf")
+		gs.RunID = ptr("run-g")
+		txg, _ := gdb.BeginTx(ctx, nil)
+		domain.MapClientSession(ctx, txg, gs)
+		txg.Commit()
 		ok("W0301-FENCE-HELPER", domain.EnsureClientSessionFence(ctx, gdb) == nil)
+		var seeded int
+		gdb.QueryRowContext(ctx, `SELECT count(*) FROM backup_restore_barriers WHERE run='run-g'`).Scan(&seeded)
+		ok("W0301-NO-BARRIER-FOR-SETTLED-RUN", seeded == 0, seeded)
+		_, ferr := gdb.ExecContext(ctx, `UPDATE client_sessions SET writer_epoch=writer_epoch+1 WHERE id='gs'`)
+		ok("W0301-SETTLED-RUN-SESSION-ADVANCES", ferr == nil, ferr)
 		gdb.ExecContext(ctx, `INSERT OR IGNORE INTO backup_restore_barriers VALUES('pf','run-f','2026-10-01T00:00:00Z')`)
-		_, ferr := gdb.ExecContext(ctx, `UPDATE client_sessions SET writer_epoch=writer_epoch-1 WHERE id='fs'`)
+		_, ferr = gdb.ExecContext(ctx, `UPDATE client_sessions SET writer_epoch=writer_epoch-1 WHERE id='fs'`)
 		ok("W0301-EPOCH-REGRESSION-BLOCKED", ferr != nil && strings.Contains(ferr.Error(), "SESSION_EPOCH_REGRESSION"), ferr)
 		_, ferr = gdb.ExecContext(ctx, `UPDATE client_sessions SET writer_epoch=writer_epoch+1 WHERE id='fs'`)
 		ok("W0301-RESTORED-EPOCH-NEEDS-FRESH-OBSERVATION", ferr != nil && strings.Contains(ferr.Error(), "RESTORE_FRESH_RECONCILIATION_REQUIRED"), ferr)
+		// production-shaped fresh observation unlocks the advance
+		_, oerr := gdb.ExecContext(ctx, `INSERT INTO runtime_observations(project,run,epoch,receipt_hash,body,observed_at)
+			VALUES('pf','run-f',1,'obs-1','{"children_stopped":1,"queue_empty":1}','2026-10-02T00:00:00Z')`)
+		ok("W0301-OBSERV-INSERT", oerr == nil, oerr)
+		_, ferr = gdb.ExecContext(ctx, `UPDATE client_sessions SET writer_epoch=writer_epoch+1 WHERE id='fs'`)
+		ok("W0301-FRESH-OBSERVATION-UNLOCKS", ferr == nil, ferr)
+		// session without run: advance allowed, regression still blocked
+		nr2, _ := gdb.BeginTx(ctx, nil)
+		ns := baseSession("ns", "pf")
+		domain.MapClientSession(ctx, nr2, ns)
+		nr2.Commit()
+		_, ferr = gdb.ExecContext(ctx, `UPDATE client_sessions SET writer_epoch=writer_epoch+1 WHERE id='ns'`)
+		ok("W0301-ADVANCE-WITHOUT-RUN-ALLOWED", ferr == nil, ferr)
+		_, ferr = gdb.ExecContext(ctx, `UPDATE client_sessions SET writer_epoch=writer_epoch-1 WHERE id='ns'`)
+		ok("W0301-REGRESSION-BLOCKED-WITHOUT-RUN", ferr != nil && strings.Contains(ferr.Error(), "SESSION_EPOCH_REGRESSION"), ferr)
 		pdb, err := store.Open(filepath.Join(tmp, "plain.sqlite"))
 		must(err, "OPEN-PLAIN")
 		if err == nil {

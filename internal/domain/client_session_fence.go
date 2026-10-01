@@ -30,7 +30,9 @@ func EnsureClientSessionFence(ctx context.Context, ex fenceExec) error {
 	}
 	if _, err := ex.ExecContext(ctx, `INSERT INTO backup_restore_barriers(project,run,restored_at)
 		SELECT s.project_id, s.run_id, ? FROM client_sessions s
+		JOIN domain_objects r ON r.kind='Run' AND r.project=s.project_id AND r.id=s.run_id
 		WHERE s.sealed_at IS NULL AND s.run_id IS NOT NULL
+		AND json_extract(r.body,'$.status') IN ('QUEUED','STARTING','RUNNING','CANCEL_REQUESTED','RECONCILING','LOST')
 		ON CONFLICT(project,run) DO UPDATE SET restored_at=excluded.restored_at`, Now()); err != nil {
 		return err
 	}
@@ -40,9 +42,14 @@ func EnsureClientSessionFence(ctx context.Context, ex fenceExec) error {
 	}
 	_, err := ex.ExecContext(ctx, `CREATE TRIGGER IF NOT EXISTS client_session_require_fresh BEFORE UPDATE OF writer_epoch ON client_sessions
 		WHEN NEW.writer_epoch > OLD.writer_epoch
+		AND NEW.run_id IS NOT NULL
 		AND EXISTS(SELECT 1 FROM backup_restore_barriers b WHERE b.project=NEW.project_id AND b.run=NEW.run_id)
-		AND NOT EXISTS(SELECT 1 FROM runtime_observations o WHERE o.project=NEW.project_id AND o.run=NEW.run_id AND o.epoch=OLD.writer_epoch
-			AND o.observed_at > (SELECT max(b.restored_at) FROM backup_restore_barriers b WHERE b.project=NEW.project_id AND b.run=NEW.run_id))
+		AND EXISTS(SELECT 1 FROM domain_objects r WHERE r.kind='Run' AND r.project=NEW.project_id AND r.id=NEW.run_id
+			AND json_extract(r.body,'$.status') IN ('QUEUED','STARTING','RUNNING','CANCEL_REQUESTED','RECONCILING','LOST'))
+		AND NOT EXISTS(SELECT 1 FROM runtime_observations o
+			WHERE o.project=NEW.project_id AND o.run=NEW.run_id
+			AND o.observed_at > (SELECT max(b.restored_at) FROM backup_restore_barriers b WHERE b.project=NEW.project_id AND b.run=NEW.run_id)
+			AND json_extract(o.body,'$.children_stopped')=1 AND json_extract(o.body,'$.queue_empty')=1)
 		BEGIN SELECT RAISE(ABORT,'RESTORE_FRESH_RECONCILIATION_REQUIRED'); END;`)
 	return err
 }

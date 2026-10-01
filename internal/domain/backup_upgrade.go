@@ -160,7 +160,7 @@ func upgradeRelease(root string, count int) (Object, [][]byte, error) {
 	if count != 13 && count != 14 && count != 20 {
 		return nil, nil, fmt.Errorf("UPGRADE_PLAN_UNSUPPORTED")
 	}
-	files, e := filepath.Glob(filepath.Join(root, "migrations/sqlite/*.sql"))
+	files, e := filepath.Glob(filepath.Join(root, "migrations/sqlite/0*.sql")) // release inputs are the numbered migrations only; unnumbered additive files (e.g. next_v24_sessions.sql) are applied through their own single-transaction path
 	if e != nil || len(files) != count {
 		return nil, nil, fmt.Errorf("UPGRADE_RELEASE_MIGRATIONS: require exact 1..%d", count)
 	}

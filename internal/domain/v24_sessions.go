@@ -43,11 +43,20 @@ var (
 	ErrUnknownProtocol = errors.New("UNKNOWN_PROTOCOL")
 	ErrBadLogHash      = errors.New("BAD_UPSTREAM_LOG_HASH")
 	ErrSealed          = errors.New("SESSION_SEALED")
+	ErrUnknownSession  = errors.New("UNKNOWN_SESSION")
+	ErrStaleWatermark  = errors.New("STALE_WATERMARK")
 	ErrUnknownProject  = errors.New("UNKNOWN_PROJECT")
 	ErrMissingWriter   = errors.New("MISSING_WRITER_ATTRIBUTION")
 )
 
 const ClientSessionProtocol = "researchos-client/2"
+
+func fmtTime(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return t.UTC().Format(time.RFC3339Nano)
+}
 
 func validLogHash(h *string) bool {
 	if h == nil {
@@ -96,9 +105,9 @@ func MapClientSession(ctx context.Context, tx *sql.Tx, s ClientSession) error {
 		 model_config_ref, core_build_id, resume_requires_explicit_user, sealed_at, archived_at, protocol)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		s.ID, s.ProjectID, s.Revision, s.CreatedAt.UTC().Format(time.RFC3339Nano), s.UpdatedAt.UTC().Format(time.RFC3339Nano),
-		s.GoalID, s.TaskID, s.RunID, s.WriterEpoch, s.WriterClientID, s.LeaseExpiresAt, s.EventWatermark,
+		s.GoalID, s.TaskID, s.RunID, s.WriterEpoch, s.WriterClientID, fmtTime(s.LeaseExpiresAt), s.EventWatermark,
 		s.UpstreamSession, s.UpstreamLogHash, s.UpstreamLogID, s.WorkspaceRef, s.Title,
-		s.ModelConfigRef, s.CoreBuildID, s.ResumeExplicit, s.SealedAt, s.ArchivedAt, s.Protocol)
+		s.ModelConfigRef, s.CoreBuildID, s.ResumeExplicit, fmtTime(s.SealedAt), fmtTime(s.ArchivedAt), s.Protocol)
 	return err
 }
 
@@ -106,20 +115,17 @@ func MapClientSession(ctx context.Context, tx *sql.Tx, s ClientSession) error {
 // expected revision; single-step and multi-step advances are both valid (22 §161).
 func AdvanceWatermark(ctx context.Context, tx *sql.Tx, id string, epoch, expectedRevision, watermark int64) error {
 	var cur int64
+	var curEpoch, rev int64
 	var sealed sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT event_watermark, sealed_at FROM client_sessions WHERE id=?`, id).Scan(&cur, &sealed)
+	err := tx.QueryRowContext(ctx, `SELECT event_watermark, writer_epoch, revision, sealed_at FROM client_sessions WHERE id=?`, id).Scan(&cur, &curEpoch, &rev, &sealed)
+	if err == sql.ErrNoRows {
+		return ErrUnknownSession
+	}
 	if err != nil {
 		return err
 	}
 	if sealed.Valid {
 		return ErrSealed
-	}
-	if epoch < 1 {
-		return ErrStaleEpoch
-	}
-	var curEpoch, rev int64
-	if err := tx.QueryRowContext(ctx, `SELECT writer_epoch, revision FROM client_sessions WHERE id=?`, id).Scan(&curEpoch, &rev); err != nil {
-		return err
 	}
 	if rev != expectedRevision {
 		return ErrStaleRevision
@@ -127,10 +133,13 @@ func AdvanceWatermark(ctx context.Context, tx *sql.Tx, id string, epoch, expecte
 	if epoch != curEpoch {
 		return ErrStaleEpoch
 	}
+	if watermark <= cur {
+		return ErrStaleWatermark
+	}
 	res, err := tx.ExecContext(ctx, `UPDATE client_sessions
 		SET event_watermark=?, revision=revision+1, updated_at=?
-		WHERE id=? AND writer_epoch=? AND sealed_at IS NULL AND event_watermark < ?`,
-		watermark, time.Now().UTC().Format(time.RFC3339Nano), id, curEpoch, watermark)
+		WHERE id=? AND writer_epoch=? AND revision=? AND sealed_at IS NULL AND event_watermark=?`,
+		watermark, time.Now().UTC().Format(time.RFC3339Nano), id, curEpoch, expectedRevision, cur)
 	if err != nil {
 		return err
 	}
@@ -144,7 +153,9 @@ func AdvanceWatermark(ctx context.Context, tx *sql.Tx, id string, epoch, expecte
 func HandoffEpoch(ctx context.Context, tx *sql.Tx, id string, fromEpoch int64, expectedRevision int64) (int64, error) {
 	var curEpoch, rev int64
 	var sealed sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT writer_epoch, revision, sealed_at FROM client_sessions WHERE id=?`, id).Scan(&curEpoch, &rev, &sealed); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT writer_epoch, revision, sealed_at FROM client_sessions WHERE id=?`, id).Scan(&curEpoch, &rev, &sealed); err == sql.ErrNoRows {
+		return 0, ErrUnknownSession
+	} else if err != nil {
 		return 0, err
 	}
 	if sealed.Valid {
@@ -172,7 +183,7 @@ func Seal(ctx context.Context, tx *sql.Tx, id string, epoch int64, expectedRevis
 	var sealed sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT writer_epoch, revision, sealed_at FROM client_sessions WHERE id=?`, id).Scan(&curEpoch, &rev, &sealed)
 	if err == sql.ErrNoRows {
-		return ErrSealed
+		return ErrUnknownSession
 	}
 	if err != nil {
 		return err

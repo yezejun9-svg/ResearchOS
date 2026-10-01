@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS client_sessions (
   task_id                       TEXT,
   run_id                        TEXT,
   writer_epoch                  INTEGER NOT NULL CHECK (writer_epoch >= 1),
-  writer_client_id              TEXT NOT NULL,
+  writer_client_id              TEXT NOT NULL CHECK (length(writer_client_id) >= 1),
   lease_expires_at              TEXT,
   event_watermark               INTEGER NOT NULL CHECK (event_watermark >= 0),
   upstream_session_id           TEXT NOT NULL CHECK (length(upstream_session_id) >= 1),
@@ -29,9 +29,6 @@ CREATE TABLE IF NOT EXISTS client_sessions (
   archived_at                   TEXT,
   protocol                      TEXT NOT NULL DEFAULT 'researchos-client/2' CHECK (protocol = 'researchos-client/2')
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS client_sessions_open
-  ON client_sessions (project_id, id) WHERE sealed_at IS NULL;
 
 -- one run belongs to exactly one project session index; cross-project reuse rejected
 CREATE UNIQUE INDEX IF NOT EXISTS client_sessions_run
