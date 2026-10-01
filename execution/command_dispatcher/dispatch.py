@@ -65,7 +65,12 @@ def resolve_registry(root, key, spec):
         if key in (data.get('commands') or {}):
             pointer = root / 'execution/v2.4/current_spec.json'
             if pointer.is_file():
-                return v24, 'v2.4'
+                try:
+                    pdata = read(pointer)
+                except (OSError, ValueError):
+                    pdata = {}
+                if pdata.get('pointer') == 'v2.4' and pdata.get('plan_sha256') == read(v24).get('plan_sha256'):
+                    return v24, 'v2.4'
     return legacy, 'v2.0'
 
 
