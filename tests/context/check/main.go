@@ -1078,6 +1078,12 @@ func (h *harness) hardeningPhase(ctx context.Context) {
 		h.count(ctx, `SELECT count(DISTINCT id) FROM domain_objects WHERE kind='Project'`))
 	re := h.svc.RevokeWorkspaceBinding(ctx, spr, h.alphaRef)
 	ok("SEC-FOREIGN-BINDING-NOT-REVOKABLE", re != nil && strings.Contains(errText(re), "FORBIDDEN"), re)
+	// the read path later cards use must be refused too, not only the write paths above
+	_, ferr := h.svc.WorkspaceBindingFor(ctx, spr, h.authority, h.alphaRef)
+	ok("SEC-FOREIGN-BINDING-NOT-READABLE", ferr != nil && strings.Contains(errText(ferr), "FORBIDDEN"), ferr)
+	_, oerr2 := h.svc.WorkspaceBindingFor(ctx, h.principal, h.authority, h.alphaRef)
+	ok("SEC-OWNING-PRINCIPAL-STILL-READS-ITS-BINDING", oerr2 == nil, oerr2)
+
 	// the authorising principal still can, so the refusals above are ownership and not a blanket lock
 	ok("SEC-OWNER-STILL-CAN-REVOKE", h.svc.RevokeWorkspaceBinding(ctx, h.principal, h.roRef()) == nil)
 
