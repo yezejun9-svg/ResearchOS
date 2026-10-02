@@ -80,7 +80,7 @@ type w0402Handles struct {
 	art, bundle, task, state     domain.Object
 	contract                     domain.Object
 	decisions                    []any
-	goalID                       string
+	goalID, reqID                string
 }
 
 var w0402Ctx w0402Handles
@@ -436,7 +436,7 @@ func (h *harness) contextPhase(ctx context.Context) {
 
 	w0402Ctx = w0402Handles{token: token, project: project, base: base, taskID: domain.Str(task, "id"),
 		art: art, bundle: bundle, task: task, state: state, contract: contract,
-		decisions: proposedRefs, goalID: Str2(goal, "id")}
+		decisions: proposedRefs, goalID: Str2(goal, "id"), reqID: Str2(accepted, "id")}
 
 	skip("CTX-STEP-4-BLOCK-DEGRADE-UNRELATED", "blocking on missing required context, degradation on a failed "+
 		"optional retrieval and non-invalidation by an unrelated event are the next increment of this card; the "+
@@ -652,6 +652,41 @@ func (h *harness) changePhase(ctx context.Context) {
 		}
 	}
 
+	// applyChange runs a draft all the way through - proposal, independent acceptance by the
+	// verifier, apply - and hands back the applied record so each caller asserts its own property.
+	applyChange := func(targetRef domain.Object, field string, valueArt domain.Object, title string) (domain.Object, string) {
+		st, tg := h.liveState(ctx, token, base)
+		code, prop, body := h.api(ctx, token, "POST", base+"/change-proposals", domain.ID(), tg, domain.Object{
+			"title": title, "reason": "fixture change with a real dependency closure",
+			"base_state_revision": st["revision"],
+			"edits": []any{domain.Object{"target_ref": targetRef, "field": field,
+				"proposed_value_artifact_ref": domain.Ref(valueArt, "Artifact"),
+				"reason":                      "explicit fixture edit"}},
+			"migration_steps": domain.Empty(), "test_check_ids": supportedChangeChecks,
+			"rollback_steps": []any{"submit an independently accepted reversal"}})
+		if code != 201 {
+			return nil, "proposal refused " + body
+		}
+		hash, herr := h.svc.ChangeContractHash(ctx, w0402Ctx.project, Str2(prop, "id"))
+		if herr != nil {
+			return nil, "contract hash unavailable " + errText(herr)
+		}
+		code, receipt, body := h.api(ctx, verifierToken, "POST", base+"/acceptances", domain.ID(),
+			tagOf(prop), acceptBody(prop, hash))
+		if code != 201 || Str2(receipt, "verdict") != "PASS" {
+			return nil, "acceptance " + Str2(receipt, "verdict") + " " + body
+		}
+		beforeApply, _ := h.liveState(ctx, token, base)
+		code, applied, body := h.api(ctx, token, "POST",
+			base+"/change-proposals/"+Str2(prop, "id")+"/apply", domain.ID(), tagOf(prop),
+			domain.Object{"acceptance_id": receipt["id"],
+				"expected_project_state_revision": beforeApply["revision"]})
+		if code != 200 {
+			return nil, "apply refused " + body
+		}
+		return applied, ""
+	}
+
 	// two drafts over the same field, then a conflict naming both: neither draft may move
 	code, proposalB, body := proposal(nil, nil, supportedChangeChecks)
 	ok("CHG-SECOND-PROPOSAL-CREATED", code == 201, code, body)
@@ -717,17 +752,35 @@ func (h *harness) changePhase(ctx context.Context) {
 	}
 	// the positive control the earlier version of this phase could only skip: an applied change does
 	// make the tasks it impacts stale, and a task that has nothing to do with it stays untouched
-	// this change's closure is the project state and its policies, not any task, so zero tasks go
-	// stale. The positive control - a change whose closure DOES contain a task - is not reachable
-	// until analyzeChangeImpact builds that closure, and is recorded as a skip rather than faked.
-	staleTasks := h.countStaleTasks(ctx)
-	ok("CHG-APPLIED-CHANGE-STALES-NOTHING-OUTSIDE-ITS-CLOSURE", staleTasks == 0, staleTasks)
-	skip("CHG-APPLIED-CHANGE-STALES-IMPACTED-TASK", "the invalidation control needs a change whose impact closure "+
-		"contains a task, which only analyzeChangeImpact builds; that operation needs the W06 orchestration "+
-		"fixture (settled run, sealed report, live EXECUTOR grant)")
-	_, bareAfter, _ := h.api(ctx, token, "GET", base+"/tasks/"+Str2(bare, "id"), "", "", nil)
-	ok("CHG-APPLIED-CHANGE-LEAVES-THE-LATER-TASK-ALONE", Str2(bareAfter, "status") == "DRAFT",
-		Str2(bareAfter, "status"))
+	// the positive control. The freeze wrote Task -> Requirement DEPENDS_ON links, so an accepted
+	// change to that requirement has this task in its closure and must make exactly it stale, while
+	// a task that depends on nothing stays as it was.
+	revisionPayload := []byte(`"revised by an independently accepted change"`)
+	stForUpload, tagForUpload := h.liveState(ctx, token, base)
+	_ = stForUpload
+	textRef, textArt, textBody := h.api(ctx, token, "POST", base+"/content", domain.ID(), tagForUpload,
+		revisionPayload)
+	ok("CHG-REVISION-CONTENT-UPLOADED", textRef == 201, textRef, textBody[:min(len(textBody), 160)])
+	reqCode, reqNow, reqBody := h.api(ctx, token, "GET", base+"/requirements/"+w0402Ctx.reqID, "", "", nil)
+	ok("CHG-REQUIREMENT-READABLE-FOR-EDIT", reqCode == 200 && Str2(reqNow, "id") == w0402Ctx.reqID,
+		reqCode, reqBody[:min(len(reqBody), 160)])
+	st, tg := h.liveState(ctx, token, base)
+	_ = st
+	code, revisionArt, body := h.api(ctx, token, "POST", base+"/artifacts", domain.ID(), tg, domain.Object{
+		"run_id": nil, "kind": "REPORT", "evidence_kind": "GENERATED", "measurement_mode": "FIXTURE",
+		"content_hash": textArt["content_hash"], "storage_key": textArt["storage_key"],
+		"media_type": "application/json", "byte_size": len(revisionPayload), "input_refs": domain.Empty(),
+		"source_refs": domain.Empty(), "produced_by": "w0402-planner", "access_class": "PROJECT"})
+	ok("CHG-REVISION-ARTIFACT-SEALED", code == 201, code, body[:min(len(body), 200)])
+	applied2, why := applyChange(domain.Ref(reqNow, "Requirement"), "text", revisionArt,
+		"w0402 requirement revision")
+	ok("CHG-REQUIREMENT-CHANGE-APPLIED", applied2 != nil && Str2(applied2, "status") == "APPLIED", why)
+	_, frozenTask, _ := h.api(ctx, token, "GET", base+"/tasks/"+w0402Ctx.taskID, "", "", nil)
+	_, laterTask, _ := h.api(ctx, token, "GET", base+"/tasks/"+Str2(bare, "id"), "", "", nil)
+	ok("CHG-APPLIED-CHANGE-STALES-THE-DEPENDENT-TASK",
+		Str2(frozenTask, "status") == "NEEDS_REVALIDATION", Str2(frozenTask, "status"))
+	ok("CHG-APPLIED-CHANGE-LEAVES-THE-UNRELATED-TASK-ALONE",
+		Str2(laterTask, "status") == "DRAFT", Str2(laterTask, "status"))
 	skip("CHG-OPTIONAL-RETRIEVAL-DEGRADES", "the optional-retrieval warning path needs the FTS/retrieval fixture "+
 		"(retrieval.go pushes warnings and continues); no assertion here yet")
 }

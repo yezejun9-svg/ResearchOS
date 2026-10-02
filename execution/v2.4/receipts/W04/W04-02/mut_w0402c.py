@@ -46,6 +46,8 @@ MUTS = [
     ("AA1-author-can-accept-own-change", CHG, "\t\tif id == p.ID {", "\t\tif false && id == p.ID {"),
     ("AA2-resolution-does-not-require-an-applied-change", CHG,
      '\tif proposal["status"] != "APPLIED" {', '\tif proposal["status"] == "APPLIED" {'),
+    ("AC3-applied-change-stops-invalidating-its-dependents", CHG,
+     '			o["status"] = "NEEDS_REVALIDATION"', '			o["status"] = "DRAFT"'),
 ]
 
 report = []
