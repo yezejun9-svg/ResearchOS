@@ -80,6 +80,9 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 	}
 	out.Entries = append(out.Entries, domain.LocalInventoryEntry{Capability: "workspace_root", LocationRef: ".",
 		Status: "FOUND", Notes: "authorized directory is readable"})
+	// Reserve room for the verdict entries so hitting the entry cap cannot silence the very marker
+	// that says the inventory was shortened.
+	capacity := MaxInventoryEntries - 8
 	// The root is resolved once, then every subtree is asked the same question: does the directory
 	// I am about to enter still live under that root? A junction or symlink answers no, and it is
 	// recorded as unexamined instead of being walked, because walking it would quietly widen the
@@ -94,7 +97,18 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 	seen := map[string]bool{}
 	add := func(e domain.LocalInventoryEntry) {
 		key := e.Capability + "|" + e.LocationRef
-		if seen[key] || len(out.Entries) >= MaxInventoryEntries {
+		if seen[key] || len(out.Entries) >= capacity {
+			return
+		}
+		seen[key] = true
+		out.Entries = append(out.Entries, e)
+	}
+	// addVerdict appends a statement about the scan itself. It ignores the capability cap on
+	// purpose: the entries that say "this inventory is incomplete" must survive an incomplete
+	// inventory, or the cap would erase the only evidence of it.
+	addVerdict := func(e domain.LocalInventoryEntry) {
+		key := e.Capability + "|" + e.LocationRef
+		if seen[key] {
 			return
 		}
 		seen[key] = true
@@ -113,7 +127,11 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 	skippedSubtrees := 0
 	// Version control lives at the root, and the directory branch below returns before it would
 	// ever be inspected, so it is decided once here instead of by an unreachable loop variable.
-	if st, e := os.Lstat(filepath.Join(realPath, ".git")); e == nil && st.IsDir() {
+	// A .git entry is version control whether it is a directory, a worktree pointer file or a
+	// submodule stub; treating the file form as absent would be a false NOT_FOUND.
+	if st, e := os.Lstat(filepath.Join(realPath, ".git")); e == nil && !st.IsDir() {
+		found["version_control"] = true
+	} else if e == nil {
 		found["version_control"] = true
 	}
 
@@ -132,6 +150,7 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 		if depth := strings.Count(relSlash, "/"); depth > MaxScanDepth {
 			if d.IsDir() {
 				skippedSubtrees++
+				unexamined = true
 				add(domain.LocalInventoryEntry{Capability: "subtree_beyond_depth", LocationRef: relSlash,
 					Status: "NOT_CHECKED", Notes: "depth cap exceeded"})
 				return fs.SkipDir
@@ -148,6 +167,7 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 			(d.IsDir() && escapesRoot(rootReal, path)) {
 			// A link out of the authorized directory is recorded and not followed.
 			skippedSubtrees++
+			unexamined = true
 			add(domain.LocalInventoryEntry{Capability: "reparse_point", LocationRef: relSlash,
 				Status: "NOT_CHECKED", Notes: "link is not followed out of the authorized directory"})
 			if d.IsDir() {
@@ -168,7 +188,7 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 			}
 			return nil
 		}
-		if len(out.Entries) >= MaxInventoryEntries {
+		if len(out.Entries) >= capacity {
 			truncated = true
 			return filepath.SkipAll
 		}
@@ -228,10 +248,13 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 	if walkErr != nil && !strings.Contains(walkErr.Error(), "context") {
 		out.Failures = append(out.Failures, domain.LocalInventoryFileFailure{Path: ".", Reason: reasonOf(walkErr)})
 	}
-	// Absence may only be claimed over ground that was actually walked. Where a subtree was skipped,
-	// a link was not followed, or the entry or depth cap stopped the walk, an unfound capability is
-	// reported as NOT_CHECKED with the reason: 15_NEW_PROJECT_WORKFLOW forbids reading
-	// "we did not look" as "there is none".
+	// Absence may only be claimed over ground that was actually walked. A skipped subtree, an
+	// unfollowed link, a depth cut or an entry cap all mean "we did not look", and
+	// 15_NEW_PROJECT_WORKFLOW line 31 forbids reading that as "there is none".
+	if unexamined || truncated || skippedSubtrees > 0 {
+		addVerdict(domain.LocalInventoryEntry{Capability: "scan_completeness", LocationRef: "*", Status: "NOT_CHECKED",
+			Notes: "the walk was shortened by a skip, link, depth cap or entry cap"})
+	}
 	if found["version_control"] {
 		add(domain.LocalInventoryEntry{Capability: "version_control", LocationRef: ".git", Status: "FOUND",
 			Notes: "version control directory present at the authorised root"})
@@ -241,8 +264,8 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 		if found[c] {
 			continue
 		}
-		if unexamined || truncated {
-			add(domain.LocalInventoryEntry{Capability: c, LocationRef: "*", Status: "NOT_CHECKED",
+		if unexamined || truncated || skippedSubtrees > 0 {
+			addVerdict(domain.LocalInventoryEntry{Capability: c, LocationRef: "*", Status: "NOT_CHECKED",
 				Notes: "not seen in the part that was walked; unexamined subtrees remain"})
 			continue
 		}
@@ -250,11 +273,11 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 	}
 	if truncated {
 		unexamined = true
-		add(domain.LocalInventoryEntry{Capability: "inventory_truncated", LocationRef: "*", Status: "NOT_CHECKED",
+		addVerdict(domain.LocalInventoryEntry{Capability: "inventory_truncated", LocationRef: "*", Status: "NOT_CHECKED",
 			Notes: "entry cap reached; the rest of the tree was not examined"})
 	}
 	if skippedSubtrees > 0 {
-		add(domain.LocalInventoryEntry{Capability: "unexamined_subtrees", LocationRef: "*", Status: "NOT_CHECKED",
+		addVerdict(domain.LocalInventoryEntry{Capability: "unexamined_subtrees", LocationRef: "*", Status: "NOT_CHECKED",
 			Notes: "subtrees that were skipped, links or excluded directories"})
 	}
 	sort.Slice(out.Entries, func(i, j int) bool {

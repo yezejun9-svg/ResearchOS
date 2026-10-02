@@ -47,9 +47,6 @@ type WorkspaceSelection struct {
 	RealPath    string
 	DisplayPath string
 	Access      string
-	// PrincipalID is the domain principal the caller claims; the authority fills it only when it
-	// can actually attribute the choice, and the domain refuses a mismatch.
-	PrincipalID string
 	// HostPrincipalRef is the OS-principal reference the host recorded for the choice. The host
 	// compares it against its own verified local user, so the domain can keep it as evidence
 	// without ever treating it as a domain principal.
@@ -193,9 +190,11 @@ func (s *Service) RegisterWorkspace(ctx context.Context, p Principal, a Workspac
 	}
 	defer tx.Rollback()
 
-	// A command id belongs to whoever first used it, independent of any workspace right: checking
-	// that before authorisation means a colliding replay is refused with COMMAND_ID_CONFLICT
-	// rather than leaking a generic FORBIDDEN and hiding the collision.
+	// The project-creation right is checked FIRST (a caller with no right must not learn that a
+	// command id exists), and only then the command-id namespace, so a caller that does have a
+	// right but collides is refused with COMMAND_ID_CONFLICT instead of a generic FORBIDDEN.
+	// project.bootstrap uses the opposite ordering on purpose: there the namespace collision is
+	// about the replay record, and the reference scoping confines what it can reach.
 	if clash, e := s.bindingCommandOwner(ctx, tx, in.CommandID); e == nil && clash != "" && clash != p.ID {
 		return nil, Fail(409, "COMMAND_ID_CONFLICT", "this command id was already used by another principal")
 	} else if e != nil && !errors.Is(e, errNoBinding) {
@@ -220,9 +219,6 @@ func (s *Service) RegisterWorkspace(ctx context.Context, p Principal, a Workspac
 	if err != nil {
 		return nil, typedFromAuthority(err)
 	}
-	if sel.PrincipalID != "" && sel.PrincipalID != p.ID {
-		return nil, Fail(403, "FORBIDDEN", "selection belongs to another principal")
-	}
 	// Requested permission may never exceed what the directory choice authorised.
 	if in.RequestedAccess == "READ_WRITE" && sel.Access != "READ_WRITE" {
 		return nil, Fail(403, "POLICY_DENIED", "requested access exceeds the chosen directory authorisation")
@@ -233,6 +229,14 @@ func (s *Service) RegisterWorkspace(ctx context.Context, p Principal, a Workspac
 	}
 	if err := a.ConfirmPath(ctx, realPath, sel.Access); err != nil {
 		return nil, typedFromAuthority(err)
+	}
+	// A directory that already carries another principal's project is refused rather than given a
+	// second permanent identity: 重复创建永久身份 must fail, and two writable identities over one
+	// canonical path is exactly that. The refusal says nothing about who owns the other binding.
+	if taken, e := s.directoryHeldByOther(ctx, tx, realPath, p.ID); e != nil {
+		return nil, e
+	} else if taken {
+		return nil, Fail(403, "POLICY_DENIED", "this directory is already bound to another principal")
 	}
 
 	ref := "wsref-" + ID()[:16]
@@ -386,6 +390,31 @@ func (s *Service) bindingByCommand(ctx context.Context, tx *sql.Tx, principal, c
 	return decodeBinding(raw)
 }
 
+// directoryHeldByOther reports whether some other principal already bound this canonical
+// directory to a project. It never returns the other principal or reference to the caller.
+func (s *Service) directoryHeldByOther(ctx context.Context, tx *sql.Tx, realPath, principal string) (bool, error) {
+	rows, e := tx.QueryContext(ctx, `SELECT body FROM domain_objects WHERE project='' AND kind=? AND json_extract(body,'$.real_path')=?`,
+		KindWorkspaceBinding, realPath)
+	if e != nil {
+		return false, e
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		if e = rows.Scan(&raw); e != nil {
+			return false, e
+		}
+		b, e := decodeBinding(raw)
+		if e != nil {
+			return false, e
+		}
+		if b.PrincipalID != principal && b.Status == WorkspaceActive && b.ProjectID != nil {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
 // bindingByRealPath finds the live binding for the same canonical directory, which is how a
 // changed alias for one permanent project reuses the original identity instead of creating a
 // second one.
@@ -444,10 +473,15 @@ func decodeBinding(raw string) (*WorkspaceBinding, error) {
 		CreatedAt: Str(o, "created_at")}, nil
 }
 
-// putOpaque stores a domain-owned record that no VersionRef may ever target. It keeps the same
-// append-only version bookkeeping as put() - the version history stays immutable and the current
-// row is replaced only by an advancing revision - while grading is done by the caller against the
-// pinned protocol definition, because these kinds are not entities of the frozen domain schema.
+// putOpaque stores a domain-owned record that no VersionRef may ever target.
+//
+// It writes ONLY domain_objects, on purpose. The accepted restore path (internal/domain/backup.go)
+// validates every domain_versions row against the frozen domain schema by kind, and WorkspaceBinding,
+// BootstrapStage, BootstrapReplay and Project are not schema entities - versioning them here made
+// release recovery fail with RESTORE_CONTRACT_INCOMPATIBLE for any backup taken after the first
+// bootstrap. The append-only history of the business entities these records point at (ProjectProfile,
+// ProjectState, Artifact) is still written by put(). These rows are current-state association records,
+// and the revision compare-and-set below keeps them monotonic so a stale writer cannot overwrite one.
 func (s *Service) putOpaque(ctx context.Context, tx *sql.Tx, project, kind, id string, o Object) error {
 	rev, e := Num(o, "revision")
 	if e != nil {
@@ -465,10 +499,6 @@ func (s *Service) putOpaque(ctx context.Context, tx *sql.Tx, project, kind, id s
 		return err
 	}
 	body := string(Bytes(o))
-	if _, e := tx.ExecContext(ctx, `INSERT INTO domain_versions(project,kind,id,revision,body,content_hash) VALUES(?,?,?,?,?,?)`,
-		project, kind, id, rev, body, Digest([]byte(body))); e != nil {
-		return e
-	}
 	if _, e := tx.ExecContext(ctx, `INSERT INTO domain_objects(project,kind,id,revision,body,content_hash,immutable) VALUES(?,?,?,?,?,?,0)
 		ON CONFLICT(project,kind,id) DO UPDATE SET revision=excluded.revision, body=excluded.body, content_hash=excluded.content_hash`,
 		project, kind, id, rev, body, Digest([]byte(body))); e != nil {
@@ -489,7 +519,10 @@ func canonicalLocalPath(p string) (string, error) {
 	if !filepath.IsAbs(p) {
 		return "", Fail(403, "PATH_OUT_OF_SCOPE", "directory path must already be absolute and canonical")
 	}
-	if i := strings.Index(p, ":"); i > 1 && i < len(p)-1 {
+	// A stream separator is a colon that appears AFTER the volume name: "D:\dir\file.txt:$DATA".
+	// Testing the first colon would look at the drive letter instead, so the volume name is stripped
+	// before the search.
+	if stream := strings.Index(strings.TrimPrefix(p, filepath.VolumeName(p)), ":"); stream >= 0 {
 		return "", Fail(400, "INVALID_REQUEST", "path carries an alternate data stream")
 	}
 	return filepath.Clean(p), nil

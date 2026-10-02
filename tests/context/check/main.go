@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"researchos.local/research-os/adapters/local_workspace"
@@ -612,9 +613,17 @@ func (h *harness) inventoryPhase(ctx context.Context) {
 	// a rewritten history
 	ok("INV-REPEAT-STAGE-REVISION-ADVANCES-ONE", addsOne(stageBefore, h.stageRevision(ctx, h.alphaProj)),
 		stageBefore, h.stageRevision(ctx, h.alphaProj))
-	ok("INV-STAGE-HISTORY-GROWS-BY-ONE", h.count(ctx,
-		`SELECT count(*) FROM domain_versions WHERE kind='BootstrapStage' AND json_extract(body,'$.stage')='LOCAL_INVENTORY'`) >= 2,
-		h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind='BootstrapStage'`))
+	// Recovery contract: every domain_versions row must validate against the frozen domain schema,
+	// because internal/domain/backup.go does exactly this for every row before a restore is
+	// accepted. A future writer that versions a non-schema kind would fail here first.
+	totalRows, badRows := h.versionedRowsThatValidate(ctx)
+	ok("REC-VERSIONS-ALL-VALIDATE", totalRows > 0 && badRows == 0, totalRows, badRows)
+	ok("REC-NON-SCHEMA-KINDS-ARE-NOT-VERSIONED", h.count(ctx,
+		`SELECT count(*) FROM domain_versions WHERE kind IN ('WorkspaceBinding','BootstrapStage','BootstrapReplay','Project')`) == 0,
+		h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind IN ('WorkspaceBinding','BootstrapStage','BootstrapReplay','Project')`))
+	ok("REC-BUSINESS-HISTORY-STILL-VERSIONED", h.count(ctx,
+		`SELECT count(*) FROM domain_versions WHERE kind IN ('ProjectProfile','ProjectState','Artifact')`) >= 3,
+		h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind IN ('ProjectProfile','ProjectState','Artifact')`))
 	ok("INV-REPEAT-ADDS-ONE-OBSERVATION", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Artifact'`) == beforeArtifacts+1,
 		beforeArtifacts, h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Artifact'`))
 	ok("INV-REPEAT-BINDING-REVISION-UNCHANGED", h.bindingField(ctx, h.alphaRef, "revision") == "2",
@@ -641,8 +650,6 @@ func (h *harness) inventoryPhase(ctx context.Context) {
 	invStage := h.stageSummary(ctx, h.alphaProj)
 	ok("INV-STAGE-REFRESH-KEEPS-ORDER", strings.Contains(invStage, "RESEARCH:NOT_STARTED") &&
 		strings.Contains(invStage, "LOCAL_INVENTORY:"), invStage)
-	ok("INV-STAGE-HISTORY-GROWS", h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind='BootstrapStage'`) >= 4,
-		h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind='BootstrapStage'`))
 
 	// grading is load-bearing, not a formality: the same project with a scanner that emits an entry
 	// the published definition rejects must be refused before anything is written
@@ -802,6 +809,132 @@ func removeJunction(dir string) {
 	os.RemoveAll(dir)
 }
 
+// bootstrapWith runs a full project.bootstrap for a fresh directory with the given scanner, and
+// returns the project id so the caller can read the stage row that was written.
+func (h *harness) bootstrapWith(ctx context.Context, scan domain.LocalInventoryScanner) string {
+	dir := filepath.Join(h.root, "probe-tree-"+randomSuffix())
+	os.MkdirAll(dir, 0o755)
+	sel, err := h.choose("cli-desktop", dir, "READ_ONLY")
+	if err != nil {
+		return ""
+	}
+	bind, err := h.register(ctx, sel, "Probe", "READ_ONLY", "cmd-probe-"+randomSuffix(), "cli-desktop")
+	if err != nil {
+		return ""
+	}
+	ref, _ := bind["authorized_workspace_ref"].(string)
+	res, err := h.svc.BootstrapProject(ctx, h.principal, h.authority, h.grader, scan, domain.BootstrapProjectInput{
+		AuthorizedWorkspaceRef: ref, DisplayName: "Probe", CommandID: "cmd-probe-boot-" + randomSuffix(), ClientID: "cli-desktop"})
+	if err != nil {
+		return ""
+	}
+	p, _ := res["project_id"].(string)
+	return p
+}
+
+func hasCapability(entries []domain.LocalInventoryEntry, capability string) bool {
+	for _, e := range entries {
+		if e.Capability == capability {
+			return true
+		}
+	}
+	return false
+}
+
+func mustSel(ctx context.Context, h *harness, clientID, dir, access string) string {
+	sel, err := h.choose(clientID, dir, access)
+	if err != nil {
+		return "sel-unavailable"
+	}
+	return sel
+}
+
+var probeCounter int64
+
+func randomSuffix() string {
+	atomic.AddInt64(&probeCounter, 1)
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), probeCounter)
+}
+
+// recoveryProbe re-reads every domain_versions row and validates it the way the accepted restore
+// path does, so the recovery contract is checked here rather than assumed.
+func (h *harness) versionedRowsThatValidate(ctx context.Context) (int, int) {
+	rows, err := h.db.QueryContext(ctx, `SELECT kind, body FROM domain_versions`)
+	if err != nil {
+		return -1, -1
+	}
+	defer rows.Close()
+	total, bad := 0, 0
+	for rows.Next() {
+		var kind, raw string
+		if rows.Scan(&kind, &raw) != nil {
+			return total, bad + 1
+		}
+		total++
+		obj, derr := domain.Decode([]byte(raw))
+		if derr != nil || h.svc.Contracts.Validate(kind, obj) != nil {
+			bad++
+		}
+	}
+	return total, bad
+}
+
+// bindingSequenceOK asserts the revision the binding row carries after mint (1), first project
+// bind (2) and revoke (3). The compare-and-set inside putOpaque refuses any other value, so this
+// is the observable half of that guard.
+func (h *harness) bindingSequenceOK(ctx context.Context) bool {
+	return h.bindingField(ctx, h.alphaRef, "revision") == "3"
+}
+
+// scopedScanner returns entries whose location escapes the authorised root, which the domain must
+// refuse instead of trusting the adapter.
+type scopedScanner struct {
+	fallback *localworkspace.Scanner
+	location string
+}
+
+func (b scopedScanner) Scan(ctx context.Context, realPath string) (domain.LocalInventoryScan, error) {
+	res, err := b.fallback.Scan(ctx, realPath)
+	res.Entries = append(res.Entries, domain.LocalInventoryEntry{Capability: "probe", LocationRef: b.location,
+		Status: "FOUND"})
+	return res, err
+}
+
+// constantScanner ignores the directory entirely, which is how the empty and unreachable
+// derivations are observed without depending on OS permission behaviour this machine cannot give.
+type constantScanner struct {
+	entries  []domain.LocalInventoryEntry
+	failures []domain.LocalInventoryFileFailure
+}
+
+func (c constantScanner) Scan(ctx context.Context, realPath string) (domain.LocalInventoryScan, error) {
+	return domain.LocalInventoryScan{Environment: "probe", Entries: c.entries, Failures: c.failures}, nil
+}
+
+func (h *harness) stageStatusOf(ctx context.Context, project string) string {
+	var st string
+	h.db.QueryRowContext(ctx, `SELECT json_extract(body,'$.status') FROM domain_objects WHERE project=? AND kind='BootstrapStage' AND json_extract(body,'$.stage')='LOCAL_INVENTORY'`,
+		project).Scan(&st)
+	return st
+}
+
+func (h *harness) markerRevisions(ctx context.Context, project string) string {
+	rows, err := h.db.QueryContext(ctx, `SELECT json_extract(body,'$.stage'), json_extract(body,'$.revision') FROM domain_objects WHERE project=? AND kind='BootstrapStage' AND json_extract(body,'$.stage')!='LOCAL_INVENTORY' ORDER BY id`, project)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var a, b sql.NullString
+		if rows.Scan(&a, &b) != nil {
+			continue
+		}
+		out = append(out, a.String+"="+b.String)
+	}
+	return strings.Join(out, ",")
+}
+
 // badScanner returns an entry the pinned LocalInventoryPayload definition refuses (an empty
 // capability). The domain has no hand-written rule against it, so only the contract grading can
 // catch it: if grading were decorative this bootstrap would succeed and the assertions below fail.
@@ -924,6 +1057,102 @@ func (h *harness) hardeningPhase(ctx context.Context) {
 	ok("SEC-FOREIGN-BINDING-NOT-REVOKABLE", re != nil && strings.Contains(errText(re), "FORBIDDEN"), re)
 	// the authorising principal still can, so the refusals above are ownership and not a blanket lock
 	ok("SEC-OWNER-STILL-CAN-REVOKE", h.svc.RevokeWorkspaceBinding(ctx, h.principal, h.roRef()) == nil)
+
+	// a replay record is scoped to the reference it was created for: one command id cannot be
+	// answered with a different directory's project
+	_, p1 := h.svc.BootstrapProject(ctx, h.principal, h.authority, h.grader, h.scanner, domain.BootstrapProjectInput{
+		AuthorizedWorkspaceRef: h.betaRef, DisplayName: "Beta", CommandID: "cmd-bootstrap-1", ClientID: "cli-desktop"})
+	ok("REPLAY-SCOPED-TO-REFERENCE", p1 != nil && strings.Contains(errText(p1), "COMMAND_ID_CONFLICT"), p1)
+
+	// one canonical directory cannot gain a second permanent identity through another principal
+	if _, e := h.svc.RegisterWorkspace(ctx, spr, h.authority, h.grader, domain.RegisterWorkspaceInput{
+		SelectionRef: mustSel(ctx, h, "cli-second", h.chosen, "READ_ONLY"), DisplayName: "Same dir",
+		RequestedAccess: "READ_ONLY", CommandID: "cmd-second-dir", ClientID: "cli-second"}); true {
+		ok("ONE-DIRECTORY-ONE-IDENTITY", e != nil && strings.Contains(errText(e), "POLICY_DENIED"), e)
+	}
+	ok("ONE-DIRECTORY-STILL-TWO-PROJECTS", h.count(ctx, `SELECT count(DISTINCT id) FROM domain_objects WHERE kind='Project'`) == 2,
+		h.count(ctx, `SELECT count(DISTINCT id) FROM domain_objects WHERE kind='Project'`))
+
+	// the domain refuses an inventory entry that points outside the authorised root, so an adapter
+	// bug cannot quietly widen the scope
+	_, absScope := h.svc.BootstrapProject(ctx, h.principal, h.authority, h.grader,
+		scopedScanner{fallback: h.scanner, location: `C:\Windows\win.ini`}, domain.BootstrapProjectInput{
+			AuthorizedWorkspaceRef: h.betaRef, DisplayName: "Beta", CommandID: "cmd-abs-scope", ClientID: "cli-desktop"})
+	ok("INV-ENTRY-SCOPE-REFUSED", absScope != nil && strings.Contains(errText(absScope), "PATH_OUT_OF_SCOPE"), absScope)
+	_, dotScope := h.svc.BootstrapProject(ctx, h.principal, h.authority, h.grader,
+		scopedScanner{fallback: h.scanner, location: "../escape/file.md"}, domain.BootstrapProjectInput{
+			AuthorizedWorkspaceRef: h.betaRef, DisplayName: "Beta", CommandID: "cmd-dot-scope", ClientID: "cli-desktop"})
+	ok("INV-ENTRY-ESCAPE-REFUSED", dotScope != nil && strings.Contains(errText(dotScope), "PATH_OUT_OF_SCOPE"), dotScope)
+
+	// the stage derivation distinguishes an empty but readable root, a partially unreachable one and
+	// a wholly unreachable one, instead of collapsing them into one error or one success
+	emptyProj := h.bootstrapWith(ctx, constantScanner{})
+	ok("INV-EMPTY-BUT-READABLE-IS-COMPLETED", h.stageStatusOf(ctx, emptyProj) == "COMPLETED", h.stageStatusOf(ctx, emptyProj))
+	partProj := h.bootstrapWith(ctx, constantScanner{
+		entries: []domain.LocalInventoryEntry{{Capability: "readme", LocationRef: "README.md", Status: "FOUND"},
+			{Capability: "subtree", LocationRef: "locked", Status: "NOT_ACCESSIBLE"}},
+		failures: []domain.LocalInventoryFileFailure{{Path: "locked/x.json", Reason: "permission denied"}}})
+	ok("INV-PARTIALLY-UNREACHABLE-IS-PARTIAL", h.stageStatusOf(ctx, partProj) == "PARTIAL", h.stageStatusOf(ctx, partProj))
+	allProj := h.bootstrapWith(ctx, constantScanner{entries: []domain.LocalInventoryEntry{
+		{Capability: "workspace_root", LocationRef: ".", Status: "NOT_ACCESSIBLE"}}})
+	ok("INV-UNREACHABLE-ROOT-IS-FAILED", h.stageStatusOf(ctx, allProj) == "FAILED", h.stageStatusOf(ctx, allProj))
+
+	// the NOT_STARTED markers are created once and never rewritten by a later bootstrap
+	before := h.markerRevisions(ctx, h.alphaProj)
+	_, _ = h.svc.BootstrapProject(ctx, h.principal, h.authority, h.grader, h.scanner, domain.BootstrapProjectInput{
+		AuthorizedWorkspaceRef: h.betaRef, DisplayName: "Beta", CommandID: "cmd-marker-check", ClientID: "cli-desktop"})
+	ok("INV-MARKERS-CREATED-ONCE", strings.Contains(before, "RESEARCH=1") && strings.Contains(before, "REUSE_DECISION=1") &&
+		strings.Contains(before, "IMPLEMENTATION=1"), before)
+
+	// unexamined ground cannot claim absence: depth cut, skipped subtree and entry cap each have to
+	// leave a NOT_CHECKED verdict behind
+	deep := filepath.Join(h.root, "deep-tree")
+	probe := deep
+	for i := 0; i < 11; i++ {
+		probe = filepath.Join(probe, "lvl")
+	}
+	os.MkdirAll(filepath.Join(probe, "pkg"), 0o755)
+	os.WriteFile(filepath.Join(probe, "pkg", "pyproject.toml"), []byte("[project]\n"), 0o600)
+	deepRes, deepErr := h.scanner.Scan(context.Background(), deep)
+	deepStatus := ""
+	for _, e := range deepRes.Entries {
+		if e.Capability == "python_manifest" {
+			deepStatus = e.Status
+		}
+	}
+	ok("INV-DEPTH-CUT-IS-NOT-ABSENCE", deepErr == nil && deepStatus == "NOT_CHECKED", deepErr, deepStatus)
+	ok("INV-DEPTH-CUT-RECORDED", hasCapability(deepRes.Entries, "subtree_beyond_depth") &&
+		hasCapability(deepRes.Entries, "scan_completeness"), deepRes.Entries)
+
+	wide := filepath.Join(h.root, "wide-tree")
+	os.MkdirAll(wide, 0o755)
+	// Each unparseable document is its own entry, so this is what actually reaches the cap.
+	for i := 0; i < localworkspace.MaxInventoryEntries+5; i++ {
+		os.WriteFile(filepath.Join(wide, fmt.Sprintf("bad-%04d.json", i)), []byte("{oops"), 0o600)
+	}
+	wideRes, wideErr := h.scanner.Scan(context.Background(), wide)
+	ok("INV-ENTRY-CAP-LEAVES-A-VERDICT", wideErr == nil && hasCapability(wideRes.Entries, "inventory_truncated") &&
+		hasCapability(wideRes.Entries, "scan_completeness"), len(wideRes.Entries))
+	widePy := ""
+	for _, e := range wideRes.Entries {
+		if e.Capability == "node_manifest" {
+			widePy = e.Status
+		}
+	}
+	ok("INV-ENTRY-CAP-NEVER-CLAIMS-ABSENCE", widePy == "NOT_CHECKED", widePy)
+
+	// a .git file (worktree or submodule pointer) is version control too
+	wt := filepath.Join(h.root, "worktree-dir")
+	os.MkdirAll(wt, 0o755)
+	os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: ../elsewhere/.git/worktrees/x\n"), 0o600)
+	wtRes, wtErr := h.scanner.Scan(context.Background(), wt)
+	vcFile := false
+	for _, e := range wtRes.Entries {
+		if e.Capability == "version_control" && e.Status == "FOUND" {
+			vcFile = true
+		}
+	}
+	ok("INV-GIT-FILE-DETECTED", wtErr == nil && vcFile, wtErr, wtRes)
 }
 
 // -------------------------------------------------------------------------- binding lifecycle
@@ -963,9 +1192,10 @@ func (h *harness) lifecyclePhase(ctx context.Context) {
 	ok("LIFE-SECOND-REVOKE-IS-IDEMPOTENT", h.bindingField(ctx, h.alphaRef, "revision") == before, before, h.bindingField(ctx, h.alphaRef, "revision"))
 
 	// version history is append-only, and the domain refuses to reuse a command id for a new mint
-	ok("LIFE-BINDING-HISTORY-IMMUTABLE", h.versionHistoryImmutable(ctx))
-	ok("LIFE-BINDING-HISTORY-GROWS", h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind='WorkspaceBinding'`) >= 2,
-		h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind='WorkspaceBinding'`))
+	// The binding row is current-state, so its history is the revision sequence rather than a
+	// version table: 1 when minted, 2 when a project is bound, 3 when revoked.
+	ok("LIFE-BINDING-REVISION-SEQUENCE", h.bindingSequenceOK(ctx), h.bindingField(ctx, h.alphaRef, "revision"))
+	ok("REC-BINDING-KIND-NEVER-VERSIONED", h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind='WorkspaceBinding'`) == 0)
 
 	// a directory that moved out from under the binding is refused, not scanned as an empty place
 	betaLive := h.betaRef

@@ -100,8 +100,13 @@ func (s *Service) BootstrapProject(ctx context.Context, p Principal, a Workspace
 	// A command id belongs to the principal that first used it. Proving that before any workspace
 	// right is consulted means a colliding replay is refused as a collision, not as a generic
 	// authorisation failure that would hide it.
-	if owner, e := s.replayOwner(ctx, tx, in.CommandID); e == nil && owner != "" && owner != p.ID {
+	// A command id belongs to the principal AND the workspace reference that first used it. Without
+	// the reference half, one reused id could be answered with a different directory's project, which
+	// is a silent wrong answer rather than a refusal.
+	if owner, ref, e := s.replayOwner(ctx, tx, in.CommandID); e == nil && owner != "" && owner != p.ID {
 		return nil, Fail(409, "COMMAND_ID_CONFLICT", "this command id was already used by another principal")
+	} else if e == nil && owner == p.ID && ref != "" && ref != in.AuthorizedWorkspaceRef {
+		return nil, Fail(409, "COMMAND_ID_CONFLICT", "this command id was already used for a different workspace")
 	} else if e != nil && !errors.Is(e, sql.ErrNoRows) {
 		return nil, e
 	}
@@ -195,11 +200,22 @@ func (s *Service) BootstrapProject(ctx context.Context, p Principal, a Workspace
 		return nil, err
 	}
 
+	// One decision, made here, from the recorded entries: a readable but genuinely empty directory
+	// is COMPLETED with nothing found; a directory whose every entry is unreachable is FAILED; a mix
+	// is PARTIAL. The scanner no longer refuses the empty case, so "nothing is there" and "we could
+	// not look" stay distinguishable instead of collapsing into one error.
 	status := StageCompleted
-	if len(failures) > 0 && len(entries) > 0 {
-		status = StagePartial
-	} else if len(entries) == 0 {
+	unreachable := 0
+	for _, e := range entries {
+		if e.Status == "NOT_ACCESSIBLE" {
+			unreachable++
+		}
+	}
+	switch {
+	case len(entries) > 0 && unreachable == len(entries):
 		status = StageFailed
+	case len(failures) > 0 || unreachable > 0:
+		status = StagePartial
 	}
 	stageID := "stage-" + project + "-local-inventory"
 	stageRev, e := s.nextRevision(ctx, tx, project, KindBootstrapStage, stageID)
@@ -233,7 +249,8 @@ func (s *Service) BootstrapProject(ctx context.Context, p Principal, a Workspace
 		}
 	}
 	record := Object{"project_id": project, "command_id": in.CommandID, "principal_id": p.ID,
-		"stage_id": stageID, "artifact_id": Str(artifact, "id"), "revision": int64(1)}
+		"authorized_workspace_ref": binding.AuthorizedRef, "stage_id": stageID,
+		"artifact_id": Str(artifact, "id"), "revision": int64(1)}
 	if e := s.putOpaque(ctx, tx, project, "BootstrapReplay", "replay-"+in.CommandID, record); e != nil {
 		return nil, e
 	}
@@ -277,13 +294,6 @@ func (s *Service) collectInventory(ctx context.Context, scan LocalInventoryScann
 		}
 		failures = append(failures, f)
 	}
-	// A directory the scanner could read but found nothing in is a legitimate empty project; a
-	// scanner that returns no entry at all hid the difference between those two, which is exactly
-	// the failure this card must not allow. Unreadable roots must come back as one
-	// NOT_ACCESSIBLE entry instead.
-	if len(list) == 0 {
-		return entries, Object{}, failures, Fail(422, "GATE_FAILED", "inventory scanner reported neither findings nor an inaccessible root")
-	}
 	env := res.Environment
 	if env == "" {
 		env = "local-workspace"
@@ -326,17 +336,17 @@ func (s *Service) authorisedBinding(ctx context.Context, tx *sql.Tx, p Principal
 }
 
 // replayOwner reports which principal, if any, already ran a bootstrap under this command id.
-func (s *Service) replayOwner(ctx context.Context, tx *sql.Tx, commandID string) (string, error) {
-	var principal string
-	e := tx.QueryRowContext(ctx, `SELECT json_extract(body,'$.principal_id') FROM domain_objects WHERE kind='BootstrapReplay' AND id=?`,
-		"replay-"+commandID).Scan(&principal)
+func (s *Service) replayOwner(ctx context.Context, tx *sql.Tx, commandID string) (string, string, error) {
+	var principal, ref sql.NullString
+	e := tx.QueryRowContext(ctx, `SELECT json_extract(body,'$.principal_id'), json_extract(body,'$.authorized_workspace_ref')
+		FROM domain_objects WHERE kind='BootstrapReplay' AND id=?`, "replay-"+commandID).Scan(&principal, &ref)
 	if errors.Is(e, sql.ErrNoRows) {
-		return "", nil
+		return "", "", nil
 	}
 	if e != nil {
-		return "", e
+		return "", "", e
 	}
-	return principal, nil
+	return principal.String, ref.String, nil
 }
 
 // bootstrapReplay rebuilds the original answer from the durable records a previous delivery wrote.
@@ -366,7 +376,10 @@ func (s *Service) bootstrapReplay(ctx context.Context, tx *sql.Tx, principal, co
 		return nil, e
 	}
 	withProject := *b
-	withProject.ProjectID = &project
+	if withProject.ProjectID == nil {
+		bound := project
+		withProject.ProjectID = &bound
+	}
 	return Object{"project_id": project, "workspace": withProject.Reply(), "project_profile_ref": Ref(profile, "ProjectProfile"),
 		"inventory_artifact_ref": Ref(artifact, "Artifact"), "bootstrap_task_id": Str(o, "stage_id"), "bootstrap_run_id": nil}, nil
 }
