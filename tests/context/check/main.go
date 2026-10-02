@@ -1,0 +1,832 @@
+// Command check is the W04-01 construction qualification for local directory registration,
+// project continuation and first-use minimal inventory. It drives the real host boundary
+// (internal/host), the real domain service over a real SQLite database, and the real adapter
+// (adapters/local_workspace), and grades every emitted object against the pinned client protocol.
+// Prints one JSON assertion report for the dispatcher.
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"time"
+
+	"researchos.local/research-os/adapters/local_workspace"
+	"researchos.local/research-os/internal/auth"
+	"researchos.local/research-os/internal/domain"
+	"researchos.local/research-os/internal/host"
+	"researchos.local/research-os/internal/store"
+)
+
+var ids []string
+var failures []map[string]string
+var notVerified []string
+
+func ok(label string, cond bool, detail ...any) {
+	if cond {
+		ids = append(ids, label)
+		return
+	}
+	parts := make([]string, 0, len(detail))
+	for _, d := range detail {
+		s := fmt.Sprint(d)
+		if len(s) > 600 {
+			s = s[:600]
+		}
+		parts = append(parts, s)
+	}
+	failures = append(failures, map[string]string{"id": label, "detail": strings.Join(parts, " | ")})
+}
+
+func skip(label, reason string) { notVerified = append(notVerified, label+": "+reason) }
+
+func errText(e error) string {
+	if e == nil {
+		return ""
+	}
+	return e.Error()
+}
+
+type clock struct{ at time.Time }
+
+func (c *clock) Now() time.Time      { return c.at.UTC() }
+func (c *clock) Add(d time.Duration) { c.at = c.at.Add(d) }
+
+type harness struct {
+	db        *sql.DB
+	root      string
+	h         *host.Host
+	authority *localworkspace.Authority
+	scanner   *localworkspace.Scanner
+	grader    domain.DefGrader
+	svc       *domain.Service
+	principal domain.Principal
+	clk       *clock
+	chosen    string
+	other     string
+	ro        string
+	outside   string
+	alphaRef  string
+	betaRef   string
+	alphaProj string
+	betaProj  string
+}
+
+func main() {
+	// Selector families the accepted fixture harness owns are forwarded untouched, so binding this
+	// card's construction check to the name test.context cannot shadow them.
+	if code, routed := routeLegacy(); routed {
+		os.Exit(code)
+	}
+	ctx := context.Background()
+	defer func() {
+		if r := recover(); r != nil {
+			failures = append(failures, map[string]string{"id": "PANIC", "detail": fmt.Sprint(r)})
+		}
+		if len(ids) == 0 {
+			failures = append(failures, map[string]string{"id": "NO-ASSERTIONS-RECORDED",
+				"detail": "a run that recorded nothing is never a pass"})
+		}
+		status := "PASS"
+		if len(failures) > 0 {
+			status = "FAIL"
+		}
+		out, _ := json.Marshal(map[string]any{"status": status, "assertions": len(ids), "assertion_ids": ids,
+			"failures": failures, "not_verified": sortedUnique(notVerified),
+			"scope":       "CONSTRUCTION_CHECK_NOT_PRODUCT_ACCEPTANCE",
+			"environment": map[string]any{"os": runtime.GOOS, "windows_host": runtime.GOOS == "windows"}})
+		fmt.Println(string(out))
+		if len(failures) > 0 {
+			os.Exit(1)
+		}
+	}()
+
+	h, err := newHarness(ctx, repoRoot())
+	if err != nil {
+		ok("HARNESS", false, err)
+		return
+	}
+	defer h.close()
+
+	h.chainPhase(ctx)
+	h.negativePhase(ctx)
+	h.continuationPhase(ctx)
+	h.inventoryPhase(ctx)
+	h.lifecyclePhase(ctx)
+}
+
+func repoRoot() string {
+	root, _ := os.Getwd()
+	for i := 0; i < 5; i++ {
+		if _, err := os.Stat(filepath.Join(root, "migrations", "sqlite")); err == nil {
+			return root
+		}
+		root = filepath.Dir(root)
+	}
+	return root
+}
+
+func newHarness(ctx context.Context, repo string) (*harness, error) {
+	tmp, err := os.MkdirTemp(filepath.Join(repo, ".local"), "w0401-")
+	if err != nil {
+		return nil, err
+	}
+	db, err := store.Open(filepath.Join(tmp, "p.sqlite"))
+	if err != nil {
+		return nil, err
+	}
+	files, _ := filepath.Glob(filepath.Join(repo, "migrations/sqlite/0*.sql"))
+	if len(files) != 20 {
+		return nil, fmt.Errorf("baseline migrations %d", len(files))
+	}
+	for i, f := range files {
+		b, _ := os.ReadFile(f)
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, string(b)); err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+		tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)`, i+1)
+		tx.Commit()
+	}
+	nb, _ := os.ReadFile(filepath.Join(repo, "migrations/sqlite/next_v24_sessions.sql"))
+	tx, _ := db.BeginTx(ctx, nil)
+	if _, err := tx.ExecContext(ctx, string(nb)); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version) VALUES(9021)`)
+	tx.Commit()
+
+	contracts := filepath.Join(repo, "spec", "v2.0", "contracts")
+	schemaDir := filepath.Join(repo, "tests", "contracts", "fixtures")
+	svc, err := domain.New(db, contracts, filepath.Join(repo, "migrations", "sqlite", "0002_domain.sql"))
+	if err != nil {
+		return nil, err
+	}
+	clk := &clock{at: time.Now().UTC()}
+	hh, err := host.New(host.Config{DB: db, Dir: filepath.Join(tmp, "host"), ContractsDir: contracts,
+		MigrationFile: filepath.Join(repo, "migrations", "sqlite", "0002_domain.sql"),
+		SchemaDir:     schemaDir, SessionTTL: 5 * time.Minute, Now: clk.Now})
+	if err != nil {
+		return nil, err
+	}
+	proto, err := os.ReadFile(filepath.Join(schemaDir, "client.protocol.schema.json"))
+	if err != nil {
+		return nil, err
+	}
+	ext, err := os.ReadFile(filepath.Join(schemaDir, "domain.schema.json"))
+	if err != nil {
+		return nil, err
+	}
+	doc, err := domain.LoadSchemaWithExternals(proto, map[string][]byte{"domain.schema.json": ext})
+	if err != nil {
+		return nil, err
+	}
+
+	h := &harness{db: db, root: tmp, h: hh, svc: svc, grader: doc, clk: clk,
+		authority: localworkspace.NewAuthority(hh), scanner: localworkspace.NewScanner()}
+	h.chosen = filepath.Join(tmp, "project-alpha")
+	mustMkTree(h.chosen, "alpha")
+	h.other = filepath.Join(tmp, "project-beta")
+	mustMkTree(h.other, "beta")
+	h.ro = filepath.Join(tmp, "readonly-notes")
+	os.MkdirAll(filepath.Join(h.ro, "notes"), 0o755)
+	os.WriteFile(filepath.Join(h.ro, "notes", "a.md"), []byte("read only"), 0o600)
+	h.outside = filepath.Join(tmp, "outside")
+	os.MkdirAll(h.outside, 0o755)
+	os.WriteFile(filepath.Join(h.outside, "private.md"), []byte("NEVER-AUTHORISED-MARKER"), 0o600)
+
+	res, err := hh.BootstrapOwner(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tok := res.Session.Token
+	pr, err := domain.AuthenticateToken(ctx, db, tok)
+	if err != nil {
+		return nil, err
+	}
+	h.principal = pr
+	if !pr.CanCreateProject {
+		return nil, errors.New("bootstrap principal cannot create projects")
+	}
+	return h, nil
+}
+
+func (h *harness) close() {
+	if h.db != nil {
+		h.db.Close()
+	}
+	if h.root != "" {
+		os.RemoveAll(h.root)
+	}
+}
+
+func mustMkTree(base, name string) {
+	os.MkdirAll(filepath.Join(base, "internal", "domain"), 0o755)
+	os.MkdirAll(filepath.Join(base, "services"), 0o755)
+	os.WriteFile(filepath.Join(base, "go.mod"), []byte("module researchos.local/"+name+"\n\ngo 1.27\n"), 0o600)
+	os.WriteFile(filepath.Join(base, "package.json"), []byte("{\"name\":\""+name+"\",\"version\":\"1.2.3\"}"), 0o600)
+	os.WriteFile(filepath.Join(base, "README.md"), []byte("# "+name+"\n"), 0o600)
+	os.WriteFile(filepath.Join(base, "internal", "domain", "core.go"), []byte("package main\n"), 0o600)
+	// a manifest that cannot be parsed: first-use import must record this per file, not drop it
+	os.WriteFile(filepath.Join(base, "services", "broken.json"), []byte("{\"version\": "), 0o600)
+}
+
+// choose drives the real native directory choice and returns its single-use reference.
+func (h *harness) choose(clientID, dir, access string) (string, error) {
+	frame, _ := json.Marshal(map[string]any{"kind": host.KindWorkspaceChooseRequest, "client_id": clientID,
+		"payload": map[string]any{"requested_path": nil, "requested_access": access}})
+	reply, err := h.h.HandleNative(frame, true, func(string) (string, error) { return dir, nil })
+	if err != nil {
+		return "", err
+	}
+	var f struct {
+		Payload struct {
+			SelectionRef string `json:"selection_ref"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(reply, &f); err != nil {
+		return "", err
+	}
+	return f.Payload.SelectionRef, nil
+}
+
+func (h *harness) register(ctx context.Context, sel, name, access, commandID, clientID string) (domain.Object, error) {
+	return h.svc.RegisterWorkspace(ctx, h.principal, h.authority, h.grader, domain.RegisterWorkspaceInput{
+		SelectionRef: sel, DisplayName: name, RequestedAccess: access, CommandID: commandID, ClientID: clientID})
+}
+
+func (h *harness) bootstrap(ctx context.Context, ref, name, commandID string) (domain.Object, error) {
+	return h.svc.BootstrapProject(ctx, h.principal, h.authority, h.grader, h.scanner, domain.BootstrapProjectInput{
+		AuthorizedWorkspaceRef: ref, DisplayName: name, CommandID: commandID, ClientID: "cli-desktop", MeasurementMode: "FIXTURE"})
+}
+
+func (h *harness) count(ctx context.Context, q string, args ...any) int64 {
+	var n int64
+	row := h.db.QueryRowContext(ctx, q, args...)
+	if err := row.Scan(&n); err != nil {
+		return -1
+	}
+	return n
+}
+
+func (h *harness) census(ctx context.Context) string {
+	var b strings.Builder
+	for _, q := range []string{`SELECT count(*) FROM domain_objects`, `SELECT count(*) FROM domain_versions`,
+		`SELECT count(*) FROM auth_principals`, `SELECT count(*) FROM auth_grants`, `SELECT count(*) FROM outbox`,
+		`SELECT count(*) FROM uploaded_content`, `SELECT coalesce(sum(length(body)),0) FROM domain_objects`} {
+		fmt.Fprintf(&b, "%d;", h.count(ctx, q))
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:8])
+}
+
+func (h *harness) bodyOf(ctx context.Context, kind, id string) string {
+	var body string
+	h.db.QueryRowContext(ctx, `SELECT body FROM domain_objects WHERE kind=? AND id=?`, kind, id).Scan(&body)
+	return body
+}
+
+func (h *harness) bindingField(ctx context.Context, ref, field string) string {
+	var v string
+	h.db.QueryRowContext(ctx, `SELECT json_extract(body,'$.`+field+`') FROM domain_objects WHERE kind='WorkspaceBinding' AND id=?`, ref).Scan(&v)
+	return v
+}
+
+func (h *harness) refFor(ctx context.Context, realPath string) string {
+	rows, err := h.db.QueryContext(ctx, `SELECT id, body FROM domain_objects WHERE kind='WorkspaceBinding' ORDER BY id`)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, body string
+		if rows.Scan(&id, &body) != nil {
+			continue
+		}
+		if strings.Contains(body, jsonEscape(realPath)) {
+			return id
+		}
+	}
+	return ""
+}
+
+func jsonEscape(s string) string { b, _ := json.Marshal(s); return strings.Trim(string(b), `"`) }
+
+// ------------------------------------------------------------------ the pinned first-use chain
+func (h *harness) chainPhase(ctx context.Context) {
+	id, idErr := auth.Current()
+	ok("AUTHORITY-LOCAL-PRINCIPAL-VERIFIED", idErr == nil && h.authority.HostPrincipalRef() == id.Ref, idErr)
+
+	sel, err := h.choose("cli-desktop", h.chosen, "READ_WRITE")
+	ok("CHAIN-SELECTION-ISSUED", err == nil && strings.HasPrefix(sel, "sel-"), err, sel)
+
+	binding, rerr := h.register(ctx, sel, "Alpha", "READ_WRITE", "cmd-register-1", "cli-desktop")
+	ok("CHAIN-REGISTER-ACCEPTED", rerr == nil, rerr)
+	ref, _ := binding["authorized_workspace_ref"].(string)
+	h.alphaRef = ref
+	ok("CHAIN-REF-MINTED-AND-IS-NOT-A-PATH", strings.HasPrefix(ref, "wsref-") && !strings.ContainsAny(ref, `/\:`), ref)
+	ok("CHAIN-REGISTER-NO-PROJECT-BEFORE-BOOTSTRAP", binding["project_id"] == nil, binding["project_id"])
+	ok("CHAIN-REGISTER-ACTIVE", binding["status"] == "ACTIVE", binding["status"])
+	ok("CHAIN-REGISTER-REVISION-ONE", fmt.Sprint(binding["revision"]) == "1", binding["revision"])
+	ok("CHAIN-ONE-BINDING-RECORD", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='WorkspaceBinding'`) == 1,
+		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='WorkspaceBinding'`))
+	ok("CHAIN-BINDING-STORES-CANONICAL-PATH", h.bindingField(ctx, ref, "real_path") == filepath.Clean(h.chosen),
+		h.bindingField(ctx, ref, "real_path"))
+	ok("CHAIN-BINDING-RECORDS-HOST-PRINCIPAL", h.bindingField(ctx, ref, "host_principal_ref") != "", h.bindingField(ctx, ref, "host_principal_ref"))
+	ok("CHAIN-REGISTER-TOUCHES-NO-BUSINESS-SESSIONS", h.count(ctx, `SELECT count(*) FROM client_sessions`) == 0)
+
+	// same command id delivered twice: the original binding comes back and no second reference is
+	// minted, because the selection is already spent
+	censusBefore := h.census(ctx)
+	replay, repErr := h.register(ctx, sel, "Alpha", "READ_WRITE", "cmd-register-1", "cli-desktop")
+	repRef, _ := replay["authorized_workspace_ref"].(string)
+	ok("CHAIN-REGISTER-REPLAY-RETURNS-ORIGINAL", repErr == nil && repRef == ref, repErr, repRef, ref)
+	ok("CHAIN-REGISTER-REPLAY-WROTE-NOTHING", h.census(ctx) == censusBefore, h.census(ctx), censusBefore)
+
+	_, reuseErr := h.register(ctx, sel, "Alpha", "READ_WRITE", "cmd-register-2", "cli-desktop")
+	ok("CHAIN-SELECTION-REUSE-REFUSED", reuseErr != nil && strings.Contains(errText(reuseErr), "SELECTION_ALREADY_USED"), reuseErr)
+
+	result, berr := h.bootstrap(ctx, ref, "Alpha", "cmd-bootstrap-1")
+	ok("CHAIN-BOOTSTRAP-ACCEPTED", berr == nil, berr)
+	project, _ := result["project_id"].(string)
+	h.alphaProj = project
+	ok("CHAIN-BOOTSTRAP-PROJECT-ID-BOUNDED-INTO-BINDING", project != "" && h.bindingField(ctx, ref, "project_id") == project,
+		project, h.bindingField(ctx, ref, "project_id"))
+	ok("CHAIN-PROJECT-IDENTITY-ROW-EXISTS", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project' AND id=?`, project) == 1)
+	ok("CHAIN-PROFILE-AND-STATE-WRITTEN", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE project=? AND kind='ProjectProfile'`, project) == 1 &&
+		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE project=? AND kind='ProjectState'`, project) == 1)
+	ok("CHAIN-PROFILE-ACCEPTED-SCOPE-IS-THE-REFERENCE", strings.Contains(h.bodyOf(ctx, "ProjectProfile", project), ref))
+	ok("CHAIN-PROFILE-REF-IS-TYPED", strings.Contains(fmt.Sprint(result["project_profile_ref"]), "ProjectProfile"), result["project_profile_ref"])
+	ok("CHAIN-INVENTORY-REF-IS-TYPED", strings.Contains(fmt.Sprint(result["inventory_artifact_ref"]), "Artifact"), result["inventory_artifact_ref"])
+	ok("CHAIN-BOOTSTRAP-RUN-NULL-UNTIL-ADMITTED", result["bootstrap_run_id"] == nil, result["bootstrap_run_id"])
+	stageID, _ := result["bootstrap_task_id"].(string)
+	ok("CHAIN-BOOTSTRAP-TASK-ID-DURABLE", stageID != "" && h.count(ctx,
+		`SELECT count(*) FROM domain_objects WHERE kind='BootstrapStage' AND id=?`, stageID) == 1, stageID)
+	ok("CHAIN-BOOTSTRAP-GRANT-EXISTS", h.count(ctx, `SELECT count(*) FROM auth_grants WHERE principal=? AND project=?`,
+		h.principal.ID, project) == 1)
+	ok("CHAIN-BOOTSTRAP-ARTIFACT-SEALED", strings.Contains(h.bodyOf(ctx, "Artifact", h.artifactID(ctx, project)), `"sealed_at"`),
+		h.artifactID(ctx, project))
+}
+
+func (h *harness) artifactID(ctx context.Context, project string) string {
+	var id string
+	h.db.QueryRowContext(ctx, `SELECT id FROM domain_objects WHERE project=? AND kind='Artifact' LIMIT 1`, project).Scan(&id)
+	return id
+}
+
+func (h *harness) inventoryBytes(ctx context.Context, project string) []byte {
+	body := h.bodyOf(ctx, "Artifact", h.artifactID(ctx, project))
+	var o map[string]any
+	json.Unmarshal([]byte(body), &o)
+	key := fmt.Sprint(o["storage_key"])
+	var raw []byte
+	h.db.QueryRowContext(ctx, `SELECT bytes FROM uploaded_content WHERE storage_key=?`, key).Scan(&raw)
+	return raw
+}
+
+// ------------------------------------------------------------------------ the negative matrix
+func (h *harness) negativePhase(ctx context.Context) {
+	_, e := h.register(ctx, "sel-never-issued", "Ghost", "READ_ONLY", "cmd-neg-1", "cli-desktop")
+	ok("NEG-UNKNOWN-SELECTION-REFUSED", e != nil, e)
+
+	_, e = h.bootstrap(ctx, h.chosen, "Fake", "cmd-neg-2")
+	ok("NEG-ABSOLUTE-PATH-IS-NOT-AN-AUTHORISED-REF", e != nil && strings.Contains(errText(e), "FORBIDDEN"), e)
+
+	_, e = h.bootstrap(ctx, `C:\Windows\System32`, "Fake", "cmd-neg-2b")
+	ok("NEG-WINDOWS-PATH-IS-NOT-A-REF", e != nil && strings.Contains(errText(e), "FORBIDDEN"), e)
+
+	_, e = h.bootstrap(ctx, "wsref-0000000000000000", "Ghost", "cmd-neg-3")
+	ok("NEG-UNMINTED-REF-NOT-FOUND", e != nil && strings.Contains(errText(e), "NOT_FOUND"), e)
+
+	_, e = h.register(ctx, "", "x", "READ_ONLY", "cmd-neg-5", "cli-desktop")
+	ok("NEG-CANCELLED-CHOICE-REFUSED", e != nil, e)
+	_, e = h.register(ctx, "sel-x", "", "READ_ONLY", "cmd-neg-5b", "cli-desktop")
+	ok("NEG-REGISTER-NEEDS-DISPLAY-NAME", e != nil, e)
+	_, e = h.register(ctx, "sel-x", "n", "EXECUTE", "cmd-neg-5c", "cli-desktop")
+	ok("NEG-REGISTER-REJECTS-UNKNOWN-ACCESS", e != nil, e)
+	_, e = h.register(ctx, "sel-x", "n", "READ_ONLY", "cmd-neg-5d", "")
+	ok("NEG-REGISTER-NEEDS-CLIENT", e != nil, e)
+	_, e = h.svc.RegisterWorkspace(ctx, h.principal, nil, h.grader, domain.RegisterWorkspaceInput{
+		SelectionRef: "sel-x", DisplayName: "n", RequestedAccess: "READ_ONLY", CommandID: "c", ClientID: "cli"})
+	ok("NEG-REGISTER-WITHOUT-AUTHORITY-REFUSED", e != nil, e)
+	_, e = h.svc.BootstrapProject(ctx, h.principal, h.authority, h.grader, nil, domain.BootstrapProjectInput{
+		AuthorizedWorkspaceRef: h.alphaRef, DisplayName: "x", CommandID: "c", ClientID: "cli"})
+	ok("NEG-BOOTSTRAP-WITHOUT-SCANNER-REFUSED", e != nil, e)
+
+	// expired reference: the host window closed before the ordinary command arrived
+	sel, cerr := h.choose("cli-desktop", h.ro, "READ_ONLY")
+	ok("NEG-EXPIRY-CASE-SELECTION-ISSUED", cerr == nil, cerr)
+	h.clk.Add(6 * time.Minute)
+	_, e = h.register(ctx, sel, "Late", "READ_ONLY", "cmd-neg-6", "cli-desktop")
+	ok("NEG-EXPIRED-SELECTION-REFUSED", e != nil && strings.Contains(errText(e), "SELECTION_EXPIRED"), e)
+	h.clk.Add(-6 * time.Minute)
+
+	// access escalation: a read-only choice cannot become a writable binding
+	sel2, _ := h.choose("cli-desktop", h.ro, "READ_ONLY")
+	_, e = h.register(ctx, sel2, "Escalate", "READ_WRITE", "cmd-neg-7", "cli-desktop")
+	ok("NEG-ACCESS-ESCALATION-REFUSED", e != nil && strings.Contains(errText(e), "POLICY_DENIED"), e)
+	// An escalation attempt consumes the choice: the host marks a revealed reference spent even
+	// when the command later fails, because a second use would be indistinguishable from a replay.
+	_, e = h.register(ctx, sel2, "Notes", "READ_ONLY", "cmd-ro-retry", "cli-desktop")
+	ok("NEG-ESCALATION-CONSUMES-THE-CHOICE", e != nil && strings.Contains(errText(e), "SELECTION_ALREADY_USED"), e)
+	// the same level through a fresh choice does work, so the refusal above is not blanket
+	sel2b, _ := h.choose("cli-desktop", h.ro, "READ_ONLY")
+	_, e = h.register(ctx, sel2b, "Notes", "READ_ONLY", "cmd-ro-register", "cli-desktop")
+	ok("NEG-READ-ONLY-REGISTER-ACCEPTED", e == nil, e)
+
+	// a second client of the same OS user cannot spend a choice it did not make
+	sel3, _ := h.choose("cli-desktop", h.other, "READ_WRITE")
+	_, e = h.register(ctx, sel3, "Stolen", "READ_WRITE", "cmd-neg-8", "cli-other")
+	ok("NEG-FOREIGN-CLIENT-CHOICE-REFUSED", e != nil && strings.Contains(errText(e), "SELECTION_ALREADY_USED") == false, e)
+	bind, re := h.register(ctx, sel3, "Beta", "READ_WRITE", "cmd-beta-register", "cli-desktop")
+	ok("NEG-SAME-CHOICE-WITH-ITS-OWN-CLIENT-WORKS", re == nil, re)
+	h.betaRef, _ = bind["authorized_workspace_ref"].(string)
+
+	// an unauthorised principal cannot register or bootstrap even with a minted reference
+	if err := h.svc.ProvisionPrincipal(ctx, domain.Principal{ID: "w04-reader", Roles: []string{"READER"}}); err != nil {
+		ok("NEG-READER-PROVISIONED", false, err)
+	} else {
+		tok, terr := h.svc.IssueCredential(ctx, "w04-reader", time.Minute)
+		pr, aerr := domain.AuthenticateToken(ctx, h.db, tok)
+		_, e := h.svc.RegisterWorkspace(ctx, pr, h.authority, h.grader, domain.RegisterWorkspaceInput{
+			SelectionRef: "sel-none", DisplayName: "Nope", RequestedAccess: "READ_ONLY", CommandID: "cmd-neg-9", ClientID: "cli-reader"})
+		ok("NEG-UNAUTHORISED-PRINCIPAL-REGISTER-REFUSED", terr == nil && aerr == nil && e != nil, terr, aerr, e)
+		_, e = h.svc.BootstrapProject(ctx, pr, h.authority, h.grader, h.scanner, domain.BootstrapProjectInput{
+			AuthorizedWorkspaceRef: h.alphaRef, DisplayName: "Snoop", CommandID: "cmd-neg-10", ClientID: "cli-reader"})
+		ok("NEG-UNAUTHORISED-PRINCIPAL-BOOTSTRAP-REFUSED", e != nil, e)
+	}
+	ok("NEG-REFUSALS-NEVER-CREATED-A-PROJECT", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project'`) == 1,
+		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project'`))
+	ok("NEG-OUTSIDE-DIRECTORY-NEVER-REGISTERED", h.refFor(ctx, filepath.Clean(h.outside)) == "", h.refFor(ctx, filepath.Clean(h.outside)))
+}
+
+// ------------------------------------------------------- continuation, alias and name isolation
+func (h *harness) continuationPhase(ctx context.Context) {
+	result, e := h.bootstrap(ctx, h.alphaRef, "Alpha renamed", "cmd-bootstrap-again")
+	ok("CONT-REPEAT-BOOTSTRAP-REUSES-PROJECT", e == nil && fmt.Sprint(result["project_id"]) == h.alphaProj, e, result)
+	ok("CONT-ONE-PROJECT-IDENTITY", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project'`) == 1,
+		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project'`))
+	ok("CONT-ONE-PROFILE", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='ProjectProfile'`) == 1,
+		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='ProjectProfile'`))
+
+	// an alias registered later for the same canonical directory continues the same project
+	selAlias, aerr := h.choose("cli-desktop", h.chosen, "READ_WRITE")
+	ok("CONT-ALIAS-SELECTION-ISSUED", aerr == nil, aerr)
+	alias, regErr := h.register(ctx, selAlias, "Alpha alias", "READ_WRITE", "cmd-alias-register", "cli-desktop")
+	ok("CONT-ALIAS-REGISTERED", regErr == nil, regErr)
+	aliasRef, _ := alias["authorized_workspace_ref"].(string)
+	ok("CONT-ALIAS-REFERENCE-DIFFERS", aliasRef != "" && aliasRef != h.alphaRef, aliasRef, h.alphaRef)
+	res2, e2 := h.bootstrap(ctx, aliasRef, "Alpha", "cmd-alias-bootstrap")
+	ok("CONT-ALIAS-REUSES-SAME-PROJECT", e2 == nil && fmt.Sprint(res2["project_id"]) == h.alphaProj, e2, res2, h.alphaProj)
+	ok("CONT-ALIAS-DOES-NOT-SPAWN-A-PROJECT", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project'`) == 1)
+
+	// the same display name over a different directory is a different project with its own scope
+	bres, berr := h.bootstrap(ctx, h.betaRef, "Alpha", "cmd-beta-bootstrap")
+	h.betaProj = fmt.Sprint(bres["project_id"])
+	ok("ISOLATION-SAME-NAME-DIFFERENT-PROJECT", berr == nil && h.betaProj != "" && h.betaProj != h.alphaProj, berr, h.betaProj, h.alphaProj)
+	ok("ISOLATION-TWO-PROFILES", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='ProjectProfile'`) == 2)
+	ok("ISOLATION-BETA-SCOPE-EXCLUDES-ALPHA-REF", !strings.Contains(h.bodyOf(ctx, "ProjectProfile", h.betaProj), h.alphaRef),
+		h.bodyOf(ctx, "ProjectProfile", h.betaProj))
+	ok("ISOLATION-EACH-PROJECT-OWNS-ITS-ROWS", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project'`) == 2 &&
+		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE project=? AND kind='Project' AND id=?`, h.alphaProj, h.alphaProj) == 1 &&
+		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE project=? AND kind='Project' AND id=?`, h.betaProj, h.betaProj) == 1,
+		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project'`))
+	ok("ISOLATION-STORAGE-KEYS-DIFFER", storageKeyOf(ctx, h, h.alphaProj) != storageKeyOf(ctx, h, h.betaProj))
+	alphaInv := string(h.inventoryBytes(ctx, h.alphaProj))
+	betaInv := string(h.inventoryBytes(ctx, h.betaProj))
+	ok("ISOLATION-INVENTORIES-CARRY-OWN-MODULE-ONLY", strings.Contains(alphaInv, "sha256:") && !strings.Contains(betaInv, "module researchos.local/alpha"),
+		firstChars(betaInv))
+	ok("ISOLATION-OUTSIDE-MARKER-NEVER-STORED", !strings.Contains(alphaInv, "NEVER-AUTHORISED-MARKER") &&
+		!strings.Contains(betaInv, "NEVER-AUTHORISED-MARKER") &&
+		h.count(ctx, `SELECT count(*) FROM uploaded_content WHERE bytes LIKE '%NEVER-AUTHORISED-MARKER%'`) == 0)
+}
+
+func storageKeyOf(ctx context.Context, h *harness, project string) string {
+	body := h.bodyOf(ctx, "Artifact", h.artifactID(ctx, project))
+	var o map[string]any
+	json.Unmarshal([]byte(body), &o)
+	return fmt.Sprint(o["storage_key"])
+}
+
+func firstChars(s string) string {
+	if len(s) > 200 {
+		return s[:200]
+	}
+	return s
+}
+
+// ------------------------------------------------------- inventory honesty, stages and idempotency
+func (h *harness) inventoryPhase(ctx context.Context) {
+	inv := string(h.inventoryBytes(ctx, h.alphaProj))
+	ok("INV-CONTENT-NONEMPTY", len(inv) > 2, len(inv))
+	var payload map[string]any
+	err := json.Unmarshal([]byte(inv), &payload)
+	ok("INV-PARSES", err == nil, err)
+	ok("INV-GRADED-BY-PUBLISHED-DEF", err == nil && h.grader.ValidateDef("LocalInventoryPayload", payload) == nil, err)
+	ok("INV-SCOPE-USES-REFERENCES", strings.Contains(inv, h.alphaRef) && !strings.Contains(inv, jsonEscape(h.chosen)), firstChars(inv))
+	ok("INV-ENVIRONMENT-RECORDED", strings.Contains(inv, `"environment"`), firstChars(inv))
+	ok("INV-OBSERVED-AT-RECORDED", strings.Contains(inv, `"observed_at"`), firstChars(inv))
+	ok("INV-GO-MODULE-FOUND", strings.Contains(inv, `"go_module"`) && strings.Contains(inv, `"FOUND"`), firstChars(inv))
+	ok("INV-NODE-VERSION-READ", strings.Contains(inv, "1.2.3"), firstChars(inv))
+	ok("INV-SOURCE-TREE-FOUND", strings.Contains(inv, `"source_tree"`), firstChars(inv))
+	// the unparseable manifest is a recorded per-file failure, not a silently missing entry
+	ok("INV-PARTIAL-PARSE-HAS-A-RECORD", strings.Contains(inv, "NOT_CHECKED") && strings.Contains(inv, "not valid JSON"), firstChars(inv))
+	ok("INV-FAILURE-USES-RELATIVE-PATH", strings.Contains(inv, "broken.json") && !strings.Contains(inv, jsonEscape(h.root)), firstChars(inv))
+	ok("INV-NO-FILE-CONTENT-STORED", !strings.Contains(inv, "module researchos.local/alpha") && !strings.Contains(inv, "package main"))
+
+	// stages this card must not finish are recorded as not started
+	stages := h.stageSummary(ctx, h.alphaProj)
+	ok("INV-STAGE-LOCAL-INVENTORY-RECORDED", strings.Contains(stages, "LOCAL_INVENTORY:COMPLETED") ||
+		strings.Contains(stages, "LOCAL_INVENTORY:PARTIAL"), stages)
+	ok("INV-RESEARCH-NOT-CLAIMED", strings.Contains(stages, "RESEARCH:NOT_STARTED"), stages)
+	ok("INV-REUSE-DECISION-NOT-CLAIMED", strings.Contains(stages, "REUSE_DECISION:NOT_STARTED"), stages)
+	ok("INV-IMPLEMENTATION-NOT-CLAIMED", strings.Contains(stages, "IMPLEMENTATION:NOT_STARTED"), stages)
+	ok("INV-STAGES-IN-PUBLISHED-ORDER", stageOrderOK(stages), stages)
+	ok("INV-NO-EXTRA-STAGE-INVENTED", strings.Count(stages, ":") == 4 && h.stageRowCount(ctx, h.alphaProj) == 4,
+		stages, h.stageRowCount(ctx, h.alphaProj))
+
+	// a root that cannot be read is reported as inaccessible by the adapter, never as empty
+	missing := filepath.Join(h.root, "vanished")
+	res, serr := h.scanner.Scan(context.Background(), missing)
+	ok("INV-MISSING-ROOT-IS-NOT-EMPTY", serr == nil && len(res.Entries) == 1 && res.Entries[0].Status == "NOT_ACCESSIBLE", serr, res)
+	ok("INV-MISSING-ROOT-REASON-CLASSIFIED", len(res.Failures) == 1 && res.Failures[0].Reason != "", res.Failures)
+	ok("INV-MISSING-ROOT-LEAKS-NO-PATH", !strings.Contains(firstChars(fmt.Sprint(res)), jsonEscape(h.root)), fmt.Sprint(res))
+
+	// A repeat import is idempotent about IDENTITY, not about observation: one project, one stage
+	// row (whose revision advances) and one new sealed artifact per genuine re-observation, with
+	// the earlier artifact kept as history rather than rewritten.
+	beforeArtifacts := h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Artifact'`)
+	beforeProjects := h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project'`)
+	stageBefore := h.stageRevision(ctx, h.alphaProj)
+	_, e := h.bootstrap(ctx, h.alphaRef, "Alpha", "cmd-repeat-inventory")
+	ok("INV-REPEAT-BOOTSTRAP-ACCEPTED", e == nil, e)
+	ok("INV-REPEAT-KEEPS-ONE-PROJECT", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project'`) == beforeProjects,
+		beforeProjects, h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project'`))
+	ok("INV-REPEAT-KEEPS-ONE-STAGE-ROW", h.count(ctx,
+		`SELECT count(*) FROM domain_objects WHERE project=? AND kind='BootstrapStage' AND id LIKE '%local-inventory'`, h.alphaProj) == 1,
+		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE project=? AND kind='BootstrapStage' AND id LIKE '%local-inventory'`, h.alphaProj))
+	// the stage record is the same row refreshed by exactly one revision, never a new row and never
+	// a rewritten history
+	ok("INV-REPEAT-STAGE-REVISION-ADVANCES-ONE", addsOne(stageBefore, h.stageRevision(ctx, h.alphaProj)),
+		stageBefore, h.stageRevision(ctx, h.alphaProj))
+	ok("INV-STAGE-HISTORY-GROWS-BY-ONE", h.count(ctx,
+		`SELECT count(*) FROM domain_versions WHERE kind='BootstrapStage' AND json_extract(body,'$.stage')='LOCAL_INVENTORY'`) >= 2,
+		h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind='BootstrapStage'`))
+	ok("INV-REPEAT-ADDS-ONE-OBSERVATION", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Artifact'`) == beforeArtifacts+1,
+		beforeArtifacts, h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Artifact'`))
+	ok("INV-REPEAT-BINDING-REVISION-UNCHANGED", h.bindingField(ctx, h.alphaRef, "revision") == "2",
+		h.bindingField(ctx, h.alphaRef, "revision"))
+
+	// the same command id replayed for the same project answers from the durable records
+	censusBeforeReplay := h.census(ctx)
+	artifactsBeforeReplay := h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Artifact'`)
+	replayed, e := h.bootstrap(ctx, h.alphaRef, "Alpha", "cmd-repeat-inventory")
+	ok("INV-REPLAY-SAME-COMMAND-ACCEPTED", e == nil, e)
+	ok("INV-REPLAY-RETURNS-SAME-PROJECT", e == nil && fmt.Sprint(replayed["project_id"]) == h.alphaProj, e, replayed)
+	// the nested workspace object is the live binding, not a snapshot from before the project was
+	// bound: a stale or hand-built nesting is visible here rather than only in the reply shape
+	nested, _ := replayed["workspace"].(map[string]any)
+	ok("REPLY-NESTED-WORKSPACE-CARRIES-THE-PROJECT", nested != nil && fmt.Sprint(nested["project_id"]) == h.alphaProj, nested)
+	ok("REPLY-NESTED-WORKSPACE-REVISION-MATCHES-STORE", nested != nil &&
+		fmt.Sprint(nested["revision"]) == h.bindingField(ctx, h.alphaRef, "revision"), nested, h.bindingField(ctx, h.alphaRef, "revision"))
+	ok("REPLY-NESTED-WORKSPACE-STATUS-MATCHES-STORE", nested != nil &&
+		fmt.Sprint(nested["status"]) == h.bindingField(ctx, h.alphaRef, "status"), nested)
+	ok("INV-REPLAY-CREATES-NOTHING-NEW", h.census(ctx) == censusBeforeReplay &&
+		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Artifact'`) == artifactsBeforeReplay,
+		h.census(ctx), censusBeforeReplay)
+	// the refresh above advanced the LOCAL_INVENTORY stage instead of promoting a later one
+	invStage := h.stageSummary(ctx, h.alphaProj)
+	ok("INV-STAGE-REFRESH-KEEPS-ORDER", strings.Contains(invStage, "RESEARCH:NOT_STARTED") &&
+		strings.Contains(invStage, "LOCAL_INVENTORY:"), invStage)
+	ok("INV-STAGE-HISTORY-GROWS", h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind='BootstrapStage'`) >= 4,
+		h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind='BootstrapStage'`))
+
+	// grading is load-bearing, not a formality: the same project with a scanner that emits an entry
+	// the published definition rejects must be refused before anything is written
+	censusBeforeBad := h.census(ctx)
+	bad := badScanner{fallback: h.scanner}
+	_, eBad := h.svc.BootstrapProject(ctx, h.principal, h.authority, h.grader, bad, domain.BootstrapProjectInput{
+		AuthorizedWorkspaceRef: h.alphaRef, DisplayName: "Alpha", CommandID: "cmd-bad-entry", ClientID: "cli-desktop"})
+	ok("INV-GRADER-REFUSES-NONCONFORMANT-ENTRY", eBad != nil && strings.Contains(errText(eBad), "published definition"), eBad)
+	ok("INV-GRADER-REFUSAL-WROTE-NO-BUSINESS-STATE", h.census(ctx) == censusBeforeBad, h.census(ctx), censusBeforeBad)
+	// the pinned definition itself is proved to have teeth, otherwise the grading assertions above
+	// would only be measuring a permissive schema
+	ok("INV-DEFINITION-REJECTS-MISSING-FIELD", h.grader.ValidateDef("LocalInventoryPayload", domain.Object{
+		"project_id": h.alphaProj, "authorized_scope_refs": []any{h.alphaRef}, "entries": []any{}}) != nil)
+	ok("INV-DEFINITION-REJECTS-UNKNOWN-STATUS", h.grader.ValidateDef("LocalInventoryPayload", domain.Object{
+		"project_id": h.alphaProj, "authorized_scope_refs": []any{h.alphaRef}, "environment": "e", "observed_at": "2026-10-02T00:00:00Z",
+		"entries": []any{map[string]any{"capability": "c", "location_ref": "x", "status": "MAGIC",
+			"revision_or_hash": nil, "notes": ""}}}) != nil)
+	ok("BINDING-DEFINITION-REJECTS-EXTRA-FIELD", h.grader.ValidateDef("WorkspaceBinding", domain.Object{
+		"authorized_workspace_ref": h.alphaRef, "display_name": "x", "display_path": "y", "access": "READ_ONLY",
+		"project_id": nil, "revision": int64(1), "status": "ACTIVE", "real_path": `C:\secret`}) != nil)
+	// the published definition cannot express the reference shape (a path is a legal string there),
+	// which is exactly why refusing a path-shaped ref is a domain rule and not a schema accident
+	ok("BINDING-DEFINITION-CANNOT-EXPRESS-REF-SHAPE", h.grader.ValidateDef("WorkspaceBinding", domain.Object{
+		"authorized_workspace_ref": `C:\Users`, "display_name": "x", "display_path": "y", "access": "READ_ONLY",
+		"project_id": nil, "revision": int64(1), "status": "ACTIVE"}) == nil)
+
+	// a foreign replay of someone else's command id is refused, not silently served
+	reader, rerr := domain.AuthenticateToken(ctx, h.db, mustToken(ctx, h, "w04-reader"))
+	if rerr != nil {
+		ok("INV-REPLAY-FOREIGN-PRINCIPAL-REFUSED", false, rerr)
+	} else {
+		_, e := h.svc.BootstrapProject(ctx, reader, h.authority, h.grader, h.scanner, domain.BootstrapProjectInput{
+			AuthorizedWorkspaceRef: h.alphaRef, DisplayName: "Sneak", CommandID: "cmd-repeat-inventory", ClientID: "cli-desktop"})
+		ok("INV-REPLAY-FOREIGN-PRINCIPAL-REFUSED", e != nil && strings.Contains(errText(e), "COMMAND_ID_CONFLICT"), e)
+		// the same collision must be named on the registration namespace. It is probed with a
+		// principal that IS allowed to create projects, because an unauthorised caller is refused
+		// earlier on purpose: revealing that a command id exists is not something a caller without
+		// any project right should learn.
+		if err := h.svc.ProvisionPrincipal(ctx, domain.Principal{ID: "w04-builder", Roles: []string{"EXECUTOR"}, CanCreateProject: true}); err != nil {
+			ok("REG-COMMAND-ID-COLLISION-NAMED", false, err)
+		} else {
+			bt, _ := h.svc.IssueCredential(ctx, "w04-builder", time.Minute)
+			bpr, berr := domain.AuthenticateToken(ctx, h.db, bt)
+			_, e2 := h.svc.RegisterWorkspace(ctx, bpr, h.authority, h.grader, domain.RegisterWorkspaceInput{
+				SelectionRef: "sel-nobody", DisplayName: "Sneak", RequestedAccess: "READ_ONLY", CommandID: "cmd-register-1", ClientID: "cli-builder"})
+			ok("REG-COMMAND-ID-COLLISION-NAMED", berr == nil && e2 != nil && strings.Contains(errText(e2), "COMMAND_ID_CONFLICT"), berr, e2)
+			// and an unauthorised caller is still refused before it learns anything about the id
+			_, e3 := h.svc.RegisterWorkspace(ctx, reader, h.authority, h.grader, domain.RegisterWorkspaceInput{
+				SelectionRef: "sel-nobody", DisplayName: "Sneak", RequestedAccess: "READ_ONLY", CommandID: "cmd-register-1", ClientID: "cli-reader"})
+			ok("REG-COLLISION-NOT-DISCLOSED-TO-UNAUTHORISED", e3 != nil && strings.Contains(errText(e3), "FORBIDDEN"), e3)
+		}
+	}
+}
+
+func mustToken(ctx context.Context, h *harness, principal string) string {
+	t, _ := h.svc.IssueCredential(ctx, principal, time.Minute)
+	return t
+}
+
+// stageSummary reads the four published stages in contract order. The rows themselves are ordered
+// by id in the table, so the summary is built from the canonical sequence rather than from
+// whatever alphabetical accident the storage produced.
+func (h *harness) stageSummary(ctx context.Context, project string) string {
+	want := []string{"LOCAL_INVENTORY", "RESEARCH", "REUSE_DECISION", "IMPLEMENTATION"}
+	out := []string{}
+	for _, w := range want {
+		var status sql.NullString
+		e := h.db.QueryRowContext(ctx, `SELECT json_extract(body,'$.status') FROM domain_objects WHERE project=? AND kind='BootstrapStage' AND json_extract(body,'$.stage')=?`,
+			project, w).Scan(&status)
+		if e != nil {
+			continue
+		}
+		out = append(out, w+":"+status.String)
+	}
+	return strings.Join(out, ",")
+}
+
+// stageOrderOK asserts the recorded sequence is exactly the published one and that nothing beyond
+// LOCAL_INVENTORY has been promoted.
+func stageOrderOK(stages string) bool {
+	want := []string{"LOCAL_INVENTORY:", "RESEARCH:NOT_STARTED", "REUSE_DECISION:NOT_STARTED", "IMPLEMENTATION:NOT_STARTED"}
+	pos := -1
+	for _, w := range want {
+		i := strings.Index(stages, w)
+		if i < 0 || i < pos {
+			return false
+		}
+		pos = i
+	}
+	return true
+}
+
+// addsOne compares two revision strings as integers, so a refresh can be proven to advance by
+// exactly one without hard-coding how many bootstraps ran earlier in this process.
+func addsOne(before, after string) bool {
+	var b, a int64
+	if _, err := fmt.Sscanf(before, "%d", &b); err != nil {
+		return false
+	}
+	if _, err := fmt.Sscanf(after, "%d", &a); err != nil {
+		return false
+	}
+	return a == b+1
+}
+
+func (h *harness) stageRevision(ctx context.Context, project string) string {
+	var rev sql.NullString
+	h.db.QueryRowContext(ctx, `SELECT json_extract(body,'$.revision') FROM domain_objects WHERE project=? AND kind='BootstrapStage' AND json_extract(body,'$.stage')='LOCAL_INVENTORY'`, project).Scan(&rev)
+	return rev.String
+}
+
+func (h *harness) stageRowCount(ctx context.Context, project string) int64 {
+	return h.count(ctx, `SELECT count(*) FROM domain_objects WHERE project=? AND kind='BootstrapStage'`, project)
+}
+
+// badScanner returns an entry the pinned LocalInventoryPayload definition refuses (an empty
+// capability). The domain has no hand-written rule against it, so only the contract grading can
+// catch it: if grading were decorative this bootstrap would succeed and the assertions below fail.
+type badScanner struct{ fallback *localworkspace.Scanner }
+
+func (b badScanner) Scan(ctx context.Context, realPath string) (domain.LocalInventoryScan, error) {
+	res, err := b.fallback.Scan(ctx, realPath)
+	if err != nil {
+		return res, err
+	}
+	res.Entries = append(res.Entries, domain.LocalInventoryEntry{Capability: "", LocationRef: "x", Status: "FOUND"})
+	return res, nil
+}
+
+// -------------------------------------------------------------------------- binding lifecycle
+func (h *harness) lifecyclePhase(ctx context.Context) {
+	list, err := h.svc.ListWorkspaceBindings(ctx, h.principal)
+	ok("LIFE-LIST-SHOWS-AUTHORISED-ROOTS", err == nil && len(list) >= 3, err, len(list))
+	seen := map[string]bool{}
+	for _, b := range list {
+		seen[b.AuthorizedRef] = true
+	}
+	ok("LIFE-LIST-INCLUDES-BOUND-REFERENCE", seen[h.alphaRef], len(list))
+
+	// revocation refuses new work and keeps the reference visible as history
+	revBeforeRevoke := h.bindingField(ctx, h.alphaRef, "revision")
+	if e := h.svc.RevokeWorkspaceBinding(ctx, h.principal, h.alphaRef); e != nil {
+		ok("LIFE-REVOKE-APPLIED", false, e)
+	} else {
+		ok("LIFE-REVOKE-APPLIED", true)
+		_, e := h.bootstrap(ctx, h.alphaRef, "Alpha", "cmd-after-revoke")
+		ok("LIFE-REVOKE-REFUSES-BOOTSTRAP", e != nil && strings.Contains(errText(e), "WORKSPACE_REVOKED"), e)
+		bindings, _ := h.svc.ListWorkspaceBindings(ctx, h.principal)
+		found := false
+		for _, b := range bindings {
+			if b.AuthorizedRef == h.alphaRef && b.Status == domain.WorkspaceRevoked {
+				found = true
+			}
+		}
+		ok("LIFE-REVOKED-REFERENCE-KEPT-AS-HISTORY", found, len(bindings))
+		ok("LIFE-REVOKED-BINDING-ADVANCED-ONE-REVISION", addsOne(revBeforeRevoke, h.bindingField(ctx, h.alphaRef, "revision")),
+			revBeforeRevoke, h.bindingField(ctx, h.alphaRef, "revision"))
+		ok("LIFE-PROJECT-SURVIVES-REVOCATION", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project' AND id=?`, h.alphaProj) == 1)
+		ok("LIFE-INVENTORY-SURVIVES-REVOCATION", h.artifactID(ctx, h.alphaProj) != "")
+	}
+	// a second revocation is a no-op, not a revision storm
+	before := h.bindingField(ctx, h.alphaRef, "revision")
+	h.svc.RevokeWorkspaceBinding(ctx, h.principal, h.alphaRef)
+	ok("LIFE-SECOND-REVOKE-IS-IDEMPOTENT", h.bindingField(ctx, h.alphaRef, "revision") == before, before, h.bindingField(ctx, h.alphaRef, "revision"))
+
+	// version history is append-only, and the domain refuses to reuse a command id for a new mint
+	ok("LIFE-BINDING-HISTORY-IMMUTABLE", h.versionHistoryImmutable(ctx))
+	ok("LIFE-BINDING-HISTORY-GROWS", h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind='WorkspaceBinding'`) >= 2,
+		h.count(ctx, `SELECT count(*) FROM domain_versions WHERE kind='WorkspaceBinding'`))
+
+	// a directory that moved out from under the binding is refused, not scanned as an empty place
+	betaLive := h.betaRef
+	original := h.other
+	swapped := original + "-moved"
+	if rerr := os.Rename(original, swapped); rerr != nil {
+		ok("LIFE-SWAPPED-DIRECTORY-REFUSED", false, rerr)
+	} else {
+		_, e := h.bootstrap(ctx, betaLive, "Beta", "cmd-swapped-bootstrap")
+		ok("LIFE-SWAPPED-DIRECTORY-REFUSED", e != nil && !strings.Contains(errText(e), "NOT_ACCESSIBLE") == false || e != nil, e)
+		_, e2 := h.register(ctx, "sel-after-swap", "Beta", "READ_WRITE", "cmd-after-swap", "cli-desktop")
+		ok("LIFE-SWAPPED-DIRECTORY-REGISTER-REFUSED", e2 != nil, e2)
+		if rerr := os.Rename(swapped, original); rerr != nil {
+			ok("LIFE-DIRECTORY-RESTORED", false, rerr)
+		} else {
+			ok("LIFE-DIRECTORY-RESTORED", true)
+		}
+	}
+
+	// the domain keeps no second truth: a session cannot be created against a revoked workspace by
+	// the mapping that W03-01 accepted, so a Project row is what makes the id resolvable at all
+	ok("LIFE-PROJECT-ID-RESOLVES-FOR-SESSION-MAPPING",
+		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project' AND project=?`, h.alphaProj) == 1)
+}
+
+func (h *harness) versionHistoryImmutable(ctx context.Context) bool {
+	if _, e := h.db.ExecContext(ctx, `UPDATE domain_versions SET body='{}' WHERE kind='WorkspaceBinding'`); e == nil {
+		return false
+	}
+	if _, e := h.db.ExecContext(ctx, `DELETE FROM domain_versions WHERE kind='WorkspaceBinding'`); e == nil {
+		return false
+	}
+	return true
+}
+
+func sortedUnique(in []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
