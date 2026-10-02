@@ -19,13 +19,15 @@ W04-02 已被第三个全新身份判 **ACCEPT_WITH_RESERVATIONS**（0 条 block
 ```bash
 cd D:/作品集/ResearchOS/research-os
 export PYTHONIOENCODING=utf-8
-git log --oneline -4                      # HEAD 应为 b7db6981「W04-02 accepted with reservations」
+git log --oneline -4                      # 顶部两条应是「rewrite the branch handoff for W12-01」
+                                          # 与其下的 b7db6981「W04-02 accepted with reservations」
 git status --porcelain | grep -v '^??'     # 应为空（源码树干净）
 python -c "import json,io;c=json.load(io.open('execution/v2.4/checkpoint.json',encoding='utf-8'));print(c['revision'],c['expected_previous_revision'],len(c['accepted_steps']),c['work_in_progress'],c['current_step_id'],len(c['failure_counters']),len(c['open_obligations_before_next_card']),c['blocked_steps'])"
 python "D:/作品集/ResearchOS/ResearchOS_Implementation_Package_v2.4/tools/task_packet.py" next --state execution/v2.4/step_state.json
 ```
 
-本文件写完时的实测值：HEAD `b7db6981`；源码树 0 个 modified；checkpoint
+本文件写完时的实测值：**登记提交是 `b7db6981`**，本文件自己所在的那次 docs 提交在它之上，所以 HEAD 的
+hash 每次重写本文件都会变——**按提交标题核对，不要按 hash 核对**。源码树 0 个 modified；checkpoint
 `revision 28 / expected_previous_revision 27 / accepted_steps 15 / work_in_progress None /
 current_step_id W12-01 / failure_counters 13 / open_obligations_before_next_card 48 /
 blocked_steps ['W01-99']`；`task_packet next` 返回 `state_source=VALIDATED_FILE`、
