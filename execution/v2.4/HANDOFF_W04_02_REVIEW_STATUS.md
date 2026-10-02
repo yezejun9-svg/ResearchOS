@@ -70,11 +70,61 @@ its accept does not register the card, and a fresh identity must review the reme
 
 ## Registering the verdict, once it exists
 
-**Operational warning before any remediation run:** `qoder-desktop:/root/w0402_verifier_r2` may still
-be alive and running Go-heavy probes against this same repo. Do not start mutation or check suites
-while it is running - check for its verdict file and for `.local/ctx_final*.txt`/`.local/ver_w0402/`
-activity, or stop it explicitly, then wait, before the first `go run` of the next window. Its verdict,
-when it arrives, is a second opinion on assertion quality and nothing more.
+## Round 2 also rejected: the merged remediation set is nine items
+
+`qoder-desktop:/root/w0402_verifier_r2` finished too, also on the un-remediated tree, also **REJECT**
+(7 blocking issues, `independent_review_round2.json`, reviewed_at 2026-10-02T14:10:00Z, checkpoint now
+rev 27). It reproduced PASS 239 on four runs with order-identical id lists, re-ran 8 of 15 mutations with
+the same failing id sets, proved both product fixes load-bearing by separate reverts, and A/B'd my
+"pre-existing failures" claim down to one deterministic case - `TestW17UpgradeActiveRecovery`
+(`no such table: runtime_dispatches`) - the other three being this machine's loopback flake. It also
+confirmed the registry revision 11 does not weaken W04-01: its 158 accepted ids remain a strict subset of
+the 239.
+
+Five of its items are the same as round 1's. Three are new and matter:
+
+- **B5** `CTX-CONTEXT-READABLE-AGAIN-AFTER-RESTORE` (`w0402.go:351`) is **never emitted in any run**,
+  because `store.go:165` refuses the receipt UPDATE as immutable. So `CTX-TAMPERED-BUNDLE-REFUSED` is
+  green via the storage branch and the service-side integrity check has zero coverage. That is the real
+  reason mutation Z3 survived - I had written it up as a "redundant defence", which was wrong.
+- **B7** undisclosed drift inside an ACCEPTED card: 3 of W04-01 receipt.json's 30 artifact hashes now
+  differ (`tests/context/check/legacy.go`, `tests/context/check/main.go`,
+  `execution/v2.4/commands.json`); its 20 step_state pins are all intact. Disclosed by
+  `receipts/W04/W04-01/pin_drift_erratum_1.json`, computed - nothing was re-pinned and W04-01's
+  acceptance is not withdrawn.
+- a mutation the reviewer invented itself: storing the caller's claimed revision instead of
+  `state["revision"]` **survives at PASS 239** - a second surviving case the card's own evidence did not
+  contain.
+
+Non-blocking but worth closing while the file is open: the check can silently lose assertion ids
+(`w0402.go:430-436`) with no count floor, and `contextPhase` returns on the first refusal - the exact
+mistake pattern already recorded once in this construction's history.
+
+**Remediation order for the next window, serialised (never two Go-heavy suites at once, and no reviewer
+running alongside the work):**
+
+1. product defects in `internal/domain/changes.go` `resolveConflict` - prune the settled conflict from
+   `ProjectState.blocking_conflict_ids` the way `applyChange:547-557` does, and require that the applied
+   change actually relates to the conflict and that the conflict is OPEN (B3, B4);
+2. assert the recovered next step by value, not key presence: `resume_instruction` / next step, and
+   `unresolved_items` content (B6);
+3. un-skip impact naming - `createChange` fills `impacted_refs` and `impact_link_ids` deterministically
+   via `closure()`, so `CHG-PROPOSAL-NAMES-ITS-IMPACT` is this card's step 3, not W06's (B2);
+4. rebuild the accept-authority assertion on a principal that genuinely holds VERIFIER instead of
+   accepting `403 || 409` from the role gate (B1);
+5. give the tamper refusal a positive control that actually runs, fixing the never-emitted assertion and
+   the Z3 explanation (B5);
+6. correct the remaining evidence text: the two further misquoted counts, `progress_note_1.json`
+   carrying no hashes and its provenance list short one file, the stale six-test legacy-failure list, the
+   two skip attributions the reviewers judged mis-described (`CHG-OPTIONAL-RETRIEVAL-DEGRADES` is deferred
+   in substance but wrongly attributed in the note; `CHG-PROPOSAL-NAMES-ITS-IMPACT` is not deferred at all)
+   and the drift disclosure (already done via erratum).
+
+Then re-run the check and the mutation matrix serially, and ask a **third fresh identity** to review the
+remediated tree. `python .local/register_w0402_accepted.py` will only register an ACCEPT that postdates
+both rejections and carries an identity that is neither the executor's nor either reviewer's; it moves
+checkpoint 27 -> 28. Nothing here is a completion claim: 14 of 71 cards, 0 of 22 parents, 0 of 42 formal
+cases.
 
 `.local/register_w0402_accepted.py` (untracked by `.gitignore`, like all local tooling) performs the
 acceptance mechanically and refuses when it should:
