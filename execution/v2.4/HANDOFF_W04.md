@@ -1,7 +1,9 @@
 # ResearchOS v2.4 施工交接 — W04 支路（2026-10-02）
 
-> **本文件已过期，只作历史保留。** 当前交接（含 W04-02 两轮 REJECT 的 9 条整改项、登记前置条件与四条
-> 自检命令）在 [HANDOFF_W04_02_REVIEW_STATUS.md](HANDOFF_W04_02_REVIEW_STATUS.md)，以那份为准；
+> **本文件已过期，只作历史保留。** 当前交接在
+> [HANDOFF_W04_02_REVIEW_STATUS.md](HANDOFF_W04_02_REVIEW_STATUS.md)——注意那个文件名是历史遗留
+> （两份已 hash 的裁定按名引用它，不能改），内容已于 2026-10-03 整篇重写为 **W12-01 交接**：
+> W04-02 已被第三个独立身份判 ACCEPT_WITH_RESERVATIONS 并登记，checkpoint 到 rev 28、15/71 卡。
 > 两者不一致时，再以其开头的 `git log` / `checkpoint.json` / `task_packet.py next` 实际输出为准。
 
 ## 冻结环境（每条命令都要用，勿换工具链）
