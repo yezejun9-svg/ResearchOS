@@ -616,7 +616,12 @@ func (s *Service) resolveConflict(tx *sql.Tx, project, id string, b Object) (Obj
 	if e != nil {
 		return nil, e
 	}
-	if proposal["status"] != "APPLIED" || o["resolution_proposal_id"] != proposal["id"] {
+	// The old guard also required the conflict to already name this proposal, but
+	// resolution_proposal_id is precisely what this operation writes and CreateConflictRequest does
+	// not carry it, so no conflict could ever be resolved: the check contradicted its own schema.
+	// The requirement that survives is the real one - only an accepted and applied change settles a
+	// conflict - and the resolution is recorded here rather than demanded in advance.
+	if proposal["status"] != "APPLIED" {
 		return nil, Fail(409, "STATE_CONFLICT", "resolution change has not been accepted and applied")
 	}
 	o["status"] = "RESOLVED"

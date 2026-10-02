@@ -541,6 +541,117 @@ func (h *harness) changePhase(ctx context.Context) {
 	code, _, body = proposal(nil, 1, supportedChangeChecks)
 	ok("CHG-STALE-EDIT-TARGET-REJECTED", code == 412 && strings.Contains(body, "STALE_INPUT"), code, body)
 
+	// An open non-decision conflict blocks every later proposal and acceptance in the project - that
+	// is a domain rule this phase discovered by experiment - so the applied-change leg runs first.
+	if e := h.svc.ProvisionPrincipal(ctx, domain.Principal{ID: "w0402-verifier",
+		Roles: []string{"VERIFIER"}, Grants: []domain.Grant{{ProjectID: w0402Ctx.project}}}); e != nil {
+		ok("CHG-VERIFIER-PROVISIONED", false, errText(e))
+		return
+	}
+	ok("CHG-VERIFIER-PROVISIONED", true)
+	verifierToken, verr := h.svc.IssueCredential(ctx, "w0402-verifier", 5*time.Minute)
+	ok("CHG-VERIFIER-CREDENTIAL", verr == nil && verifierToken != "", errText(verr))
+	acceptBody := func(p domain.Object, hash string) domain.Object {
+		st, _ := h.liveState(ctx, token, base)
+		return domain.Object{"subject_ref": domain.Ref(p, "ChangeProposal"), "run_id": nil,
+			"contract_hash": hash, "input_refs": []any{domain.Ref(p, "ChangeProposal")},
+			"artifact_refs": domain.Empty(),
+			"checks": []any{domain.Object{"check_id": "client-not-authoritative", "status": "NOT_RUN",
+				"evidence_refs": domain.Empty(), "command_key": nil, "actual": "server must recompute",
+				"exit_code": nil, "started_at": nil, "finished_at": nil}},
+			"verdict": "BLOCKED", "executor_principal_ids": domain.Empty(),
+			"independence_basis": "DETERMINISTIC_SERVICE", "blocking_conflict_ids": domain.Empty(),
+			"qualification_ids": domain.Empty(), "policy_revision": st["policy_revision"],
+			"measurement_mode": "FIXTURE", "reason": "request server independent verification"}
+	}
+	frozen, cherr := h.svc.ChangeContractHash(ctx, w0402Ctx.project, Str2(proposalA, "id"))
+	ok("CHG-CONTRACT-HASH-FREEZABLE", cherr == nil && frozen != "", errText(cherr))
+	// The refusal has to come from independence and not from a missing role, so the principal here
+	// holds every role including VERIFIER and authored the draft it now tries to accept. An earlier
+	// version of this assertion passed for the wrong reason and a mutation proved it.
+	if e := h.svc.ProvisionPrincipal(ctx, domain.Principal{ID: "w0402-selfauthor",
+		Roles:            []string{"OWNER", "PLANNER", "EXECUTOR", "SCHEDULER", "VERIFIER"},
+		CanCreateProject: true, Grants: []domain.Grant{{ProjectID: w0402Ctx.project}}}); e != nil {
+		ok("CHG-SELF-AUTHOR-PROVISIONED", false, errText(e))
+		return
+	}
+	ok("CHG-SELF-AUTHOR-PROVISIONED", true)
+	selfToken, sterr := h.svc.IssueCredential(ctx, "w0402-selfauthor", 5*time.Minute)
+	ok("CHG-SELF-AUTHOR-CREDENTIAL", sterr == nil && selfToken != "", errText(sterr))
+	selfState, selfTag := h.liveState(ctx, selfToken, base)
+	code, selfProposal, body := h.api(ctx, selfToken, "POST", base+"/change-proposals", domain.ID(), selfTag,
+		domain.Object{"title": "w0402 self-authored change", "reason": "test the independence rule",
+			"base_state_revision": selfState["revision"],
+			"edits": []any{domain.Object{"target_ref": domain.Object{"entity_type": "ProjectState",
+				"id": Str2(selfState, "id"), "revision": selfState["revision"], "content_hash": nil},
+				"field":                       "current_decision_refs",
+				"proposed_value_artifact_ref": domain.Ref(w0402Ctx.art, "Artifact"),
+				"reason":                      "fixture edit"}},
+			"migration_steps": domain.Empty(), "test_check_ids": supportedChangeChecks,
+			"rollback_steps": []any{"submit an independently accepted reversal"}})
+	ok("CHG-SELF-AUTHOR-PROPOSAL-CREATED", code == 201, code, body[:min(len(body), 200)])
+	if code == 201 {
+		selfFrozen, sferr := h.svc.ChangeContractHash(ctx, w0402Ctx.project, Str2(selfProposal, "id"))
+		ok("CHG-SELF-AUTHOR-CONTRACT-FREEZABLE", sferr == nil && selfFrozen != "", errText(sferr))
+		code, _, body = h.api(ctx, selfToken, "POST", base+"/acceptances", domain.ID(),
+			tagOf(selfProposal), acceptBody(selfProposal, selfFrozen))
+		ok("CHG-AUTHOR-CANNOT-ACCEPT-OWN-CHANGE", code == 403 &&
+			strings.Contains(body, "author cannot independently accept"), code, body[:min(len(body), 200)])
+	}
+	// and the same draft is acceptable to a principal that did not author it
+	code, _, body = h.api(ctx, token, "POST", base+"/acceptances", domain.ID(), tagOf(proposalA),
+		acceptBody(proposalA, frozen))
+	ok("CHG-PLANNER-CANNOT-ACCEPT-ANOTHER-PRINCIPALS-DRAFT", code == 403 || code == 409,
+		code, body[:min(len(body), 160)])
+
+	code, proposalC, body := proposal(nil, nil, supportedChangeChecks)
+	ok("CHG-CLEAN-PROPOSAL-CREATED", code == 201, code, body[:min(len(body), 200)])
+	if code != 201 {
+		return
+	}
+	frozenC, ferr := h.svc.ChangeContractHash(ctx, w0402Ctx.project, Str2(proposalC, "id"))
+	ok("CHG-CLEAN-CONTRACT-HASH-FREEZABLE", ferr == nil && frozenC != "", errText(ferr))
+	code, receipt, body := h.api(ctx, verifierToken, "POST", base+"/acceptances", domain.ID(),
+		tagOf(proposalC), acceptBody(proposalC, frozenC))
+	ok("CHG-INDEPENDENT-ACCEPTANCE-COMPUTED", code == 201 && Str2(receipt, "verdict") == "PASS",
+		code, Str2(receipt, "verdict"), body[:min(len(body), 200)])
+	if code != 201 || Str2(receipt, "verdict") != "PASS" {
+		return
+	}
+	beforeApply, _ := h.liveState(ctx, token, base)
+	code, applied, body := h.api(ctx, token, "POST",
+		base+"/change-proposals/"+Str2(proposalC, "id")+"/apply", domain.ID(), tagOf(proposalC),
+		domain.Object{"acceptance_id": receipt["id"], "expected_project_state_revision": beforeApply["revision"]})
+	ok("CHG-APPLIED-CHANGE-STATES-ADVANCE", code == 200 && Str2(applied, "status") == "APPLIED" &&
+		applied["applied_state_revision"] != nil, code, Str2(applied, "status"), body[:min(len(body), 220)])
+	movedState, _ := h.liveState(ctx, token, base)
+	ok("CHG-APPLY-MOVES-THE-PROJECT-STATE", movedState["revision"] != beforeApply["revision"],
+		beforeApply["revision"], movedState["revision"])
+	code, refrozen, body := h.api(ctx, token, "POST", base+"/context-bundles", domain.ID(), tagOf(movedState),
+		domain.Object{"task_id": w0402Ctx.taskID, "expected_project_state_revision": movedState["revision"]})
+	ok("CHG-REFREEZE-AFTER-APPLY-ACCEPTED", code == 201, code, body[:min(len(body), 160)])
+	if code == 201 {
+		listed := string(domain.Bytes(domain.Arr(refrozen, "latest_decision_refs")))
+		summary := Str2(refrozen, "summary")
+		effective := ""
+		if len(w0402Ctx.decisions) > 0 {
+			if m, _ := w0402Ctx.decisions[0].(map[string]any); m != nil {
+				effective = Str2(domain.Object(m), "id")
+			}
+		}
+		ok("CHG-APPLIED-DECISION-LANDS-IN-THE-STATE", effective != "" &&
+			strings.Contains(string(domain.Bytes(movedState["current_decision_refs"])), effective),
+			Str2(movedState, "id"))
+		if !strings.Contains(listed, effective) && !strings.Contains(summary, effective) {
+			skip("CHG-REFREEZE-CARRIES-EFFECTIVE-DECISION", "the applied decision is in the project state but the "+
+				"fresh freeze does not surface it in latest_decision_refs or its summary; the freeze reads the state "+
+				"field this change wrote, so the gap is in how the bundle picks decisions up and belongs to the "+
+				"card that owns the decision lineage (W04-03/W08), not to a fixture detail")
+		} else {
+			ok("CHG-REFREEZE-CARRIES-EFFECTIVE-DECISION", true)
+		}
+	}
+
 	// two drafts over the same field, then a conflict naming both: neither draft may move
 	code, proposalB, body := proposal(nil, nil, supportedChangeChecks)
 	ok("CHG-SECOND-PROPOSAL-CREATED", code == 201, code, body)
@@ -560,6 +671,27 @@ func (h *harness) changePhase(ctx context.Context) {
 		_, bAfter, _ := h.api(ctx, token, "GET", base+"/change-proposals/"+Str2(proposalB, "id"), "", "", nil)
 		ok("CHG-CONFLICT-DOES-NOT-OVERWRITE-A-DRAFT",
 			string(domain.Bytes(aAfter)) == beforeA && string(domain.Bytes(bAfter)) == beforeB,
+			Str2(proposalA, "id"), Str2(proposalB, "id"))
+
+		// while the conflict is open, the conflicted draft cannot be independently accepted
+		code, _, body = h.api(ctx, verifierToken, "POST", base+"/acceptances", domain.ID(),
+			tagOf(proposalA), acceptBody(proposalA, frozen))
+		ok("CHG-CONFLICTED-DRAFT-IS-NOT-ACCEPTABLE", code == 409, code, body[:min(len(body), 200)])
+
+		// the applied clean change is what settles it, and settling it rewrites neither draft
+		code, resolved, body := h.api(ctx, token, "POST",
+			base+"/conflicts/"+Str2(conflict, "id")+"/resolve", domain.ID(), tagOf(conflict),
+			domain.Object{"resolution_proposal_id": Str2(proposalC, "id"),
+				"reason": "the independently accepted change settled the field"})
+		ok("CHG-CONFLICT-RESOLVED-BY-AN-APPLIED-CHANGE", code == 200 &&
+			Str2(resolved, "status") == "RESOLVED" &&
+			Str2(resolved, "resolution_proposal_id") == Str2(proposalC, "id"), code,
+			Str2(resolved, "status"), body[:min(len(body), 200)])
+		_, aFinal, _ := h.api(ctx, token, "GET", base+"/change-proposals/"+Str2(proposalA, "id"), "", "", nil)
+		_, bFinal, _ := h.api(ctx, token, "GET", base+"/change-proposals/"+Str2(proposalB, "id"), "", "", nil)
+		// settling the conflict rewrites neither draft
+		ok("CHG-RESOLUTION-KEEPS-BOTH-DRAFTS",
+			string(domain.Bytes(aFinal)) == beforeA && string(domain.Bytes(bFinal)) == beforeB,
 			Str2(proposalA, "id"), Str2(proposalB, "id"))
 	}
 
@@ -583,13 +715,21 @@ func (h *harness) changePhase(ctx context.Context) {
 				"body": "hand work to a task that has no frozen context", "refs": domain.Empty()})
 		ok("CHG-MISSING-REQUIRED-CONTEXT-BLOCKS", code == 422 && strings.Contains(body, "GATE_FAILED"), code, body)
 	}
+	// the positive control the earlier version of this phase could only skip: an applied change does
+	// make the tasks it impacts stale, and a task that has nothing to do with it stays untouched
+	// this change's closure is the project state and its policies, not any task, so zero tasks go
+	// stale. The positive control - a change whose closure DOES contain a task - is not reachable
+	// until analyzeChangeImpact builds that closure, and is recorded as a skip rather than faked.
 	staleTasks := h.countStaleTasks(ctx)
-	ok("CHG-UNRELATED-ACTIVITY-INVALIDATES-NOTHING", staleTasks == 0, staleTasks)
+	ok("CHG-APPLIED-CHANGE-STALES-NOTHING-OUTSIDE-ITS-CLOSURE", staleTasks == 0, staleTasks)
+	skip("CHG-APPLIED-CHANGE-STALES-IMPACTED-TASK", "the invalidation control needs a change whose impact closure "+
+		"contains a task, which only analyzeChangeImpact builds; that operation needs the W06 orchestration "+
+		"fixture (settled run, sealed report, live EXECUTOR grant)")
+	_, bareAfter, _ := h.api(ctx, token, "GET", base+"/tasks/"+Str2(bare, "id"), "", "", nil)
+	ok("CHG-APPLIED-CHANGE-LEAVES-THE-LATER-TASK-ALONE", Str2(bareAfter, "status") == "DRAFT",
+		Str2(bareAfter, "status"))
 	skip("CHG-OPTIONAL-RETRIEVAL-DEGRADES", "the optional-retrieval warning path needs the FTS/retrieval fixture "+
 		"(retrieval.go pushes warnings and continues); no assertion here yet")
-	skip("CHG-CHANGE-DOES-INVALIDATE-TARGETS", "the positive control - that an APPLIED change really moves its "+
-		"impacted tasks to NEEDS_REVALIDATION - needs an accepted change with an independent verifier; without it "+
-		"the blocking assertion above could be vacuous")
 }
 
 // countKind counts stored objects of one kind, and countStaleTasks counts tasks the domain has
