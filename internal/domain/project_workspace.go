@@ -272,8 +272,11 @@ func (s *Service) WorkspaceBindingFor(ctx context.Context, p Principal, a Worksp
 	if err != nil {
 		return nil, err
 	}
-	if b.PrincipalID != p.ID && !p.HasRole("OWNER") {
-		return nil, Fail(403, "FORBIDDEN", "workspace is not authorised for this principal")
+	// The reference belongs to the principal who made the choice. An OWNER role is not a pass:
+	// authorisation here came from that user's own OS-scoped directory choice, and treating a role
+	// as a universal key would let any OWNER bind another user's workspace and inherit its project.
+	if b.PrincipalID != p.ID {
+		return nil, Fail(403, "FORBIDDEN", "workspace was authorised for a different principal")
 	}
 	if b.Status != WorkspaceActive {
 		return nil, Fail(410, "WORKSPACE_REVOKED", "authorized workspace is revoked")
@@ -299,8 +302,8 @@ func (s *Service) RevokeWorkspaceBinding(ctx context.Context, p Principal, ref s
 	if err != nil {
 		return err
 	}
-	if b.PrincipalID != p.ID && !p.HasRole("OWNER") {
-		return Fail(403, "FORBIDDEN", "only the authorising principal or an OWNER may revoke this workspace")
+	if b.PrincipalID != p.ID {
+		return Fail(403, "FORBIDDEN", "only the principal that authorised this workspace may revoke it")
 	}
 	if b.Status == WorkspaceRevoked {
 		return nil
@@ -333,7 +336,7 @@ func (s *Service) ListWorkspaceBindings(ctx context.Context, p Principal) ([]*Wo
 		if err != nil {
 			return nil, err
 		}
-		if b.PrincipalID == p.ID || p.HasRole("OWNER") {
+		if b.PrincipalID == p.ID {
 			out = append(out, b)
 		}
 	}
@@ -518,6 +521,10 @@ func typedFromAuthority(err error) error {
 		return Fail(403, "PATH_OUT_OF_SCOPE", "the chosen directory is outside the authorised scope")
 	case strings.Contains(err.Error(), "WORKSPACE_REVOKED"):
 		return Fail(410, "WORKSPACE_REVOKED", "the authorized workspace is revoked")
+	case strings.Contains(err.Error(), "pinned workspace root is unavailable"),
+		strings.Contains(err.Error(), "PATH_OUT_OF_SCOPE"),
+		strings.Contains(err.Error(), "WORKSPACE_ROOT_UNAVAILABLE"):
+		return Fail(403, "PATH_OUT_OF_SCOPE", "the authorized directory is no longer the directory that was chosen")
 	case strings.Contains(err.Error(), "UNAUTHENTICATED"), strings.Contains(err.Error(), "FORBIDDEN"):
 		return Fail(403, "FORBIDDEN", "the directory choice does not belong to this caller")
 	default:

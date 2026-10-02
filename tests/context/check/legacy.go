@@ -19,16 +19,21 @@ import (
 	"path/filepath"
 )
 
-var forwardedCheckGroups = map[string]bool{
-	"W04-G01": true, "W04-G02": true, "W04-G03": true, "W06-G02": true,
-}
-
-// routeLegacy runs the accepted fixture harness when the invocation carries one of its selectors.
-// It reports whether a route was taken, and returns the harness exit code.
+// routeLegacy runs the accepted fixture harness for every selector except this card's own.
+// The legacy registry entry for the same key covers task ids W04/W06/W12/W17, the W04-G01..G03 and
+// W06-G02 groups and case ids C01/C02/C03/C04/C13/A01; a whitelist of only some of those would
+// silently turn them into NOT_IMPLEMENTED while the v2.4 pointer is active, which the review proved.
+// Default-forward is the only ordering that cannot shadow an accepted binding.
 func routeLegacy() (int, bool) {
 	check := os.Getenv("RESEARCHOS_CHECK_ID")
 	caseID := os.Getenv("RESEARCHOS_CASE_ID")
-	if caseID == "" && !forwardedCheckGroups[check] {
+	// With no selector at all this is a plain developer run of the construction check, so it runs
+	// its own program. Anything the legacy registry served - any other check id, or a case id - is
+	// forwarded, because refusing those would turn an accepted binding into NOT_IMPLEMENTED.
+	if check == "" && caseID == "" {
+		return 0, false
+	}
+	if check == "W04-01" && caseID == "" {
 		return 0, false
 	}
 	cmd := exec.Command("python", "-X", "utf8", filepath.Join("ops", "ci", "context.py"))

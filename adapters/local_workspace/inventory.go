@@ -109,7 +109,13 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 
 	found := map[string]bool{}
 	truncated := false
+	unexamined := false
 	skippedSubtrees := 0
+	// Version control lives at the root, and the directory branch below returns before it would
+	// ever be inspected, so it is decided once here instead of by an unreachable loop variable.
+	if st, e := os.Lstat(filepath.Join(realPath, ".git")); e == nil && st.IsDir() {
+		found["version_control"] = true
+	}
 
 	walkErr := filepath.WalkDir(realPath, func(path string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
@@ -152,9 +158,13 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 		if d.IsDir() {
 			if s.skip(d.Name()) {
 				skippedSubtrees++
+				unexamined = true
 				add(domain.LocalInventoryEntry{Capability: "excluded_subtree", LocationRef: relSlash,
 					Status: "NOT_CHECKED", Notes: "contents are not inventoried on first use"})
 				return fs.SkipDir
+			}
+			if strings.EqualFold(d.Name(), ".git") {
+				found["version_control"] = true
 			}
 			return nil
 		}
@@ -213,23 +223,33 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 				}
 			}
 		}
-		if strings.EqualFold(d.Name(), ".git") {
-			found["version_control"] = true
-		}
 		return nil
 	})
 	if walkErr != nil && !strings.Contains(walkErr.Error(), "context") {
 		out.Failures = append(out.Failures, domain.LocalInventoryFileFailure{Path: ".", Reason: reasonOf(walkErr)})
 	}
-	if !found["version_control"] {
-		markAbsent("version_control")
+	// Absence may only be claimed over ground that was actually walked. Where a subtree was skipped,
+	// a link was not followed, or the entry or depth cap stopped the walk, an unfound capability is
+	// reported as NOT_CHECKED with the reason: 15_NEW_PROJECT_WORKFLOW forbids reading
+	// "we did not look" as "there is none".
+	if found["version_control"] {
+		add(domain.LocalInventoryEntry{Capability: "version_control", LocationRef: ".git", Status: "FOUND",
+			Notes: "version control directory present at the authorised root"})
 	}
-	for _, c := range []string{"go_module", "node_manifest", "python_manifest", "readme", "source_tree", "researchos_project_marker"} {
-		if !found[c] {
-			markAbsent(c)
+	for _, c := range append([]string{"version_control"}, []string{"go_module", "node_manifest", "python_manifest",
+		"readme", "source_tree", "researchos_project_marker"}...) {
+		if found[c] {
+			continue
 		}
+		if unexamined || truncated {
+			add(domain.LocalInventoryEntry{Capability: c, LocationRef: "*", Status: "NOT_CHECKED",
+				Notes: "not seen in the part that was walked; unexamined subtrees remain"})
+			continue
+		}
+		markAbsent(c)
 	}
 	if truncated {
+		unexamined = true
 		add(domain.LocalInventoryEntry{Capability: "inventory_truncated", LocationRef: "*", Status: "NOT_CHECKED",
 			Notes: "entry cap reached; the rest of the tree was not examined"})
 	}

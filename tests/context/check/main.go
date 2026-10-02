@@ -122,6 +122,7 @@ func main() {
 	h.negativePhase(ctx)
 	h.continuationPhase(ctx)
 	h.inventoryPhase(ctx)
+	h.hardeningPhase(ctx)
 	h.lifecyclePhase(ctx)
 }
 
@@ -209,6 +210,7 @@ func newHarness(ctx context.Context, repo string) (*harness, error) {
 	h.outside = filepath.Join(tmp, "outside")
 	os.MkdirAll(h.outside, 0o755)
 	os.WriteFile(filepath.Join(h.outside, "private.md"), []byte("NEVER-AUTHORISED-MARKER"), 0o600)
+	os.WriteFile(filepath.Join(h.outside, "README.md"), []byte("# NEVER-AUTHORISED-MARKER-project\n"), 0o600)
 
 	res, err := hh.BootstrapOwner(ctx)
 	if err != nil {
@@ -224,6 +226,27 @@ func newHarness(ctx context.Context, repo string) (*harness, error) {
 		return nil, errors.New("bootstrap principal cannot create projects")
 	}
 	return h, nil
+}
+
+// roRef returns the reference this principal authorised for the read-only fixture directory.
+func (h *harness) roRef() string {
+	rows, err := h.db.QueryContext(context.Background(), `SELECT id, body FROM domain_objects WHERE kind='WorkspaceBinding' AND json_extract(body,'$.access')='READ_ONLY' ORDER BY id`)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, body string
+		if rows.Scan(&id, &body) != nil {
+			continue
+		}
+		// status is read from the row already in hand: the pool is a single connection, so a second
+		// query inside an open rows iteration would deadlock.
+		if strings.Contains(body, jsonEscape(h.ro)) && strings.Contains(body, "\"status\":\"ACTIVE\"") {
+			return id
+		}
+	}
+	return ""
 }
 
 func (h *harness) close() {
@@ -383,9 +406,11 @@ func (h *harness) chainPhase(ctx context.Context) {
 		h.artifactID(ctx, project))
 }
 
+// artifactID returns the newest sealed artifact for a project. With an unordered LIMIT 1 a leak
+// could land in an artifact no assertion ever reads, so the ordering is part of the check.
 func (h *harness) artifactID(ctx context.Context, project string) string {
 	var id string
-	h.db.QueryRowContext(ctx, `SELECT id FROM domain_objects WHERE project=? AND kind='Artifact' LIMIT 1`, project).Scan(&id)
+	h.db.QueryRowContext(ctx, `SELECT id FROM domain_objects WHERE project=? AND kind='Artifact' ORDER BY rowid DESC LIMIT 1`, project).Scan(&id)
 	return id
 }
 
@@ -452,7 +477,7 @@ func (h *harness) negativePhase(ctx context.Context) {
 	// a second client of the same OS user cannot spend a choice it did not make
 	sel3, _ := h.choose("cli-desktop", h.other, "READ_WRITE")
 	_, e = h.register(ctx, sel3, "Stolen", "READ_WRITE", "cmd-neg-8", "cli-other")
-	ok("NEG-FOREIGN-CLIENT-CHOICE-REFUSED", e != nil && strings.Contains(errText(e), "SELECTION_ALREADY_USED") == false, e)
+	ok("NEG-FOREIGN-CLIENT-CHOICE-REFUSED", e != nil && strings.Contains(errText(e), "FORBIDDEN"), e)
 	bind, re := h.register(ctx, sel3, "Beta", "READ_WRITE", "cmd-beta-register", "cli-desktop")
 	ok("NEG-SAME-CHOICE-WITH-ITS-OWN-CLIENT-WORKS", re == nil, re)
 	h.betaRef, _ = bind["authorized_workspace_ref"].(string)
@@ -502,6 +527,8 @@ func (h *harness) continuationPhase(ctx context.Context) {
 	ok("ISOLATION-TWO-PROFILES", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='ProjectProfile'`) == 2)
 	ok("ISOLATION-BETA-SCOPE-EXCLUDES-ALPHA-REF", !strings.Contains(h.bodyOf(ctx, "ProjectProfile", h.betaProj), h.alphaRef),
 		h.bodyOf(ctx, "ProjectProfile", h.betaProj))
+	ok("ISOLATION-TWO-DISTINCT-PROJECT-ROWS", h.count(ctx, `SELECT count(DISTINCT id) FROM domain_objects WHERE kind='Project'`) == 2,
+		h.count(ctx, `SELECT count(DISTINCT id) FROM domain_objects WHERE kind='Project'`))
 	ok("ISOLATION-EACH-PROJECT-OWNS-ITS-ROWS", h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project'`) == 2 &&
 		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE project=? AND kind='Project' AND id=?`, h.alphaProj, h.alphaProj) == 1 &&
 		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE project=? AND kind='Project' AND id=?`, h.betaProj, h.betaProj) == 1,
@@ -509,7 +536,8 @@ func (h *harness) continuationPhase(ctx context.Context) {
 	ok("ISOLATION-STORAGE-KEYS-DIFFER", storageKeyOf(ctx, h, h.alphaProj) != storageKeyOf(ctx, h, h.betaProj))
 	alphaInv := string(h.inventoryBytes(ctx, h.alphaProj))
 	betaInv := string(h.inventoryBytes(ctx, h.betaProj))
-	ok("ISOLATION-INVENTORIES-CARRY-OWN-MODULE-ONLY", strings.Contains(alphaInv, "sha256:") && !strings.Contains(betaInv, "module researchos.local/alpha"),
+	ok("ISOLATION-INVENTORIES-CARRY-OWN-MODULE-ONLY", strings.Contains(alphaInv, "sha256:") &&
+		strings.Contains(betaInv, "sha256:") && !strings.Contains(betaInv, "researchos.local/alpha"),
 		firstChars(betaInv))
 	ok("ISOLATION-OUTSIDE-MARKER-NEVER-STORED", !strings.Contains(alphaInv, "NEVER-AUTHORISED-MARKER") &&
 		!strings.Contains(betaInv, "NEVER-AUTHORISED-MARKER") &&
@@ -788,6 +816,116 @@ func (b badScanner) Scan(ctx context.Context, realPath string) (domain.LocalInve
 	return res, nil
 }
 
+// hardeningPhase covers the properties the first review proved were missing: a junction must not
+// bridge content into the inventory (with a positive control that shows the scanner would have seen
+// it), absence may only be claimed over ground that was actually walked, version control is
+// detected where it exists, and an authorized workspace reference is not transferable - not even to
+// another OWNER.
+func (h *harness) hardeningPhase(ctx context.Context) {
+	// the outside directory is inventoriable in its own right, which is what makes the next
+	// assertion able to fail rather than resting on filenames the scanner ignores
+	outRes, oerr := h.scanner.Scan(context.Background(), h.outside)
+	outControl := false
+	for _, e := range outRes.Entries {
+		if e.Capability == "readme" && e.Status == "FOUND" {
+			outControl = true
+		}
+	}
+	ok("INV-OUTSIDE-DIRECTORY-IS-INVENTORABLE", oerr == nil && outControl, oerr, outRes)
+
+	junctionPath := filepath.Join(h.chosen, "linkout2")
+	if made, reason := makeJunction(junctionPath, h.outside); made {
+		res, serr := h.scanner.Scan(context.Background(), h.chosen)
+		bridged, markedLink := false, false
+		for _, e := range res.Entries {
+			if strings.HasPrefix(e.LocationRef, "linkout2/") {
+				bridged = true
+			}
+			if e.Capability == "reparse_point" {
+				markedLink = true
+			}
+		}
+		ok("INV-NO-ENTRY-CROSSES-A-JUNCTION", serr == nil && !bridged && markedLink, serr, bridged, markedLink)
+		removeJunction(junctionPath)
+	} else {
+		skip("INV-NO-ENTRY-CROSSES-A-JUNCTION", reason)
+	}
+
+	// a capability that exists only inside a skipped subtree is NOT_CHECKED, never NOT_FOUND
+	edge := filepath.Join(h.root, "skipped-tree")
+	os.MkdirAll(filepath.Join(edge, "node_modules", "pkg"), 0o755)
+	os.WriteFile(filepath.Join(edge, "node_modules", "pkg", "pyproject.toml"), []byte("[project]\n"), 0o600)
+	os.WriteFile(filepath.Join(edge, "README.md"), []byte("# edge\n"), 0o600)
+	edgeRes, eerr := h.scanner.Scan(context.Background(), edge)
+	pyStatus, vcStatus := "", ""
+	for _, e := range edgeRes.Entries {
+		switch e.Capability {
+		case "python_manifest":
+			pyStatus = e.Status
+		case "version_control":
+			vcStatus = e.Status
+		}
+	}
+	ok("INV-SKIPPED-SUBTREE-IS-NOT-ABSENCE", eerr == nil && pyStatus == "NOT_CHECKED", eerr, pyStatus)
+	ok("INV-SKIPPED-GROUNDS-NEVER-CLAIM-ABSENCE", vcStatus == "NOT_CHECKED", vcStatus)
+	// over ground that was walked completely the same capability may say NOT_FOUND
+	cleanTree := filepath.Join(h.root, "clean-tree")
+	os.MkdirAll(filepath.Join(cleanTree, "src"), 0o755)
+	os.WriteFile(filepath.Join(cleanTree, "src", "main.go"), []byte("package main\n"), 0o600)
+	cleanRes, cerr := h.scanner.Scan(context.Background(), cleanTree)
+	cleanVC, cleanGo := "", ""
+	for _, e := range cleanRes.Entries {
+		switch e.Capability {
+		case "version_control":
+			cleanVC = e.Status
+		case "go_module":
+			cleanGo = e.Status
+		}
+	}
+	ok("INV-WALKED-GROUND-CAN-SAY-NOT-FOUND", cerr == nil && cleanVC == "NOT_FOUND" && cleanGo == "NOT_FOUND",
+		cerr, cleanVC, cleanGo)
+
+	gitTree := filepath.Join(h.root, "with-git")
+	os.MkdirAll(filepath.Join(gitTree, ".git"), 0o755)
+	os.WriteFile(filepath.Join(gitTree, "README.md"), []byte("# g\n"), 0o600)
+	gitRes, gerr := h.scanner.Scan(context.Background(), gitTree)
+	vcFound := false
+	for _, e := range gitRes.Entries {
+		if e.Capability == "version_control" && e.Status == "FOUND" {
+			vcFound = true
+		}
+	}
+	ok("INV-GIT-DIRECTORY-DETECTED", gerr == nil && vcFound, gerr, gitRes)
+
+	// a binding is not transferable, not even to another OWNER: it records that one user chose that
+	// directory, and a role is not a universal key over other users' choices
+	if err := h.svc.ProvisionPrincipal(ctx, domain.Principal{ID: "w04-second-owner", Roles: []string{"OWNER"},
+		CanCreateProject: true}); err != nil {
+		ok("SEC-SECOND-OWNER-PROVISIONED", false, err)
+		return
+	}
+	st, terr := h.svc.IssueCredential(ctx, "w04-second-owner", time.Minute)
+	spr, aerr := domain.AuthenticateToken(ctx, h.db, st)
+	ok("SEC-SECOND-OWNER-PROVISIONED", terr == nil && aerr == nil, terr, aerr)
+	l2, lerr := h.svc.ListWorkspaceBindings(ctx, spr)
+	cross := false
+	for _, b := range l2 {
+		if b.AuthorizedRef == h.alphaRef {
+			cross = true
+		}
+	}
+	ok("SEC-FOREIGN-BINDING-NOT-LISTABLE", lerr == nil && !cross, lerr, cross)
+	_, be := h.svc.BootstrapProject(ctx, spr, h.authority, h.grader, h.scanner, domain.BootstrapProjectInput{
+		AuthorizedWorkspaceRef: h.alphaRef, DisplayName: "Hijack", CommandID: "cmd-hijack", ClientID: "cli-second"})
+	ok("SEC-FOREIGN-BINDING-NOT-BOOTSTRAPPABLE", be != nil && strings.Contains(errText(be), "FORBIDDEN"), be)
+	ok("SEC-HIJACK-CREATED-NO-PROJECT", h.count(ctx, `SELECT count(DISTINCT id) FROM domain_objects WHERE kind='Project'`) == 2,
+		h.count(ctx, `SELECT count(DISTINCT id) FROM domain_objects WHERE kind='Project'`))
+	re := h.svc.RevokeWorkspaceBinding(ctx, spr, h.alphaRef)
+	ok("SEC-FOREIGN-BINDING-NOT-REVOKABLE", re != nil && strings.Contains(errText(re), "FORBIDDEN"), re)
+	// the authorising principal still can, so the refusals above are ownership and not a blanket lock
+	ok("SEC-OWNER-STILL-CAN-REVOKE", h.svc.RevokeWorkspaceBinding(ctx, h.principal, h.roRef()) == nil)
+}
+
 // -------------------------------------------------------------------------- binding lifecycle
 func (h *harness) lifecyclePhase(ctx context.Context) {
 	list, err := h.svc.ListWorkspaceBindings(ctx, h.principal)
@@ -837,7 +975,8 @@ func (h *harness) lifecyclePhase(ctx context.Context) {
 		ok("LIFE-SWAPPED-DIRECTORY-REFUSED", false, rerr)
 	} else {
 		_, e := h.bootstrap(ctx, betaLive, "Beta", "cmd-swapped-bootstrap")
-		ok("LIFE-SWAPPED-DIRECTORY-REFUSED", e != nil && !strings.Contains(errText(e), "NOT_ACCESSIBLE") == false || e != nil, e)
+		ok("LIFE-SWAPPED-DIRECTORY-REFUSED", e != nil && (strings.Contains(errText(e), "PATH_OUT_OF_SCOPE") ||
+			strings.Contains(errText(e), "WORKSPACE_REVOKED")), e)
 		_, e2 := h.register(ctx, "sel-after-swap", "Beta", "READ_WRITE", "cmd-after-swap", "cli-desktop")
 		ok("LIFE-SWAPPED-DIRECTORY-REGISTER-REFUSED", e2 != nil, e2)
 		if rerr := os.Rename(swapped, original); rerr != nil {

@@ -220,6 +220,10 @@ func (s *Service) BootstrapProject(ctx context.Context, p Principal, a Workspace
 		}
 	}
 
+	// Every observation is a new sealed artifact: the payload carries observed_at, so re-scanning
+	// the same tree is by definition a different content hash and the seal path cannot dedupe it.
+	// The earlier artifact stays as history rather than being rewritten (see the stage record, which
+	// IS a single refreshed row).
 	// The first bootstrap binds the identity to the reference; a later one on the same reference
 	// must not churn the binding revision, so continuation is recognised before it is written.
 	if binding.ProjectID == nil {
@@ -310,8 +314,10 @@ func (s *Service) authorisedBinding(ctx context.Context, tx *sql.Tx, p Principal
 	if err != nil {
 		return nil, err
 	}
-	if b.PrincipalID != p.ID && !p.HasRole("OWNER") {
-		return nil, Fail(403, "FORBIDDEN", "workspace is not authorised for this principal")
+	// A role is not a universal key: the authorisation behind this reference is one principal's own
+	// OS-scoped directory choice, so only that principal may bind a project through it.
+	if b.PrincipalID != p.ID {
+		return nil, Fail(403, "FORBIDDEN", "workspace was authorised for a different principal")
 	}
 	if b.Status != WorkspaceActive {
 		return nil, Fail(410, "WORKSPACE_REVOKED", "authorized workspace is revoked")
