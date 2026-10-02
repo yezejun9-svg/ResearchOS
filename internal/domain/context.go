@@ -346,6 +346,26 @@ func (s *Service) createContext(tx *sql.Tx, p Principal, project string, b Objec
 			decisions = append(decisions, r)
 		}
 	}
+	// The decisions a project is currently governed by live on its state, not only on the input
+	// list of whichever task is being frozen. Without this merge a fresh session picking up a task
+	// that does not name those decisions as inputs recovered no governing decision at all, which is
+	// exactly what the card's "有效/废弃决定" requirement forbids. A reference that no longer resolves
+	// is reported as unresolved instead of being dropped silently or failing the freeze.
+	for _, v := range Arr(state, "current_decision_refs") {
+		r, ok := v.(map[string]any)
+		if !ok || Str(r, "entity_type") != "DecisionReceipt" {
+			continue
+		}
+		if seen[Hash(r)] {
+			continue
+		}
+		seen[Hash(r)] = true
+		if _, e := load(tx, project, "DecisionReceipt", Str(r, "id")); e != nil {
+			unresolved = append(unresolved, "governing decision no longer resolvable: "+Str(r, "id"))
+			continue
+		}
+		decisions = append(decisions, r)
+	}
 	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
 	if e != nil {
 		return nil, e

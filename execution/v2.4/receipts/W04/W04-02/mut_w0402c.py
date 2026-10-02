@@ -1,8 +1,8 @@
-"""Two mutations for the acceptance and resolution legs W04-02 just added.
+"""Mutations for the W04-02 acceptance, resolution and governing-decision legs.
 
-AA1 removes the rule that an author cannot independently accept its own change; AA2 inverts the rule
-that only an accepted-and-applied change settles a conflict. Both live in internal/domain, which this
-card's write scope covers, and each file is restored and hash-verified before the next case.
+Each case is applied alone to internal/domain (all inside this card's write scope), the construction
+check runs, the failing assertion ids are recorded, and the file is restored and hash-verified
+before the next case. Anchors carry explicit escapes because a console heredoc mangles them.
 """
 import hashlib
 import io
@@ -17,7 +17,14 @@ ENV.update({"GOTOOLCHAIN": "local", "GOFLAGS": "", "GOENV": "off",
             "GOPATH": os.path.join(REPO, ".local", "gopath"),
             "GOCACHE": os.path.join(REPO, ".local", "gocache"), "RESEARCHOS_GO": GO})
 CHG = "internal/domain/changes.go"
+CTX = "internal/domain/context.go"
 OUT = os.path.join(".local", "mutation_selfcheck_w0402c.json")
+
+MERGE_TAIL = ("\t\t\tunresolved = append(unresolved, \"governing decision no longer resolvable: \"+Str(r, \"id\"))\n"
+              "\t\t\tcontinue\n"
+              "\t\t}\n"
+              "\t\tdecisions = append(decisions, r)")
+MERGE_DROPPED = MERGE_TAIL.replace("decisions = append(decisions, r)", "_ = r")
 
 
 def sha(p):
@@ -43,11 +50,13 @@ def run_check():
 
 
 MUTS = [
-    ("AA1-author-can-accept-own-change", CHG, "\t\tif id == p.ID {", "\t\tif false && id == p.ID {"),
+    ("AA1-author-can-accept-own-change", CHG,
+     "\t\tif id == p.ID {", "\t\tif false && id == p.ID {"),
     ("AA2-resolution-does-not-require-an-applied-change", CHG,
-     '\tif proposal["status"] != "APPLIED" {', '\tif proposal["status"] == "APPLIED" {'),
+     "\tif proposal[\"status\"] != \"APPLIED\" {", "\tif proposal[\"status\"] == \"APPLIED\" {"),
     ("AC3-applied-change-stops-invalidating-its-dependents", CHG,
-     '			o["status"] = "NEEDS_REVALIDATION"', '			o["status"] = "DRAFT"'),
+     "\t\t\to[\"status\"] = \"NEEDS_REVALIDATION\"", "\t\t\to[\"status\"] = \"DRAFT\""),
+    ("AD1-freeze-ignores-the-governing-decisions", CTX, MERGE_TAIL, MERGE_DROPPED),
 ]
 
 report = []

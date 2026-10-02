@@ -81,6 +81,7 @@ type w0402Handles struct {
 	contract                     domain.Object
 	decisions                    []any
 	goalID, reqID                string
+	decEffective, decRetired     string
 }
 
 var w0402Ctx w0402Handles
@@ -298,10 +299,10 @@ func (h *harness) contextPhase(ctx context.Context) {
 			len(domain.Arr(bundle, "latest_decision_refs")) == 0 &&
 				!strings.Contains(Str2(bundle, "summary"), Str2(decisionA, "id")),
 			domain.Arr(bundle, "latest_decision_refs"))
-		skip("CTX-BUNDLE-CARRIES-EFFECTIVE-AND-RETIRED-DECISIONS", "the card asks the freeze to carry effective and "+
-			"deprecated decisions; the implementation reads them from the project state, so the assertion needs a "+
-			"change that reaches APPLIED status with an independent verifier (W04-03 acceptance, W08). Until then "+
-			"this half of step 1 is unverified rather than claimed")
+		skip("CTX-BUNDLE-DECISION-SCOPE", "before any change is applied the project has no governing decision, so "+
+			"an empty latest_decision_refs here is the correct answer and not a gap; the populated case is "+
+			"asserted after the independently accepted change by CHG-REFREEZE-CARRIES-EFFECTIVE-DECISION and "+
+			"CHG-REFREEZE-KEEPS-RETIRED-DECISION-AS-HISTORY")
 	}
 	// the vector is a set of version references, each pinned to an entity, an id and a revision -
 	// not a list of names a later reader would have to guess at
@@ -436,15 +437,20 @@ func (h *harness) contextPhase(ctx context.Context) {
 
 	w0402Ctx = w0402Handles{token: token, project: project, base: base, taskID: domain.Str(task, "id"),
 		art: art, bundle: bundle, task: task, state: state, contract: contract,
-		decisions: proposedRefs, goalID: Str2(goal, "id"), reqID: Str2(accepted, "id")}
+		decisions: proposedRefs, goalID: Str2(goal, "id"), reqID: Str2(accepted, "id"),
+		decEffective: Str2(decisionB, "id"), decRetired: Str2(decisionA, "id")}
 
-	skip("CTX-STEP-4-BLOCK-DEGRADE-UNRELATED", "blocking on missing required context, degradation on a failed "+
-		"optional retrieval and non-invalidation by an unrelated event are the next increment of this card; the "+
-		"entry points are known (taskContext gate 422 GATE_FAILED, retrieval warnings list, ConsumeEvent touches "+
-		"only context_projection while staleness comes from applyChange) but are not asserted yet")
-	skip("CTX-STEP-3-CHANGE-IMPACT", "explicit impact links, rejection of a proposal built on an old input and "+
-		"conflicts preserving both sides are not asserted yet; analyzeChangeImpact additionally needs a settled "+
-		"orchestration fixture run, which this increment has not built")
+	// card step 4 is asserted by the CHG ids: a task with no frozen context is blocked
+	// (CHG-MISSING-REQUIRED-CONTEXT-BLOCKS) and an applied change stales exactly the tasks in its
+	// closure while leaving an unrelated task as it was (CHG-APPLIED-CHANGE-*). The one half still
+	// open - an optional retrieval degrading instead of blocking - is declared as
+	// CHG-OPTIONAL-RETRIEVAL-DEGRADES, not glossed over.
+	//
+	// card step 3 is asserted too: the freeze writes explicit DEPENDS_ON links, drafts over an old
+	// input or with an unfrozen check list are refused, and a conflict keeps both drafts and is
+	// settled only by an accepted and applied change. What remains unasserted is the proposal's own
+	// impacted_refs and impact_link_ids arrays, which analyzeChangeImpact fills and which need the
+	// W06 orchestration fixture - recorded as CHG-PROPOSAL-NAMES-ITS-IMPACT.
 }
 
 // changePhase covers card step 3 and the reachable half of step 4: a change record must name what it
@@ -642,14 +648,14 @@ func (h *harness) changePhase(ctx context.Context) {
 		ok("CHG-APPLIED-DECISION-LANDS-IN-THE-STATE", effective != "" &&
 			strings.Contains(string(domain.Bytes(movedState["current_decision_refs"])), effective),
 			Str2(movedState, "id"))
-		if !strings.Contains(listed, effective) && !strings.Contains(summary, effective) {
-			skip("CHG-REFREEZE-CARRIES-EFFECTIVE-DECISION", "the applied decision is in the project state but the "+
-				"fresh freeze does not surface it in latest_decision_refs or its summary; the freeze reads the state "+
-				"field this change wrote, so the gap is in how the bundle picks decisions up and belongs to the "+
-				"card that owns the decision lineage (W04-03/W08), not to a fixture detail")
-		} else {
-			ok("CHG-REFREEZE-CARRIES-EFFECTIVE-DECISION", true)
-		}
+		// the governing decisions live on the project state, so a freeze taken after an accepted
+		// change carries them even though this task never named them as inputs - that is the card's
+		// effective-decision requirement, asserted rather than skipped
+		ok("CHG-REFREEZE-CARRIES-EFFECTIVE-DECISION", w0402Ctx.decEffective != "" &&
+			strings.Contains(listed, w0402Ctx.decEffective), domain.Arr(refrozen, "latest_decision_refs"))
+		ok("CHG-REFREEZE-KEEPS-RETIRED-DECISION-AS-HISTORY", w0402Ctx.decRetired != "" &&
+			strings.Contains(summary, "historical_decision_refs") &&
+			strings.Contains(summary, w0402Ctx.decRetired), summary[:min(len(summary), 260)])
 	}
 
 	// applyChange runs a draft all the way through - proposal, independent acceptance by the
