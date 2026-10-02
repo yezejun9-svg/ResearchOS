@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -640,6 +641,28 @@ func (h *harness) inventoryPhase(ctx context.Context) {
 		"authorized_workspace_ref": `C:\Users`, "display_name": "x", "display_path": "y", "access": "READ_ONLY",
 		"project_id": nil, "revision": int64(1), "status": "ACTIVE"}) == nil)
 
+	// a link planted inside the chosen directory is recorded as unexamined and is never followed:
+	// the inventory must not acquire anything from outside the authorised root
+	junctionPath := filepath.Join(h.chosen, "linkout")
+	if made, reason := makeJunction(junctionPath, h.outside); made {
+		res, serr := h.scanner.Scan(context.Background(), h.chosen)
+		linked := false
+		for _, e := range res.Entries {
+			if e.Capability == "reparse_point" && e.Status == "NOT_CHECKED" {
+				linked = true
+			}
+		}
+		ok("INV-LINK-INSIDE-ROOT-RECORDED-NOT-FOLLOWED", serr == nil && linked, serr, linked)
+		_, e := h.svc.BootstrapProject(ctx, h.principal, h.authority, h.grader, h.scanner, domain.BootstrapProjectInput{
+			AuthorizedWorkspaceRef: h.alphaRef, DisplayName: "Alpha", CommandID: "cmd-link-scan", ClientID: "cli-desktop"})
+		after := string(h.inventoryBytes(ctx, h.alphaProj))
+		ok("INV-LINK-NEVER-BRIDGES-OUTSIDE-CONTENT", e == nil && !strings.Contains(after, "NEVER-AUTHORISED-MARKER"), e)
+		removeJunction(junctionPath)
+	} else {
+		skip("INV-LINK-INSIDE-ROOT-RECORDED-NOT-FOLLOWED", reason)
+		skip("INV-LINK-NEVER-BRIDGES-OUTSIDE-CONTENT", reason)
+	}
+
 	// a foreign replay of someone else's command id is refused, not silently served
 	reader, rerr := domain.AuthenticateToken(ctx, h.db, mustToken(ctx, h, "w04-reader"))
 	if rerr != nil {
@@ -727,6 +750,28 @@ func (h *harness) stageRevision(ctx context.Context, project string) string {
 
 func (h *harness) stageRowCount(ctx context.Context, project string) int64 {
 	return h.count(ctx, `SELECT count(*) FROM domain_objects WHERE project=? AND kind='BootstrapStage'`, project)
+}
+
+// makeJunction and removeJunction create or drop an NTFS junction through the shell's own mklink,
+// which works without elevation. They are Windows features, so the check discloses the case rather
+// than pretending it ran elsewhere.
+func makeJunction(dir, target string) (bool, string) {
+	if runtime.GOOS != "windows" {
+		return false, "junctions are a Windows filesystem feature"
+	}
+	out, err := exec.Command("cmd", "/c", "mklink", "/J", dir, target).CombinedOutput()
+	if err != nil {
+		return false, "mklink /J refused: " + strings.TrimSpace(string(out))
+	}
+	return true, ""
+}
+
+func removeJunction(dir string) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	exec.Command("cmd", "/c", "rmdir", dir).Run()
+	os.RemoveAll(dir)
 }
 
 // badScanner returns an entry the pinned LocalInventoryPayload definition refuses (an empty

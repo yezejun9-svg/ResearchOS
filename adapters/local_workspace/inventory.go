@@ -80,6 +80,16 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 	}
 	out.Entries = append(out.Entries, domain.LocalInventoryEntry{Capability: "workspace_root", LocationRef: ".",
 		Status: "FOUND", Notes: "authorized directory is readable"})
+	// The root is resolved once, then every subtree is asked the same question: does the directory
+	// I am about to enter still live under that root? A junction or symlink answers no, and it is
+	// recorded as unexamined instead of being walked, because walking it would quietly widen the
+	// authorised scope to a directory the user never chose. An OS link flag alone is not enough:
+	// an NTFS junction is not reported as a symlink by the directory iterator.
+	rootReal, rerr := filepath.EvalSymlinks(realPath)
+	if rerr != nil {
+		rootReal = realPath
+	}
+	rootReal = filepath.Clean(rootReal)
 
 	seen := map[string]bool{}
 	add := func(e domain.LocalInventoryEntry) {
@@ -128,7 +138,8 @@ func (s *Scanner) Scan(ctx context.Context, realPath string) (domain.LocalInvent
 				Status: "NOT_ACCESSIBLE", Notes: reasonOf(err)})
 			return nil
 		}
-		if d.Type()&fs.ModeSymlink != 0 || reparsePoint(path) {
+		if d.Type()&fs.ModeSymlink != 0 || d.Type() == fs.ModeIrregular || reparsePoint(path) ||
+			(d.IsDir() && escapesRoot(rootReal, path)) {
 			// A link out of the authorized directory is recorded and not followed.
 			skippedSubtrees++
 			add(domain.LocalInventoryEntry{Capability: "reparse_point", LocationRef: relSlash,
@@ -301,17 +312,20 @@ type parseError struct{ msg string }
 
 func (p *parseError) Error() string { return p.msg }
 
-// reparsePoint reports whether a path element is a Windows reparse point (junction or symlink)
-// that WalkDir surfaced as an ordinary directory.
-func reparsePoint(path string) bool {
-	if runtime.GOOS != "windows" {
-		return false
-	}
-	st, err := os.Lstat(path)
+// escapesRoot reports whether a directory resolves, after every link, to something outside the
+// authorised root. Comparison is case-insensitive on Windows because that is what the filesystem
+// is.
+func escapesRoot(rootReal, path string) bool {
+	tgt, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return false
+		return false // unreadable links are handled by the walk error branch
 	}
-	return st.Mode()&os.ModeSymlink != 0
+	tgt = filepath.Clean(tgt)
+	if runtime.GOOS == "windows" {
+		return !strings.EqualFold(tgt, rootReal) &&
+			!strings.HasPrefix(strings.ToLower(tgt+string(filepath.Separator)), strings.ToLower(rootReal+string(filepath.Separator)))
+	}
+	return tgt != rootReal && !strings.HasPrefix(tgt+string(filepath.Separator), rootReal+string(filepath.Separator))
 }
 
 var _ domain.LocalInventoryScanner = (*Scanner)(nil)
