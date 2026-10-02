@@ -935,6 +935,29 @@ func (h *harness) markerRevisions(ctx context.Context, project string) string {
 	return strings.Join(out, ",")
 }
 
+// routingTruthTable asserts the forwarding rule itself, so a change that answers a task-only
+// invocation with this card's assertion ids fails here rather than only showing up in a dispatch.
+func routingTruthTableOK() bool {
+	cases := []struct {
+		check, caseID, taskID string
+		forward               bool
+	}{
+		{"W04-01", "", "W04", false},
+		{"W04-01", "A01", "W04", true},
+		{"", "", "W04", true},
+		{"", "", "", false},
+		{"W04-G01", "", "W04", true},
+		{"W06-G02", "", "W06", true},
+		{"", "C02", "W17", true},
+	}
+	for _, c := range cases {
+		if routesToLegacy(c.check, c.caseID, c.taskID) != c.forward {
+			return false
+		}
+	}
+	return true
+}
+
 // badScanner returns an entry the pinned LocalInventoryPayload definition refuses (an empty
 // capability). The domain has no hand-written rule against it, so only the contract grading can
 // catch it: if grading were decorative this bootstrap would succeed and the assertions below fail.
@@ -1220,6 +1243,7 @@ func (h *harness) lifecyclePhase(ctx context.Context) {
 	// the mapping that W03-01 accepted, so a Project row is what makes the id resolvable at all
 	ok("LIFE-PROJECT-ID-RESOLVES-FOR-SESSION-MAPPING",
 		h.count(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project' AND project=?`, h.alphaProj) == 1)
+	ok("ROUTE-TRUTH-TABLE", routingTruthTableOK())
 }
 
 func (h *harness) versionHistoryImmutable(ctx context.Context) bool {

@@ -25,15 +25,7 @@ import (
 // silently turn them into NOT_IMPLEMENTED while the v2.4 pointer is active, which the review proved.
 // Default-forward is the only ordering that cannot shadow an accepted binding.
 func routeLegacy() (int, bool) {
-	check := os.Getenv("RESEARCHOS_CHECK_ID")
-	caseID := os.Getenv("RESEARCHOS_CASE_ID")
-	taskID := os.Getenv("RESEARCHOS_TASK_ID")
-	// This program owns exactly one selector: check_id W04-01 with no case id. Anything else the
-	// registry can route here - another check id, any case id, or a bare task id, which the accepted
-	// harness treats as "run the whole fixture group" - is forwarded, because answering a task-only
-	// invocation with this card's assertion ids would silently replace an accepted binding's result
-	// set. With no selector at all this is a developer run of the check itself.
-	if caseID == "" && (check == "W04-01" || (check == "" && taskID == "")) {
+	if !routesToLegacy(os.Getenv("RESEARCHOS_CHECK_ID"), os.Getenv("RESEARCHOS_CASE_ID"), os.Getenv("RESEARCHOS_TASK_ID")) {
 		return 0, false
 	}
 	cmd := exec.Command("python", "-X", "utf8", filepath.Join("ops", "ci", "context.py"))
@@ -49,4 +41,17 @@ func routeLegacy() (int, bool) {
 		return 3, true
 	}
 	return 0, true
+}
+
+// routesToLegacy is the whole routing rule, kept free of side effects so the truth table is an
+// assertion rather than a comment. This program owns exactly one selector - check_id W04-01 with no
+// case id - and a bare run with no selector at all is a developer run of the check itself.
+func routesToLegacy(check, caseID, taskID string) bool {
+	if caseID != "" {
+		return true
+	}
+	if check == "W04-01" {
+		return false
+	}
+	return check != "" || taskID != ""
 }
