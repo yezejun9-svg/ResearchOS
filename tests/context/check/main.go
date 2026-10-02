@@ -58,6 +58,17 @@ func errText(e error) string {
 	return e.Error()
 }
 
+// faultOf reads the protocol class and the HTTP status back out of a refusal. Matching a code
+// substring alone let a refusal move to another status while the suite stayed green, so the
+// typed assertions below compare both halves of the answer.
+func faultOf(e error) (int, string) {
+	var f *domain.Fault
+	if errors.As(e, &f) {
+		return f.Status, f.Code
+	}
+	return 0, ""
+}
+
 type clock struct{ at time.Time }
 
 func (c *clock) Now() time.Time      { return c.at.UTC() }
@@ -460,6 +471,9 @@ func (h *harness) negativePhase(ctx context.Context) {
 	h.clk.Add(6 * time.Minute)
 	_, e = h.register(ctx, sel, "Late", "READ_ONLY", "cmd-neg-6", "cli-desktop")
 	ok("NEG-EXPIRED-SELECTION-REFUSED", e != nil && strings.Contains(errText(e), "SELECTION_EXPIRED"), e)
+	// an expired selection is a 410 naming its own class: a generic denial that happens to mention
+	// the word would satisfy the substring match above and still be the wrong answer
+	ok("NEG-EXPIRED-SELECTION-STATUS-CLASS", func() bool { st, code := faultOf(e); return st == 410 && code == "SELECTION_EXPIRED" }(), e)
 	h.clk.Add(-6 * time.Minute)
 
 	// access escalation: a read-only choice cannot become a writable binding
@@ -1091,6 +1105,12 @@ func (h *harness) hardeningPhase(ctx context.Context) {
 	ok("SEC-FOREIGN-BINDING-NOT-READABLE", ferr != nil && strings.Contains(errText(ferr), "FORBIDDEN"), ferr)
 	_, oerr2 := h.svc.WorkspaceBindingFor(ctx, h.principal, h.authority, h.alphaRef)
 	ok("SEC-OWNING-PRINCIPAL-STILL-READS-ITS-BINDING", oerr2 == nil, oerr2)
+	// the read path refuses a filesystem path the same way bootstrap does; without this, the guard
+	// in WorkspaceBindingFor could be deleted and nothing in the suite would notice, because every
+	// other case hands it a minted reference
+	_, perr := h.svc.WorkspaceBindingFor(ctx, h.principal, h.authority, h.root)
+	pst, pcode := faultOf(perr)
+	ok("NEG-READ-PATH-REJECTS-PATH-SHAPED-REF", pst == 403 && pcode == "FORBIDDEN", perr)
 
 	// the authorising principal still can, so the refusals above are ownership and not a blanket lock
 	ok("SEC-OWNER-STILL-CAN-REVOKE", h.svc.RevokeWorkspaceBinding(ctx, h.principal, h.roRef()) == nil)
