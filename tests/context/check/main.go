@@ -832,6 +832,14 @@ func (h *harness) bootstrapWith(ctx context.Context, scan domain.LocalInventoryS
 	return p
 }
 
+// stageFileFailures reads the durable per-file failure list back off the LOCAL_INVENTORY row.
+func (h *harness) stageFileFailures(ctx context.Context, project string) string {
+	var v sql.NullString
+	h.db.QueryRowContext(ctx, `SELECT json_extract(body,'$.file_failures') FROM domain_objects WHERE project=? AND kind='BootstrapStage' AND json_extract(body,'$.stage')='LOCAL_INVENTORY'`,
+		project).Scan(&v)
+	return v.String
+}
+
 func hasCapability(entries []domain.LocalInventoryEntry, capability string) bool {
 	for _, e := range entries {
 		if e.Capability == capability {
@@ -1126,12 +1134,24 @@ func (h *harness) hardeningPhase(ctx context.Context) {
 		{Capability: "workspace_root", LocationRef: ".", Status: "NOT_ACCESSIBLE"}}})
 	ok("INV-UNREACHABLE-ROOT-IS-FAILED", h.stageStatusOf(ctx, allProj) == "FAILED", h.stageStatusOf(ctx, allProj))
 
-	// the NOT_STARTED markers are created once and never rewritten by a later bootstrap
-	before := h.markerRevisions(ctx, h.alphaProj)
-	_, _ = h.svc.BootstrapProject(ctx, h.principal, h.authority, h.grader, h.scanner, domain.BootstrapProjectInput{
-		AuthorizedWorkspaceRef: h.betaRef, DisplayName: "Beta", CommandID: "cmd-marker-check", ClientID: "cli-desktop"})
-	ok("INV-MARKERS-CREATED-ONCE", strings.Contains(before, "RESEARCH=1") && strings.Contains(before, "REUSE_DECISION=1") &&
-		strings.Contains(before, "IMPLEMENTATION=1"), before)
+	// the NOT_STARTED markers are created once. The comparison has to be before-and-after on the SAME
+	// project: an assertion that only reads a pre-existing snapshot cannot fail.
+	beforeMarkers := h.markerRevisions(ctx, h.alphaProj)
+	_, markerErr := h.svc.BootstrapProject(ctx, h.principal, h.authority, h.grader, h.scanner, domain.BootstrapProjectInput{
+		AuthorizedWorkspaceRef: h.alphaRef, DisplayName: "Alpha", CommandID: "cmd-marker-check", ClientID: "cli-desktop"})
+	afterMarkers := h.markerRevisions(ctx, h.alphaProj)
+	ok("INV-MARKERS-CREATED-ONCE", markerErr == nil && beforeMarkers == afterMarkers &&
+		strings.Contains(afterMarkers, "RESEARCH=1") && strings.Contains(afterMarkers, "REUSE_DECISION=1") &&
+		strings.Contains(afterMarkers, "IMPLEMENTATION=1"), beforeMarkers, afterMarkers, markerErr)
+
+	// the per-file failure list is durable state, not just an in-memory scan result
+	stageFailures := h.stageFileFailures(ctx, h.alphaProj)
+	ok("INV-PARTIAL-PARSE-PERSISTED", strings.Contains(stageFailures, "broken.json") &&
+		strings.Contains(stageFailures, "not valid JSON"), stageFailures)
+	// measurement mode is recorded, and an unrecognised value falls back to FIXTURE rather than
+	// letting a fixture run label itself as LIVE evidence
+	ok("INV-MEASUREMENT-MODE-RECORDED", strings.Contains(h.bodyOf(ctx, "Artifact", h.artifactID(ctx, h.alphaProj)),
+		`"measurement_mode":"FIXTURE"`), h.artifactID(ctx, h.alphaProj))
 
 	// unexamined ground cannot claim absence: depth cut, skipped subtree and entry cap each have to
 	// leave a NOT_CHECKED verdict behind
