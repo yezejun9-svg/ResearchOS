@@ -966,6 +966,9 @@ func routingTruthTableOK() bool {
 	}{
 		{"W04-01", "", "W04", false},
 		{"W04-01", "A01", "W04", true},
+		{"W04-02", "", "W04", false},
+		{"W04-02", "C03", "W04", true},
+		{"W04-03", "", "W04", true},
 		{"", "", "W04", true},
 		{"", "", "", false},
 		{"W04-G01", "", "W04", true},
