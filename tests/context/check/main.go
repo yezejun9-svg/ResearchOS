@@ -139,6 +139,7 @@ func main() {
 	// W04-02 adds the frozen-context and worker-materialization properties on top of W04-01's
 	// registration chain; both cards run in one program, and the report's ids say which is which.
 	h.contextPhase(ctx)
+	h.changePhase(ctx)
 }
 
 func repoRoot() string {

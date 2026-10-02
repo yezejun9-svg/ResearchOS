@@ -73,6 +73,18 @@ func (h *harness) liveState(ctx context.Context, token, base string) (domain.Obj
 	return state, tagOf(state)
 }
 
+// w0402Ctx hands the objects the context phase produced to the change phase. The program is
+// single-threaded, so one package-level handoff is honest and keeps the two phases readable.
+type w0402Handles struct {
+	token, project, base, taskID string
+	art, bundle, task, state     domain.Object
+	contract                     domain.Object
+	decisions                    []any
+	goalID                       string
+}
+
+var w0402Ctx w0402Handles
+
 // contextPhase covers card steps 1 and 2.
 func (h *harness) contextPhase(ctx context.Context) {
 	project := h.alphaProj
@@ -135,8 +147,62 @@ func (h *harness) contextPhase(ctx context.Context) {
 		return
 	}
 
+	// a rubric artifact gives the decisions something pinned to point at
+	rubric := []byte(`{"rubric":"w0402 deterministic fixture"}`)
+	state, _ = h.liveState(ctx, token, base)
+	code, rubricUpload, body := h.api(ctx, token, "POST", base+"/content", domain.ID(), "", rubric)
+	ok("CTX-RUBRIC-CONTENT-UPLOADED", code == 201, code, body)
+	if code != 201 {
+		return
+	}
+	code, rubricArt, body := h.api(ctx, token, "POST", base+"/artifacts", domain.ID(), tagOf(state), domain.Object{
+		"run_id": nil, "kind": "REPORT", "evidence_kind": "GENERATED", "measurement_mode": "FIXTURE",
+		"content_hash": rubricUpload["content_hash"], "storage_key": rubricUpload["storage_key"],
+		"media_type": "application/json", "byte_size": len(rubric),
+		"input_refs": domain.Empty(), "source_refs": domain.Empty(),
+		"produced_by": "w0402-planner", "access_class": "PROJECT"})
+	ok("CTX-RUBRIC-ARTIFACT-SEALED", code == 201, code, body)
+	if code != 201 {
+		return
+	}
+
+	// two decisions in one lineage: the second supersedes the first, so the freeze has to carry both
+	// roles - the current one as a decision reference, the older one as history
+	reqRef := domain.Ref(accepted, "Requirement")
+	recordDecision := func(selected string, supersedes any, key string) (int, domain.Object, string) {
+		st, _ := h.liveState(ctx, token, base)
+		return h.api(ctx, token, "POST", base+"/decisions", key, tagOf(st), domain.Object{
+			"subject_ref": reqRef, "input_refs": []any{reqRef}, "input_hash": domain.Hash([]any{reqRef}),
+			"scope": domain.Object{"task_type": "construction", "language": "en",
+				"provider": "deterministic-fixture", "model_revision": "none", "rubric_revision": "1"},
+			"mode": "ADVISORY", "qualification_id": nil,
+			"rubric_ref": domain.Ref(rubricArt, "Artifact"), "options": []any{"A", "B"},
+			"selected": selected, "status": "DECIDED", "signals": domain.Empty(),
+			"deterministic_results": domain.Empty(),
+			"evidence_refs":         []any{domain.Ref(rubricArt, "Artifact")},
+			"rationale":             "explicit deterministic fixture decision", "missing_evidence": domain.Empty(),
+			"revocation_conditions": []any{"input changes"}, "supersedes_id": supersedes})
+	}
+	code, decisionA, body := recordDecision("A", nil, "w0402-decision-a")
+	ok("CTX-DECISION-RECORDED", code == 201, code, body)
+	var decisionB domain.Object
+	if code == 201 {
+		code, decisionB, body = recordDecision("B", Str2(decisionA, "id"), "w0402-decision-b")
+		ok("CTX-SUPERSEDING-DECISION-RECORDED", code == 201, code, body)
+	}
+
 	// a real input file, so the worker manifest has bytes to deliver and hashes to check
-	evidence := []byte("w0402 fixture evidence: the operator owns this context, delivered byte for byte")
+	proposedRefs := []any{domain.Ref(decisionA, "DecisionReceipt")}
+	if Str2(decisionB, "id") != "" {
+		proposedRefs = []any{domain.Ref(decisionB, "DecisionReceipt")}
+	}
+	rawProposed, marshalErr := json.Marshal(proposedRefs)
+	if marshalErr != nil {
+		ok("CTX-PROPOSAL-VALUE-ENCODABLE", false, errText(marshalErr))
+		return
+	}
+	ok("CTX-PROPOSAL-VALUE-ENCODABLE", true)
+	evidence := rawProposed
 	state, _ = h.liveState(ctx, token, base)
 	code, upload, body := h.api(ctx, token, "POST", base+"/content", domain.ID(), "", evidence)
 	ok("CTX-INPUT-CONTENT-UPLOADED", code == 201, code, body)
@@ -146,7 +212,7 @@ func (h *harness) contextPhase(ctx context.Context) {
 	code, art, body := h.api(ctx, token, "POST", base+"/artifacts", domain.ID(), tagOf(state), domain.Object{
 		"run_id": nil, "kind": "REPORT", "evidence_kind": "GENERATED", "measurement_mode": "FIXTURE",
 		"content_hash": upload["content_hash"], "storage_key": upload["storage_key"],
-		"media_type": "text/plain", "byte_size": len(evidence),
+		"media_type": "application/json", "byte_size": len(evidence),
 		"input_refs": domain.Empty(), "source_refs": domain.Empty(),
 		"produced_by": "w0402-planner", "access_class": "PROJECT"})
 	ok("CTX-INPUT-ARTIFACT-SEALED", code == 201, code, body)
@@ -224,6 +290,19 @@ func (h *harness) contextPhase(ctx context.Context) {
 	bundleJSON := string(domain.Bytes(bundle))
 	ok("CTX-BUNDLE-KEEPS-USER-WORDS-VERBATIM", strings.Contains(bundleJSON, userWords),
 		bundleJSON[:min(len(bundleJSON), 500)])
+	// what the freeze carries as decisions comes from ProjectState.current_decision_refs, which an
+	// accepted change fills; two recorded-but-unapplied decisions therefore must NOT appear, and
+	// asserting their absence is the honest statement of where this property still lives
+	if Str2(decisionB, "id") != "" {
+		ok("CTX-BUNDLE-DECISIONS-FOLLOW-THE-APPLIED-STATE",
+			len(domain.Arr(bundle, "latest_decision_refs")) == 0 &&
+				!strings.Contains(Str2(bundle, "summary"), Str2(decisionA, "id")),
+			domain.Arr(bundle, "latest_decision_refs"))
+		skip("CTX-BUNDLE-CARRIES-EFFECTIVE-AND-RETIRED-DECISIONS", "the card asks the freeze to carry effective and "+
+			"deprecated decisions; the implementation reads them from the project state, so the assertion needs a "+
+			"change that reaches APPLIED status with an independent verifier (W04-03 acceptance, W08). Until then "+
+			"this half of step 1 is unverified rather than claimed")
+	}
 	// the vector is a set of version references, each pinned to an entity, an id and a revision -
 	// not a list of names a later reader would have to guess at
 	vector := domain.Arr(bundle, "version_vector")
@@ -355,6 +434,10 @@ func (h *harness) contextPhase(ctx context.Context) {
 		}
 	}
 
+	w0402Ctx = w0402Handles{token: token, project: project, base: base, taskID: domain.Str(task, "id"),
+		art: art, bundle: bundle, task: task, state: state, contract: contract,
+		decisions: proposedRefs, goalID: Str2(goal, "id")}
+
 	skip("CTX-STEP-4-BLOCK-DEGRADE-UNRELATED", "blocking on missing required context, degradation on a failed "+
 		"optional retrieval and non-invalidation by an unrelated event are the next increment of this card; the "+
 		"entry points are known (taskContext gate 422 GATE_FAILED, retrieval warnings list, ConsumeEvent touches "+
@@ -362,4 +445,169 @@ func (h *harness) contextPhase(ctx context.Context) {
 	skip("CTX-STEP-3-CHANGE-IMPACT", "explicit impact links, rejection of a proposal built on an old input and "+
 		"conflicts preserving both sides are not asserted yet; analyzeChangeImpact additionally needs a settled "+
 		"orchestration fixture run, which this increment has not built")
+}
+
+// changePhase covers card step 3 and the reachable half of step 4: a change record must name what it
+// affects, a proposal built on an input that has moved must be refused, and a conflict must keep both
+// drafts instead of silently promoting the newer one.
+func (h *harness) changePhase(ctx context.Context) {
+	if w0402Ctx.task == nil {
+		ok("CHG-CONTEXT-PHASE-RAN-FIRST", false, "the change phase needs the bundle, task and artifact from contextPhase")
+		return
+	}
+	ok("CHG-CONTEXT-PHASE-RAN-FIRST", true)
+	token, base := w0402Ctx.token, w0402Ctx.base
+
+	// freezing a context records dependency links for THIS task, so the assertions read the links the
+	// freeze produced instead of any link some other phase happened to write. An unscoped count let two
+	// mutations survive, which is the evidence that scoping was needed rather than decorative.
+	code, listed, body := h.api(ctx, token, "GET", base+"/impact-links?limit=100", "", "", nil)
+	items := domain.Arr(listed, "items")
+	if len(items) == 0 {
+		items = domain.Arr(listed, "objects")
+	}
+	mine, shaped, deterministic := 0, 0, 0
+	for _, raw := range items {
+		m, _ := raw.(map[string]any)
+		if m == nil {
+			continue
+		}
+		l := domain.Object(m)
+		from, _ := l["from_ref"].(map[string]any)
+		if from == nil || Str2(domain.Object(from), "id") != w0402Ctx.taskID {
+			continue
+		}
+		mine++
+		if l["to_ref"] != nil && Str2(l, "relation") == "DEPENDS_ON" && Str2(l, "status") == "ACTIVE" {
+			shaped++
+		}
+		if Str2(l, "basis") == "DETERMINISTIC" {
+			deterministic++
+		}
+	}
+	ok("CHG-IMPACT-LINKS-ARE-EXPLICIT", code == 200 && mine > 0 && shaped == mine,
+		code, mine, shaped, body[:min(len(body), 160)])
+	ok("CHG-IMPACT-LINK-BASIS-IS-DETERMINISTIC", mine > 0 && deterministic == mine, mine, deterministic)
+	ok("CHG-IMPACT-LINKS-EVIDENCE-POINTS-AT-THE-FREEZE",
+		mine > 0 && strings.Contains(string(domain.Bytes(listed)), Str2(w0402Ctx.bundle, "id")),
+		Str2(w0402Ctx.bundle, "id"))
+
+	state, _ := h.liveState(ctx, token, base)
+	stateID := Str2(state, "id")
+	// the domain accepts a proposal only when it freezes exactly the supported deterministic checks
+	supportedChangeChecks := []any{"context.inputs-frozen", "context.impact-exact",
+		"context.authority-independent"}
+	// every attempt reads the current state itself: a precondition captured once would go stale
+	// between attempts and the refusal would then be about the fixture, not about the property
+	proposal := func(baseRev any, targetRev any, checks []any) (int, domain.Object, string) {
+		current, currentTag := h.liveState(ctx, token, base)
+		if baseRev == nil {
+			baseRev = current["revision"]
+		}
+		if targetRev == nil {
+			targetRev = current["revision"]
+		}
+		return h.api(ctx, token, "POST", base+"/change-proposals", domain.ID(), currentTag, domain.Object{
+			"title": "w0402 change", "reason": "carry the frozen decision forward",
+			"base_state_revision": baseRev,
+			"edits": []any{domain.Object{"target_ref": domain.Object{"entity_type": "ProjectState",
+				"id": stateID, "revision": targetRev, "content_hash": nil},
+				"field":                       "current_decision_refs",
+				"proposed_value_artifact_ref": domain.Ref(w0402Ctx.art, "Artifact"),
+				"reason":                      "fixture edit"}},
+			"migration_steps": domain.Empty(), "test_check_ids": checks,
+			"rollback_steps": []any{"submit an independently accepted reversal"}})
+	}
+	code, proposalA, body := proposal(nil, nil, supportedChangeChecks)
+	ok("CHG-PROPOSAL-CREATED", code == 201, code, body)
+	if code != 201 {
+		return
+	}
+	ok("CHG-PROPOSAL-RECORDS-BASE-STATE", proposalA["base_state_revision"] != nil &&
+		(Str2(proposalA, "status") == "DRAFT" || Str2(proposalA, "status") == "IMPACT_ANALYZED"),
+		Str2(proposalA, "status"))
+	// the card's step 3: the record names what it affects, deterministically, rather than leaving a
+	// later reader to guess the closure
+	skip("CHG-PROPOSAL-NAMES-ITS-IMPACT", "impacted_refs and impact_link_ids stay empty on a proposal until analyzeChangeImpact runs, and that operation needs a settled orchestration fixture run (live EXECUTOR grant, authority root, frozen contract, trusted observation, sealed report) which is W06/harness territory. The deterministic links the freeze itself writes ARE asserted above.")
+
+	// a proposal that drops one of the supported checks is refused before anything is recorded
+	code, _, body = proposal(nil, nil, []any{"context.inputs-frozen", "context.impact-exact"})
+	ok("CHG-UNFROZEN-CHECKS-REJECTED", code == 422 && strings.Contains(body, "GATE_FAILED"), code, body)
+
+	// a proposal built on a state that has moved is refused, and so is an edit whose own target
+	// reference is older than what the project now holds
+	code, _, body = proposal(99999, nil, supportedChangeChecks)
+	ok("CHG-STALE-BASE-STATE-REJECTED", code == 412 && strings.Contains(body, "STALE_REVISION"), code, body)
+	code, _, body = proposal(nil, 1, supportedChangeChecks)
+	ok("CHG-STALE-EDIT-TARGET-REJECTED", code == 412 && strings.Contains(body, "STALE_INPUT"), code, body)
+
+	// two drafts over the same field, then a conflict naming both: neither draft may move
+	code, proposalB, body := proposal(nil, nil, supportedChangeChecks)
+	ok("CHG-SECOND-PROPOSAL-CREATED", code == 201, code, body)
+	if code == 201 {
+		beforeA := string(domain.Bytes(proposalA))
+		beforeB := string(domain.Bytes(proposalB))
+		conflictState, _ := h.liveState(ctx, token, base)
+		code, conflict, body := h.api(ctx, token, "POST", base+"/conflicts", domain.ID(), tagOf(conflictState),
+			// CreateConflictRequest is closed: kind, the two subjects and what they block, nothing else
+			domain.Object{"kind": "REVISION",
+				"subject_refs": []any{domain.Ref(proposalA, "ChangeProposal"),
+					domain.Ref(proposalB, "ChangeProposal")},
+				"description": "two drafts edit the same field", "blocks_refs": domain.Empty()})
+		ok("CHG-CONFLICT-KEEPS-BOTH-SIDES", code == 201 &&
+			len(domain.Arr(conflict, "subject_refs")) == 2 && Str2(conflict, "status") == "OPEN", code, body)
+		_, aAfter, _ := h.api(ctx, token, "GET", base+"/change-proposals/"+Str2(proposalA, "id"), "", "", nil)
+		_, bAfter, _ := h.api(ctx, token, "GET", base+"/change-proposals/"+Str2(proposalB, "id"), "", "", nil)
+		ok("CHG-CONFLICT-DOES-NOT-OVERWRITE-A-DRAFT",
+			string(domain.Bytes(aAfter)) == beforeA && string(domain.Bytes(bAfter)) == beforeB,
+			Str2(proposalA, "id"), Str2(proposalB, "id"))
+	}
+
+	// a task with no frozen context cannot be handed work, and none of the activity above
+	// invalidated an unrelated task
+	goalID := Str2(w0402Ctx.task, "goal_id")
+	_, goalNow, _ := h.api(ctx, token, "GET", base+"/goals/"+w0402Ctx.goalID, "", "", nil)
+	code, bare, body := h.api(ctx, token, "POST", base+"/tasks", domain.ID(), tagOf(goalNow), domain.Object{
+		"goal_id": goalID, "title": "w0402 unbundled task", "task_type": "construction",
+		"stage": "verification", "dependency_task_ids": domain.Empty(), "requirement_refs": domain.Empty(),
+		"input_refs": domain.Empty(), "acceptance_contract": w0402Ctx.contract,
+		"origin_problem_id": "p-w0402", "candidate_id": "c-w0402",
+		"stop_policy": domain.Object{"wall_time_seconds": 60, "max_attempts": 3, "max_parallel_runs": 1,
+			"stop_conditions": []any{"no effective progress"}}})
+	ok("CHG-SECOND-TASK-WAITING", code == 201 && bare["context_bundle_id"] == nil, code, body)
+	if code == 201 {
+		stateNow, _ := h.liveState(ctx, token, base)
+		code, _, body = h.api(ctx, token, "POST", base+"/messages", domain.ID(), tagOf(stateNow),
+			domain.Object{"task_id": Str2(bare, "id"), "run_id": nil, "correlation_id": domain.ID(),
+				"recipient_id": "w0402-planner", "message_type": "HANDOFF",
+				"body": "hand work to a task that has no frozen context", "refs": domain.Empty()})
+		ok("CHG-MISSING-REQUIRED-CONTEXT-BLOCKS", code == 422 && strings.Contains(body, "GATE_FAILED"), code, body)
+	}
+	staleTasks := h.countStaleTasks(ctx)
+	ok("CHG-UNRELATED-ACTIVITY-INVALIDATES-NOTHING", staleTasks == 0, staleTasks)
+	skip("CHG-OPTIONAL-RETRIEVAL-DEGRADES", "the optional-retrieval warning path needs the FTS/retrieval fixture "+
+		"(retrieval.go pushes warnings and continues); no assertion here yet")
+	skip("CHG-CHANGE-DOES-INVALIDATE-TARGETS", "the positive control - that an APPLIED change really moves its "+
+		"impacted tasks to NEEDS_REVALIDATION - needs an accepted change with an independent verifier; without it "+
+		"the blocking assertion above could be vacuous")
+}
+
+// countKind counts stored objects of one kind, and countStaleTasks counts tasks the domain has
+// marked for revalidation. Both read the store the service wrote, not a value the test kept.
+func (h *harness) countKind(ctx context.Context, kind string) int {
+	var n int
+	if err := h.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM domain_objects WHERE project=? AND kind=?`, h.alphaProj, kind).Scan(&n); err != nil {
+		return -1
+	}
+	return n
+}
+
+func (h *harness) countStaleTasks(ctx context.Context) int {
+	var n int
+	if err := h.db.QueryRowContext(ctx, `SELECT count(*) FROM domain_objects WHERE project=?
+		AND kind='Task' AND json_extract(body,'$.status')='NEEDS_REVALIDATION'`, h.alphaProj).Scan(&n); err != nil {
+		return -1
+	}
+	return n
 }
