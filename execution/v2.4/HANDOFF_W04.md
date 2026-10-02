@@ -1,5 +1,9 @@
 # ResearchOS v2.4 施工交接 — W04 支路（2026-10-02）
 
+> **本文件已过期，只作历史保留。** 当前交接（含 W04-02 两轮 REJECT 的 9 条整改项、登记前置条件与四条
+> 自检命令）在 [HANDOFF_W04_02_REVIEW_STATUS.md](HANDOFF_W04_02_REVIEW_STATUS.md)，以那份为准；
+> 两者不一致时，再以其开头的 `git log` / `checkpoint.json` / `task_packet.py next` 实际输出为准。
+
 ## 冻结环境（每条命令都要用，勿换工具链）
 
 ```

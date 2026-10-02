@@ -1,173 +1,102 @@
-# W04-02 review status (executor disclosure, written while the independent review is running)
+# W04 分支交接（W04-02 待整改）— 写给下一个窗口
 
-This file exists because the previous construction window parked W04-02 mid-review, and the two
-things a resuming session needs most are recorded here rather than in prose nobody can find.
+更新时间：2026-10-02（UTC）· 仓库：`D:/作品集/ResearchOS/research-os`
+本文件由执行 Agent 撰写，取代它自己前几版层层叠加的叙述（旧版由 git 历史保留，不删）。
+**它是叙述，不是权威**；权威是下面「先跑这四条」里的机器输出。两者不一致时以机器输出为准，并把这当作一次待报的偏差。
 
-## The first review request produced no verdict
+## 1 · 一句话现状
 
-**Corrected immediately, because it was wrong when written:** at the time of writing no verdict file
-existed, which was true then and false minutes later. Round 1 completed and is described in the section
-above. The claim in this paragraph is kept rather than deleted so the record shows what was actually
-known at each step.
+W04-02 的实现与证据已完整入库，被两个先后独立身份各判一次 **REJECT**（都复核在未整改的树上），
+9 条合并整改项已登记，下一张可做的卡**仍是 W04-02**，不是新卡。
 
-A round-1 independent reviewer was launched as a background agent in the window that ended at
-checkpoint revision 25. It had not delivered
-`execution/v2.4/receipts/W04/W04-02/independent_review_round1.json` by the time this note was first
-written. It was therefore provisionally treated as not delivered. It was not: it completed and returned a
-REJECT, which is now the binding verdict for this round and is summarised in the section above rather
-than here.
+## 2 · 先跑这四条，确认真实状态（不要跳过这步）
 
-A fresh identity was asked instead, and its brief is stricter than round 1's was: re-run the check
-and confirm the assertion-id set is identical across runs, read `tests/context/check/w0402.go` in
-full hunting for assertions that cannot fail or are satisfied by the wrong layer, judge whether the
-three `not_verified` skips are genuinely blocked by the W06 orchestration fixture and the FTS path,
-re-run at least three of the fifteen mutations itself (including the conflict-keeps-both-sides and
-freeze-from-live-state ones) and restore the tree exactly, A/B the declared pre-existing
-`go test ./internal/domain` failures, and audit `git diff` against the card's write scope.
+```bash
+cd D:/作品集/ResearchOS/research-os
+git log --oneline -3                      # HEAD 应为「交接整理」那次提交，且下面第 4 条不报错
+git status --porcelain                     # 应只见 ?? execution/... 与 ?? qualification/... 两类未跟踪目录
+python -c "import json,io;c=json.load(io.open('execution/v2.4/checkpoint.json',encoding='utf-8'));print(c['revision'],c['accepted_steps'],c['work_in_progress']['status'],c['failure_counters'][-1]['origin_key'])"
+python "D:/作品集/ResearchOS/ResearchOS_Implementation_Package_v2.4/tools/task_packet.py" next --state execution/v2.4/step_state.json
+```
 
-That reviewer's verdict lands in
-`execution/v2.4/receipts/W04/W04-02/independent_review_round2.json` under
-`qoder-desktop:/root/w0402_verifier_r2`.
+本文件写完时的实测值：checkpoint `revision 27`、`accepted_steps` 14 项、
+`work_in_progress.status = EXECUTION_REPORTED`、最后一条计数是 `W04-02/independent_review_round2`、
+`blocked_steps = ['W01-99']`、`task_packet next` 返回 `step.id = W04-02` 且 `product_acceptance = NOT_ASSERTED`。
+锁定环境（必须用仓库内工具链，勿用系统 go/node）：
 
-## SUPERSEDED by the round-1 verdict: W04-02 is REJECTED at checkpoint rev 26
+```bash
+export GO="$PWD/.local/tools/go1.27.1/go/bin/go.exe" GOTOOLCHAIN=local GOENV=off
+export GOPATH="$PWD/.local/gopath" GOCACHE="$PWD/.local/gocache"
+export RESEARCHOS_GO="$GO" RESEARCHOS_NODE=node RESEARCHOS_NPM_CLI=npm_cli
+```
 
-Round 1 did not die. It finished and delivered
-`execution/v2.4/receipts/W04/W04-02/independent_review_round1.json` with verdict **REJECT**
-(`qoder-desktop:/root/w0402_verifier_r1`, reviewed_at 2026-10-02T13:33:23Z). Everything below this
-heading still describes how the registration script behaves, but the card is not registrable right
-now: the script was tested against the real verdict and correctly refuses with
-"no registrable ACCEPT: the round-1 rejection stands and remediation is due".
+## 3 · 这张卡现在是什么状态
 
-What the reviewer reproduced and agreed with: PASS 239 three times with identical id lists, 0
-failures, exactly 3 `not_verified` (40 CTX / 41 CHG), the binding line under its own invocation,
-gofmt/vet/build clean, all fifteen mutation cases re-run with 14 caught and only the already-disclosed
-Z3 surviving, plus its own revert of both product fixes killing exactly five named assertions before
-restoring them hash-exact. It judged the product work good and explicitly said both fixes must stay,
-and its scope audit over 22 files found no spec, contract or migration touched.
+| 通道 | 内容 |
+| --- | --- |
+| 检查 | `go run ./tests/context/check` → **PASS 239**（40 CTX + 41 CHG 为本卡新增），0 失败，3 条 `not_verified`；三次以上运行的断言 id 集合逐序相同 |
+| 绑定命令 | `python execution/command_dispatcher/dispatch.py test.context --task-id W04 --check-id W04-02` → PASS 239，exit 0（registry `commands.json` rev 11；round-2 复核确认未削弱已接受的 W04-01：其 158 条 id 是 239 条的真子集） |
+| 变异 | 15 例，14 例按点名 id 致死，Z3 存活；**存活的真因已由复核查清**（见 B5），原先写成「冗余防线」是错的 |
+| 产品缺陷修复 | 两处真实缺陷已修并保留：`changes.go` 的 `resolveConflict` 门卫自相矛盾（原先任何冲突都不可能被判解决）；`context.go` 的 `createContext` 丢弃 ProjectState 上的治理决定 |
+| 裁定 | `receipts/W04/W04-02/independent_review_round1.json`（r1，REJECT，8 项）与 `independent_review_round2.json`（r2，REJECT，7 项，5 项与 r1 重合、3 项为新增） |
+| 执行者回应 | `executor_response_round1.json`、`executor_response_round2.json`；W04-01 的 hash 漂移披露在 `receipts/W04/W04-01/pin_drift_erratum_1.json` |
 
-Eight items are recorded as obligations in `checkpoint.json` (rev 26, counters appended to 11, never
-reset). The two that matter most are **new product defects that only became reachable because
-`resolveConflict` was repaired**: a RESOLVED conflict stays in `blocking_conflict_ids`, so every later
-freeze reports an open conflict that is closed; and the replacement guard has no relation check, so any
-APPLIED change settles any conflict (a Requirement-text change settled a ProjectState conflict with
-200). The third is that my `CHG-PROPOSAL-NAMES-ITS-IMPACT` skip was **false** - `createChange` does
-populate `impacted_refs` and `impact_link_ids` deterministically (the reviewer measured 3/3), so naming
-the impacted refs is this card's own step 3 obligation and was never W06's to inherit. The rest: assert
-accept-authority with a principal that actually holds VERIFIER rather than leaning on the frozen
-`x-required-roles` gate; read the next step / `resume_instruction` in at least one assertion; make
-`CTX-TAMPERED-BUNDLE-REFUSED` unable to pass on either branch; correct the stale evidence text (two
-more misquoted counts, `progress_note_1.json` has no hashes and its provenance list is short one file,
-and the declared "six pre-existing legacy failures" pass in both A/B states - the honest A/B gives 3
-per state with 2 common); and disclose that 2 of W04-01's 30 pinned hashes now differ.
+## 4 · 9 条整改项与建议顺序（都在 checkpoint `open_obligations` 里，这里只是可读版）
 
-**Executor mistake, disclosed in checkpoint `integrity_events`:** assuming round 1 had died, this window
-launched `qoder-desktop:/root/w0402_verifier_r2` against the same card while round 1 was still running.
-Two Go-heavy suites on one machine produced a flake round 1 observed and attributed to the overlap
-(`TestRuntimeCoordinatorConcurrentSealConflict`, 1/2, isolated 0/3). That is the same concurrency
-mistake the log already records once. Consequence, recorded as a gate rule rather than left implicit:
-**round 2 cannot be the post-remediation verdict** - it started before the blocking items existed - so
-its accept does not register the card, and a fresh identity must review the remediated tree.
+1. **产品缺陷优先**：`resolveConflict` 了结冲突后必须像 `applyChange:547-557` 那样把该 id 从
+   `ProjectState.blocking_conflict_ids` 中摘除，并加关联校验与 OPEN 状态门卫——现状是任何 APPLIED
+   变更都能了结任何冲突（实测 Requirement 文本变更以 200 了结 ProjectState 冲突），且 RESOLVED
+   冲突可被重复了结；后果是之后每次冻结都把已关闭冲突报成 `unresolved=["Open conflict: <id>"]`，
+   直接违背本卡「新会话恢复准确下一步」。
+2. **按值断言下一步**：`resume_instruction` / next step 与 `unresolved_items` 内容要有真断言，不能只
+   检查键存在（`put()` 的 schema 校验本来就保证键存在）。
+3. **取消假跳过**：`createChange` 经 `closure()` 确定性填充 `impacted_refs` 与 `impact_link_ids`（实测
+   3/3），所以 `CHG-PROPOSAL-NAMES-ITS-IMPACT` 属本卡 step 3，不是 W06 的债。
+4. **接受权限要真**：`w0402.go:608` 现在靠 `403 || 409` 过关，而探针拿到的 403 是「role not authorized」
+   （该主体根本没有 VERIFIER）——这正是本卡已为 AA1 修掉的那类陷阱的孪生；要用真正持有 VERIFIER 的主体断言。
+5. **补正向对照**：`CTX-CONTEXT-READABLE-AGAIN-AFTER-RESTORE`（`w0402.go:351`）**任何运行都不会发出**，
+   因为 `store.go:165` 以「回执不可变」拒绝那次 UPDATE；于是篡改拒绝只走存储支路、服务侧完整性检查
+   零覆盖，这也是 Z3 幸存的真因。
+6. **证据文本更正**：两处计数仍报错、`progress_note_1.json` 没有 hash 且 provenance 少一个文件、
+   被宣告的「6 个 pre-existing 遗留失败」实为两态都通过（诚实 A/B 只剩一个确定性失败
+   `TestW17UpgradeActiveRecovery: no such table: runtime_dispatches`，其余 3 个是本机 loopback 抖动）、
+   两个跳过的归因（`CHG-OPTIONAL-RETRIEVAL-DEGRADES` 实质可延但归因错、`CHG-PROPOSAL-NAMES-ITS-IMPACT` 根本不该延）。
+7. **补第二个存活变异的处理**：r2 自创的「存调用方声称的 revision 而非 `state["revision"]`」在 PASS 239 下存活。
+8. **堵静默退化**：检查程序可以无声丢掉断言 id（`w0402.go:430-436`），既无失败也无数量地板；
+   `contextPhase` 首次拒绝即 `return`（这个坑本历史里已经记过一次）。
+9. **W04-01 hash 漂移**：已用重算方式披露（`receipt.json` 30 条 artifact hash 中 3 条变了；
+   `step_state` 的 20 条 pin 全部完好）。不撤销 W04-01、不偷偷重 pin；后续按 commit pin 的事属于既有的
+   registry/回执卫生义务。
 
-## Registering the verdict, once it exists
+做完 1–8 后：**串行**复跑 `go run ./tests/context/check`（≥2 次比对 id 集合）与变异矩阵，再派**第三个全新身份**
+复核整改后的树；登记用 `python .local/register_w0402_accepted.py`（`--dry-run` 先看它找到哪个裁定）。它硬性要求
+裁定是 ACCEPT/ACCEPT_WITH_RESERVATIONS、**晚于两次 REJECT 的时间戳**、身份不属于执行者也不属于 r1/r2、且不再留有
+`blocking_issues`；通过才写 `step_state` 的 ACCEPTED 记录（hash 现场重算）、把 checkpoint 27→28、追加
+`failure_counters` 并把复核发现转成义务。**已实测**：当前它只输出「no registrable ACCEPT」，拒绝写入。
 
-## Round 2 also rejected: the merged remediation set is nine items
+## 5 · 两条纪律，别再犯
 
-`qoder-desktop:/root/w0402_verifier_r2` finished too, also on the un-remediated tree, also **REJECT**
-(7 blocking issues, `independent_review_round2.json`, reviewed_at 2026-10-02T14:10:00Z, checkpoint now
-rev 27). It reproduced PASS 239 on four runs with order-identical id lists, re-ran 8 of 15 mutations with
-the same failing id sets, proved both product fixes load-bearing by separate reverts, and A/B'd my
-"pre-existing failures" claim down to one deterministic case - `TestW17UpgradeActiveRecovery`
-(`no such table: runtime_dispatches`) - the other three being this machine's loopback flake. It also
-confirmed the registry revision 11 does not weaken W04-01: its 158 accepted ids remain a strict subset of
-the 239.
+**不要以为后台 Agent 死了就另派一个。** 这一轮我就犯了：以为 r1 随上一窗口丢失，派了 r2，结果 r1 活着，
+两个 Go 重负载套件同机并发，r1 观测到一次 `TestRuntimeCoordinatorConcurrentSealConflict` 抖动并归因于此。
+后果写成硬规则，而不是靠记性：**先派出的裁定 binding，后派出的那次不能充当「整改后的复核」**。
+交接前先查 `receipts/W04/W04-02/independent_review*.json` 是否已有新文件，或在同一份通知里等它落地。
 
-Five of its items are the same as round 1's. Three are new and matter:
+**能重算的数字就不要抄。** 我给 W04-01 写漂移 erratum 的第一版量错了 pin 集（拿 `step_state` 的 20 条去
+描述 `receipt.json` 的 30 条），差点发布「0 drifted」旁边跟一句声称漂移的话。提交前重算才发现，
+现在两个集合分开陈述。
 
-- **B5** `CTX-CONTEXT-READABLE-AGAIN-AFTER-RESTORE` (`w0402.go:351`) is **never emitted in any run**,
-  because `store.go:165` refuses the receipt UPDATE as immutable. So `CTX-TAMPERED-BUNDLE-REFUSED` is
-  green via the storage branch and the service-side integrity check has zero coverage. That is the real
-  reason mutation Z3 survived - I had written it up as a "redundant defence", which was wrong.
-- **B7** undisclosed drift inside an ACCEPTED card: 3 of W04-01 receipt.json's 30 artifact hashes now
-  differ (`tests/context/check/legacy.go`, `tests/context/check/main.go`,
-  `execution/v2.4/commands.json`); its 20 step_state pins are all intact. Disclosed by
-  `receipts/W04/W04-01/pin_drift_erratum_1.json`, computed - nothing was re-pinned and W04-01's
-  acceptance is not withdrawn.
-- a mutation the reviewer invented itself: storing the caller's claimed revision instead of
-  `state["revision"]` **survives at PASS 239** - a second surviving case the card's own evidence did not
-  contain.
+## 6 · 完成度红线（禁止据此宣布完成）
 
-Non-blocking but worth closing while the file is open: the check can silently lose assertion ids
-(`w0402.go:430-436`) with no count floor, and `contextPhase` returns on the first refusal - the exact
-mistake pattern already recorded once in this construction's history.
+14/71 卡 ACCEPTED、**0/22 父任务**、**0/42 正式用例终验**。W04 父门槛仍欠：migration 权威表
+（WorkspaceBinding / BootstrapStage / BootstrapReplay / Project + 存储层规范化路径唯一性 + 一次真实
+CreateBackup/RestoreBackup 复证）、`/v2/command` 路由 `workspace.register` 与 `project.bootstrap`
+（`internal/domain/client_protocol.go` 的 owner 卡）、`internal/host` 那个 nil 参数后面的原生目录选择器、
+`bootstrap_task_id` 指向的 Goal/Task 链、W08 对 RESEARCH / REUSE_DECISION / IMPLEMENTATION 的晋升、
+以及 W04-99 的正式用例。W01-99 因缺 LIVE 资源继续只阻塞该支路，失败计数不清零。
 
-**Remediation order for the next window, serialised (never two Go-heavy suites at once, and no reviewer
-running alongside the work):**
+## 7 · 工作树里可能出现的「别人的改动」
 
-1. product defects in `internal/domain/changes.go` `resolveConflict` - prune the settled conflict from
-   `ProjectState.blocking_conflict_ids` the way `applyChange:547-557` does, and require that the applied
-   change actually relates to the conflict and that the conflict is OPEN (B3, B4);
-2. assert the recovered next step by value, not key presence: `resume_instruction` / next step, and
-   `unresolved_items` content (B6);
-3. un-skip impact naming - `createChange` fills `impacted_refs` and `impact_link_ids` deterministically
-   via `closure()`, so `CHG-PROPOSAL-NAMES-ITS-IMPACT` is this card's step 3, not W06's (B2);
-4. rebuild the accept-authority assertion on a principal that genuinely holds VERIFIER instead of
-   accepting `403 || 409` from the role gate (B1);
-5. give the tamper refusal a positive control that actually runs, fixing the never-emitted assertion and
-   the Z3 explanation (B5);
-6. correct the remaining evidence text: the two further misquoted counts, `progress_note_1.json`
-   carrying no hashes and its provenance list short one file, the stale six-test legacy-failure list, the
-   two skip attributions the reviewers judged mis-described (`CHG-OPTIONAL-RETRIEVAL-DEGRADES` is deferred
-   in substance but wrongly attributed in the note; `CHG-PROPOSAL-NAMES-ITS-IMPACT` is not deferred at all)
-   and the drift disclosure (already done via erratum).
-
-Then re-run the check and the mutation matrix serially, and ask a **third fresh identity** to review the
-remediated tree. `python .local/register_w0402_accepted.py` will only register an ACCEPT that postdates
-both rejections and carries an identity that is neither the executor's nor either reviewer's; it moves
-checkpoint 27 -> 28. Nothing here is a completion claim: 14 of 71 cards, 0 of 22 parents, 0 of 42 formal
-cases.
-
-`.local/register_w0402_accepted.py` (untracked by `.gitignore`, like all local tooling) performs the
-acceptance mechanically and refuses when it should:
-
-- it reads whichever `independent_review*.json` is present, takes the newest ACCEPT /
-  ACCEPT_WITH_RESERVATIONS, and exits without writing if the only verdict is a REJECT;
-- it exits if that verdict still names a `blocking_issues` entry while calling itself an accept, or
-  if the `verifier_id` is missing or equal to the executor's;
-- it recomputes the sha256 of every file in the receipt directory instead of copying numbers,
-  appends the `W04-02` ACCEPTED record to `step_state.json`, asks `tools/task_packet.py next` what
-  the next card is, moves `checkpoint.json` 25 → 26 with that step id, appends (never resets) a
-  `failure_counters` row carrying the three disclosed incidents above, and turns each review finding
-  into an open obligation;
-- `--dry-run` prints which verdict it found and changes nothing.
-
-Run it only from the repo root with the locked environment already exported. Its checkpoint guard
-will fail loudly if the revision has moved, which is the intended outcome rather than something to
-edit around.
-
-## What is currently in the working tree, and whose it is
-
-`internal/domain/changes.go` and `internal/domain/context.go` show as modified while the review is
-in flight. **Those two diffs are the reviewer's own A/B revert of the executor's product fixes** —
-removing the `createContext` governing-decision merge and restoring the old self-contradictory
-`resolveConflict` guard, so it can tell which `internal/domain` test failures predate this card. The
-executor has no uncommitted change of its own: everything it wrote is in commits `f38b6d2c`,
-`c6fca501`, `acbe4e0c`, `636c9e04`, `419c2e75`, `277fa05f`, `40babf14`, `38025c24`, `9353354c`. If
-those two files are still modified after the reviewer reports, restore them from `HEAD`
-(`git checkout -- internal/domain/changes.go internal/domain/context.go`) — that remediates the
-reviewer's temporary mutation, it does not undo any accepted work — and re-run
-`python execution/command_dispatcher/dispatch.py test.context --task-id W04 --check-id W04-02`
-before registering, expecting PASS 239 with three skips.
-
-`qualification/v2.4/mu/` is a pre-existing untracked vendor snapshot from 2026-10-01 with its own
-`.git`; it is not this card's output and is not in anyone's scope.
-
-## Nothing here is a completion claim
-
-W04-02 is `EXECUTION_REPORTED`, not accepted, until a verdict file exists. 14 of 71 cards are
-accepted at the moment this note is written, 0 of 22 parent tasks, and 0 of 42 formal cases finally
-verified. The W04 parent gate still owes the migration-owned binding/stage/replay/Project tables
-with store-level canonical-path uniqueness and a green CreateBackup/RestoreBackup re-proof,
-`/v2/command` routing for `workspace.register` and `project.bootstrap` (owner of
-`internal/domain/client_protocol.go`), a real native directory chooser behind `internal/host`'s nil
-argument, the Goal/Task chain that `bootstrap_task_id` will name, W08's promotion of RESEARCH /
-REUSE_DECISION / IMPLEMENTATION, and the W04-99 formal cases.
+两个复核 Agent 都曾临时回退 `internal/domain/changes.go`、`context.go` 做 A/B；截至本文件更新时源码树
+**干净**（已用 `git status --porcelain` 复验，两文件 hash 已按复核报告字节复原）。若接手时又见到这两个
+文件 modified，先确认是否有复核仍在运行，再决定复原，不要顺手 commit。
+`qualification/v2.4/mu/` 是 2026-10-01 就存在的未跟踪 vendor 快照（自带 `.git`），与本卡无关、不在任何人范围内。
