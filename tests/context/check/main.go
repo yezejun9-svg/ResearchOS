@@ -140,6 +140,9 @@ func main() {
 	// registration chain; both cards run in one program, and the report's ids say which is which.
 	h.contextPhase(ctx)
 	h.changePhase(ctx)
+	// Runs last and unconditionally: it is the floor that turns an assertion W04-02 declared but never
+	// emitted into a failure, so it must not be reachable only when both phases completed.
+	h.w0402Reconcile(ctx)
 }
 
 func repoRoot() string {

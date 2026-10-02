@@ -607,22 +607,108 @@ func (s *Service) createConflict(tx *sql.Tx, project string, b Object) (Object, 
 	}
 	return o, s.put(tx, "ProjectState", state)
 }
+
+// editKey names one disputed (entity, id, field) triple.
+func editKey(kind, id, field string) string { return kind + "|" + id + "|" + field }
+
+// disputedScope is what a conflict is actually about: every entity id it names as a subject or as
+// blocked, plus the (entity, id, field) triples edited by any ChangeProposal among its subjects.
+// A change that touches none of them has no relation to the conflict, so letting it settle the
+// conflict would record a relation that does not exist.
+func (s *Service) disputedScope(tx *sql.Tx, project string, c Object) (map[string]bool, map[string]bool, error) {
+	ids := map[string]bool{}
+	triples := map[string]bool{}
+	recordEdits := func(p Object) {
+		for _, v := range Arr(p, "edits") {
+			edit, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			r, _ := edit["target_ref"].(map[string]any)
+			if r == nil {
+				continue
+			}
+			target := Object(r)
+			ids[Str(target, "id")] = true
+			triples[editKey(Str(target, "entity_type"), Str(target, "id"), Str(edit, "field"))] = true
+		}
+	}
+	for _, field := range []string{"subject_refs", "blocks_refs"} {
+		for _, v := range Arr(c, field) {
+			r, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			ref := Object(r)
+			ids[Str(ref, "id")] = true
+			if Str(ref, "entity_type") != "ChangeProposal" {
+				continue
+			}
+			subject, e := load(tx, project, "ChangeProposal", Str(ref, "id"))
+			if e != nil {
+				return nil, nil, e
+			}
+			recordEdits(subject)
+		}
+	}
+	return ids, triples, nil
+}
+
+// settlesDispute reports whether the applied proposal is genuinely related to the conflict: it
+// declared the conflict itself, or it edits an entity the conflict names, or it edits the same
+// (entity, id, field) triple one of the conflicting drafts edits.
+func settlesDispute(proposal Object, conflictID string, ids, triples map[string]bool) bool {
+	if containsString(Arr(proposal, "conflict_ids"), conflictID) {
+		return true
+	}
+	for _, v := range Arr(proposal, "edits") {
+		edit, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		r, _ := edit["target_ref"].(map[string]any)
+		if r == nil {
+			continue
+		}
+		target := Object(r)
+		if ids[Str(target, "id")] {
+			return true
+		}
+		if triples[editKey(Str(target, "entity_type"), Str(target, "id"), Str(edit, "field"))] {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Service) resolveConflict(tx *sql.Tx, project, id string, b Object) (Object, error) {
 	o, e := load(tx, project, "Conflict", id)
 	if e != nil {
 		return nil, e
+	}
+	if o["status"] != "OPEN" {
+		return nil, Fail(409, "STATE_CONFLICT", "conflict is already "+Str(o, "status"))
 	}
 	proposal, e := load(tx, project, "ChangeProposal", Str(b, "resolution_proposal_id"))
 	if e != nil {
 		return nil, e
 	}
 	// The old guard also required the conflict to already name this proposal, but
-	// resolution_proposal_id is precisely what this operation writes and CreateConflictRequest does
-	// not carry it, so no conflict could ever be resolved: the check contradicted its own schema.
-	// The requirement that survives is the real one - only an accepted and applied change settles a
-	// conflict - and the resolution is recorded here rather than demanded in advance.
+	// resolution_proposal_id is precisely what this operation writes and ResolveConflictRequest
+	// carries only that id and a reason, so no conflict could ever be resolved: the check
+	// contradicted its own schema. What replaces it is not "any applied change settles any
+	// conflict" - that let a Requirement-text change close a REVISION conflict over two unrelated
+	// drafts - but a real relation to the disputed scope, plus the OPEN guard above so a settled
+	// conflict cannot be settled again.
 	if proposal["status"] != "APPLIED" {
 		return nil, Fail(409, "STATE_CONFLICT", "resolution change has not been accepted and applied")
+	}
+	ids, triples, e := s.disputedScope(tx, project, o)
+	if e != nil {
+		return nil, e
+	}
+	if !settlesDispute(proposal, id, ids, triples) {
+		return nil, Fail(409, "STATE_CONFLICT", "resolution change does not touch the disputed scope")
 	}
 	o["status"] = "RESOLVED"
 	o["resolution_proposal_id"] = proposal["id"]
@@ -630,7 +716,27 @@ func (s *Service) resolveConflict(tx *sql.Tx, project, id string, b Object) (Obj
 	if e = bump(o); e != nil {
 		return nil, e
 	}
-	return o, s.put(tx, "Conflict", o)
+	if e = s.put(tx, "Conflict", o); e != nil {
+		return nil, e
+	}
+	// A settled conflict must also stop blocking the project. applyChange already prunes this index;
+	// leaving it behind made every later freeze tell a new session that a closed conflict was open.
+	state, e := singleton(tx, project, "ProjectState")
+	if e != nil {
+		return nil, e
+	}
+	remaining := Empty()
+	for _, v := range Arr(state, "blocking_conflict_ids") {
+		if fmt.Sprint(v) == id {
+			continue
+		}
+		remaining = append(remaining, v)
+	}
+	state["blocking_conflict_ids"] = remaining
+	if e = bump(state); e != nil {
+		return nil, e
+	}
+	return o, s.put(tx, "ProjectState", state)
 }
 func (s *Service) ChangeContractHash(ctx context.Context, project, id string) (string, error) {
 	var raw string
