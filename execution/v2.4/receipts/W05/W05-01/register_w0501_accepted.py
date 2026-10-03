@@ -1,0 +1,208 @@
+"""Register W05-01 as ACCEPTED from an independent verdict, then move the checkpoint.
+
+Written before any verdict exists, so it can only succeed after one does. Every figure is recomputed
+from disk, the verifier identity is taken from the verdict file rather than from here, and it refuses
+when the evidence does not support acceptance. Failure counters are appended to, never rewritten.
+"""
+import argparse, datetime, glob, hashlib, io, json, os, subprocess, sys
+
+def _root():
+    # was dirname(__file__)/".." while the script lived in .local; kept working from either place
+    g = os.path.abspath(os.path.dirname(__file__))
+    while g != os.path.dirname(g):
+        if os.path.exists(os.path.join(g, "execution", "v2.4", "commands.json")):
+            return g
+        g = os.path.dirname(g)
+    raise RuntimeError("repository root not found from " + __file__)
+
+
+REPO = _root()
+os.chdir(REPO)
+SPEC = r"D:\作品集\ResearchOS\ResearchOS_Implementation_Package_v2.4"
+RD = os.path.join("execution", "v2.4", "receipts", "W05", "W05-01")
+STATE = os.path.join("execution", "v2.4", "step_state.json")
+CP = os.path.join("execution", "v2.4", "checkpoint.json")
+EXECUTOR = "qoder-desktop:/root/construction"
+# The plan of record has used ACCEPT, ACCEPT_WITH_LIMITATIONS and ACCEPT_WITH_RESERVATIONS (W04-02 was
+# registered with the last of these), so all three are registrable - but only when the verdict carries no
+# blocking_issues, which is checked below. ACCEPT_BLOCKED_RECORDING is deliberately absent: round 1 of
+# this card used exactly that word to say the increment reproduces while recording is refused, and a
+# script that matched on an "ACCEPT" prefix would have registered it.
+ACCEPTS = ("ACCEPT", "ACCEPT_WITH_LIMITATIONS", "ACCEPT_WITH_RESERVATIONS")
+NON_REGISTRABLE = ("ACCEPT_BLOCKED_RECORDING", "REJECT", "REJECT_FOR_REWORK")
+
+
+def sha(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+
+
+def load(p):
+    return json.load(io.open(p, encoding="utf-8-sig"))
+
+
+def dump(p, obj):
+    io.open(p, "w", encoding="utf-8", newline="\n").write(json.dumps(obj, indent=1, ensure_ascii=False))
+
+
+def find_verdict():
+    """The newest verdict on disk that is an accept, postdates every rejection, and is a fresh identity."""
+    files = [f for f in sorted(os.listdir(RD)) if f.startswith("independent_review") and f.endswith(".json")]
+    if not files:
+        raise SystemExit("no independent review for W05-01 has been delivered")
+    rejects, reject_reviewers, reject_at = [], set(), ""
+    for f in files:
+        v = load(os.path.join(RD, f))
+        if v.get("verdict") == "REJECT":
+            rejects.append(f)
+            reject_at = max(reject_at, str(v.get("reviewed_at") or ""))
+            reject_reviewers.add(v.get("reviewer_id") or v.get("verifier_id"))
+        else:
+            print("%s verdict=%r" % (f, v.get("verdict")))
+    best, best_at = None, ""
+    for f in files:
+        v = load(os.path.join(RD, f))
+        if v.get("verdict") in NON_REGISTRABLE:
+            print("%s verdict=%r is not registrable by name" % (f, v.get("verdict")))
+            continue
+        if v.get("verdict") not in ACCEPTS:
+            continue
+        at = str(v.get("reviewed_at") or "")
+        if reject_at and at <= reject_at:
+            print("%s accepts at %s, which does not postdate a rejection at %s: a reviewer that began "
+                  "before the blocking items existed is not the post-remediation verdict" % (f, at, reject_at))
+            continue
+        if at >= best_at:
+            best, best_at = (f, v), at
+    if best is None:
+        raise SystemExit("no registrable ACCEPT for W05-01 (rejections on file: %s)" % (rejects or "none"))
+    fname, verdict = best
+    vid = verdict.get("reviewer_id") or verdict.get("verifier_id")
+    if not vid or vid == EXECUTOR or vid in reject_reviewers:
+        raise SystemExit("verdict identity is missing, is the executor, or already ruled on this tree: %r" % vid)
+    if verdict.get("blocking_issues"):
+        # a verdict that lists items to fix before recording is not a recording authorisation,
+        # whatever its verdict word says
+        raise SystemExit("%s says %s while still naming %d blocking issue(s)" %
+                         (fname, verdict["verdict"], len(verdict["blocking_issues"])))
+    if verdict.get("verdict") == "ACCEPT_WITH_LIMITATIONS" and not (
+            verdict.get("limitations") or verdict.get("acceptance_scope")):
+        raise SystemExit("an accept-with-limitations must state the limitations this script can carry forward")
+    return fname, verdict, vid
+
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--dry-run", action="store_true")
+args = ap.parse_args()
+
+state = load(STATE)
+if any(s.get("id") == "W05-01" for s in state["steps"]):
+    raise SystemExit("W05-01 already has a step_state record")
+cp = load(CP)
+frozen = {(RD, e["path"]) for s in state["steps"] for e in s.get("evidence", [])}
+for guard in (STATE, CP):
+    if os.path.abspath(guard) in {os.path.abspath(os.path.join("execution", "v2.4", p)) for _, p in frozen}:
+        raise SystemExit("a state file is itself registered as evidence; stop and reconcile")
+
+verdict_file, verdict, vid = find_verdict()
+if args.dry_run:
+    print("registrable: %s verdict=%s by %s" % (verdict_file, verdict["verdict"], vid))
+    raise SystemExit(0)
+
+receipt = load(os.path.join(RD, "receipt.json"))
+if receipt.get("status") != "EXECUTION_REPORTED" or receipt.get("verifier_id") is not None:
+    raise SystemExit("the receipt must stay an executor report; acceptance lives in step_state and the verdict")
+
+carried = ["%s (W05-01 %s): %s" % (i, verdict_file, t)
+           for i, t in enumerate(verdict.get("limitations") or [], 1)]
+
+present = sorted(os.listdir(RD))
+needed = ("receipt.json", "mutation_selfcheck_w0501.json", "binding_and_parity_rev14.json",
+          "before_baseline_test.runtime.json", "executor_identity_measurement.json",
+          "receipt_addendum_round2.json", verdict_file)
+missing = [n for n in needed if n not in present]
+if missing:
+    raise SystemExit("required evidence file is not in the receipt directory: %s" % missing)
+
+now = datetime.datetime.now(datetime.timezone.utc)
+state["steps"].append({
+ "id": "W05-01", "status": "ACCEPTED", "executor_id": EXECUTOR, "verifier_id": vid,
+ "accepted_at": now.isoformat(), "verdict": verdict["verdict"],
+ "verdict_file": "receipts/W05/W05-01/" + verdict_file,
+ "note": ("card-level increment only; parent W05 and case A04 and parent W05 are not accepted here"),
+ "evidence": [{"path": "receipts/W05/W05-01/" + f, "sha256": sha(os.path.join(RD, f))}
+              for f in present if not os.path.isdir(os.path.join(RD, f))]})
+dump(STATE, state)
+
+out = subprocess.run([sys.executable, os.path.join(SPEC, "tools", "task_packet.py"), "next", "--state", STATE],
+                     capture_output=True, text=True, encoding="utf-8", errors="replace")
+nxt = None
+if out.returncode == 0:
+    try:
+        nxt = json.loads(out.stdout)
+    except ValueError:
+        raise SystemExit("task_packet next produced no JSON: %r" % out.stdout[:400])
+nxt_id = ((nxt or {}).get("step") or {}).get("id")
+if not nxt_id:
+    raise SystemExit("task_packet next named no step after the acceptance: rc=%s out=%r"
+                     % (out.returncode, out.stdout[:400]))
+
+old = cp["revision"]
+cp["revision"] = old + 1
+cp["expected_previous_revision"] = old
+cp["current_step_id"] = None
+cp["next_step_id"] = nxt_id
+cp["accepted_steps"] = cp.get("accepted_steps", []) + ["W05-01"]
+cp["failure_counters"].append({
+ "origin_key": "W05-01/" + verdict_file, "status": verdict["verdict"], "mid_card_repairs": 0,
+ "recorded_at": now.isoformat(), "reviewer_id": vid,
+ "disclosed_incidents": [
+   "W05-01 disclosure: the LIVE model-tool capability is not asserted at all. Model shell execution and "
+   "model workspace writes are denied by the executor policy recorded in ops/runtime/capabilities.json, "
+   "and the executor binary pinned by that record is absent while a different build is installed, so the "
+   "live identity cannot be re-qualified without substituting the binary, which the card forbids. A real "
+   "file read is proven only through the adapter phase, which runs without a model",
+   "W05-01 self-caught defects: an early draft asserted a 4xx class for the unqualified LIVE refusal "
+   "(the service really answers 503 RESOURCE_UNAVAILABLE), read the claim reply's Run from the wrong "
+   "level, created the journal directory the adapter must create itself, paraphrased the denial needle "
+   "the decoder does not match, and one cost assertion was tautological until it was replaced by a "
+   "count over reservations keyed by provider_request_id and amount",
+   "W05-01 tooling lesson repeated: the mutation runner and receipt generator both resolve the "
+   "repository root by walking up from their own path, because a copied script that assumes "
+   'dirname(__file__)/\"..\" points at a tree that is not the repository',
+   "this card's first mutation matrix silently skipped three cases whose hard-coded anchors had drifted, "
+   "and two mutants survived; both were traced to assertions that matched only the substring GATE_FAILED. "
+   "Round 2 reached 10 caught / 0 survived; after the round-1 review found its own mutants X2/X3 surviving, "
+   "the disjunction was isolated through the only legal policy shape (ESTIMATED/BLOCK) and round 4 reaches "
+   "13 caught / 0 survived, with one equivalence probe (E1) filed outside the matrix on purpose",
+   "correction recorded as a checkpoint integrity event rather than edited after the fact",
+   "execution/v2.4/commands.json went to revision 12 and then 13 outside this card's write_scope (13 "
+   "because the entry this card registered had been copied from test.context and misdescribed itself). "
+   "registry_parity_rev13.json carries the re-resolution of all seven pre-existing selectors, including "
+   "W12-G02 failing identically under --spec v2.0 and C14 moving attempt-to-attempt",
+   "receipt.json is generated by a script that runs every guard BEFORE writing and renames a temporary "
+   "file only after both passes, derives each command row from a captured log or the frozen harness "
+   "report, and refuses an acceptance claim, a disagreeing matrix bucket, a non-zero binding run or "
+   "binding runs pinned to a different code_revision",
+   "the round-1 review refuted this card's own not_verified excuse about a start-time refusal being "
+   "unreachable; the excuse was deleted and the property is asserted by 12 named ids instead",
+   "commit 1cd63377 asserted the selector re-resolution before it had run; the measurement followed in "
+   "b5a14e4e and the premature claim is recorded as a checkpoint integrity event",
+   "the first accepted-card pin scan in this window reported 133 stale pins because it resolved "
+   "step_state evidence paths against the repository root; the corrected reading is 5 stale rows on 3 "
+   "paths, none of them broken by this card",
+   "open obligations this card found outside its scope are recorded in "
+   "execution/v2.4/HANDOFF_OPEN_GAPS_2026-10-03.md (formal-case executability, unbound CLI/Desktop "
+   "commands, no write scope over apps/**, unadvanced client_mapping rows)"],
+ "carried_forward": carried})
+for t in carried:
+    cp["open_obligations_before_next_card"].append(t)
+cp["work_in_progress"] = None
+cp["note"] = ("rev %d: W05-01 %s by %s. 16 of 71 cards accepted, 0 of 22 parents, 0 of 42 formal cases "
+              "finally verified. No completion claim - the W04 parent gate still owes the migration-owned "
+              "binding tables, /v2/command routing and the native chooser, and W12 still owes its own -99."
+              % (cp["revision"], verdict["verdict"], vid))
+cp["updated_at"] = now.isoformat()
+cp["updated_by"] = EXECUTOR
+dump(CP, cp)
+print("W05-01 %s | evidence %d files | next %s | checkpoint rev %d" %
+      (verdict["verdict"], len(state["steps"][-1]["evidence"]), nxt_id, cp["revision"]))
