@@ -25,6 +25,7 @@ RUNTIME = os.path.join("adapters", "runtime", "runtime_windows.go")
 CODEX = os.path.join("adapters", "runtime", "codex.go")
 ADMISSION = os.path.join("internal", "domain", "runtime_admission.go")
 SCOPES = os.path.join("internal", "domain", "budget_scopes.go")
+CHECK = os.path.join("tests", "runtime", "check", "w0501.go")
 
 CASES = [
  # --- adapter lifecycle: the claims the card makes about the worker itself ---
@@ -78,6 +79,17 @@ CASES = [
  {"id": "M15-fixture-dispatch-not-zero", "file": SCOPES,
   "marker": '"provider_request_id": "fixture-dispatch/" + Str(run, "id")',
   "body": '_, e = s.appendBudget(tx, project, Object{"policy_id": goal["budget_policy_id"], "run_id": run["id"], "operation": "RESERVE", "money": Object{"amount": "1.00", "currency": currency}, "provider_request_id": "fixture-dispatch/" + Str(run, "id"), "provider_event_id": "fixture-dispatch/" + Str(run, "id"), "reservation_id": nil, "cost_basis": "UPPER_BOUND", "occurred_at": Now()})'},
+
+ # --- the executor identity comparison the round-1 review called inert ---
+ {"id": "M16-executor-comparison-always-matches", "file": CHECK,
+  "marker": "return false // no recorded digest carries the pinned one",
+  "body": "return true // MUTANT: every comparison reports the pinned digest as installed"},
+ {"id": "M17-executor-comparison-never-matches", "file": CHECK,
+  "marker": "if strings.EqualFold(normalizeDigest(entry), digest) {",
+  "body": "if false && strings.EqualFold(normalizeDigest(entry), digest) {"},
+ {"id": "M18-executor-pin-prefix-unnormalised", "file": CHECK,
+  "marker": 'if after, isPrefix := strings.CutPrefix(s, "sha256:"); isPrefix {',
+  "body": 'if after, isPrefix := strings.CutPrefix(s, "sha512:"); isPrefix {'},
 ]
 
 env = dict(os.environ)

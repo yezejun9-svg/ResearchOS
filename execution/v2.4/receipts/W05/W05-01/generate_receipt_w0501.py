@@ -245,7 +245,11 @@ receipt = {
   "nothing here accepts parent W05 or signs any formal case"],
  "not_verified_on_this_machine": [
   "no real Codex/provider call was made from this working tree in this round, so nothing is claimed about current provider behaviour beyond what the recorded receipts and the decoder rows show"],
- "independent_review": None, "independent_reviews": [], "rework_of": None,
+ "independent_review": None, "independent_reviews": [],
+ "rework_of": "round 1 of this card: the receipt generated at 2c8e04cb (committed at ec7f0da2) and the verdict "
+              "execution/v2.4/receipts/W05/W05-01/independent_review_round1.json by w0501_verifier_r1, which returned "
+              "REWORK_REQUIRED with three blocking issues. This file replaces that report; the round-1 receipt and the "
+              "verdict stay in git history and are not edited.",
  "reuse_notes": "harness boot mirrors tests/resources/check (store.Open + real migrations + domain.New + the service's own HTTP handler); the adapter phase drives adapters/runtime directly, which that program does not"}
 
 
