@@ -184,6 +184,8 @@ artifacts = [CHECK, os.path.join("apps", "desktop", "main", "lib", "host.js"),
              os.path.join("apps", "desktop", "preload", "preload.js"),
              os.path.join("apps", "desktop", "main", "workbench.html"),
              "execution/v2.4/commands.json", os.path.join(RD, CENSUS).replace("\\", "/"),
+             os.path.join(RD, "census_c23_w1301.py"),
+             os.path.join(RD, "add_census_probe_w1301.py"),
              os.path.join(RD, MATRIX), os.path.join(RD, PARITY),
              os.path.join(RD, "binding_and_parity_rev15.json"),
              os.path.join(RD, "before_baseline_test.ui.routes.json")]

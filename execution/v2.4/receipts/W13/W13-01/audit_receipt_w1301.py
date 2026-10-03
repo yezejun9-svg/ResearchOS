@@ -62,6 +62,8 @@ tracked = [l for l in os.popen("git status --porcelain").read().splitlines()
 for l in tracked:
     if "self_audit_run.json" in l:
         continue  # this auditor's own output cannot have been disclosed by a receipt written before it ran
+    if "receipt.json" in l:
+        continue  # the generator writes this file after it measured the tree; it cannot disclose itself
     chk(l in (R["uncommitted_source_files_at_reporting"] or []),
         "a tracked modification is not disclosed: %s" % l)
 
