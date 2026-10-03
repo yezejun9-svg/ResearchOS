@@ -41,6 +41,7 @@ func main() {
 		fmt.Println("  version   product/protocol version")
 		fmt.Println("  help      this help")
 		fmt.Println("  doctor    host discovery + health + protocol handshake")
+		fmt.Println("  task      run one coding task: read, propose, real diff, real check, bounded repair")
 		fmt.Println("planned (owned by later cards; NOT_IMPLEMENTED here):")
 		for _, c := range []string{"init", "status", "resume", "cancel", "config", "chat (interactive TUI)", "run --output jsonl", "/goal"} {
 			fmt.Printf("  %-28s NOT_IMPLEMENTED\n", c)
@@ -79,6 +80,8 @@ func main() {
 		if status != "UP" {
 			os.Exit(4)
 		}
+	case "task":
+		runCodingTask(args[1:])
 	default:
 		fmt.Printf("%s: NOT_IMPLEMENTED (%s is registered to a later card; no silent success)\n", cmd, cmd)
 		os.Exit(3)
