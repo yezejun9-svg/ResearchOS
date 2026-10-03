@@ -225,6 +225,12 @@ func ledgerPhase(ctx context.Context, h *harness, g *runGraph) {
 
 	code, _, body = h.ledger(ctx, tightenedTag, entry("RECONCILE", "req-unknown", "ACTUAL", dollars("0.50"), "evt-unknown-settled", unknown["id"], holdAt))
 	ok("W1201-UNKNOWN-RECONCILES-WHEN-PROVEN", code == 201, code, body)
+	// positive control beside the refusal: the same amount expressed as a proven bound must be
+	// admitted at this very moment, otherwise the estimate refusal could be some other rule
+	// rejecting everything and the assertion below would pass for the wrong reason
+	code, _, body = h.ledger(ctx, tightenedTag, entry("RESERVE", "req-bound-ok", "UPPER_BOUND", dollars("1.00"), "evt-bound-ok", nil, holdAt))
+	ok("W1201-STRICT-CAP-ADMITS-PROVEN-BOUND", code == 201, code, body)
+
 	code, _, body = h.ledger(ctx, tightenedTag, entry("RESERVE", "req-over", "UPPER_BOUND", dollars("500.00"), "evt-over", nil, holdAt))
 	ok("W1201-STRICT-CAP-REFUSES-OVER-CAP", code == 422 && strings.Contains(body, "budget exhausted"), code, body)
 
