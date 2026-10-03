@@ -32,6 +32,9 @@ def sha(p):
 
 
 R = load(os.path.join(RD, "receipt.json"))
+
+# the count is derived from the numbered probe families in this file, because a hardcoded number here understated what the audit actually does once the census probe was added (round-2 reservation 3)
+PROBE_FAMILIES = len(re.findall(r"^# (\d+) - ", io.open(__file__, encoding="utf-8").read(), re.M))
 bad = []
 
 
@@ -229,7 +232,7 @@ chk(census_digests_verify(cen_rows), "the census on disk does not verify even th
 
 print(json.dumps({"receipt": os.path.relpath(os.path.join(RD, "receipt.json"), REPO).replace("\\", "/"),
                   "receipt_sha256": sha(os.path.join(RD, "receipt.json")),
-                  "probes": 8, "artifacts": len(R["artifacts"]), "commands": len(R["commands"]),
+                  "probes": PROBE_FAMILIES, "artifacts": len(R["artifacts"]), "commands": len(R["commands"]),
                   "assertions": cr["assertions"], "disclosed": len(cr["not_verified"]),
                   "matrix_buckets": m["buckets"], "census_runs": cs["runs"],
                   "inconsistencies": bad}, indent=1, ensure_ascii=False))

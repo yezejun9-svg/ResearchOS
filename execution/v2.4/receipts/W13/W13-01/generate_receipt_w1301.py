@@ -142,7 +142,13 @@ parity_source = PARITY
 if any(v.get("code_revision") != os.popen("git rev-parse HEAD").read().strip() for v in parity.values()):
     raise SystemExit("a parity row was not measured at this HEAD")
 CENSUS = "c23_forwarded_flake_census.json"
+rc_cen = subprocess.run([sys.executable, os.path.join(RD, "census_c23_w1301.py")], cwd=REPO,
+                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
+if rc_cen.returncode != 0:
+    raise SystemExit("the C23 census could not be regenerated, so no count from it may be quoted: %s"
+                     % ((rc_cen.stdout or "") + (rc_cen.stderr or ""))[-300:])
 census = load(os.path.join(RD, CENSUS))
+CENSUS_IDS = {x["invocation_id"] for x in census["rows"]}
 if census["runs"] != len(census["rows"]) or sum(census["cause_counts"].values()) != census["runs"]:
     raise SystemExit("the C23 census does not account for its own rows: %s vs %d" % (census["cause_counts"], census["runs"]))
 if any("unclassified" in r["cause"] for r in census["rows"]):
@@ -258,8 +264,14 @@ receipt = {
                             "conclusion": census["conclusion"]},
   "forwarding": "tests/ui/check/main.py forwards every selector except task W13 with check W13-01 to "
                 "ops/ci/ui.py --phase workflow, asserted as W1301-ROUTING-TRUTH-TABLE",
-  "disclosed_consequence": "the forwarded branch resolves python through PATH rather than the locked tool "
-                           "table, exactly as the v2.0 entry it replaces did"},
+  "disclosed_consequence": "both interpreters in this chain are the pinned ones, not PATH lookups: the "
+                           "dispatcher launches tests/ui/check/main.py from locked['tools'][executable_tool]['path'] "
+                           "after verifying the toolchain table, and the forwarder hands the case to "
+                           "[sys.executable, '-X', 'utf8', 'ops/ci/ui.py', ...], which is that same locked python "
+                           "build. The round-1 and round-2 reviews both blocked the earlier sentence claiming the "
+                           "forwarded branch resolves python through PATH; the claim was false in every clause and "
+                           "it was also copied into the registry note this card owns, so the note was corrected "
+                           "with it"},
  "defects_found_and_fixed_across_all_rounds": [
   {"defect": "a router convenience treated a selector-less invocation as a local run, so an unspecified "
              "dispatch returned PASS",
@@ -334,6 +346,14 @@ def guard(obj, where):
         raise SystemExit("registry revision in the receipt disagrees with the file (%s)" % where)
     if len(obj["known_limitations_and_obligations"]) < 6:
         raise SystemExit("the obligation list has been shortened below what this card knows (%s)" % where)
+    cited = set()
+    for c in obj["commands"]:
+        rr = c.get("result")
+        if isinstance(rr, dict) and rr.get("invocation_id"):
+            cited.add(rr["invocation_id"])
+    if cited and not cited <= CENSUS_IDS:
+        raise SystemExit("the receipt cites C23 runs that the census it quotes does not list: %s (%s)"
+                         % (sorted(x[:8] for x in cited - CENSUS_IDS), where))
     for c in obj["commands"]:
         r = c.get("result")
         if isinstance(r, dict):
