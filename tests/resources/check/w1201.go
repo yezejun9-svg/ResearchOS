@@ -233,6 +233,10 @@ func ledgerPhase(ctx context.Context, h *harness, g *runGraph) {
 	code, _, body = h.ledger(ctx, tightenedTag, entry("COMMIT", "req-held", "ACTUAL", dollars("1.50"), "evt-held-second", reserve["id"], holdAt))
 	ok("W1201-SETTLED-REQUEST-REFUSES-SECOND-COMMIT", code == 409 && strings.Contains(body, "already settled"), code, body)
 
+	code, _, body = h.ledger(ctx, tightenedTag, entry("COMMIT", "req-estimate", "ACTUAL", dollars("1.00"), "evt-foreign-settle", reserve["id"], holdAt))
+	ok("W1201-SETTLEMENT-REFUSES-FOREIGN-RESERVATION",
+		code == 422 && strings.Contains(body, "bind original reservation"), code, body)
+
 	usage, e = h.svc.BudgetUsage(ctx, h.token, h.project, g.runID)
 	if e != nil {
 		ok("W1201-COLUMNS-RECOMPUTED-AFTER-SETTLEMENT", false, e)
@@ -316,6 +320,8 @@ func restartPhase(ctx context.Context, h *harness, g *runGraph) {
 		code == 201 && domain.Str(shared, "no_progress_record_id") == record,
 		domain.Object{"record": record, "child": domain.Str(shared, "no_progress_record_id"), "detail": body})
 
+	takeoverPhase(ctx)
+
 	// the two disclosures this card cannot close, stated rather than dressed up as coverage
 	skip("W1201-ATTEMPT-BOUND-HOLDS-ACROSS-RETRIES",
 		"driving a task to its attempt limit needs the failed-run lifecycle (observation and report of a terminal run) that belongs to the accepted W05/W06 orchestration fixtures; the counter semantics themselves are asserted by the accepted C16-01 and C16-02 ids, which this program forwards to ops/ci/resources.py unchanged")
@@ -347,4 +353,46 @@ func countColumn(usage domain.Object, column, request string) int {
 		}
 	}
 	return n
+}
+
+// takeoverPhase folds the lease-takeover proofs into this card's report. The reservation path they
+// exercise is only reachable from a native dispatch, which the accepted native coordinator fixtures
+// own; driving AppContainer processes from here would add a machine-dependent flake to a check that
+// has to be reproducible, so the proofs run as the package's own test and their named assertion ids
+// are lifted into this report. A missing or malformed line is a failure, never a silent pass.
+func takeoverPhase(ctx context.Context) {
+	out, e := goTest("-v", "-run", "TestW12BudgetLeaseTakeover$", "-timeout=6m")
+	if e != nil {
+		ok("W1201-TAKEOVER-PROVES-RESTART-SEMANTICS", false, "go test failed: "+e.Error(), tail(out))
+		return
+	}
+	want := []string{"W12-TAKEOVER-HISTORY-RETAINED", "W12-TAKEOVER-SINGLE-OPEN-HOLD",
+		"W12-TAKEOVER-REPLAY-ADDS-NOTHING", "W12-TAKEOVER-PROJECTION-COUNTS-ONE"}
+	seen := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "W12_ASSERTION ") {
+			continue
+		}
+		row := domain.Object{}
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "W12_ASSERTION ")), &row) != nil {
+			continue
+		}
+		seen[domain.Str(row, "assertion_id")] = domain.Str(row, "status")
+	}
+	missing, failed := []string{}, []string{}
+	for _, id := range want {
+		status, found := seen[id]
+		if !found {
+			missing = append(missing, id)
+		} else if status != "PASS" {
+			failed = append(failed, id)
+		}
+	}
+	ok("W1201-TAKEOVER-PROVES-RESTART-SEMANTICS", len(missing) == 0 && len(failed) == 0,
+		domain.Object{"missing": missing, "failed": failed, "emitted": len(seen)})
+	for _, id := range want {
+		if seen[id] == "PASS" {
+			ids = append(ids, id)
+		}
+	}
 }

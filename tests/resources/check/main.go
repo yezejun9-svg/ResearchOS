@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -245,4 +246,28 @@ func sortedUnique(in []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// goTest runs the package's own test binary with the locked toolchain and returns its stdout.
+func goTest(args ...string) (string, error) {
+	goExe := os.Getenv("RESEARCHOS_GO")
+	if goExe == "" {
+		// the dispatcher pins the locked toolchain through tool_env; a developer running this by
+		// hand falls back to the same repository-local binary rather than whatever go is on PATH
+		goExe = filepath.Join(repoRoot(), ".local", "tools", "go1.27.1", "go", "bin", "go.exe")
+		if _, e := os.Stat(goExe); e != nil {
+			return "", fmt.Errorf("no locked toolchain: RESEARCHOS_GO is unset and %s is missing", goExe)
+		}
+	}
+	cmd := exec.Command(goExe, append([]string{"test", "./internal/domain", "-count=1"}, args...)...)
+	cmd.Dir = repoRoot()
+	out, e := cmd.CombinedOutput()
+	return string(out), e
+}
+
+func tail(s string) string {
+	if len(s) > 400 {
+		return s[len(s)-400:]
+	}
+	return s
 }
