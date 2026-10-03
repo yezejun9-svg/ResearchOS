@@ -52,7 +52,7 @@ def find_verdict():
     rejects, reject_reviewers, reject_at = [], set(), ""
     for f in files:
         v = load(os.path.join(RD, f))
-        if v.get("verdict") == "REJECT":
+        if str(v.get("verdict") or "").upper() in ("REJECT", "REJECTED", "REWORK", "REWORK_REQUIRED"):
             rejects.append(f)
             reject_at = max(reject_at, str(v.get("reviewed_at") or ""))
             reject_reviewers.add(v.get("reviewer_id") or v.get("verifier_id"))
