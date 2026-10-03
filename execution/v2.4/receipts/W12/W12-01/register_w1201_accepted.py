@@ -23,7 +23,13 @@ RD = os.path.join("execution", "v2.4", "receipts", "W12", "W12-01")
 STATE = os.path.join("execution", "v2.4", "step_state.json")
 CP = os.path.join("execution", "v2.4", "checkpoint.json")
 EXECUTOR = "qoder-desktop:/root/construction"
-ACCEPTS = ("ACCEPT", "ACCEPT_WITH_LIMITATIONS")
+# The plan of record has used ACCEPT, ACCEPT_WITH_LIMITATIONS and ACCEPT_WITH_RESERVATIONS (W04-02 was
+# registered with the last of these), so all three are registrable - but only when the verdict carries no
+# blocking_issues, which is checked below. ACCEPT_BLOCKED_RECORDING is deliberately absent: round 1 of
+# this card used exactly that word to say the increment reproduces while recording is refused, and a
+# script that matched on an "ACCEPT" prefix would have registered it.
+ACCEPTS = ("ACCEPT", "ACCEPT_WITH_LIMITATIONS", "ACCEPT_WITH_RESERVATIONS")
+NON_REGISTRABLE = ("ACCEPT_BLOCKED_RECORDING", "REJECT", "REJECT_FOR_REWORK")
 
 
 def sha(p):
@@ -55,6 +61,9 @@ def find_verdict():
     best, best_at = None, ""
     for f in files:
         v = load(os.path.join(RD, f))
+        if v.get("verdict") in NON_REGISTRABLE:
+            print("%s verdict=%r is not registrable by name" % (f, v.get("verdict")))
+            continue
         if v.get("verdict") not in ACCEPTS:
             continue
         at = str(v.get("reviewed_at") or "")
@@ -71,6 +80,8 @@ def find_verdict():
     if not vid or vid == EXECUTOR or vid in reject_reviewers:
         raise SystemExit("verdict identity is missing, is the executor, or already ruled on this tree: %r" % vid)
     if verdict.get("blocking_issues"):
+        # a verdict that lists items to fix before recording is not a recording authorisation,
+        # whatever its verdict word says
         raise SystemExit("%s says %s while still naming %d blocking issue(s)" %
                          (fname, verdict["verdict"], len(verdict["blocking_issues"])))
     if verdict.get("verdict") == "ACCEPT_WITH_LIMITATIONS" and not (
@@ -105,7 +116,9 @@ carried = ["%s (W12-01 %s): %s" % (i, verdict_file, t)
            for i, t in enumerate(verdict.get("limitations") or [], 1)]
 
 present = sorted(os.listdir(RD))
-needed = ("receipt.json", "binding_assertion_ids.json", "mutation_selfcheck_w1201_round2.json", verdict_file)
+needed = ("receipt.json", "binding_assertion_ids.json", "binding_assertion_ids_r2.json",
+          "mutation_selfcheck_w1201_round4.json", "mutation_equivalence_w1201.json",
+          "receipt_addendum_round2.json", "registry_parity_rev13.json", verdict_file)
 missing = [n for n in needed if n not in present]
 if missing:
     raise SystemExit("required evidence file is not in the receipt directory: %s" % missing)
