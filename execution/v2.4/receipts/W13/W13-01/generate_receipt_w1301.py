@@ -103,7 +103,9 @@ if "--capture" in sys.argv:
     sys.exit(0)
 
 head = git("rev-parse", "HEAD")
-dirty = [l for l in git("status", "--porcelain").splitlines()
+porcelain = subprocess.run(["git", "-C", REPO, "status", "--porcelain"], capture_output=True,
+                            text=True, encoding="utf-8").stdout
+dirty = [l for l in porcelain.split(chr(10))
          if l.strip() and not l.startswith("?? execution/") and not l.startswith("?? .local/")]
 
 check_out = subprocess.run([PY, CHECK, "--check-id", "W13-01"], cwd=REPO, env=env, capture_output=True,
@@ -182,7 +184,8 @@ artifacts = [CHECK, os.path.join("apps", "desktop", "main", "lib", "host.js"),
              os.path.join("apps", "desktop", "preload", "preload.js"),
              os.path.join("apps", "desktop", "main", "workbench.html"),
              "execution/v2.4/commands.json", os.path.join(RD, CENSUS).replace("\\", "/"),
-             os.path.join(RD, MATRIX), os.path.join(RD, "binding_and_parity_rev15.json"),
+             os.path.join(RD, MATRIX), os.path.join(RD, PARITY),
+             os.path.join(RD, "binding_and_parity_rev15.json"),
              os.path.join(RD, "before_baseline_test.ui.routes.json")]
 missing = [a for a in artifacts if not os.path.exists(a)]
 if missing:
@@ -259,8 +262,9 @@ receipt = {
   {"defect": "a router convenience treated a selector-less invocation as a local run, so an unspecified "
              "dispatch returned PASS",
    "fix": "local mode requires an explicit --check-id W13-01 or the dispatcher naming task W13 with that check; "
-          "a selector-less run returns COMMAND_FAILED with zero assertions under its own id "
-          "W1301-SELECTORS-REQUIRED"},
+          "a selector-less run returns COMMAND_FAILED with zero assertions "
+          "with no assertion id emitted; the harness source carries a failure row for that refusal, but no "
+          "dispatcher run in this round emitted it, so it is not quoted as an id here"},
   {"defect": "a refusal branch was written after the branch that forwards, so it could never execute",
    "fix": "the refusal now precedes forwarding, and the truth-table row enumerates the refuse branch"},
   {"defect": "a mutation case was credited as caught while the mutant had actually broken the module's syntax, "

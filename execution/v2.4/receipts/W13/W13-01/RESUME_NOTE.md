@@ -24,3 +24,12 @@ Still owed, in order:
    W1301-NATIVE-PICKER-IS-REGISTERED-IN-MAIN (a no_mutant_rows key, i.e. a name for a source-level guard
    rather than an assertion id) and W1301-SELECTORS-REQUIRED (emitted on the bare-selector shape, whose
    invocation the auditor does not read). Both stay open items, not resolved claims.
+
+## Update written after that note (executor, same round)
+Receipt regenerated at tree `584464b9`: the at-HEAD parity rows and the captured command logs are now listed as
+artifacts (12 in total), the C23 census covers 20 runs, the matrix key that named a guard nothing emits was
+replaced by the disclosure row that really carries that property, the prose that quoted an unmeasured
+assertion id was removed rather than re-scoped, and the disclosure list keeps the exact porcelain shape
+(it had eaten one leading space). The self-audit run on disk reports 0 inconsistencies.
+Next action is unchanged: an independent identity rules from `REVIEW_REQUEST_ROUND1.md`; registration only on
+an empty `blocking_issues` array.

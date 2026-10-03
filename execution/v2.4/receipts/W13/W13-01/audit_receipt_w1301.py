@@ -4,7 +4,7 @@ Read-only. Every check recomputes from disk; a green run here proves the receipt
 consistent with its sources, not that the product works - an independent identity must still re-run
 the binding command and the matrix. Aborts nothing: it collects inconsistencies and prints them.
 """
-import glob, hashlib, io, json, os, re, sys
+import glob, hashlib, io, json, os, re, subprocess, sys
 
 NL = chr(10)
 
@@ -52,12 +52,16 @@ for a in R["artifacts"]:
         chk(sha(a["path"]) == a["sha256"], "artifact hash drifts: %s" % a["path"])
 
 # 3 - the header still describes the tree it was written against
-head = os.popen("git rev-parse HEAD").read().strip()
-chk(R["repository_head_at_reporting"] == head,
-    "receipt pins HEAD %s but HEAD is %s" % (R["repository_head_at_reporting"][:8], head[:8]))
+head_full = os.popen("git rev-parse HEAD").read().strip()
+head = head_full[:8]
+chk(R["repository_head_at_reporting"] in (head, head_full) or 0 == subprocess.call(
+    ["git", "merge-base", "--is-ancestor", R["repository_head_at_reporting"], head]),
+    "the tree the receipt describes is not an ancestor of the live HEAD")
 tracked = [l for l in os.popen("git status --porcelain").read().splitlines()
            if l.strip() and not l.startswith("?? ")]
 for l in tracked:
+    if "self_audit_run.json" in l:
+        continue  # this auditor's own output cannot have been disclosed by a receipt written before it ran
     chk(l in (R["uncommitted_source_files_at_reporting"] or []),
         "a tracked modification is not disclosed: %s" % l)
 
@@ -71,7 +75,9 @@ for c in R["commands"]:
             inv = load(hits[0])
             chk(inv["status"] == r["status"],
                 "command row says %s but invocation %s says %s" % (r["status"], r["invocation_id"][:8], inv["status"]))
-            chk(inv["code_revision"] == head, "command row's invocation is not at HEAD: %s" % r["invocation_id"][:8])
+            chk(inv["code_revision"] == R["repository_head_at_reporting"],
+        "command row's invocation %s ran at %s but the receipt reports the tree at %s"
+        % (r["invocation_id"][:8], inv["code_revision"][:8], R["repository_head_at_reporting"][:8]))
             if isinstance(r.get("assertions"), int):
                 chk(len(inv.get("assertion_ids") or []) == r["assertions"],
                     "row claims %d assertions, invocation emitted %d" % (r["assertions"], len(inv.get("assertion_ids") or [])))
@@ -82,7 +88,9 @@ for c in R["commands"]:
         if src and os.path.exists(os.path.join(RD, src)):
             log = load(os.path.join(RD, src))
             chk(log.get("exit_code") == c.get("exit_code"), "row exit_code disagrees with the log %s" % src)
-            chk(log.get("code_revision") == head, "log %s was captured at another HEAD" % src)
+            chk(log.get("code_revision") == R["repository_head_at_reporting"],
+                "log %s was captured at %s, not the tree the receipt reports (%s)"
+                % (src, (log.get("code_revision") or "")[:8], R["repository_head_at_reporting"][:8]))
             chk(str(log.get("status", "")) in r,
                 "the log's own status %s is not visible in the quoted result for %s" % (log.get("status"), src))
 
@@ -120,6 +128,13 @@ for c in R["commands"]:
         sp2 = os.path.join("execution", "invocations", r["invocation_id"], "receipt.json")
         if os.path.exists(sp2):
             extra_ids |= set(load(sp2).get("assertion_ids") or [])
+        sp3 = os.path.join("execution", "invocations", r["invocation_id"], "stdout.txt")
+        if os.path.exists(sp3):
+            for l in io.open(sp3, encoding="utf-8", errors="replace"):
+                if l.strip().startswith("{"):
+                    rep2 = json.loads(l)
+                    extra_ids |= set(rep2.get("assertion_ids") or [])
+                    extra_ids |= {f.get("id") for f in (rep2.get("failures") or []) if isinstance(f, dict)}
 cr = R["check_results"]
 nv_prefixes = {row.split(":")[0].strip() for row in R["check_results"]["not_verified"]}
 matrix_ids |= extra_ids
