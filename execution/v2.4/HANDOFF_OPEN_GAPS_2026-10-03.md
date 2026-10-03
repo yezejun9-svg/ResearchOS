@@ -80,3 +80,27 @@ accepts C01/A02/A03, with final ownership belonging to W11 and W16.
 
 `.local` is not tracked by git; if a later window needs any of these as evidence, move the file into the
 owning card's receipt directory and re-run it from there.
+
+## 6. Follow-up on item 1: the eight unselected cases are reachable, not orphaned
+
+Checked each case's owner parent against `contracts/tasks.json` and both registries:
+
+| case | owner | owner status | its parent's verification keys (registry side) |
+| --- | --- | --- | --- |
+| A04 | W05 | NOT_STARTED | test.runtime (v2.0) |
+| A10, A11 | W17 | NOT_STARTED | test.context (v2.0+v2.4), test.security (v2.0+v2.4), test.evaluation.security (v2.0), test.ui (v2.0) |
+| A13 | W14 | NOT_STARTED | test.cycle.live (v2.0) |
+| A14 | W19 | NOT_STARTED | test.overnight (v2.0) |
+| A15 | W20 | NOT_STARTED | acceptance.audit (v2.0), release.reproduce (v2.0) |
+| A16 | W16 | NOT_STARTED | acceptance.audit, test.evolution, test.jev.fixture, test.orchestration (all v2.0) |
+| C26 | W13 | NOT_STARTED | test.domain (v2.0+v2.4), test.contracts.security, test.ui.* (v2.0) |
+
+So the earlier phrasing "cannot be approached by finishing cards" was too strong and is corrected here:
+every one of these cases does have a registered command key owned by its parent, and all eight parents
+are NOT_STARTED. What is missing is that no card has added the `case_id` selector for them yet - exactly
+the step W12-01 performed for `test.resources`. Each such card inherits the same duty this document's
+item 1 implies: take the before-baseline for every selector on the key it binds, because adding a v2.4
+key flips resolution for all of them.
+
+Nothing here is a structural plan hole; the CLI/Desktop items (2 and 3) still are, because they need a
+write scope over `apps/**` that no card grants.
