@@ -10,7 +10,10 @@ import (
 	"os/exec"
 )
 
-var servedChecks = map[string]bool{"W05-01": true}
+// servedChecks names the cards this program answers itself. W05-02 was added by W05-02; anything not
+// listed here is forwarded to the accepted legacy harness, so a selector this program cannot serve is
+// never answered with another card's assertions.
+var servedChecks = map[string]bool{"W05-01": true, "W05-02": true}
 
 func routesToLegacy(check, caseID, taskID string) bool {
 	if servedChecks[check] {

@@ -191,6 +191,12 @@ func main() {
 		}
 	}()
 
+	// Each served selector runs only its own suite, so no card can inherit another card's PASS.
+	if os.Getenv("RESEARCHOS_CHECK_ID") == "W05-02" {
+		cliPhaseW0502(ctx)
+		return
+	}
+
 	routingTruthTableOK()
 	dir := filepath.Join(repoRoot(), ".local", "w0501-run")
 	_ = os.RemoveAll(dir)
