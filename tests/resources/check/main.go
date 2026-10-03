@@ -220,6 +220,9 @@ func main() {
 		skip("W1201-LEDGER-COLUMNS-SEPARATED", "no run could be admitted: "+e.Error())
 		return
 	}
+	// the start-time refusal probe runs before the ledger probes: it needs the Goal policy still at its
+	// default so an unresolved liability can enter, and it restores that policy on the way out
+	startRefusalPhase(ctx, h, graph)
 	ledgerPhase(ctx, h, graph)
 	restartPhase(ctx, h, graph)
 }

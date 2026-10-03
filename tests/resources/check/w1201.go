@@ -18,9 +18,9 @@ import (
 )
 
 type runGraph struct {
-	goalID, taskID, runID, policyID string
-	policyTag                       string
-	origin, candidate               string
+	goalID, taskID, runID, policyID, runtimeID string
+	policyTag                                  string
+	origin, candidate                          string
 }
 
 func num(o domain.Object, field string) int64 {
@@ -103,6 +103,7 @@ func orchestrationGraph(ctx context.Context, h *harness) (*runGraph, error) {
 	if e := h.svc.RegisterOrchestrationFixture(ctx, h.project, domain.Str(runtime, "id")); e != nil {
 		return nil, fmt.Errorf("fixture registration %w", e)
 	}
+	runtimeID := domain.Str(runtime, "id")
 
 	_, goalNow, _ := h.api(ctx, "GET", h.base+"/goals/"+domain.Str(goal, "id"), "", "", nil)
 	taskBody := domain.Object{"goal_id": domain.Str(goal, "id"), "title": "w1201 spend task",
@@ -158,13 +159,19 @@ func orchestrationGraph(ctx context.Context, h *harness) (*runGraph, error) {
 	}
 	return &runGraph{goalID: domain.Str(goal, "id"), taskID: domain.Str(task, "id"),
 		runID: domain.Str(run, "id"), policyID: domain.Str(policy, "id"),
-		policyTag: tagOf(policy), origin: "p-w1201", candidate: "c-w1201"}, nil
+		runtimeID: runtimeID, policyTag: tagOf(policy), origin: "p-w1201", candidate: "c-w1201"}, nil
 }
 
 // ledgerPhase covers steps 2 and 3: reservation, unknown and settled costs stay in separate columns,
 // a STRICT cap refuses a cost that cannot be bounded, and a late or repeated provider event is
 // reconciled against the original run and idempotency key instead of being charged twice.
+
 func ledgerPhase(ctx context.Context, h *harness, g *runGraph) {
+	// the policy tag is read fresh here: a phase that ran before this one may have written to the
+	// same budget aggregate, and a stale If-Match would fail every probe below for the wrong reason
+	if _, current, _ := h.api(ctx, "GET", h.base+"/goals/"+g.goalID+"/budget-policy", "", "", nil); current["id"] != nil {
+		g.policyTag = tagOf(current)
+	}
 	// one clock value is reused for the replay probe, because the ledger's idempotency compares the
 	// whole request payload and a fresh occurred_at is a different request, not a repeated one
 	holdAt := domain.Now()
@@ -351,11 +358,11 @@ func restartPhase(ctx context.Context, h *harness, g *runGraph) {
 
 	takeoverPhase(ctx)
 
-	// the two disclosures this card cannot close, stated rather than dressed up as coverage
+	// The only disclosure left in this program. The round-1 review refuted the second one that used to
+	// sit here ("a start-time refusal cannot be reached through any public path"): a claim IS a public
+	// start, so that property is now asserted by name in startRefusalPhase instead of excused.
 	skip("W1201-ATTEMPT-BOUND-HOLDS-ACROSS-RETRIES",
-		"driving a task to its attempt limit needs the failed-run lifecycle (observation and report of a terminal run) that belongs to the accepted W05/W06 orchestration fixtures; the counter semantics themselves are asserted by the accepted C16-01 and C16-02 ids, which this program forwards to ops/ci/resources.py unchanged")
-	skip("W1201-START-REFUSAL-NEEDS-NO-UNREACHABLE-BRANCH",
-		"the only runtime that can reach a start without a provable bound is refused earlier: claimTaskMode (internal/domain/orchestration.go:347) rejects any claim whose runtime is not registered FIXTURE without a qualification, and reserveQualificationDispatch requires a positive max_cost, so a start-time refusal added to reserveFixtureDispatch would be unreachable dead code. Measured by reverting it in the W12-01 remediation (commits 5ae713ea and 15c429d6).")
+		"driving a task to its attempt limit needs a run to reach terminal state, and run terminality is written only by ObserveRuntime (the failed-run lifecycle owned by the accepted W05/W06 fixtures); the counter semantics themselves are asserted by the accepted C16-01, C16-02 and C16-03 ids, which this program forwards to ops/ci/resources.py unchanged. A second start-time refusal already ships: reserveQualificationDispatch (internal/domain/runtime_qualification.go:189-192, 'LIVE qualification cost bound missing'), so nobody should re-implement one in reserveFixtureDispatch.")
 }
 
 // contractDigest mirrors the rule the service enforces at activation (orchestration.go): the hash
