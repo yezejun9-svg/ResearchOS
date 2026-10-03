@@ -110,3 +110,32 @@ are untouched.
 
 Updated 2026-10-03T16:55:42.773864+00:00 at HEAD 67935d3e.
 
+## Passes 6 and 7 - clean kills, and a row that does not test what its name says
+
+`F1-F5` turn the five provider failure branches into `ok:true`. All five are caught with the driver
+alive. They credit no new row, because those two rows were already counted as measured by the round-3
+reviewer - the difference is that the measurements are now reproducible from this repository instead of
+from a temp directory.
+
+`F6` exposed a defect in **this addendum's own bucketing**, now fixed and recorded: the earlier rule
+looked only at rows no shipped case had ever killed, so a mutant that failed only already-covered rows
+printed as "survived". Re-measured, F6 kills `W1301-DEGRADED-PROBE-IS-NEVER-SUCCESS` and
+`W1301-DEGRADED-PROVIDER-VIA-CHANNEL-IS-FAILURE`. Buckets are now `caught-new` /
+`caught-already-covered` / `crashed` / `survived`, decided on the full lost set.
+
+`G2` makes `emptyState()` report `FIRST_RUN` even when projects exist and cleanly kills
+`W1301-EXISTING-PROJECT-SKIPS-EMPTY-STATE` - a new row out of OWED.
+
+`G1` is the sharpest result of the pass: setting `requires_terminal: true` in `host.js` failed
+`W1301-FIRST-RUN-NEEDS-NO-TERMINAL`, while
+`W1301-WORKBENCH-TELLS-NOBODY-TO-USE-A-TERMINAL` stayed PASS. A row named for the terminal promise is
+not sensitive to the terminal flag, so it either reads markup only or duplicates the other row - and
+that is now written as a demonstrated mismatch rather than as a missing mutant.
+
+Counts after pass 7: **11** accounted, **8** OWED, 0 unclassified. The remaining important owed item
+is `W1301-PROVIDER-OK-IS-SUCCESS`: the provider catch-all branch (A6) still answers `ok:true` for an
+unlisted status without any row noticing, which is the card's own second negative.
+
+Regenerated 2026-10-03T16:58:17.443449+00:00 at HEAD 36620507; `host.js` restored byte-identically after every run and the pinned receipt
+and its 14 artifacts are untouched.
+
