@@ -104,3 +104,24 @@ key flips resolution for all of them.
 
 Nothing here is a structural plan hole; the CLI/Desktop items (2 and 3) still are, because they need a
 write scope over `apps/**` that no card grants.
+
+## 7. Correction to item 2, found while reading the next card's scope
+
+I wrote that "no card in `tasks/steps/*.md` grants write scope over `apps/**`". That claim was based on
+grepping card files for the literal strings `apps/cli` and `apps/control`, and it is wrong. Card scopes
+are written in W02's **alias** vocabulary, and `execution/v2.4/path_ownership.json` resolves them:
+
+- `CLI` -> `apps/cli (W02-02)`, owner `qoder-desktop:/root/cli_owner`
+- `DESKTOP` -> `apps/desktop (W02-03)`, owner `qoder-desktop:/root/desktop_owner`
+- `CORE` -> `internal/domain, internal/store, internal/api, apps/control`, owner `qoder-desktop:/root/orchestration_owner`
+- `ADAPTERS` -> `adapters`, owner `qoder-desktop:/root/orchestration_owner`
+
+W05-01, the card `task_packet next` now names, has `CLI/**` and `ADAPTERS/**` in its write scope, so the
+CLI directory is writable today and `apps/control` is reachable through CORE.
+
+What survives of the finding, stated precisely: the three commands `cli.entry_run`,
+`desktop.shell_launch` and `desktop.installer_build` are registered with `state: UNBOUND` and no card or
+check binds them; `client_mapping.json` has 23 methods, none bound; and the chooser is still not injected,
+so a directory pick is refused. The gap is **unbound commands and missing assertions**, not a missing write
+scope. Method lesson kept: a scope claim must be checked through the registered alias map, never by
+grepping a card for a literal path.
