@@ -187,6 +187,44 @@ for c in R["input"]["write_scope"]:
     ok = [x for x in candidates if x and os.path.isdir(x)]
     chk(bool(ok), "write_scope entry %s resolves to %s and none of it is a directory" % (c, candidates))
 
+# 9 - the census digests must verify against the bytes on disk, not against a re-encoded copy of them.
+# This probe exists because the round-1 review found the auditor skipped it while claiming the census.
+cen_rows = load(os.path.join(RD, "c23_forwarded_flake_census.json"))["rows"]
+non_empty_stdout = 0
+for row in cen_rows:
+    base = os.path.dirname(row["receipt_path"])
+    for kind, field in (("stdout", "stdout_sha256"), ("stderr", "stderr_sha256")):
+        p = os.path.join(base, kind + ".txt")
+        b = open(p, "rb").read() if os.path.exists(p) else b""
+        chk(hashlib.sha256(b).hexdigest() == row[field],
+            "census row %s: %s digest does not verify against the raw bytes" % (row["invocation_id"][:8], kind))
+        if kind == "stdout" and len(b) > 0:
+            non_empty_stdout += 1
+            if "stdout_bytes" in row:
+                chk(row["stdout_bytes"] == len(b), "census row %s reports %s stdout bytes, the file holds %d"
+                    % (row["invocation_id"][:8], row.get("stdout_bytes"), len(b)))
+chk(non_empty_stdout > 0, "every census stdout is empty, so the digest check above could not detect an "
+                          "encoding mistake - the original bug hid behind empty files")
+
+
+def census_digests_verify(rows):
+    """True only when every named stream hashes the same as the recorded digest."""
+    for row in rows:
+        base = os.path.dirname(row["receipt_path"])
+        for kind, field in (("stdout", "stdout_sha256"), ("stderr", "stderr_sha256")):
+            p = os.path.join(base, kind + ".txt")
+            b = open(p, "rb").read() if os.path.exists(p) else b""
+            if hashlib.sha256(b).hexdigest() != row[field]:
+                return False
+    return True
+
+
+tampered = [dict(r) for r in cen_rows]
+tampered[0]["stdout_sha256"] = hashlib.sha256(b"not the recorded bytes").hexdigest()
+chk(not census_digests_verify(tampered),
+    "positive control failed: the census probe accepts a falsified digest, so it proves nothing")
+chk(census_digests_verify(cen_rows), "the census on disk does not verify even though the row loop above said it did")
+
 print(json.dumps({"receipt": os.path.relpath(os.path.join(RD, "receipt.json"), REPO).replace("\\", "/"),
                   "receipt_sha256": sha(os.path.join(RD, "receipt.json")),
                   "probes": 8, "artifacts": len(R["artifacts"]), "commands": len(R["commands"]),
