@@ -140,7 +140,13 @@ func startRefusalPhase(ctx context.Context, h *harness, g *runGraph) {
 		domain.Object{"claim_code": code, "run_rows": runs, "body": rbody})
 	note("startref-control", code, rbody)
 
-	// 5. leave the Goal policy and ledger as ledgerPhase expects to find them
+	// 5. isolate the two halves of the unresolved-cost rule. The round-1 reviewer mutated
+	// `unknown && (STRICT || BLOCK)` into `&&` and into each half alone and nothing in this suite died,
+	// because every probe here set both halves at once. These probes set one half at a time, so a mutant
+	// that drops either half, or that demands both, now has a named assertion it fails.
+	disjunctionIsolationPhase(ctx, h, g, at)
+
+	// 6. leave the Goal policy and ledger as ledgerPhase expects to find them
 	restore := domain.Object{"mode": policyBefore["mode"], "cap": policyBefore["cap"],
 		"enforcement": policyBefore["enforcement"], "period": policyBefore["period"],
 		"timezone": policyBefore["timezone"], "effective_from": policyBefore["effective_from"],
@@ -159,4 +165,89 @@ func startRefusalPhase(ctx context.Context, h *harness, g *runGraph) {
 func etagOfLatestPolicy(ctx context.Context, h *harness, g *runGraph) string {
 	_, p, _ := h.api(ctx, "GET", h.base+"/goals/"+g.goalID+"/budget-policy", "", "", nil)
 	return tagOf(p)
+}
+
+// disjunctionIsolationPhase plants one unresolved liability and then walks the Goal policy through
+// every combination of the two halves that may block admission, so each half is seen refusing on its
+// own and the pair is seen admitting when neither is set.
+func disjunctionIsolationPhase(ctx context.Context, h *harness, g *runGraph, at string) {
+	setShape := func(enforcement, unknownAction string) (string, int, string) {
+		tag := etagOfLatestPolicy(ctx, h, g)
+		code, out, body := h.api(ctx, "PUT", h.base+"/goals/"+g.goalID+"/budget-policy", domain.ID(), tag,
+			domain.Object{"mode": "CAPPED", "cap": dollars("100.00"), "enforcement": enforcement,
+				"period": "LIFETIME", "timezone": "Asia/Shanghai", "effective_from": at,
+				"unknown_cost_action": unknownAction})
+		return tagOf(out), code, body
+	}
+	reserve := func(tag, request, amount string) (int, string) {
+		code, _, body := h.ledger(ctx, tag, domain.Object{"policy_id": g.policyID, "run_id": g.runID,
+			"operation": "RESERVE", "money": dollars(amount), "provider_request_id": request,
+			"provider_event_id": request + "-evt", "reservation_id": nil, "cost_basis": "UPPER_BOUND",
+			"occurred_at": at})
+		note(request, code, body)
+		return code, body
+	}
+	const unresolved = "unresolved cost prevents bounded admission"
+
+	// neither half set: ESTIMATED with ALLOW_AND_RECORD leaves the liability open and admits anyway, so a
+	// refusal below can only come from a rule and not from a cap that refuses everything
+	tag, code, body := setShape("ESTIMATED", "ALLOW_AND_RECORD")
+	if code != 200 {
+		ok("W1201-START-REFUSAL-NEITHER-HALF-ADMITTS", false, domain.Object{"shape": code, "body": body})
+		return
+	}
+	code, unknown, body := h.ledger(ctx, tag, domain.Object{"policy_id": g.policyID, "run_id": g.runID,
+		"operation": "UNKNOWN", "money": nil, "provider_request_id": "startref-iso",
+		"provider_event_id": "startref-iso-evt", "reservation_id": nil, "cost_basis": "UNKNOWN",
+		"occurred_at": at})
+	if code != 201 {
+		ok("W1201-START-REFUSAL-NEITHER-HALF-ADMITTS", false, domain.Object{"plant": code, "body": body})
+		return
+	}
+	code, rbody := reserve(tag, "startref-iso-neither", "0.10")
+	ok("W1201-START-REFUSAL-NEITHER-HALF-ADMITTS", code == 201, domain.Object{"code": code, "body": rbody})
+
+	// the BLOCK half on its own: enforcement is ESTIMATED, so nothing but unknown_cost_action can refuse
+	tag, code, body = setShape("ESTIMATED", "BLOCK")
+	if code != 200 {
+		ok("W1201-START-REFUSAL-BLOCK-HALF-REFUSES", false, domain.Object{"shape": code, "body": body})
+		return
+	}
+	code, rbody = reserve(tag, "startref-iso-block", "0.12")
+	ok("W1201-START-REFUSAL-BLOCK-HALF-REFUSES", code == 422 && strings.Contains(rbody, unresolved),
+		domain.Object{"code": code, "body": rbody})
+	note("startref-iso-block", code, rbody)
+
+	// The other half cannot be isolated through the public protocol, and this says so as a measurement:
+	// UpdateBudgetRequest requires enforcement in {STRICT, ESTIMATED} once a policy is CAPPED and forces
+	// unknown_cost_action to BLOCK whenever enforcement is STRICT, so no legal policy ever carries STRICT
+	// without BLOCK. A mutant that turns the disjunction into a conjunction therefore has no legal shape
+	// left for a STRICT-only probe to distinguish, which is why the ESTIMATED/BLOCK probe above is the
+	// isolating one and this probe asserts the schema refusal instead.
+	tag, code, body = setShape("STRICT", "ALLOW_AND_RECORD")
+	ok("W1201-START-REFUSAL-STRICT-HALF-NOT-ISOLABLE",
+		code == 400 && strings.Contains(body, "violates UpdateBudgetRequest schema"),
+		domain.Object{"code": code, "body": body})
+	if code != 400 {
+		return
+	}
+
+	// settle the liability and the same BLOCK shape admits: the refusal above was the unresolved cost
+	tag, code, body = setShape("ESTIMATED", "BLOCK")
+	if code != 200 {
+		ok("W1201-START-REFUSAL-ISOLATION-SETTLED-ADMITTS", false, domain.Object{"shape": code, "body": body})
+		return
+	}
+	code, _, body = h.ledger(ctx, tag, domain.Object{"policy_id": g.policyID, "run_id": g.runID,
+		"operation": "RECONCILE", "money": dollars("0.20"), "provider_request_id": "startref-iso",
+		"provider_event_id": "startref-iso-settled", "reservation_id": unknown["id"],
+		"cost_basis": "ACTUAL", "occurred_at": at})
+	if code != 201 {
+		ok("W1201-START-REFUSAL-ISOLATION-SETTLED-ADMITTS", false, domain.Object{"reconcile": code, "body": body})
+		return
+	}
+	code, rbody = reserve(tag, "startref-iso-after-settle", "0.13")
+	ok("W1201-START-REFUSAL-ISOLATION-SETTLED-ADMITTS", code == 201,
+		domain.Object{"code": code, "body": rbody})
+	note("startref-iso-after-settle", code, rbody)
 }
