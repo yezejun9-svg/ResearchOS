@@ -1,17 +1,29 @@
 # W05-01 resume note
 
-Round 4 submitted, written at 2026-10-03T08:53:58.285878+00:00 (HEAD 28db611a, checkpoint revision 52).
+Round 5 entry point, written at 2026-10-03T09:29:38.596648+00:00 (HEAD 6719f1c3, checkpoint revision 53).
 
-- Round 3 verdict REWORK_REQUIRED (4 blocking) committed at 22dc53c4; all four are remediated at code HEAD c6fa8b18 and the round-4 receipt is at that HEAD: 31 assertions, 12 disclosed NOT_RUN rows, 19 matrix cases each killed by a named assertion, CLEAN self-audit. Evidence commits e790f321 and 28db611a.
-- The register script was repaired before it was needed and its refusal path re-measured (exit 1, no writes).
-- w0501_verifier_r4 is in flight and may write only independent_review_round4.json.
+Round 4 verdict: REWORK_REQUIRED by qoder-desktop:/root/w0501_verifier_r4 - 4 blocking issues, 16 reservations, 7 limitations. Committed verbatim; the executor has not edited it. The round-4 receipt (code HEAD c6fa8b18, 31 assertions, 19 matrix cases all caught, CLEAN self-audit) is superseded by a round-5 chain, not rewritten.
 
-Next, in order:
+- W0501-R4-B-01 (medium): round-3 B-01 is only half closed: the false rpc_binding count survives verbatim in the checkpoint obligation that round 3 named by id, and a second inherited obligation now states two facts the round-4 tree refutes
+    where: execution/v2.4/checkpoint.json revision 52, open_obligations_before_next_card (115 entries), ids W05-01-provider-binding-is-upstream and W05-01-explicit-protocol-error, measured against execution/v2.4/client_mapping.json method_map and tests/runtime/check/w050
+    owed: three string edits in the checkpoint plus one in the check source. (i) W05-01-provider-binding-is-upstream: replace 'all 23 mapped methods carry an empty rpc_binding' with the measured clause the receipt already carries ('20 of 23 carry an empty rpc_binding; provider.models is annotated n/a (Go-owned catalog); only session.send and session.control name anything'), and land it as a record_correction as the author did for the r2
+- W0501-R4-B-02 (low-medium): three clauses in the rows rewritten this round describe the tree in a way the tree refutes, and the new -list capture proves less than the row claims it proves
+    where: tests/runtime/check/w0501.go:484 and :488 and :496 (copied verbatim into receipt.json check_results.not_verified and review_request_round4.json not_verified_rows), measured against adapters/runtime/runtime_windows_test.go:48, .local/r4_receipt_round3.json comm
+    owed: say 'the old filter ran TestW05Protocol in that file but its anchors excluded TestW05ProtocolTransientReconnect'; say 'cli.entry_run is the only cli.* key, it is state UNBOUND with wildcard selectors so it matches this card, its owner_card names the already-accepted W03-01, and dispatching it returns NOT_IMPLEMENTED with 0 assertions (measured at invocation af4e1f5f)'; either add the -list run as a receipt command row derived 
+- W0501-R4-B-03 (medium): W0501-RUN-EVENT-AND-COST-CORRELATION blocks a property whose decisive half sits inside this card's write scope and is assertable today, which is also the answer the brief's open_question asks for
+    where: tests/runtime/check/w0501.go:489-490 (row), :76-80 (adapter run under RunID run-copy-1 / task-copy-1 / Epoch 1), :359-372 (the claimed domain Run carrying id, lease_epoch and lease_token), :403-431 (BudgetUsage already keyed to that Run id), against card steps
+    owed: start the adapter from the claimed domain Run - rt.Start(dir, rt.Spec{RunID: domain.Str(run,'id'), TaskID: domain.Str(taskA,'id'), Epoch: lease_epoch-as-int, ...}) - and assert one new row that the journal's Spec RunID, TaskID and Epoch equal the claimed Run's id, task and lease_epoch, and that the reservation W0501-FIXTURE-DISPATCH-CHARGE-IS-PROVEN-ZERO already counts is keyed to that same Run id; keep the event-ledger half d
+- W0501-R4-B-04 (low-medium): the new worker-identity row defers to the provider binding while the v2.4 registry names W05-01 as the owner of two UNBOUND worker commands that appear nowhere in the receipt, and the measured reason is one directory away
+    where: tests/runtime/check/w0501.go:493-494 (W0501-WORKER-IDENTITY-MU-PI-SDK-LOOP) and :487-488, against execution/v2.4/commands.json revision 14 keys fork.worker_launch_rpc and fork.worker_stop, third_party/mu/packages/coding-agent, card step 2
+    owed: one sentence and one measurement in the row: name fork.worker_launch_rpc and fork.worker_stop as UNBOUND entries whose owner_card this card's name, state that third_party/mu/packages/coding-agent/dist/rpc-entry.js is absent and that fork.build_worker and fork.install_deps - the commands that would create it - are UNBOUND under W02-99/W01-G03 rerun, and say which half W05-01 owes (the adapter-side stop/launch contract) and whic
 
-1. Wait for independent_review_round4.json to appear and stay byte-stable for about ninety seconds. A missing artifact is not a dead reviewer; an appeared one may still be unfinished.
-2. Commit the verdict verbatim, with no executor edits.
-3. Register only on an empty blocking_issues array: python execution/v2.4/receipts/W05/W05-01/register_w0501_accepted.py. It now carries reservations as well as limitations into open_obligations and derives the accepted-card count from step_state.
-4. If it returns REWORK_REQUIRED again, the pattern from three rounds applies: the finding is almost always a claim outrunning a measurement, so re-measure the whole tree rather than only the check program, and correct propagated text through integrity events rather than silent edits.
-5. Still owed regardless of the verdict: the model identity comparison the decoder never populates, the dispatch-to-adapter wiring behind the Run correlation, and the 42-case and parent-task gates.
+Order of work, learned from four rounds that each found the same class of mistake:
+
+1. Build the Run correlation rather than disclosing it: the decisive half is inside this cards write scope (the service phase already has a Run id and lease epoch and rt.Start takes both), so the card owes an assertion that a worker started under that Run id settles and that the ledger holds exactly that Runs reservation and no other. Until that exists, the property cannot be reported as blocked on a missing resource.
+2. Own the two UNBOUND worker commands execution/v2.4/commands.json assigns to W05-01, or record why the registry says what it says; the receipt currently does not mention them at all.
+3. Sweep for inherited text: a refuted count still survives verbatim in an obligation raised by id in round 3, and three clauses written this round are refuted by the tree. Re-measure each quoted number at the moment of writing, and correct propagated text with a record_correction event rather than a silent edit.
+4. Only claim a capture proves what it proves: the go test -list row names the packages contents, not the selection a -run filter actually matched, so state which log evidences which claim.
+5. Re-run the chain whole (python execution/v2.4/receipts/W05/W05-01/run_evidence_chain_w0501.py), self-audit, commit, then ask a fifth identity with python execution/v2.4/receipts/W05/W05-01/make_review_request_w0501.py round5.
+6. Register only on an empty blocking_issues array with the repaired registrar; its refusal path was re-measured at round 4 (exit 1, zero writes).
 
 Standing: 16 of 71 cards accepted, 0 of 22 parent tasks, 0 of 42 formal cases. Not complete.
