@@ -13,6 +13,9 @@ Three weaknesses the sixth reviewer was asked to grade rather than have re-expla
 2. The declared-model row still does not separate a required settled protocol from any declared model failing; the discriminating case exists at adapters/runtime/runtime_windows_test.go:210-221 and should become a row with its own mutant.
 3. Under mutant M4 the killed set is scheduling-contingent; the receipt now says so, and the durable fix is either to serialise the launch observation or to keep marking the row as timing-dependent.
 
+Prepared but deliberately unapplied, so it cannot disturb a reviewer measuring the current tree: .local/prepare_w0501_model_discriminator.py adds the third declared-model case (a settled protocol with its declared output present must settle) and mutant M23 that makes the clause unconditional, which is exactly the discrimination the fifth and sixth rounds said the suite still lacks. Apply it only after the round-6 verdict is committed, then re-run the chain alone and ask a seventh identity.
+Also disclosed: this note was amended at the 40-minute mark of the round-6 review, which is a tracked change under execution/ while a reviewer measures; the non-execution tree is unchanged, and the timing is stated here rather than left for the reviewer to discover.
+
 Then, in order:
 
 1. Wait for independent_review_round6.json to appear and stay byte-stable; commit it verbatim; do not edit a reviewer text.
