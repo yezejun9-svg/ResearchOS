@@ -214,12 +214,13 @@ receipt = {
    "evidence": "the card's own live tool-file-read property is reported not_verified rather than asserted, with the reason measured in executor_identity_measurement.json: the executor policy denies model shell tools and writes, and the pinned executor binary is absent while a different build is installed"},
   {"case": "W05-01-NEGATIVE: a worker must not be able to escape its workspace, inherit credentials silently, or record an artifact it did not produce",
    "result": "EXECUTION_REPORTED",
-   "evidence": "W0501-ADAPTER-OUTPUT-ESCAPE-REFUSED, W0501-ADAPTER-EXPLICIT-ENVIRONMENT-REQUIRED, W0501-ADAPTER-ARTIFACT-BOUNDED-TO-BYTES (hash recomputed from the bytes on disk) and W0501-ADAPTER-TREE-DRAINED; M1, M2, M5 and M6 each die on a named row"}],
+   "evidence": "W0501-ADAPTER-OUTPUT-ESCAPE-REFUSED, W0501-ADAPTER-EXPLICIT-ENVIRONMENT-REQUIRED, W0501-ADAPTER-ARTIFACT-BOUNDED-TO-BYTES (hash recomputed from the bytes on disk) and W0501-ADAPTER-TREE-DRAINED; M2, M5 and M6 each die on a named row. The drained-tree claim is pinned twice, by W0501-ADAPTER-TREE-DRAINED and by W0501-ADAPTER-DRAINED-REPORT-CORRELATES-TREE which compares the report against the tree the harness observed; the corresponding mutant is deliberately filed outside the matrix as equivalence probe E1 because the fixture's worker really does drain its job object, so assuming an empty tree is observationally identical there and a kill would be a fiction"}],
  "mutation_selfcheck": {
   "cases": matrix["cases"], "buckets": buckets, "caught": caught,
   "survived": [], "crashed": [], "anchor_missing": [],
   "runner": os.path.join(RD, "mut_w0501.py"), "matrix_source": MATRIX,
   "tree_clean_after_restore": bool(matrix.get("tree_clean_after_restore")),
+  "equivalence_probe": matrix.get("equivalence_probe"),
   "restoration": "the matrix file's own tree_clean_after_restore is %s and each row carries restored_byte_identical; this generator aborts unless the tree was clean"
                  % bool(matrix.get("tree_clean_after_restore")),
   "coverage_limit": "M13 redaction and M11 denial mutants exercise the decoder only as far as its own phrase table reaches; the suite also asserts that limit as W0501-PROTOCOL-DENIAL-DETECTION-IS-PHRASE-SCOPED rather than pretending broader detection"},

@@ -8,6 +8,8 @@ cases silently never run.
 """
 import hashlib, io, json, os, subprocess, sys
 
+NL = chr(10)
+
 def _find_repo(start):
     d = start
     for _ in range(10):
@@ -71,8 +73,8 @@ CASES = [
 
  # --- service admission and cost: the two claims made over HTTP ---
  {"id": "M14-unqualified-live-admitted", "file": ADMISSION,
-  "marker": 'return nil, Fail(503, "RESOURCE_UNAVAILABLE", "LIVE runtime has no current qualification")',
-  "body": "return nil, nil // MUTANT: an unqualified LIVE runtime is admitted"},
+  "marker": 'if runtime["measurement_mode"] == "LIVE" && len(Arr(runtime, "qualification_ids")) == 0 {',
+  "body": "if false { // MUTANT: an unqualified LIVE runtime is admitted on the ordinary path"},
  {"id": "M15-fixture-dispatch-not-zero", "file": SCOPES,
   "marker": '"provider_request_id": "fixture-dispatch/" + Str(run, "id")',
   "body": '_, e = s.appendBudget(tx, project, Object{"policy_id": goal["budget_policy_id"], "run_id": run["id"], "operation": "RESERVE", "money": Object{"amount": "1.00", "currency": currency}, "provider_request_id": "fixture-dispatch/" + Str(run, "id"), "provider_event_id": "fixture-dispatch/" + Str(run, "id"), "reservation_id": nil, "cost_basis": "UPPER_BOUND", "occurred_at": Now()})'},
@@ -92,6 +94,9 @@ def run_check():
     lines = [l for l in (p.stdout or "").splitlines() if l.startswith("{")]
     return (json.loads(lines[-1]) if lines else None), p
 
+
+def write_lines(path, lines):
+    io.open(path, "w", encoding="utf-8", newline=NL).write(NL.join(lines))
 
 def locate(path, marker, want=1):
     lines = io.open(os.path.join(REPO, path), encoding="utf-8").read().split("\n")
@@ -133,11 +138,11 @@ for case in CASES:
     before = hashlib.sha256(open(path, "rb").read()).hexdigest()
     tree_state[case["file"]] = tree_state.get(case["file"], before)
     lines[idx] = mutated
-    io.open(path, "w", encoding="utf-8", newline="\n").write("\n".join(lines))
+    write_lines(path, lines)
     try:
         rep, proc = run_check()
     finally:
-        io.open(path, "w", encoding="utf-8", newline="\n").write(original + "\n".join([""] * 0) if False else "\n".join(lines[:idx] + [original] + lines[idx + 1:]))
+        write_lines(path, lines[:idx] + [original] + lines[idx + 1:])
         after = hashlib.sha256(open(path, "rb").read()).hexdigest()
         case["restored"] = (after == before)
 
@@ -165,15 +170,11 @@ for case in EQUIV:
     path = os.path.join(REPO, case["file"])
     before = hashlib.sha256(open(path, "rb").read()).hexdigest()
     lines[idx] = indent + case["body"]
-    io.open(path, "w", encoding="utf-8", newline="
-").write("
-".join(lines))
+    write_lines(path, lines)
     try:
         rep, proc = run_check()
     finally:
-        io.open(path, "w", encoding="utf-8", newline="
-").write("
-".join(lines[:idx] + [original] + lines[idx + 1:]))
+        write_lines(path, lines[:idx] + [original] + lines[idx + 1:])
         case["restored"] = hashlib.sha256(open(path, "rb").read()).hexdigest() == before
     killed = sorted({f["id"] for f in ((rep or {}).get("failures") or [])}) if rep else []
     lost = sorted(set(base_ids) - set((rep or {}).get("assertion_ids") or [])) if rep else []
