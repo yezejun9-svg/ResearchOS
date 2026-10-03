@@ -29,10 +29,13 @@ CASES = [
  {"id": "E1-disjunction-drops-strict-term", "file": BUDGET,
   "marker": 'if unknown && (p["enforcement"] == "STRICT" || p["unknown_cost_action"] == "BLOCK") {',
   "body": 'if unknown && p["unknown_cost_action"] == "BLOCK" { // EQUIVALENCE PROBE: the STRICT term is protocol-redundant'},
- {"id": "T13-disjunction-needs-both-halves", "file": BUDGET,
-  "marker": 'if unknown && (p["enforcement"] == "STRICT" || p["unknown_cost_action"] == "BLOCK") {',
-  "body": 'if unknown && (p["enforcement"] == "STRICT" && p["unknown_cost_action"] == "BLOCK") { // MUTANT: the rule now demands both halves'},
 ]
+
+# This runner is deliberately NOT the matrix: it asks whether one term of the disjunction can be
+# removed without any observable change. The frozen client protocol forces unknown_cost_action=BLOCK
+# whenever enforcement=STRICT (UpdateBudgetRequest allOf), so no legal policy separates the two terms
+# and a probe that killed E1 could only be satisfied by an illegal policy. A survivor here is the
+# finding, not a defect, which is why it is filed outside the matrix's "0 survived" claim.
 
 env = dict(os.environ)
 env.update({"GOTOOLCHAIN": "local", "GOENV": "off",

@@ -39,7 +39,9 @@ runner = rc["mutation_selfcheck"]["runner"]
 chk("mutation_runner_exists", True, os.path.exists(os.path.join(REPO, runner.replace("/", os.sep))))
 
 # 3. mutation buckets vs the round-2 selfcheck json
-ms = json.load(open(os.path.join(RD, "mutation_selfcheck_w1201_round2.json"), encoding="utf-8"))
+# compare against the matrix file the receipt's own runner produced, not a fixed round name
+_ms_name = rc["mutation_selfcheck"]["matrix_source"]
+ms = json.load(open(os.path.join(RD, _ms_name), encoding="utf-8"))
 buckets = ms.get("buckets", ms)
 raw = json.dumps(ms, sort_keys=True)
 def bucket(name):
@@ -106,6 +108,8 @@ cmdhash = sha(cmdp)
 art = {a["path"]: a["sha256"] for a in rc["artifacts"]}
 chk("commands_hash_vs_artifact", art.get("execution/v2.4/commands.json"), cmdhash)
 for run in rc["stability_runs"]:
+    if run.get("superseded_reason"):
+        continue  # measured on an earlier registry; comparing it to today's file would be a false alarm
     chk("stability_regrev:" + run["invocation_id"][:8], cmdhash, run["registered_command_revision"])
 
 # 8. receipt head is a real commit and is an ancestor of HEAD

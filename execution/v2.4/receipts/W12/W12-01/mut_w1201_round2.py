@@ -9,7 +9,16 @@ as anchor-missing and is treated as an untested guard, never as a pass.
 """
 import io, json, os, subprocess, sys, hashlib
 
-REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+def _find_repo(start):
+    d = start
+    for _ in range(8):
+        if os.path.isdir(os.path.join(d, "execution", "v2.4")) and os.path.isdir(os.path.join(d, "internal")):
+            return d
+        d = os.path.dirname(d)
+    raise SystemExit("cannot locate the repository root from %s" % start)
+
+
+REPO = _find_repo(os.path.dirname(os.path.abspath(__file__)))
 GO = os.path.join(REPO, ".local", "tools", "go1.27.1", "go", "bin", "go.exe")
 BUDGET = os.path.join("internal", "domain", "budget.go")
 SCOPES = os.path.join("internal", "domain", "budget_scopes.go")

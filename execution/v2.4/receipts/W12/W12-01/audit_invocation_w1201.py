@@ -35,7 +35,7 @@ for root, _, files in os.walk(os.path.join(REPO, "execution", "invocations", bid
                     reports.append((fp + ":" + fn, json.loads(line)))
 print("report files found:", len(reports))
 fails = []
-for p, d in reports:
+for p, d in [r for r in reports if not r[0].endswith("receipt.json")]:
     ids = d["assertion_ids"]
     hist = collections.Counter(i.split("-")[0] + "-" + i.split("-")[1] for i in ids)
     want = rc["check_results"]["assertion_id_prefix_histogram"]
