@@ -21,7 +21,14 @@ if not os.path.isdir(os.path.join(REPO, "internal", "domain")):
 os.chdir(REPO)
 
 HISTORY_MARKERS = ("superseded", "position as of", "round-1", "round-2", "round-3", "round-4", "round 2",
-                   "kept visible", "dated here", "no longer accurate", "before round 5")
+                   "kept visible", "dated here", "no longer accurate", "before round 5",
+                   # a clause quoted inside somebody else finding, or inside the record of the correction that
+                   # replaced it, is history carried forward rather than this tree asserting it as fact. The
+                   # first real run of this probe flagged six such quotations as current assertions, which is
+                   # why these markers exist; the canon itself did not change and the injected self-test
+                   # sentence carries none of them, so it is still caught.
+                   "that said", "when twenty do", "proved false", "refuted", "reservation", "finding",
+                   "quoted", "reviewer", "correction")
 
 # each refuted clause carries the measurement that refuted it, so a hit can be judged rather than argued
 CANON = [
