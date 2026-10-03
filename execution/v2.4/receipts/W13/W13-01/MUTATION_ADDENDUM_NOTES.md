@@ -139,3 +139,30 @@ unlisted status without any row noticing, which is the card's own second negativ
 Regenerated 2026-10-03T16:58:17.443449+00:00 at HEAD 36620507; `host.js` restored byte-identically after every run and the pinned receipt
 and its 14 artifacts are untouched.
 
+## Pass 8 - reservation 7 becomes a reproducible mutant
+
+`H4` put a PATH fallback back at the place that actually launches the driver
+(`[node_bin, drv, td]` -> `[node_bin or 'node', drv, td]`). The run stayed **PASS with all 31
+assertions and the driver alive**. The round-3 reviewer predicted this in prose as reservation 7 -
+that `W1301-TOOLCHAIN-NODE-PATH-FALLBACK-IS-REFUSED` tests a hard-coded bogus table rather than the
+launch site - and this pass turns that prediction into a mutant anyone can re-run:
+`python execution/v2.4/receipts/W13/W13-01/mut_addendum8_w1301.py`.
+
+`H2` (accept a mismatched node hash) was skipped rather than fudged: the anchor it wanted to break
+was located by its refusal *message* line, and the condition it needed to disable sits elsewhere, so
+the script recorded a skip instead of editing something nearby and calling it the same mutant.
+
+## Two counts in this file, deliberately reconciled
+
+- `19` rows in the disposition table (emitted 31 minus rows the shipped matrix kills).
+- `8` marked OWED: no filed mutant **and** no reviewer measurement covers them.
+- `15` rows that no mutant filed in this repository has taken down: this set is larger because some
+  rows rest only on the round-3 reviewer's temp-directory measurements, which are evidence but are not
+  runnable from here.
+
+Both numbers are kept on purpose: collapsing them would either overstate what this repository can
+reproduce or understate what the card has actually shown.
+
+Updated 2026-10-03T16:59:09.152759+00:00 at HEAD 08b3db2d; `tests/ui/check/main.py` is a pinned artifact and was edited only transiently,
+restored byte-identically, exactly as the shipped matrix does with the equally pinned `host.js`.
+
