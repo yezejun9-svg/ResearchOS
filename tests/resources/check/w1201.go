@@ -178,6 +178,10 @@ func ledgerPhase(ctx context.Context, h *harness, g *runGraph) {
 	code, reserve, body := h.ledger(ctx, g.policyTag, hold)
 	ok("W1201-RESERVATION-ADMITTED", code == 201 && reserve["operation"] == "RESERVE", code, body)
 
+	code, _, body = h.ledger(ctx, g.policyTag, entry("UNKNOWN", "req-unknown-money", "UNKNOWN", dollars("1.00"), "evt-unknown-money", nil, holdAt))
+	ok("W1201-UNKNOWN-REFUSES-INVENTED-AMOUNT",
+		code == 422 && strings.Contains(body, "unknown must remain null"), code, body)
+
 	code, unknown, body := h.ledger(ctx, g.policyTag, entry("UNKNOWN", "req-unknown", "UNKNOWN", nil, "evt-unknown", nil, holdAt))
 	ok("W1201-UNKNOWN-CARRIES-NO-INVENTED-AMOUNT",
 		code == 201 && unknown["money"] == nil && domain.Str(unknown, "cost_basis") == "UNKNOWN", code, body)
@@ -204,7 +208,7 @@ func ledgerPhase(ctx context.Context, h *harness, g *runGraph) {
 	ok("W1201-DUPLICATE-BILL-ADDS-NO-ROW", rows == 1, rows)
 
 	// a strict cap may not be satisfied by a cost nobody bounded: unknown and estimate both refuse
-	capped := domain.Object{"mode": "CAPPED", "cap": dollars("3.00"), "enforcement": "STRICT",
+	capped := domain.Object{"mode": "CAPPED", "cap": dollars("100.00"), "enforcement": "STRICT",
 		"period": "LIFETIME", "timezone": "Asia/Shanghai", "effective_from": domain.Now(),
 		"unknown_cost_action": "BLOCK"}
 	_, policyNow, _ := h.api(ctx, "GET", h.base+"/goals/"+g.goalID+"/budget-policy", "", "", nil)
@@ -221,7 +225,7 @@ func ledgerPhase(ctx context.Context, h *harness, g *runGraph) {
 
 	code, _, body = h.ledger(ctx, tightenedTag, entry("RECONCILE", "req-unknown", "ACTUAL", dollars("0.50"), "evt-unknown-settled", unknown["id"], holdAt))
 	ok("W1201-UNKNOWN-RECONCILES-WHEN-PROVEN", code == 201, code, body)
-	code, _, body = h.ledger(ctx, tightenedTag, entry("RESERVE", "req-over", "UPPER_BOUND", dollars("9.00"), "evt-over", nil, holdAt))
+	code, _, body = h.ledger(ctx, tightenedTag, entry("RESERVE", "req-over", "UPPER_BOUND", dollars("500.00"), "evt-over", nil, holdAt))
 	ok("W1201-STRICT-CAP-REFUSES-OVER-CAP", code == 422 && strings.Contains(body, "budget exhausted"), code, body)
 
 	// late settlement still binds the original run and request even after the cap tightened
