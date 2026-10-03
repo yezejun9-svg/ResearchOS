@@ -166,3 +166,31 @@ reproduce or understate what the card has actually shown.
 Updated 2026-10-03T16:59:09.152759+00:00 at HEAD 08b3db2d; `tests/ui/check/main.py` is a pinned artifact and was edited only transiently,
 restored byte-identically, exactly as the shipped matrix does with the equally pinned `host.js`.
 
+## Pass 9 - the staged mutants are finally filed, and the toolchain rows fail to notice their own removal
+
+`M27`, `M28` and `M29` were taken **verbatim** from
+`.local/prepare_w1301_mutants_round3.py` (parsed out of the file rather than retyped, so a marker
+cannot drift from the definition a reviewer already read). All three are caught with the driver alive
+and they newly discriminate four rows that previously rested on a reviewer's temp-directory
+measurement:
+
+- `W1301-ABSENT-DISCOVERY-IS-NAMED`
+- `W1301-ABSENT-PRINCIPAL-STORE-IS-NAMED`
+- `W1301-PRINCIPAL-READ-LOCAL-NOT-PASTED`
+- `W1301-LAUNCH-USES-THE-LOCAL-CONTROL-HOST`
+
+Rows with no mutant filed in this repository drops from 15 to **11**.
+
+`I1` and `I2` then did something less comfortable. Each replaced one of the two verification
+conditions inside `resolve_node` - the sha256 comparison, and the returncode/version comparison -
+with `False`, i.e. it made the pinned-binary check stop checking while leaving everything else intact.
+Both runs stayed **PASS with all 31 assertions and the driver alive**. So
+`W1301-TOOLCHAIN-NODE-FROM-LOCKED-TABLE` reports that a table was consulted, not that verification
+gates the launch: verification could be deleted wholesale and the suite would not notice. Added to
+`H4` (a PATH fallback at the launch site, also unnoticed), that is two demonstrated blind spots in the
+toolchain rows of an accepted card. Neither can be fixed inside `tests/ui/check/main.py` - the file is
+pinned by W13-01's receipt - so the finding is recorded for the card that next owns that program.
+
+Updated 2026-10-03T17:00:57.274394+00:00 at HEAD f214aa63. `main.py`, `host.js` and every other file touched by a mutant was restored
+byte-identically; the pinned receipt and its 14 artifacts are unchanged.
+
