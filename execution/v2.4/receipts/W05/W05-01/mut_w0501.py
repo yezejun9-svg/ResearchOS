@@ -96,6 +96,12 @@ CASES = [
  {"id": "M20-malformed-line-unclassified", "file": CODEX,
   "marker": 'p.Failure = "invalid_protocol"',
   "body": 'p.Failure = "" // MUTANT: a malformed line is no longer named'},
+ {"id": "M21-journal-drops-the-spec-it-was-given", "file": RUNTIME,
+  "marker": "w.journal = Journal{Spec: s,",
+  "body": "w.journal = Journal{Revision: Revision, Job: \"Local\\\\ResearchOS-\" + strings.TrimPrefix(Hash([]byte(directory+s.RunID)), \"sha256:\"), State: \"STARTING\", Worker: fmt.Sprintf(\"%d-%d\", os.Getpid(), time.Now().UnixNano()), Started: now(), Pending: len(s.Commands), Trees: []Tree{}, Streams: []Stream{}} // MUTANT: the journal no longer records the Run it was started for"},
+ {"id": "M22-fixture-reservation-unkeyed", "file": SCOPES,
+  "marker": "\"provider_request_id\": \"fixture-dispatch/\" + Str(run, \"id\")",
+  "body": "_, e = s.appendBudget(tx, project, Object{\"policy_id\": goal[\"budget_policy_id\"], \"run_id\": nil, \"operation\": \"RESERVE\", \"money\": Object{\"amount\": \"0\", \"currency\": currency}, \"provider_request_id\": \"unkeyed\", \"provider_event_id\": \"unkeyed\", \"reservation_id\": nil, \"cost_basis\": \"UPPER_BOUND\", \"occurred_at\": Now()}) // MUTANT: the fixture reservation is no longer keyed to a Run"},
 ]
 
 env = dict(os.environ)

@@ -196,7 +196,8 @@ receipt = {
                 len(report.get("diagnostics") or [])),
    "derived_from": current[0]["directory"] + "/stdout.txt"},
   command_log("go_vet_check"), command_log("go_build_adapter"),
-  command_log("go_test_runtime_fixture"), command_log("go_vet_domain")],
+  command_log("go_test_runtime_fixture"), command_log("go_test_runtime_list"),
+  command_log("go_vet_domain")],
  "check_results": {
   "status": report["status"], "assertions": len(current[0]["assertion_ids"]),
   "failures": report.get("failures"), "harness_scope": report.get("scope"),
