@@ -87,3 +87,26 @@ driver's require chain - still owed.
 Regenerated 2026-10-03T16:54:39.663726+00:00 at HEAD 78a902ae; every mutated file restored byte-identically and `git status` over apps and
 tests is clean.
 
+## Pass 5 - the aimed mutant finally landed, and so did an uncomfortable result
+
+`E2` removed one method (`models: ['GET', '/provider/models']`) from `host.ROUTES.provider`. The run
+failed with **the driver still alive** and exactly one row missing:
+`W1301-FIRST-RUN-METHODS-ALL-ROUTED`. That row therefore moves from OWED to killed by a filed mutant -
+the first clean kill this addendum produced, and the proof that the pass-2-to-4 problem was aiming,
+not the suite.
+
+`E3` is the other half of the story: it **added** a route that exists in the table and nowhere else
+(`provider.bogus -> GET /bogus`) and the run stayed PASS with the driver alive. Nothing notices an
+entry that is declared but wired to no channel. `W1301-ROUTING-TRUTH-TABLE` stays OWED, and its
+disposition now says what was demonstrated rather than what is merely missing.
+
+`E1` (removing `pick_directory`) reported anchor count 0 because the needle text differed in
+whitespace. It was left unfixed rather than retargeted by guesswork, since E2 already establishes the
+mechanism on the same map.
+
+Counts after pass 5: **10** rows accounted for by a filed or reviewer-measured mutant, **9** OWED,
+0 unclassified. Every mutated file restored byte-identically; the pinned receipt and its 14 artifacts
+are untouched.
+
+Updated 2026-10-03T16:55:42.773864+00:00 at HEAD 67935d3e.
+
