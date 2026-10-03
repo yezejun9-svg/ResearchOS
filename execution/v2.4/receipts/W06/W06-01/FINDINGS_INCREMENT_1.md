@@ -17,7 +17,7 @@ subject but not its deliverable, and the file already knows the difference.
 
 ## The gate inventory that does exist
 
-`tests/orchestration/expected.json` names **18** assertion ids across **76** groups, including the hard
+`tests/orchestration/expected.json` names **76** assertion ids across **18** groups, including the hard
 gates the card must not weaken: `A02-01-03-FROZEN-ROUTE`, `A02-04-RECOVERY-FENCE`, `A02-04-SINGLE-CLAIM`, `A03-01-CAP-ZERO`, `A03-01-FLOAT-MONEY`, `A03-01-HTTP-NO-WRITE`, `A03-01-NAIVE-TIME`, `A03-01-REVISION-ZERO`, `A03-01-ROUNDTRIP`, `A03-02-IDEMPOTENCY`, `A03-02-INVALID-STATE`, `A03-02-PROJECT-ISOLATION`, `A03-02-STALE-REVISION`, `A03-03-CONSUMER-PROJECTION`.
 
 `ops/ci/orchestration.py` exists (124 lines) and defines none matched as its gate-shaped functions.
