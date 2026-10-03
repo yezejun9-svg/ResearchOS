@@ -57,3 +57,33 @@ The single most important owed item is `W1301-PROVIDER-OK-IS-SUCCESS`: mutant A6
 Reproduce: `python execution/v2.4/receipts/W13/W13-01/mut_addendum_w1301.py`
 
 Generated 2026-10-03T16:50:05.601930+00:00 at HEAD 0ca44443; every mutated file was restored byte-identically and `git status` over apps and tests is clean.
+
+## Passes 2, 3 and 4 - what the extra attempts established
+
+Pass 1's four anchor-missing results were my wrong paths, and the fix was to read the card's own
+artifact list: the files are `apps/desktop/preload/preload.js` and `apps/desktop/main/workbench.html`.
+
+Pass 2 mutated `ipc.js` routes and a `provider` token in the workbench markup. All three applied
+cleanly and **survived**. That was a targeting error, not a hole: `tests/ui/check/main.py` builds
+`clients` from `host.CLIENTS` and `route_shape` from `host.ROUTES` (main.py:90-91) and requires
+`ipc.js` only at line 146 for a different row.
+
+Pass 3 crashed before measuring: the ROUTES map turned out to be `const CLIENTS =
+Object.keys(ROUTES).sort()`, so clients are derived, and my token anchors sat on lines that do not
+contain them.
+
+Pass 4 aimed correctly: it deleted the `status` entry, then the `workspace` entry, from
+`host.ROUTES`. Both runs **failed** - the suite does notice a client vanishing - but the driver died
+with them, so under the rule used throughout this addendum (only rows lost while
+`W1301-DRIVER-RAN` survives may be credited to a mutant) they credit no individual row. Recorded as
+`crashed`, not renamed as a kill.
+
+Net effect on the disposition table: no row moved out of OWED in passes 2-4. What did improve is the
+quality of the statement: for the structural routing rows it is now known that the suite detects their
+negation loudly at whole-run level, that the discriminating file is `host.js` rather than `ipc.js`, and
+that turning that into per-row credit needs a mutant which removes a route without breaking the
+driver's require chain - still owed.
+
+Regenerated 2026-10-03T16:54:39.663726+00:00 at HEAD 78a902ae; every mutated file restored byte-identically and `git status` over apps and
+tests is clean.
+
