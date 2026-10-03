@@ -1,0 +1,110 @@
+<!doctype html>
+<!-- W13-01 workbench: the four native clients the card names, plus the first-run empty state and a retry that
+     never asks the reader to leave this window. Nothing here imports node, nothing here takes an owner token,
+     and every action goes through the frozen preload bridge. -->
+<meta charset="utf-8">
+<title>ResearchOS</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; color: #14181f; background: #f6f7f9; }
+  header { padding: 14px 20px; background: #fff; border-bottom: 1px solid #e3e6ea; display: flex; gap: 12px; align-items: baseline; }
+  h1 { font-size: 15px; margin: 0; }
+  #host-health { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #eceff3; }
+  #host-health.UP { background: #e3f4e8; } #host-health.DOWN { background: #fbe7e7; }
+  main { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 14px; padding: 16px 20px; }
+  section { background: #fff; border: 1px solid #e3e6ea; border-radius: 8px; padding: 12px 14px; }
+  h2 { font-size: 13px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; color: #5d6773; }
+  ul { margin: 0 0 8px; padding-left: 18px; } li { font-size: 13px; }
+  button { font: inherit; padding: 5px 11px; border-radius: 6px; border: 1px solid #c9ced6; background: #fff; }
+  button.primary { background: #14508f; border-color: #14508f; color: #fff; }
+  output { display: block; margin-top: 8px; font-size: 12px; white-space: pre-wrap; color: #5d6773; }
+  output.failed { color: #a3261f; }
+  #empty { grid-column: 1 / -1; }
+</style>
+
+<header>
+  <h1>ResearchOS</h1>
+  <span id="host-health">checking…</span>
+  <button id="retry">Retry</button>
+</header>
+
+<main>
+  <section id="empty">
+    <h2>First run</h2>
+    <p id="empty-text">Choose a workspace folder and configure a model to start your first session.</p>
+    <button class="primary" data-call="workspacePickDirectory">Choose workspace folder</button>
+    <button data-call="providerConfigure">Configure model</button>
+    <button data-call="sessionCreate">Start first session</button>
+    <output id="out-empty"></output>
+  </section>
+
+  <section><h2>Workspace</h2><ul id="workspace-list"></ul>
+    <output id="out-workspace"></output></section>
+
+  <section><h2>Sessions</h2><ul id="session-list"></ul>
+    <output id="out-session"></output></section>
+
+  <section><h2>Provider</h2><ul id="provider-list"></ul>
+    <output id="out-provider"></output></section>
+
+  <section><h2>Host</h2><ul id="host-list"></ul>
+    <output id="out-status"></output></section>
+</main>
+
+<script>
+const api = window.researchos;
+const clients = ['workspace', 'session', 'provider'];
+
+function show(node, res) {
+  const el = document.getElementById(node);
+  const ok = !!(res && res.ok);
+  el.className = ok ? '' : 'failed';
+  el.textContent = ok ? (res.summary || 'done') : ('not done — ' + ((res && (res.reason || res.error)) || 'no reply'));
+}
+
+async function call(name, body) {
+  if (typeof api !== 'object' || typeof api[name] !== 'function') {
+    return show('out-' + name.slice(0, 8).toLowerCase(), { ok: false, reason: 'BRIDGE_UNAVAILABLE' });
+  }
+  const res = await api[name](body || {});
+  show('out-' + (clients.some((c) => name.toLowerCase().startsWith(c)) ? name.slice(0, 8).toLowerCase() : 'status'), res);
+  if (/^(workspace|session|provider)List$/.test(name)) fill(name, res);
+  return res;
+}
+
+function fill(name, res) {
+  const key = name.replace(/List$/, '');
+  const ul = document.getElementById(key + '-list');
+  if (!ul) return;
+  const items = (res && (res.items || res.models || res.sessions || res.workspaces)) || [];
+  ul.textContent = '';
+  for (const it of items) {
+    const li = document.createElement('li');
+    li.textContent = typeof it === 'string' ? it : (it.name || it.id || it.model || JSON.stringify(it));
+    ul.appendChild(li);
+  }
+  if (!items.length) {
+    const li = document.createElement('li');
+    li.textContent = 'none yet';
+    ul.appendChild(li);
+  }
+}
+
+document.querySelectorAll('[data-call]').forEach((b) => b.addEventListener('click', () => call(b.dataset.call)));
+document.getElementById('retry').addEventListener('click', refresh);
+
+async function refresh() {
+  const health = await call('statusHealth');
+  const host = await call('statusHost');
+  const el = document.getElementById('host-health');
+  const up = !!(host && host.ok);
+  el.className = up ? 'UP' : 'DOWN';
+  el.textContent = up ? ('local core up · ' + (host.url || '')) : ('local core unreachable · ' + ((host && host.reason) || (health && health.reason) || 'unknown'));
+  for (const c of clients) await call(c[0].toUpperCase() + c.slice(1) + 'List');
+  const empty = await call('sessionList');
+  document.getElementById('empty-text').textContent = (empty && empty.ok && (empty.items || []).length)
+    ? 'Your workbench is set up. Start another session when you need one.'
+    : 'Choose a workspace folder and configure a model to start your first session.';
+}
+
+refresh();
+</script>
