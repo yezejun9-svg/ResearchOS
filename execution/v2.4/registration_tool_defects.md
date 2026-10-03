@@ -26,11 +26,19 @@ own guard suites:
    three condition arrays are additions, so the acceptance does not lose the reviewer's conditions
    the way the 17 earlier rows did.
 
-Consequence still open: 7 cases in `.local/test_register_guards_w1301.py` (3) and
-`.local/test_register_rounds_w1301.py` (4) now fail because their fixtures mirror the registrar's
-old wrong assumption instead of the file on disk - a fixture that agrees with the tool it tests
-proves nothing. The 15-suite's 12 refusal cases and all 8 round-order cases that do not construct a
-row still pass. Fixing the fixtures to the real schema is owed before the next registration; the
-refusal guards themselves (accept vocabulary, empty blocking_issues, ruled-identity collection over
-both verifier_id and reviewer_id, instant comparison, receipt-hash match, CAS bump,
-double-registration refusal) were exercised by this run and behaved.
+Consequence, since repaired the same session: 7 cases in `.local/test_register_guards_w1301.py` (3)
+and `.local/test_register_rounds_w1301.py` (4) went red because their fixtures mirrored the
+registrar's old wrong assumption instead of the file on disk - a fixture that agrees with the tool it
+tests proves nothing. The fixtures are now **seeded from the live `execution/v2.4/step_state.json`**
+(the throwaway copy inherits its top-level key set with `steps` emptied), `row(st)` asserts the list
+shape before reading it, and one positive control was added that inspects the row apply actually wrote
+(`id`/`verdict`/`verdict_file`/`accepted_at`/`verifier_id`/`executor_id` present, `evidence` a non-empty
+list of `{path, sha256}` with 64-hex digests). Both suites pass: 15 and 9 cases, FAILED: none, with the
+refusal cases still refusing - "no verdict on disk yet ... that is not a rejection, it is a missing
+artifact". The refusal guards themselves (accept vocabulary, empty blocking_issues, ruled-identity
+collection over both verifier_id and reviewer_id, instant comparison, receipt-hash match, CAS bump,
+double-registration refusal) were exercised by the real registration and behaved.
+
+What is still owed on W13-01, unchanged by this: the M26 provider catch-all mutant survives, the C23
+frozen ids are still not emitted, `desktop.shell_launch` is still UNBOUND, step 4 is still blocked by
+resource `Windows_desktop_session`, and 13 assertion rows have neither a mutant nor a stated reason.
