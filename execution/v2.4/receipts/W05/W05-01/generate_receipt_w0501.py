@@ -32,8 +32,11 @@ MATRIX = "mutation_selfcheck_w0501.json"
 CAPTURE = [
  ("go_vet_check", ["vet", "./tests/runtime/check"], "clean"),
  ("go_build_adapter", ["build", "./adapters/runtime"], "clean"),
- ("go_test_runtime_fixture", ["test", "./adapters/runtime", "./internal/domain", "-count=1",
-   "-run", "^TestW05(Protocol|Windows|Service|Scope|Unknown)$"], "ok; the accepted W05-G01 families still pass"),
+ ("go_test_runtime_fixture", ["test", "./adapters/runtime", "-count=1",
+   "-run", "^TestW05(Protocol|ProtocolTransientReconnect)$"],
+   "ok; the decoder families the card leans on, including the pre-existing turn.failed driver"),
+ ("go_test_runtime_list", ["test", "./adapters/runtime", "-list", "."],
+   "the names this package actually contains, captured so the filter above is checked against real test names rather than an assumed family"),
  ("go_vet_domain", ["vet", "./internal/domain"], "clean"),
 ]
 

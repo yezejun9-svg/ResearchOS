@@ -90,6 +90,12 @@ CASES = [
  {"id": "M18-executor-pin-prefix-unnormalised", "file": CHECK,
   "marker": 'if after, isPrefix := strings.CutPrefix(s, "sha256:"); isPrefix {',
   "body": 'if after, isPrefix := strings.CutPrefix(s, "sha512:"); isPrefix {'},
+ {"id": "M19-declared-model-clause-dropped", "file": RUNTIME,
+  "marker": "if code != 0 || w.journal.Cancelled || (s.Model != \"\" && !w.journal.Protocol.Settled) {",
+  "body": "if code != 0 || w.journal.Cancelled { // MUTANT: a declared model no longer requires a settled protocol"},
+ {"id": "M20-malformed-line-unclassified", "file": CODEX,
+  "marker": 'p.Failure = "invalid_protocol"',
+  "body": 'p.Failure = "" // MUTANT: a malformed line is no longer named'},
 ]
 
 env = dict(os.environ)
