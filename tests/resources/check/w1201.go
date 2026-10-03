@@ -217,22 +217,41 @@ func ledgerPhase(ctx context.Context, h *harness, g *runGraph) {
 	ok("W1201-STRICT-CAP-ACCEPTED-AS-POLICY", code == 200 && domain.Str(tightened, "enforcement") == "STRICT", code, body)
 	tightenedTag := tagOf(tightened)
 
+	// Each probe below names the single rule that may refuse it. Matching "GATE_FAILED" alone let an
+	// earlier probe pass because a *different* gate refused the request - the unresolved unknown
+	// outranked the cost-basis rule while it was still open - which is how two mutants survived the
+	// first mutation matrix. Order and message are both pinned now, with a positive control beside
+	// every refusal.
 	code, _, body = h.ledger(ctx, tightenedTag, entry("UNKNOWN", "req-unknown-2", "UNKNOWN", nil, "evt-unknown-2", nil, holdAt))
-	ok("W1201-STRICT-CAP-REFUSES-UNKNOWN-COST", code == 422 && strings.Contains(body, "GATE_FAILED"), code, body)
+	ok("W1201-STRICT-CAP-REFUSES-UNKNOWN-COST",
+		code == 422 && strings.Contains(body, "bounded cost cannot be established"), code, body)
+	note("req-unknown-2", code, body)
 
-	code, _, body = h.ledger(ctx, tightenedTag, entry("RESERVE", "req-estimate", "ESTIMATE", dollars("1.00"), "evt-estimate", nil, holdAt))
-	ok("W1201-STRICT-CAP-REFUSES-UNPROVEN-ESTIMATE", code == 422 && strings.Contains(body, "GATE_FAILED"), code, body)
+	// a liability from an earlier epoch that nobody has settled must stop a fresh admission, even
+	// though the new request is itself perfectly bounded
+	code, _, body = h.ledger(ctx, tightenedTag, entry("RESERVE", "req-blocked-by-unknown", "UPPER_BOUND", dollars("0.10"), "evt-blocked", nil, holdAt))
+	ok("W1201-UNRESOLVED-COST-BLOCKS-ADMISSION",
+		code == 422 && strings.Contains(body, "unresolved cost prevents bounded admission"), code, body)
+	note("req-blocked-by-unknown", code, body)
 
 	code, _, body = h.ledger(ctx, tightenedTag, entry("RECONCILE", "req-unknown", "ACTUAL", dollars("0.50"), "evt-unknown-settled", unknown["id"], holdAt))
 	ok("W1201-UNKNOWN-RECONCILES-WHEN-PROVEN", code == 201, code, body)
-	// positive control beside the refusal: the same amount expressed as a proven bound must be
-	// admitted at this very moment, otherwise the estimate refusal could be some other rule
-	// rejecting everything and the assertion below would pass for the wrong reason
+	note("req-unknown-reconcile", code, body)
+
+	// positive control: with nothing unresolved and a cap far above the amount, a proven bound is
+	// admitted - so the next refusal can only come from the cost basis rule under test
 	code, _, body = h.ledger(ctx, tightenedTag, entry("RESERVE", "req-bound-ok", "UPPER_BOUND", dollars("1.00"), "evt-bound-ok", nil, holdAt))
 	ok("W1201-STRICT-CAP-ADMITS-PROVEN-BOUND", code == 201, code, body)
+	note("req-bound-ok", code, body)
+
+	code, _, body = h.ledger(ctx, tightenedTag, entry("RESERVE", "req-estimate", "ESTIMATE", dollars("1.00"), "evt-estimate", nil, holdAt))
+	ok("W1201-STRICT-CAP-REFUSES-UNPROVEN-ESTIMATE",
+		code == 422 && strings.Contains(body, "bounded cost cannot be established"), code, body)
+	note("req-estimate", code, body)
 
 	code, _, body = h.ledger(ctx, tightenedTag, entry("RESERVE", "req-over", "UPPER_BOUND", dollars("500.00"), "evt-over", nil, holdAt))
 	ok("W1201-STRICT-CAP-REFUSES-OVER-CAP", code == 422 && strings.Contains(body, "budget exhausted"), code, body)
+	note("req-over", code, body)
 
 	// late settlement still binds the original run and request even after the cap tightened
 	code, settled, body := h.ledger(ctx, tightenedTag, entry("COMMIT", "req-held", "ACTUAL", dollars("1.50"), "evt-held-commit", reserve["id"], holdAt))

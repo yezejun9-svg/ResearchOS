@@ -31,6 +31,22 @@ var ids []string
 var failures []map[string]string
 var notVerified []string
 
+// diagnostics records the actual answer beside a refusal assertion even when the assertion
+// passed, because a mutant that leaves a refusal green is only explainable if the response body
+// was captured while it was still passing.
+var diagnostics []map[string]any
+
+func note(probe string, code int, body string) {
+	diagnostics = append(diagnostics, map[string]any{"probe": probe, "code": code, "body": truncate(body, 320)})
+}
+
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
+
 func ok(label string, cond bool, detail ...any) {
 	if cond {
 		ids = append(ids, label)
@@ -177,7 +193,7 @@ func main() {
 			status = "FAIL"
 		}
 		out, _ := json.Marshal(map[string]any{"status": status, "assertions": len(ids), "assertion_ids": ids,
-			"failures": failures, "not_verified": sortedUnique(notVerified),
+			"failures": failures, "not_verified": sortedUnique(notVerified), "diagnostics": diagnostics,
 			"scope":       "CONSTRUCTION_CHECK_NOT_PRODUCT_ACCEPTANCE",
 			"environment": map[string]any{"os": runtime.GOOS, "windows_host": runtime.GOOS == "windows"}})
 		fmt.Println(string(out))
