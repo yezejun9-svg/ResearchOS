@@ -28,7 +28,7 @@ EXECUTOR = "qoder-desktop:/root/construction"
 # blocking_issues, which is checked below. ACCEPT_BLOCKED_RECORDING is deliberately absent: round 1 of
 # this card used exactly that word to say the increment reproduces while recording is refused, and a
 # script that matched on an "ACCEPT" prefix would have registered it.
-ACCEPTS = ("ACCEPT", "ACCEPT_WITH_LIMITATIONS", "ACCEPT_WITH_RESERVATIONS")
+ACCEPTS = ("ACCEPT", "ACCEPT_WITH_LIMITATIONS", "ACCEPTED", "ACCEPT_WITH_RESERVATIONS")
 NON_REGISTRABLE = ("ACCEPT_BLOCKED_RECORDING", "REJECT", "REJECT_FOR_REWORK")
 
 
@@ -187,9 +187,7 @@ cp["failure_counters"].append({
    "the positive control W0501-PINNED-EXECUTOR-COMPARISON-IS-NOT-VACUOUS failed on its first run and that "
    "failure is the reason the prefix asymmetry between this harness hashing and the execution record was "
    "found at all; the control and matrix cases M16, M17 and M18 are what keep the absence row falsifiable",
-   "W0501-RUN-EVENT-AND-COST-CORRELATION is disclosed as unmet, not asserted: the adapter journal and the "
-   "domain Run never meet in this tree, and the duty lives in open_obligations_before_next_card rather than "
-   "in a receipt sentence, which the round-2 reviewer measured to be the difference",
+   "position as of round 2, dated here because this array is append-only and later windows inherit it: W0501-RUN-EVENT-AND-COST-CORRELATION was disclosed as unmet because the adapter journal and the domain Run never met. From round 5 they meet inside W0501-RUN-IDENTITY-BOUND-WORKER-JOURNAL, whose Run id, task id and lease epoch come from the claimed domain Run and whose ledger reservation key must equal the fixture dispatch key, and M21 and M22 kill it. Only the service-launched event ledger stays blocked by runtime qualification",
    "one process slip is on the record: a checkpoint commit landed while the evidence chain was running, "
    "HEAD moved under it, and the receipt generator refused to write a receipt quoting a HEAD nobody "
    "measured; the chain was re-run whole and no wrong figure was ever published",

@@ -79,8 +79,13 @@ if "--capture" in sys.argv:
             result = "exit 0 but the output names failures: %s" % " | ".join(fails)[:400]
         else:
             result = "%s; last line: %s" % (expect, tail[-1] if tail else "(no output)")
+        names = sorted(l.strip() for l in text.splitlines() if l.strip().startswith("TestW05"))
+        filt = [a for i, a in enumerate(argv) if a == "-run" and i + 1 < len(argv)]
+        import re as _re
+        selected = sorted(n for n in names for f in filt if _re.match(f, n))
         dump(os.path.join(LOGS, key + ".json"),
              {"key": key, "cwd": "REPOSITORY", "argv": [os.path.relpath(GO, REPO).replace("\\", "/")] + argv,
+              "test_names_present": names, "selected_by_this_filter": selected,
               "exit_code": p.returncode, "result": result, "code_revision": head,
               "output_sha256": hashlib.sha256(text.encode("utf-8", "replace")).hexdigest(),
               "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
@@ -247,14 +252,14 @@ receipt = {
   {"defect": "round-1 review B-02: card step 1 (provider.models, provider.configure, provider.probe), three of step 4's five failure classes and the deliverable's own-CLI leg appeared neither as an assertion nor as a disclosure, so a reader counting the not_verified rows would have over-read the coverage of PASS",
    "fix": "four skip rows name each of them, the resource that blocks it and what is and is not proven; the W05-01-NEGATIVE entry about listing models now reports NOT_RUN_FOR_THE_MODEL_LEG instead of reading as though that negative had been handled"},
   {"defect": "round-1 review B-03: the adapter journal and the domain Run never met, so the card's events-and-cost-bound-to-the-Run property was unmet in FIXTURE form and undisclosed, which also made part of W0501-FIXTURE-DISPATCH-CHARGE-IS-PROVEN-ZERO easier to satisfy than it should look",
-   "fix": "disclosed as W0501-RUN-EVENT-AND-COST-CORRELATION with the accurate reason (the service phase claims a Run and reserves its fixture charge, the adapter phase runs a journal-local run id, and nothing here launches the worker under the domain Run id and lease epoch), and carried forward as an open obligation to close by wiring dispatch to the adapter rather than by asserting a coincidence of ids"}],
+   "fix": "superseded reason, kept visible rather than deleted: the round-1 and round-4 text said the service phase claims a Run while the adapter phase runs a journal-local run id and nothing launches the worker under the domain Run id and lease epoch. That described the tree before round 5 and is no longer accurate, because W0501-RUN-IDENTITY-BOUND-WORKER-JOURNAL now makes the identity join an assertion with two mutants; what remains open is only the service-launched half quoted above"}],
  "known_limitations_and_obligations": [
   "the LIVE model-tool path is not asserted at all; only the adapter's own real file read is proven, and the card's step 3 property (a model performing a file read) stays BLOCKED by executor policy and by the absent pinned binary",
   "A04 remains unaccepted: it is served by the legacy live harness, which refuses without RESEARCHOS_RUNTIME_LIVE, and case A04's owning card scope includes the live qualification this card cannot complete",
   "ops/runtime/capabilities.json pins an executor_sha256 whose binary is gone; updating that identity record belongs to W05 evidence ownership and must not be edited silently by this card",
-  "the events-and-cost-bound-to-the-Run property is unmet in this tree and disclosed as W0501-RUN-EVENT-AND-COST-CORRELATION; closing it means launching the adapter under a claimed Run id and lease epoch and asserting the journal settles against that Run single ledger row, which is carried as an open obligation rather than claimed here",
-  "the CLI leg of the deliverable stays NOT_RUN while cli.* commands remain UNBOUND with no owning card in execution/v2.4/commands.json, a plan-level gap outside this card reach",
-  "nothing here accepts parent W05 or signs any formal case"],
+  "the Run identity join is asserted as of round 5 and is not disclosed: W0501-RUN-IDENTITY-BOUND-WORKER-JOURNAL launches the worker under the claimed Run id, task id and lease epoch and requires the settled journal Spec plus the fixture reservation key to agree with that Run, killed by M21 and M22. What stays unmet is narrower: the service launching the adapter on its own and the domain event ledger behind it, which runtime qualification blocks (ops/runtime/capabilities.json and the absent pinned executor build; the only Run-keyed rt.Start call outside tests is behind the exact qualification dispatch marker in internal/domain/runtime_dispatch.go). That narrower duty is carried as an open obligation",
+  "the deliverable own-CLI leg is NOT_RUN for a reason measured in the registry: cli.entry_run is the only cli.* key in execution/v2.4/commands.json at revision 14, its state is UNBOUND, its selectors are wildcards so the card selector triple does match it, its owner_card names the already-accepted W03-01 interactive CLI, and dispatching it for this card returns NOT_IMPLEMENTED with zero assertions, which is never a PASS. The gap is an accepted owner whose command is still unbound, not an ownerless command, and apps/cli stays unexercised here even though it sits inside this cards write scope",
+  "one coverage-table entry is scheduling-contingent rather than fixed: under mutant M4 the stale-epoch cancel races the worker launch, so the Launched clause of W0501-ADAPTER-REVISION-RECORDED can survive or die depending on timing. The fifth reviewer measured the committed five-row killed set five times out of five while the fourth measured four rows once, so the bucket never moves and no mutant ever survives, but the row list for that one case is not a fixed table. The receipt also hash-pins the matrix file that its own reproduce step rewrites, so a reviewer that re-runs the matrix must expect the artifact digest to move and should compare rows rather than digests, and nothing here accepts parent W05 or signs any formal case"],
  "not_verified_on_this_machine": [
   "no real Codex/provider call was made from this working tree in this round, so nothing is claimed about current provider behaviour beyond what the recorded receipts and the decoder rows show"],
  "independent_review": None, "independent_reviews": [],
