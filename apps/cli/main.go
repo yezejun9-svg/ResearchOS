@@ -83,6 +83,10 @@ func main() {
 	case "task":
 		runCodingTask(args[1:])
 	default:
+		if h, registered := commandHandlers[cmd]; registered {
+			h(args[1:])
+			return
+		}
 		fmt.Printf("%s: NOT_IMPLEMENTED (%s is registered to a later card; no silent success)\n", cmd, cmd)
 		os.Exit(3)
 	}

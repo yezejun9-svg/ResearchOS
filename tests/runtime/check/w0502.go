@@ -16,6 +16,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+
+	rosruntime "researchos.local/research-os/adapters/runtime"
 )
 
 // lockedGo resolves Go from execution/toolchains/locked.json and verifies the digest, refusing to
@@ -219,6 +222,8 @@ func cliPhaseW0502(ctx context.Context) {
 			strings.Contains(help.stdout, "NOT_IMPLEMENTED") && strings.Contains(help.stdout, "chat"),
 		help.exitCode, help.stdout)
 
+	cancelCascadeW0502(bin, tmp)
+
 	// The namespace property: whatever this run emitted, none of it may be W05-01's.
 	own := 0
 	for _, i := range ids {
@@ -271,4 +276,105 @@ func routingW0502OK() {
 		}
 	}
 	ok("W0502-SELECTOR-ROUTING-IS-DATA-NOT-ACCIDENT", len(bad) == 0, bad)
+}
+
+// cancelCascadeW0502 drives card step 4 from the outside: a real worker writing a real file, a real
+// cancel, then the claim that matters - nothing wrote afterwards. Every absence here is paired with a
+// positive control, because "the file stopped growing" is worthless unless it was proven to be growing
+// in the first place.
+func cancelCascadeW0502(bin, tmp string) {
+	dir := filepath.Join(tmp, "cancel")
+	if e := os.MkdirAll(dir, 0o755); e != nil {
+		ok("W0502-CANCEL-SANDBOX", false, e)
+		return
+	}
+	ok("W0502-CANCEL-SANDBOX", true, dir)
+	r := runCLI(bin, dir, "run", "-dir", dir, "-job", "ros-w0502-cascade", "-queue", "3",
+		"-cancel-after", "350ms", "-observe-after", "400ms", "-settle", "8s")
+	rep := lastJSONLine(r.stdout)
+	order := []string{}
+	if v, isList := rep["order"].([]any); isList {
+		for _, x := range v {
+			if s, isStr := x.(string); isStr {
+				order = append(order, s)
+			}
+		}
+	}
+	num := func(k string) int { f, _ := rep[k].(float64); return int(f) }
+	arr, _ := rep["remaining_pids"].([]any)
+	ticks := num("ticks_at_cancel")
+	ok("W0502-CASCADE-RUNS-IN-REQUIRED-ORDER",
+		len(order) >= 4 && order[0] == "clear_queue" && order[1] == "abort" &&
+			order[2] == "settled" && order[3] == "child_confirmed", order, r.exitCode)
+	ok("W0502-WORKER-WAS-REALLY-WRITING-BEFORE-THE-CANCEL", ticks > 0 && num("worker_pid") > 0, ticks, num("worker_pid"))
+	ok("W0502-JOB-SETTLES-EMPTY-WITH-A-REAL-EXIT-CODE",
+		rep["settled"] == true && len(arr) == 0 && num("worker_exit_code") == 137,
+		rep["settled"], arr, num("worker_exit_code"))
+	ok("W0502-QUEUED-WORK-IS-DROPPED-RATHER-THAN-RUN", num("queued_dropped") == 3, num("queued_dropped"))
+	ok("W0502-WORKER-WRITES-NOTHING-AFTER-SETTLEMENT",
+		num("writes_after_cancel") == 0 && num("ticks_after_settle") == ticks && r.exitCode == 0,
+		num("writes_after_cancel"), ticks, num("ticks_after_settle"), r.exitCode)
+
+	orphan := filepath.Join(tmp, "orphan")
+	_ = os.MkdirAll(orphan, 0o755)
+	cmd := exec.Command(bin, "run", "-dir", orphan, "-job", "ros-w0502-orphan", "-queue", "5",
+		"-cancel-after", "30s", "-observe-after", "0s", "-settle", "8s")
+	cmd.Dir = orphan
+	if e := cmd.Start(); e != nil {
+		ok("W0502-ORPHAN-PARENT-STARTED", false, e)
+		return
+	}
+	ok("W0502-ORPHAN-PARENT-STARTED", true, cmd.Process.Pid)
+	tf := filepath.Join(orphan, "worker-ticks.log")
+	wrote := 0
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if s, e := os.Stat(tf); e == nil && s.Size() > 0 {
+			wrote = int(s.Size())
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	ok("W0502-ORPHAN-WORKER-WAS-WRITING-BEFORE-THE-PARENT-DIED", wrote > 0, wrote)
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+	atDeath := wrote
+	if s, e := os.Stat(tf); e == nil {
+		atDeath = int(s.Size())
+	}
+	time.Sleep(1500 * time.Millisecond)
+	later := atDeath
+	if s, e := os.Stat(tf); e == nil {
+		later = int(s.Size())
+	}
+	ok("W0502-NO-ORPHAN-WRITE-AFTER-THE-PARENT-DIES", later == atDeath, atDeath, later)
+
+	in, e1 := os.Open(os.DevNull)
+	out, e2 := os.Create(filepath.Join(tmp, "order-stdout.log"))
+	errFile, e3 := os.Create(filepath.Join(tmp, "order-stderr.log"))
+	if e1 != nil || e2 != nil || e3 != nil {
+		ok("W0502-ORDER-GUARD-HANDLES", false, e1, e2, e3)
+		return
+	}
+	child, e := rosruntime.StartChild("ros-w0502-order", rosruntime.Command{
+		Executable: bin,
+		Args:       []string{"worker", "-file", filepath.Join(tmp, "order-ticks.log"), "-every", "40ms"},
+		Directory:  tmp}, os.Environ(), out, errFile, in)
+	if e != nil {
+		ok("W0502-CANCEL-REFUSED-BEFORE-THE-QUEUE-WAS-CLEARED", false, "child did not start: "+e.Error())
+		in.Close()
+		out.Close()
+		errFile.Close()
+		return
+	}
+	_, e = child.Cancel(2 * time.Second)
+	ok("W0502-CANCEL-REFUSED-BEFORE-THE-QUEUE-WAS-CLEARED",
+		e != nil && strings.Contains(e.Error(), "CANCEL_ORDER_VIOLATED"), e)
+	child.ClearQueue()
+	late := child.Admit("after-clear")
+	ok("W0502-QUEUE-REFUSES-ADMISSION-AFTER-CLEAR",
+		late != nil && strings.Contains(late.Error(), "CANCEL_ORDER_VIOLATED"), late)
+	_, e = child.Cancel(2 * time.Second)
+	ok("W0502-CASCADE-COMPLETES-ONCE-THE-ORDER-IS-HONOURED", e == nil, e)
+	child.Close()
 }
