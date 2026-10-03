@@ -1,45 +1,18 @@
-{
- "record": "W05-01 resume note",
- "at": "2026-10-03T06:01:18.221716+00:00",
- "by": "qoder-desktop:/root/construction",
- "repository_head": "4d0afa24137ab7ceb5a5d834795d32d9c87ed7b2",
- "tracked_modifications_at_writing": [],
- "state": {
-  "checkpoint_revision": 42,
-  "accepted_cards": 16,
-  "parent_tasks_accepted": [
-   "W00(gates only, via W00-99 independent acceptance)"
-  ],
-  "next_step_id": "W05-01",
-  "open_obligations": 98,
-  "step_state_entries": 17,
-  "card_status": "NOT_STARTED - only the before-baseline has been taken"
- },
- "just_closed": "W12-01 is ACCEPTED (card-level only) by qoder-desktop:/root/w1201_verifier_r2 with a stable evidence digest chain; its pinning episode, the reviewer's eight reservations and its five measured follow-ups are in the checkpoint obligations. Parent W12 and cases C11/C13/C14/C15/C16 are explicitly not accepted.",
- "already_measured_do_not_redo": {
-  "binding_line": "python execution/command_dispatcher/dispatch.py test.runtime --task-id W05 --check-id W05-01",
-  "registry_side": "test.runtime exists only in execution/commands.json revision 5 with selectors task_id W12 and case_id C11; v2.4 has no such key",
-  "before_baseline": "see before_baseline_test.runtime.json - three rows: bare --task-id W12 COMMAND_FAILED/0 (the harness's own selector guard, quoted from stderr), --case-id C11 PASS/5, and this card's selector NOT_IMPLEMENTED/0",
-  "write_scope_resolved": "ADAPTERS/runtime/** and ADAPTERS/model/** -> adapters/..., CLI/** -> apps/cli (alias CLI in path_ownership.json, owner cli_owner), tests/runtime/**, and this receipt directory"
- },
- "next_actions_in_order": [
-  "1. decide the handler: a tests/runtime Go check program or an extension of ops/ci/runtime.py, so that --task-id W05 --check-id W05-01 resolves to a real handler; UNBOUND or zero assertions cannot be presented as PASS",
-  "2. implement the card's steps that local resources allow: provider models/configure/probe against an authorized product model backend, one Go-delegated worker carrying Task/Run/lease, a real read of a temp file recording provider/model revision and cost known/unknown, and the failure classes auth / rate limit / no tool-calling / malformed reply, plus the fixed-model-cannot-silently-substitute assertion",
-  "3. bind the key in execution/v2.4/commands.json (revision bump) and re-resolve all three baseline rows, recording before/after parity as W12-01 did",
-  "4. if authorized_product_model_backend is missing, keep exactly the LIVE parts BLOCKED with the resource named, record FIXTURE and DEVELOPMENT separately, and do not shrink A04 or the 42-case gate",
-  "5. receipt with EXECUTION_REPORTED, self-audit the numbers against the files, then an independent identity that has not reviewed this card; register only after that verdict"
- ],
- "environment": {
-  "locked_go": ".local/tools/go1.27.1/go/bin/go.exe with GOTOOLCHAIN=local GOENV=off and .local/gopath|.local/gocache",
-  "task_packet": "ResearchOS_Implementation_Package_v2.4/tools/task_packet.py - it is NOT in the repository; running tools/task_packet.py from the repo root fails",
-  "discipline": "never run two heavy Go suites at once; a verdict that has appeared may still be unfinished - wait for the completion notification before pinning; format only named files; never edit hashed evidence"
- },
- "open_frontier_beyond_this_card": [
-  "W06-01 (independent acceptance service, gates W12-02)",
-  "W12-99 (DAILY/MONTHLY budget windows)",
-  "W07-01 (source connectivity under unauthenticated quota discipline)",
-  "CLI/Desktop: three commands still state=UNBOUND, client_mapping.json 23 methods bound on nothing, no chooser injected",
-  "W01-99 still BLOCKED on own_cli_entry_present and installed_desktop_present",
-  "8 formal cases have no case_id selector in either registry: A04, A10, A11, A13, A14, A15, A16, C26"
- ]
-}
+# W05-01 resume note
+
+State at 2026-10-03T06:54:16.674779+00:00 (checkpoint revision 46, HEAD ec7f0da2):
+
+- The card reports EXECUTION_REPORTED at receipt HEAD 2c8e04cb: 28 assertions through the registry binding command, 14 matrix cases all caught by a named assertion, equivalence probe E1 filed outside the matrix, tree clean after restore.
+- Self-audit CLEAN (20 probes); the three first-pass findings were auditor scope errors, each with its reproduction note in receipt_selfaudit.json.
+- review_request_round1.json is derived from the frozen files and names the five claims to attack.
+
+Next, in order:
+
+1. Dispatch a reviewer identity that has never seen this card (suggested w0501_verifier_r1) with the brief above; it writes execution/v2.4/receipts/W05/W05-01/independent_review_round1.json and nothing else.
+2. Wait until that file is byte-stable for 90 seconds before pinning it; a missing artifact is not a dead reviewer.
+3. Register only on a verdict with blocking_issues empty: python execution/v2.4/receipts/W05/W05-01/register_w0501_accepted.py (it refuses to write without a verdict, and its dry run exits 1 with no writes).
+4. Carry every reservation and follow-up item into open_obligations_before_next_card rather than editing the frozen receipt; hashed evidence is append-only.
+
+Still owed outside this card: W06-01 needs a test.orchestration before-baseline for 12 selectors; W12-99 DAILY/MONTHLY windows; W07-01 source connection; the 42-case selector debt (8 cases with no selector, 3 CLI/Desktop commands UNBOUND); the W12-01 tooling nit list is NOT applied because all 33 W12-01 evidence files are hash-pinned, so any correction must arrive as a new file plus an integrity event.
+
+Audit standing: 16 of 71 cards accepted, 0 of 22 parent tasks, 0 of 42 formal cases. Not complete.

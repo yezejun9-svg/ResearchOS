@@ -57,7 +57,7 @@ for d in sorted(glob.glob(os.path.join(RD, "invocations", "*"))):
     rp = os.path.join(d, "receipt.json")
     if os.path.isfile(rp):
         r = load(rp)
-        if r.get("code_revision") == head:
+        if (r.get("code_revision") or "") == rh:
             runs.append({"dir": os.path.relpath(d, RD).replace("\\", "/"), "invocation_id": r["invocation_id"],
                          "status": r["status"], "assertions": len(r.get("assertion_ids") or []),
                          "assertion_ids": sorted(r.get("assertion_ids") or [])})
