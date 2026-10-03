@@ -42,6 +42,7 @@ if receipt.get("status") != "EXECUTION_REPORTED" or receipt.get("verifier_id") i
 matrix = load(os.path.join(RD, receipt["mutation_selfcheck"]["matrix_source"]))
 registry = load(os.path.join("execution", "v2.4", "commands.json"))
 entry = registry["commands"]["test.runtime"]
+ROUND = (sys.argv[1] if len(sys.argv) > 1 else "round1")
 head = git("rev-parse", "HEAD")
 rh = receipt["repository_head_at_reporting"]
 # The receipt can only ever name the HEAD that existed while its evidence was produced, and committing
@@ -65,12 +66,19 @@ if len(runs) < 2:
     raise SystemExit("need two frozen runs at this HEAD, found %d" % len(runs))
 if runs[0]["assertion_ids"] != runs[1]["assertion_ids"]:
     raise SystemExit("the two frozen runs disagree about the id set")
-prior = [f for f in glob.glob(os.path.join(RD, "independent_review*.json"))]
-if prior:
-    raise SystemExit("a verdict already exists for this card: %s" % [os.path.basename(f) for f in prior])
+prior = sorted(os.path.basename(f) for f in glob.glob(os.path.join(RD, "independent_review*.json")))
+wanted = "independent_review_%s.json" % ROUND
+if wanted in prior:
+    raise SystemExit("this round already has a verdict: " + wanted)
+previous = []
+for f in prior:
+    v = load(os.path.join(RD, f))
+    previous.append({"file": f, "verdict": v.get("verdict"), "reviewer_id": v.get("reviewer_id"),
+                 "blocking_issues": [b.get("id") for b in (v.get("blocking_issues") or [])],
+                 "reservations": len(v.get("reservations") or [])})
 
 request = {
- "record": "W05-01 round-1 independent review request",
+ "record": "W05-01 %s independent review request" % ROUND,
  "requested_at": git("log", "-1", "--format=%cI"),
  "reviewer_identity_rules": {
   "must_be": "an identity that has never reviewed W05-01 and has not read this window's narration; it forms its own verdict from the files and its own re-runs",
@@ -108,16 +116,19 @@ request = {
                          "RESEARCHOS_GO", "RESEARCHOS_TASK_ID=W05", "RESEARCHOS_CHECK_ID=W05-01",
                          "PYTHONIOENCODING=utf-8"],
                  "never": "go build ./pkg at the repository root (it drops a stray executable); concurrent heavy Go suites"},
+ "previous_rounds": previous,
+ "what_changed_since_the_previous_round": [d["defect"][:220] for d in receipt["defects_found_and_fixed_across_all_rounds"] if "review" in d["defect"]],
+ "closure_to_verify": {"matrix_cases": matrix["cases"], "assertions": receipt["check_results"]["assertions"], "disclosed_rows": len(receipt["check_results"]["not_verified"])},
  "card": os.path.join(SPEC, "tasks", "steps", "W05-01.md"),
  "guardrails_for_the_reviewer": [
   "do not edit the receipt, the matrix, the code or the checkpoint; the verdict is a new file",
   "write the verdict as one atomic file and leave it byte-stable for at least 90 seconds before anyone pins it; a partial artifact is not a missing reviewer",
   "report blocking_issues as a separate array from limitations and reservations, and say which of the five claims above you actually re-ran"],
  "expected_output": {
-  "path": os.path.join(RD, "independent_review_round1.json"),
+  "path": os.path.join(RD, "independent_review_%s.json" % ROUND),
   "verdicts": ["ACCEPTED", "ACCEPT_WITH_RESERVATIONS", "REWORK_REQUIRED", "REJECTED"],
   "note": "the executor registers only from a verdict that carries blocking_issues == []"}}
 
-dump(os.path.join(RD, "review_request_round1.json"), request)
+dump(os.path.join(RD, "review_request_%s.json" % ROUND), request)
 print("review_request_round1.json written | assertions", runs[0]["assertions"],
       "| matrix", matrix["buckets"], "| HEAD", head[:8], "| registry rev", registry["revision"])
