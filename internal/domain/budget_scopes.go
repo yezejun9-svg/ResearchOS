@@ -167,6 +167,55 @@ func (s *Service) reserveRuntimeLocalLaunch(tx *sql.Tx, project string, run, adm
 		return e
 	}
 	request := "runtime-local-launch/" + Str(run, "id") + "/" + string(Bytes(run["lease_epoch"]))
+	// A control request whose outcome is unknown is retried with the same lease epoch.
+	// Re-admitting that epoch must be a no-op: the ledger's idempotency compares the whole
+	// request payload, and occurred_at differs on every attempt, so falling through would
+	// answer IDEMPOTENCY_CONFLICT for a request that is simply being repeated.
+	var admitted int
+	if e = tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_request_id')=? AND json_extract(body,'$.operation')='RESERVE'", project, request).Scan(&admitted); e != nil {
+		return e
+	}
+	if admitted != 0 {
+		return nil
+	}
+	// Exposure groups by (project, run, provider_request_id) and a hold that is never
+	// settled keeps counting. Each lease epoch therefore takes its own reservation, and
+	// taking over a lease must first release the hold the dead epoch left open - as an
+	// explicit ledger entry, never a deletion - or the same run is charged again next to
+	// its own earlier hold while the original stays unresolved. A restart neither
+	// recounts the charge nor clears the accounting trail.
+	prefix := "runtime-local-launch/" + Str(run, "id") + "/"
+	stale, e := tx.Query("SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.provider_request_id') LIKE ? AND json_extract(body,'$.operation')='RESERVE'", project, run["id"], prefix+"%")
+	if e != nil {
+		return e
+	}
+	holds := []Object{}
+	for stale.Next() {
+		var raw string
+		if e = stale.Scan(&raw); e != nil {
+			stale.Close()
+			return e
+		}
+		o, e := Decode([]byte(raw))
+		if e != nil {
+			stale.Close()
+			return e
+		}
+		if Str(o, "provider_request_id") != request {
+			holds = append(holds, o)
+		}
+	}
+	e = stale.Err()
+	stale.Close()
+	if e != nil {
+		return e
+	}
+	for _, hold := range holds {
+		release := Str(hold, "provider_request_id") + "/released"
+		if _, e = s.appendBudget(tx, project, Object{"policy_id": goal["budget_policy_id"], "run_id": run["id"], "operation": "RELEASE", "money": Object{"amount": "0", "currency": currency}, "provider_request_id": Str(hold, "provider_request_id"), "provider_event_id": release, "reservation_id": hold["id"], "cost_basis": "ACTUAL", "occurred_at": Now()}); e != nil {
+			return e
+		}
+	}
 	_, e = s.appendBudget(tx, project, Object{"policy_id": goal["budget_policy_id"], "run_id": run["id"], "operation": "RESERVE", "money": Object{"amount": "0", "currency": currency}, "provider_request_id": request, "provider_event_id": request, "reservation_id": nil, "cost_basis": "UPPER_BOUND", "occurred_at": Now()})
 	return e
 }
