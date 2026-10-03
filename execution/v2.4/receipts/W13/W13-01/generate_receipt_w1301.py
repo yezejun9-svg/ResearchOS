@@ -350,7 +350,14 @@ def guard(obj, where):
     for c in obj["commands"]:
         rr = c.get("result")
         if isinstance(rr, dict) and rr.get("invocation_id"):
-            cited.add(rr["invocation_id"])
+            # the census tabulates the forwarded C23 runs only, so a cited invocation belongs to it exactly when
+            # that invocation really was a C23 selector. Read the invocation receipt instead of assuming the
+            # guard's own scope - the first version compared every cited run and refused a legitimate local row.
+            ip = os.path.join("execution", "invocations", rr["invocation_id"], "receipt.json")
+            if os.path.exists(ip):
+                sel = (load(ip).get("selectors") or {})
+                if sel.get("case_id") == "C23":
+                    cited.add(rr["invocation_id"])
     if cited and not cited <= CENSUS_IDS:
         raise SystemExit("the receipt cites C23 runs that the census it quotes does not list: %s (%s)"
                          % (sorted(x[:8] for x in cited - CENSUS_IDS), where))
