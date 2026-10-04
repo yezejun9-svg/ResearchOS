@@ -134,6 +134,12 @@ func ProjectStages(rows []Object, decision Object) ([]StageProjectionTurn, error
 				if _, e := ValidateReuseDecision(decision); e != nil {
 					return nil, e
 				}
+				// The card's third counter-example as a reader sees it: a completed reuse decision may not be presented
+				// when the research stage never produced a row. A blocked network is recorded as RESEARCH_BLOCKED or
+				// coverage PARTIAL, and neither entitles the projection to show a decision that skipped the reuse gate.
+				if s := researchStatusName(byStage); s != StageCompleted && s != StagePartial {
+					return nil, Fail(422, "GATE_FAILED", "REUSE_DECISION is presented as completed while RESEARCH is "+s)
+				}
 				ref := decision["adoption_decision_ref"].(Object)
 				turn.EvidenceRef = ptr(Str(ref, "id"))
 				turn.DerivedFrom = "validated reuse decision " + Str(decision, "decision") + " over " +
@@ -167,6 +173,19 @@ func readerAction(stage, status string) string {
 		return "start this stage"
 	}
 	return "unrecognised stage status; treat as unknown rather than finished"
+}
+
+// researchStatusName names the RESEARCH state the reader is looking at, keeping "no row was ever written" distinct
+// from a row that exists and says NOT_STARTED, so a refusal states which of the two it refuses.
+func researchStatusName(byStage map[string]Object) string {
+	row, present := byStage[StageResearch]
+	if !present {
+		return "ABSENT"
+	}
+	if s := Str(row, "status"); s != "" {
+		return s
+	}
+	return StageNotStarted
 }
 
 func optionalRef(v any) *string {
@@ -209,7 +228,7 @@ func ReuseJevGate(receipt Object) (float64, error) {
 	}
 	for _, k := range []string{"status", "selected", "signals"} {
 		if _, ok := receipt[k]; !ok {
-			return 0, Fail(400, "INVALID_REQUEST", "decision receipt is missing " + k)
+			return 0, Fail(400, "INVALID_REQUEST", "decision receipt is missing "+k)
 		}
 	}
 	if Str(receipt, "status") != "DECIDED" {

@@ -85,6 +85,31 @@ func readStageRow(t *testing.T, f *fixture, project, stage string) (Object, bool
 	return o, true
 }
 
+func writeBootstrapStage(t *testing.T, f *fixture, project, stage, status string) Object {
+	t.Helper()
+	ctx := context.Background()
+	tx, e := f.db.BeginTx(ctx, nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	id := "stage-" + project + "-" + strings.ToLower(stage)
+	rev, e := f.s.nextRevision(ctx, tx, project, KindBootstrapStage, id)
+	if e != nil {
+		tx.Rollback()
+		t.Fatal(e)
+	}
+	row := Object{"id": id, "project_id": project, "stage": stage, "status": status,
+		"inventory_artifact_ref": nil, "file_failures": Empty(), "observed_at": Now(), "revision": rev}
+	if e := f.s.putOpaque(ctx, tx, project, KindBootstrapStage, id, row); e != nil {
+		tx.Rollback()
+		t.Fatal(e)
+	}
+	if e := tx.Commit(); e != nil {
+		t.Fatal(e)
+	}
+	return row
+}
+
 func TestW0801RecordReuseDecisionSealsAndPromotes(t *testing.T) {
 	f, _, _ := sourceProject(t)
 	ctx := context.Background()
@@ -115,12 +140,46 @@ func TestW0801RecordReuseDecisionSealsAndPromotes(t *testing.T) {
 	if Str(row, "inventory_artifact_ref") != Str(ref, "id") {
 		t.Fatalf("the promoted stage points somewhere else: stage %+v vs reference %+v", row, ref)
 	}
-	turns, e := ProjectStages([]Object{row}, reuseDecisionFor(f.project, inventory, research, evidence, adoption))
+	// The reader needs the research stage too: a promotion is only presentable once the stage before it actually
+	// produced a row. This writes it through the product's own stage writer rather than inventing a shape.
+	writeBootstrapStage(t, f, f.project, StageResearch, StageCompleted)
+	researchRow, researchPresent := readStageRow(t, f, f.project, StageResearch)
+	if !researchPresent {
+		t.Fatal("the research stage row was not written")
+	}
+	turns, e := ProjectStages([]Object{researchRow, row}, reuseDecisionFor(f.project, inventory, research, evidence, adoption))
 	if e != nil {
 		t.Fatalf("the projection rejected a decision the writer accepted: %v", e)
 	}
 	if got := statusOf(t, turns, StageReuseDecision); got.Status != StageCompleted || got.EvidenceRef == nil {
 		t.Fatalf("projection disagrees with the stored promotion: %+v", got)
+	}
+}
+
+func TestW0801ReaderRefusesThePromotionWhileResearchNeverRan(t *testing.T) {
+	// 反例3 on stored rows: the writer validated the payload and its artifacts, but this project never ran
+	// project.bootstrap, so there is no RESEARCH row at all. The projection the CLI and Desktop read from must refuse
+	// to present the promotion rather than show a decision that skipped the reuse gate.
+	f, _, _ := sourceProject(t)
+	ctx := context.Background()
+	inventory := sealTestArtifact(t, f, f.project, "local inventory")
+	research := sealTestArtifact(t, f, f.project, "research notes")
+	evidence := sealTestArtifact(t, f, f.project, "upstream licence text")
+	adoption := sealTestArtifact(t, f, f.project, "adoption decision document")
+	b := reuseDecisionFor(f.project, inventory, research, evidence, adoption)
+	if _, e := f.s.RecordReuseDecision(ctx, f.token, f.project, b, "FIXTURE"); e != nil {
+		t.Fatalf("a decision backed by real artifacts was refused: %v", e)
+	}
+	row, present := readStageRow(t, f, f.project, StageReuseDecision)
+	if !present {
+		t.Fatal("the writer did not record the promotion this test is about")
+	}
+	_, e := ProjectStages([]Object{row}, b)
+	if e == nil {
+		t.Fatal("a completed reuse decision was presented with no research stage at all")
+	}
+	if !strings.Contains(e.Error(), "while RESEARCH is ABSENT") {
+		t.Fatalf("refusal does not name the missing stage: %v", e)
 	}
 }
 

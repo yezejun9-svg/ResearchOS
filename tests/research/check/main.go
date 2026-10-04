@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -196,6 +197,17 @@ func (h *harness) seal(ctx context.Context, project, payload, mode string) domai
 	return sealed
 }
 
+// countArtifacts counts the Artifact rows a project holds, so a refusal can be shown to have left nothing behind
+// rather than merely having returned an error.
+func countArtifacts(db *sql.DB, project string) int {
+	var n int
+	if e := db.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind=?", project, "Artifact").
+		Scan(&n); e != nil {
+		failures = append(failures, map[string]string{"id": "W0801-COUNTARTIFACTS-HARD", "detail": fmt.Sprint(e)})
+	}
+	return n
+}
+
 // as returns the same harness speaking as another credential, so an authorization refusal can be attributed to the
 // role rather than to the payload.
 func (h *harness) as(token string) *harness {
@@ -274,6 +286,39 @@ func main() {
 	if tid != "W08" || cid != "W08-01" {
 		report("FAIL")
 		return
+	}
+
+	// The guard above is exercised, not just present: this program re-runs itself under a foreign binding and requires
+	// the child to refuse. Remove the guard and this is the assertion that goes red, because the child would answer a
+	// selector it does not own. The child is marked because a guard-less build otherwise re-probes forever: uncapped,
+	// that mutant spawned several hundred processes on this host before the run was cut short.
+	if self, selfErr := os.Executable(); selfErr != nil {
+		ok("W0801-ROUTING-SELF-PROBE-REFUSES-FOREIGN-BINDING", false, selfErr)
+	} else if os.Getenv("W0801_PROBE_CHILD") == "1" {
+		ok("W0801-ROUTING-SELF-PROBE-REFUSES-FOREIGN-BINDING", false, "probe nesting stopped at depth 1")
+	} else {
+		probeCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+		defer cancel()
+		probe := exec.CommandContext(probeCtx, self)
+		probe.Dir = root
+		probe.Env = append(os.Environ(), "RESEARCHOS_TASK_ID=W08", "RESEARCHOS_CHECK_ID=W08-02",
+			"W0801_PROBE_CHILD=1")
+		out, probeErr := probe.Output()
+		probeStatus := ""
+		probeAssertions := -1.0
+		var parsed map[string]any
+		if len(bytes.TrimSpace(out)) > 0 && json.Unmarshal(bytes.TrimSpace(out), &parsed) == nil {
+			probeStatus, _ = parsed["status"].(string)
+			if n, isNum := parsed["assertions"].(float64); isNum {
+				probeAssertions = n
+			}
+		}
+		// Refusing is not enough: without the guard the program still fails at the end, having answered a selector it
+		// does not own. The measured refusal is exactly one report line whose roster is empty, because the routing
+		// check is the only thing that ran. Anything else - a full roster, or no parsable report at all - is a fail-open.
+		ok("W0801-ROUTING-SELF-PROBE-REFUSES-FOREIGN-BINDING",
+			probeErr != nil && probeStatus == "FAIL" && probeAssertions == 0,
+			probeErr, probeStatus, probeAssertions, string(out))
 	}
 
 	// --- guard against the frozen contract on disk ---------------------------------------------
@@ -406,6 +451,51 @@ func main() {
 	ok("W0801-PROJ-READER-ACTION-EVERY-INCOMPLETE", everyIncompleteHasAction, turns)
 	ok("W0801-PROJ-PARTIAL-NOT-READ-AS-DONE", statusOf(turns, "IMPLEMENTATION").Status == "PARTIAL", statusOf(turns, "IMPLEMENTATION"))
 
+	// The init/Desktop happy path: all four stages present, research complete, and a decision that passes the guard.
+	full := []domain.Object{
+		{"stage": "LOCAL_INVENTORY", "status": "COMPLETED", "revision": float64(1), "inventory_artifact_ref": "art-inv"},
+		{"stage": "RESEARCH", "status": "COMPLETED", "revision": float64(1), "inventory_artifact_ref": "art-res"},
+		{"stage": "REUSE_DECISION", "status": "COMPLETED", "revision": float64(1)},
+		{"stage": "IMPLEMENTATION", "status": "NOT_STARTED", "revision": float64(1)},
+	}
+	turns, e = domain.ProjectStages(full, base)
+	reuse := statusOf(turns, "REUSE_DECISION")
+	ok("W0801-PROJ-HAPPY-PATH-FOUR-STAGES", e == nil && reuse.Status == "COMPLETED" &&
+		reuse.EvidenceRef != nil && *reuse.EvidenceRef == "art-ado", e, reuse)
+
+	// 反例3: research never ran, yet the reuse stage claims completion. The reader refuses rather than showing a
+	// decision that skipped the reuse gate, and says which state it is objecting to.
+	noResearch := []domain.Object{
+		{"stage": "LOCAL_INVENTORY", "status": "COMPLETED", "revision": float64(1)},
+		{"stage": "RESEARCH", "status": "NOT_STARTED", "revision": float64(1)},
+		{"stage": "REUSE_DECISION", "status": "COMPLETED", "revision": float64(1)},
+	}
+	_, e = domain.ProjectStages(noResearch, base)
+	ok("W0801-PROJ-NO-SKIP-WITHOUT-RESEARCH", refusal(e, "while RESEARCH is NOT_STARTED"), e)
+
+	abstainRows := []domain.Object{
+		{"stage": "LOCAL_INVENTORY", "status": "COMPLETED", "revision": float64(1)},
+		{"stage": "REUSE_DECISION", "status": "COMPLETED", "revision": float64(1)},
+	}
+	_, e = domain.ProjectStages(abstainRows, base)
+	ok("W0801-PROJ-NO-SKIP-WHEN-RESEARCH-ROW-ABSENT", refusal(e, "while RESEARCH is ABSENT"), e)
+
+	// PARTIAL is an attempt that was made, so it is not the same as never researching; the gap it leaves open is what
+	// the decision has to state.
+	partial := []domain.Object{
+		{"stage": "LOCAL_INVENTORY", "status": "COMPLETED", "revision": float64(1)},
+		{"stage": "RESEARCH", "status": "PARTIAL", "revision": float64(1)},
+		{"stage": "REUSE_DECISION", "status": "COMPLETED", "revision": float64(1)},
+	}
+	gapDecision := domain.Object{}
+	for k, v := range base {
+		gapDecision[k] = v
+	}
+	gapDecision["decision"] = "CUSTOM_GAP"
+	gapDecision["remaining_gap"] = "no upstream project covers offline arXiv indexing"
+	_, e = domain.ProjectStages(partial, gapDecision)
+	ok("W0801-PROJ-PARTIAL-RESEARCH-STILL-A-RESEARCH-BASIS", e == nil, e)
+
 	// A hand-edited COMPLETED row must not be self-justifying.
 	tampered := append([]domain.Object{}, rows...)
 	tampered = append(tampered, domain.Object{"stage": "REUSE_DECISION", "status": "COMPLETED", "revision": float64(1)})
@@ -482,7 +572,7 @@ func main() {
 	badCode, badBody := h.as(ownerOnlyToken).call("POST", "/v1/projects/"+project+"/artifacts", domain.ID(),
 		domain.Object{"run_id": nil, "kind": "MANIFEST", "evidence_kind": "GENERATED", "measurement_mode": "FIXTURE",
 			"content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-			"storage_key": "probe", "media_type": "application/json", "byte_size": float64(1),
+			"storage_key":  "probe", "media_type": "application/json", "byte_size": float64(1),
 			"input_refs": domain.Empty(), "source_refs": domain.Empty(), "produced_by": onlyOwner.ID,
 			"access_class": "PROJECT"})
 	ok("W0801-PRODUCT-SEAL-REFUSES-OWNER-ONLY", badCode == 403 &&
@@ -499,9 +589,10 @@ func main() {
 		ado, _ := out["adoption_artifact"].(domain.Object)
 		ok("W0801-RECORD-STAGE-POINTS-AT-SEALED", domain.Str(row, "inventory_artifact_ref") ==
 			domain.Str(ado, "id"), row, out)
-		// The projection the CLI and Desktop show agrees with what the writer stored.
-		turns, e := domain.ProjectStages([]domain.Object{row}, good)
-		ok("W0801-PROJ-AGREES-WITH-STORE", e == nil && statusOf(turns, "REUSE_DECISION").Status == "COMPLETED", e, turns)
+		// On the real rows: this project was created over HTTP and never ran project.bootstrap, so there is no RESEARCH
+		// row. A reader must still refuse to present the stored promotion as a finished reuse stage.
+		_, skipErr := domain.ProjectStages([]domain.Object{row}, good)
+		ok("W0801-PRODUCT-PROJ-REFUSES-WITHOUT-RESEARCH-ROW", refusal(skipErr, "while RESEARCH is ABSENT"), skipErr)
 	}
 
 	// Promotion touches only its own stage: research and implementation keep their own evidence paths.
@@ -523,24 +614,32 @@ func main() {
 	// A refusal mid-transaction must not promote the stage either.
 	dangling := decision(project, inventory, research, evidence, adoption, "ADOPT_UPSTREAM")
 	dangling["research_artifact_ids"] = []any{"art-never-sealed"}
-	if _, e := h.s.RecordReuseDecision(ctx, h.token, project, dangling, "FIXTURE"); e == nil {
-		ok("W0801-RECORD-ABSENT-ARTIFACT-REFUSED", false, "a decision citing a non-existent artifact was accepted")
-	} else {
-		ok("W0801-RECORD-ABSENT-ARTIFACT-REFUSED", true)
-	}
+	before := countArtifacts(h.db, project)
+	_, danglingErr := h.s.RecordReuseDecision(ctx, h.token, project, dangling, "FIXTURE")
+	ok("W0801-RECORD-ABSENT-ARTIFACT-REFUSED", danglingErr != nil &&
+		strings.Contains(fmt.Sprint(danglingErr), "artifact unavailable"), danglingErr)
+	// The distinguishing control: the citation is what fails, so nothing is sealed on the way. If the existence read
+	// were removed, the write would reach the seal step and leave an artifact behind even though it still refused.
+	ok("W0801-RECORD-ABSENT-ARTIFACT-CREATES-NOTHING", countArtifacts(h.db, project) == before,
+		before, countArtifacts(h.db, project), danglingErr)
 	after, _ := readStage(h.db, project, "REUSE_DECISION")
 	ok("W0801-RECORD-REFUSAL-DOES-NOT-DOWNGRADE", present && domain.Str(after, "status") == "COMPLETED", after)
+
+	// A decision bound to another project is refused by the binding check itself, not by an artifact accident: every
+	// artifact it cites really exists, but in this project, while the payload names a different one.
+	other := h.project()
+	foreign := decision(other, inventory, research, evidence, adoption, "ADOPT_UPSTREAM")
+	foreignStage, _ := readStage(h.db, other, "REUSE_DECISION")
+	_, bindErr := h.s.RecordReuseDecision(ctx, h.token, project, foreign, "FIXTURE")
+	ok("W0801-RECORD-PROJECT-MISMATCH-REFUSED", bindErr != nil &&
+		strings.Contains(fmt.Sprint(bindErr), "bound to a different project"), bindErr)
+	ok("W0801-RECORD-PROJECT-MISMATCH-LEAVES-NO-STAGE", foreignStage == nil, foreignStage)
 
 	// measurement_mode is transport metadata, never payload: LIVE/unknown modes are refused before any write.
 	if _, e := h.s.RecordReuseDecision(ctx, h.token, project, good, "LIVE_QUALIFIED"); e == nil {
 		ok("W0801-RECORD-UNKNOWN-MODE-REFUSED", false, "an unrecognised measurement mode was accepted")
 	} else {
 		ok("W0801-RECORD-UNKNOWN-MODE-REFUSED", refusal(e, "must be FIXTURE or LIVE"), e)
-	}
-	if _, e := h.s.RecordReuseDecision(ctx, h.token, "project-that-does-not-exist", good, "FIXTURE"); e == nil {
-		ok("W0801-RECORD-PROJECT-MISMATCH-REFUSED", false, "a decision bound to another project was accepted")
-	} else {
-		ok("W0801-RECORD-PROJECT-MISMATCH-REFUSED", true)
 	}
 
 	sort.Strings(ids)
