@@ -1,9 +1,9 @@
 package main
 
-// apps/cli/cli_http.go holds the only outbound call the CLI command surface makes: a health probe against the host
-// the discovery file names. It is separate from cli_contract.go because the accepted W02-03 launcher already owns
-// net/http usage for doctor; this file never starts a process and never shells out, so the card negative "shell
-// alias delegating to another vendor CLI" cannot become true here by construction.
+// apps/cli/cli_http.go holds the CLI's plain GET helper, shared by the accepted launcher's `doctor` health probe and
+// nothing else: the command verbs themselves speak the client protocol through apps/cli/cli_v2.go, which POSTs an
+// envelope to /v2/command. This file never starts a process and never shells out, so the card negative "shell alias
+// delegating to another vendor CLI" cannot become true here by construction.
 
 import (
 	"io"
