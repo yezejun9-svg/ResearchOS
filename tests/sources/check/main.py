@@ -98,6 +98,11 @@ def routing(task, check, case):
         return "refuse"
     if task == "W07" and check == "W07-01" and not case:
         return "local"
+    # W07-02 owns its own card check id. The row that used to expect "legacy" here was written before anyone had
+    # asked the child; measured, ops/ci/sources.py whitelists only W07-G01, W07-G02 and an empty check id, so
+    # forwarding a card id is a guaranteed "unbound W07 selection" refusal, not a run.
+    if task == "W07" and check == "W07-02" and not case:
+        return "w0702"
     if check or case:
         return "legacy"
     return "refuse"
@@ -113,7 +118,7 @@ ROUTING_TABLE = [
     {"argv": ["--task-id", "W07", "--case-id", "A05"], "task": "W07", "check": "", "case": "A05",
      "expected": "legacy"},
     {"argv": ["--task-id", "W07", "--check-id", "W07-02"], "task": "W07", "check": "W07-02", "case": "",
-     "expected": "legacy"},
+     "expected": "w0702"},
     {"argv": [], "task": "", "check": "", "case": "", "expected": "refuse"},
 ]
 
@@ -248,6 +253,16 @@ def main():
                                           "note": "the forwarded sources harness produced no report"},
                          ensure_ascii=False))
         return rc
+    if decision == "w0702":
+        # This card's own handler. Its report is emitted by main_w0702.py and passed through unchanged, so the
+        # dispatcher grades the child's assertion ids rather than this file paraphrasing them.
+        child = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main_w0702.py")
+        p = subprocess.run([sys.executable, "-X", "utf8", child], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", cwd=ROOT, timeout=3000)
+        sys.stdout.write(p.stdout)
+        if p.stderr:
+            sys.stderr.write(p.stderr[-800:])
+        return p.returncode
     if decision == "refuse":
         print(json.dumps({"status": "COMMAND_FAILED", "assertions": 0, "assertion_ids": [],
                           "failures": [{"id": "W0701-SELECTORS-REQUIRED",
