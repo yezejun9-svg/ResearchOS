@@ -11,7 +11,7 @@ export const stages = [['discovery', '发现'], ['verification', '核验'], ['ex
 export const taskLabels = { DRAFT: '草稿', READY: '待执行', RUNNING: '执行中', EXECUTION_REPORTED: '结果已提交', VERIFYING: '验收中', ACCEPTED: '已验收', FAILED: '失败', BLOCKED: '受阻', CANCELLED: '已取消', NEEDS_REVALIDATION: '需重验', DEFERRED_NO_PROGRESS: '无进展延期' }
 export const runLabels = { QUEUED: '排队', STARTING: '启动中', RUNNING: '运行中', CANCEL_REQUESTED: '取消请求中', SETTLED: '执行已结束', FAILED: '执行失败', CANCELLED: '已取消', LOST: '连接丢失', RECONCILING: '恢复对账中' }
 
-const navigation = [['home', '工作台', 'workbench'], ['cycle', '研究周期', 'cycle'], ['release', '成果审查', 'release'], ['evidence', '来源证据', 'evidence'], ['experiment', '实验评测', 'experiment'], ['knowledge', '知识技能', 'knowledge'], ['team', '团队运行器', 'team'], ['resources', '费用资源', 'resources'], ['settings', '设置设备', 'settings']]
+const navigation = [['home', '工作台', 'workbench'], ['chat', '对话接续', 'continuity'], ['cycle', '研究周期', 'cycle'], ['release', '成果审查', 'release'], ['evidence', '来源证据', 'evidence'], ['experiment', '实验评测', 'experiment'], ['knowledge', '知识技能', 'knowledge'], ['team', '团队运行器', 'team'], ['resources', '费用资源', 'resources'], ['settings', '设置设备', 'settings']]
 
 function routeOf(path) {
   const p = path.split('/').filter(Boolean).map(decodeURIComponent)
@@ -19,7 +19,7 @@ function routeOf(path) {
   if (p[0] !== 'p' || !p[1]) return { kind: 'not-found', key: path }
   const projectId = p[1]
   if (p.length === 2) return { kind: 'workbench', projectId, key: path }
-  const kind = { cycles: 'cycle', tasks: 'task', releases: 'release', evidence: 'evidence', experiments: 'experiment', knowledge: 'knowledge', team: 'team', resources: 'resources', settings: 'settings' }[p[2]]
+  const kind = { cycles: 'cycle', tasks: 'task', releases: 'release', evidence: 'evidence', experiments: 'experiment', knowledge: 'knowledge', team: 'team', resources: 'resources', settings: 'settings', continuity: 'continuity' }[p[2]]
   if (!kind || (['evidence', 'knowledge', 'team', 'resources', 'settings'].includes(kind) && p.length > 3)) return { kind: 'not-found', projectId, key: path }
   if (['cycle', 'task', 'release', 'experiment'].includes(kind) && !p[3]) return { kind: 'selection', section: kind, projectId, key: path }
   return { kind, projectId, id: p[3], key: path }
@@ -48,6 +48,7 @@ function Icon({ name }) {
     team: <><circle cx="8" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M2 20c0-4 3-6 6-6s6 2 6 6M14 15c4-1 8 1 8 5"/></>,
     resources: <><circle cx="12" cy="12" r="9"/><path d="M15 8H10a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H9M12 5v3m0 8v3"/></>,
     settings: <><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2M19 5l-2 2M7 17l-2 2"/></>,
+    chat: <path d="M4 5h16v11H9l-5 4z M8 9h8M8 12h5"/>,
     menu: <path d="M3 6h18M3 12h18M3 18h18"/>, close: <path d="M5 5l14 14M19 5 5 19"/>,
   }
   return <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name] || paths.home}</svg>
@@ -156,7 +157,7 @@ function App() {
     {feedback && <div className={`feedback ${feedback.kind}`} role="status"><span>{feedback.text}</span><button aria-label="关闭提示" onClick={() => setFeedback(null)}><Icon name="close"/></button></div>}
     <div className={`drawer-overlay ${drawer ? 'visible' : ''}`} onClick={() => setDrawer(null)}/>
     <div className="app-grid"><nav className={`sidebar ${drawer === 'nav' ? 'drawer-open' : ''}`} aria-label="主导航" inert={(compact || !!drawer) && drawer !== 'nav'}><div className="sidebar-inner"><div className="sidebar-head"><span>项目空间</span><button className="icon-button drawer-close" aria-label="关闭导航" onClick={() => setDrawer(null)}><Icon name="close"/></button></div><Link to="/" navigate={navigate} className="project-switch">{profile?.name || '选择项目'}<small>{projectId ? '切换项目' : '项目入口'}</small></Link><div className="nav-group">{navigation.map(([icon, label, kind]) => <Link key={kind} to={navUrl(kind)} navigate={navigate} aria-label={label} className={`nav-link ${route.kind === kind ? 'active' : ''}`}><Icon name={icon}/><span>{label}</span></Link>)}</div><div className="sidebar-bottom"><span className="connection-dot"/> {events.online ? '已连接' : '等待连接'}<small>开发阶段 · 以服务回执为准</small></div></div></nav>
-      <main id="main" className="main-area" tabIndex="-1" inert={!!drawer}><Screen key={route.key} route={route} api={api} navigate={navigate} shared={shared} events={events} refresh={refresh + events.refresh} mutate={mutate} onRefresh={() => setRefresh(n => n + 1)}/></main>
+      <main id="main" className="main-area" tabIndex="-1" inert={!!drawer}><Screen key={route.key} route={route} api={api} token={token} navigate={navigate} shared={shared} events={events} refresh={refresh + events.refresh} mutate={mutate} onRefresh={() => setRefresh(n => n + 1)}/></main>
       <aside className={`progress-rail ${drawer === 'rail' ? 'drawer-open' : ''}`} aria-label="阶段进度" inert={(compact || !!drawer) && drawer !== 'rail'}><StageRail projection={shared.data.getProgressProjection} state={state} releases={shared.data.listMilestoneRelease} navigate={navigate} projectId={projectId} onClose={() => setDrawer(null)}/></aside></div>
     {drawer === 'notice' && <aside className="notice-drawer" aria-label="通知列表"><NotificationDrawer notifications={notifications} projectId={projectId} navigate={navigate} mutate={mutate} onClose={() => setDrawer(null)}/></aside>}
     {projectId && <nav className="bottom-nav" aria-label="手机主要导航" inert={!!drawer}>{[['home', '工作台', 'workbench'], ['cycle', '周期', 'cycle'], ['release', '成果', 'release'], ['resources', '资源', 'resources']].map(([icon, label, kind]) => <Link key={kind} to={navUrl(kind)} navigate={navigate} className={route.kind === kind ? 'active' : ''}><Icon name={icon}/><span>{label}</span></Link>)}</nav>}

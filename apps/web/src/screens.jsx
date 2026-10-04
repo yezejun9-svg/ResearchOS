@@ -5,6 +5,7 @@ import { Link, taskLabels, runLabels } from './main'
 import { ArtifactPreview } from './preview'
 import { ProfileDraft } from './profile-draft'
 import { DevicePanel } from './Pairing'
+import { Continuity } from './continuity'
 
 const briefDate = raw => raw ? new Date(raw).toLocaleString() : '未记录'
 const short = raw => raw ? String(raw).slice(0, 12) : '—'
@@ -205,11 +206,12 @@ function Selection({ route, api, projectId, navigate, refresh, onRefresh }) {
 }
 
 export function Screen(props) {
-  const { route, api, navigate, shared, refresh, onRefresh, mutate } = props
+  const { route, api, navigate, shared, refresh, onRefresh, mutate, token } = props
   const common = { route, api, navigate, shared, refresh, onRefresh, mutate, projectId: route.projectId }
   switch (route.kind) {
     case 'projects': return <Projects {...common}/>
     case 'workbench': return <Workbench {...common}/>
+    case 'continuity': return <Continuity token={token} projectId={route.projectId} shared={shared}/>
     case 'cycle': return <Cycle {...common}/>
     case 'task': return <Task {...common}/>
     case 'release': return <Release {...common}/>
