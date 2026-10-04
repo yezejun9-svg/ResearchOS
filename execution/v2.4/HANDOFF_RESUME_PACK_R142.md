@@ -89,4 +89,23 @@ at this head, not recalled.
 
 ## Unpinned evidence to fold in at W07-02 report time
 
-The W07-02 row (rev 142) pins four files. Two newer ones in the same directory are not in that list because they were written after the row was created:  and . They must be enumerated, not hand-picked, when the card is reported, or a false record stays outside the hash set.
+The W07-02 row (rev 142) pins four files, but six now exist in that directory. The two written after the row was
+created are NOT in the evidence set:
+
+- receipts/W07/W07-02/resource_gate_correction_round1.json - the correction that overturns my own absent-token
+  inference about the X backend.
+- receipts/W07/W07-02/x_backend_probe_round1.json - the read-only browser-act probe that found
+  researchos-x / direct_local_120993884286222444.
+
+Enumerate the directory rather than hand-picking paths when the card is reported, or a false record stays outside the
+hash set. Verified at 2026-10-04T14:25Z: task_packet next returns state_source VALIDATED_FILE with ready W07-02,
+checkpoint.revision 142 / expected_previous 141, current_step_id W07-02, no row EXECUTION_REPORTED, 24 ACCEPTED.
+
+Also note: checkpoint.head reads b55a0540 while actual HEAD has moved past it. That field is a human hint, not a
+guard - the CAS pair is revision/expected_previous_revision - so re-run git rev-parse HEAD at the next registration
+instead of trusting it.
+
+Two of my own slips this window, recorded so they are not repeated: the checkpoint array append omitted a separator
+between two new elements and made the file briefly unparseable (receipts/W07/W07-01/checkpoint_incident_round1.json),
+and a bulk index replace overwrote a historical card count that should have stayed at 19/71 for rev 110. Both were
+repaired by guarded textual edits, never by discarding other work.
