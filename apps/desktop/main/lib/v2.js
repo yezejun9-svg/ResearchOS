@@ -144,4 +144,4 @@ function classify(reply) {
     command_id: body.command_id || null, session_id: body.session_id || null, revision: body.revision === undefined ? null : body.revision };
 }
 
-module.exports = { PROTOCOL_VERSION, COMMAND_PATH, CONTRACT, METHODS, WRITE_METHODS, BRIDGE, bridgeFor, envelopeFor, classify };
+module.exports = { PROTOCOL_VERSION, COMMAND_PATH, CONTRACT, METHODS, WRITE_METHODS, PRODUCERS, channelFor, bridgeFor, envelopeFor, classify };
