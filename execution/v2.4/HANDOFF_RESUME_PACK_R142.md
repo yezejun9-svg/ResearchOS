@@ -86,3 +86,7 @@ at this head, not recalled.
   was safe without one — measure the resolver before judging a change's blast radius.
 - `execution/v2.4/path_ownership.json` names `shared_integrator = qoder-desktop:/root/platform_owner`; the rev-2 alias
   was written by `construction` and that deviation is disclosed, not hidden.
+
+## Unpinned evidence to fold in at W07-02 report time
+
+The W07-02 row (rev 142) pins four files. Two newer ones in the same directory are not in that list because they were written after the row was created:  and . They must be enumerated, not hand-picked, when the card is reported, or a false record stays outside the hash set.
