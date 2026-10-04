@@ -363,7 +363,11 @@ func (s *Service) captureSourcePageBound(ctx context.Context, token, project str
 	q := sources.Query{SourceID: Str(config, "source_id"), Text: Str(config, "query"), From: from.UTC(), To: to.UTC(), Cursor: pageCursor, Limit: limit}
 	page, e := adapter.Fetch(ctx, q)
 	result.Page = page
-	if e != nil || page.Failure != "" {
+	// A page that read items completely and then hit a gap is a partial observation, not a failed one. The verified
+	// prefix still gets sealed and the caller persists a pending window, so the gap is resumed on the next cycle
+	// instead of being skipped or lost. Discarding it would throw away real bytes and make one collapsed post look
+	// exactly like an unavailable source - the conflation this path exists to remove.
+	if e != nil || (page.Failure != "" && len(page.Items) == 0) {
 		if e == nil && page.Failure == "RATE_LIMITED" {
 			wait := page.RetryAfter
 			if wait == nil || !wait.After(time.Now()) {

@@ -113,27 +113,32 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 		if e != nil || published.Before(q.From) || !published.Before(q.To) {
 			continue
 		}
+		// X lazy-renders post bodies as the results list is walked, so a later article can be collapsed or mismatched
+		// even when earlier ones were read completely. Aborting the whole page there threw away a verified prefix and
+		// made a partially rendered page look identical to an unavailable source. Stop at the first gap instead, keep
+		// what is complete, and let the cursor say how far the window was actually observed - skipping silently past
+		// a gap would claim coverage of ground this read never examined.
 		if _, e = a.Runner.Run(ctx, "--session", session, "navigate", candidate.URL); e != nil {
 			p.Failure = "DETAIL_UNAVAILABLE"
-			return p, e
+			break
 		}
 		p.RequestURLs = append(p.RequestURLs, candidate.URL)
 		_, _ = a.Runner.Run(ctx, "--session", session, "wait", "stable", "--timeout", "15000")
 		post, _, e := a.eval(ctx, session, xPostScript)
 		if e != nil {
 			p.Failure = "DETAIL_UNAVAILABLE"
-			return p, e
+			break
 		}
 		if post.URL != candidate.URL || len(post.Items) != 1 {
 			p.Failure = "INCOMPLETE_ITEM"
-			return p, nil
+			break
 		}
 		p.FinalURLs = append(p.FinalURLs, post.URL)
 		p.FetchedAt = time.Now().UTC()
 		full := post.Items[0]
 		if full.URL != candidate.URL || full.Author != "/"+match[1] || strings.TrimSpace(full.Text) == "" || full.PublishedAt != candidate.PublishedAt || full.Truncated {
 			p.Failure = "INCOMPLETE_ITEM"
-			return p, nil
+			break
 		}
 		p.Items = append(p.Items, Item{SourceID: q.SourceID, CanonicalURL: full.URL, UpstreamID: match[2], Author: match[1], PublishedAt: published, UpstreamRevision: match[2], Body: []byte(full.Text), MediaType: "text/plain; charset=utf-8", Locator: "post.text"})
 		if len(p.Items) >= q.Limit {
