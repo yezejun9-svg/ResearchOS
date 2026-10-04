@@ -11,6 +11,8 @@ package domain
 // status from evidence that actually exists - it never promotes a stage because time passed.
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 )
@@ -191,4 +193,138 @@ func StrList(v any) []string {
 		out = append(out, a...)
 	}
 	return out
+}
+
+// ReuseJevGate is the J01 gate "judge before reusing": it reads a decision receipt produced by the existing Jev
+// protocol and returns the score a reader may show, or refuses. A score is only ever returned for a signal whose
+// jev_called is true, because "显示分数却未调用Jev" is one of this card's named counter-examples. A hard failure
+// outranks any score, which is the 高分硬失败 case: the highest-scoring candidate is still refused.
+//
+// The fields read here are the ones the accepted decision writer actually stores (status, selected, signals with
+// value/jev_called, deterministic_results, missing_evidence), so a receipt that was never written by that path cannot
+// satisfy the gate by shape alone.
+func ReuseJevGate(receipt Object) (float64, error) {
+	if receipt == nil {
+		return 0, Fail(422, "GATE_FAILED", "a reuse score requires a decision receipt; no Jev call was made")
+	}
+	for _, k := range []string{"status", "selected", "signals"} {
+		if _, ok := receipt[k]; !ok {
+			return 0, Fail(400, "INVALID_REQUEST", "decision receipt is missing " + k)
+		}
+	}
+	if Str(receipt, "status") != "DECIDED" {
+		return 0, Fail(422, "GATE_FAILED", "decision receipt is "+Str(receipt, "status")+"; only a DECIDED receipt may ground a reuse decision")
+	}
+	if strings.TrimSpace(Str(receipt, "selected")) == "" {
+		return 0, Fail(422, "GATE_FAILED", "decision receipt measured no action, so there is no candidate to adopt")
+	}
+	// Hard failures are re-derived here rather than trusted from the receipt's own rationale string, so a receipt that
+	// was hand-edited to say DECIDED still cannot pass a failing deterministic check.
+	if len(Arr(receipt, "missing_evidence")) > 0 {
+		return 0, Fail(422, "GATE_FAILED", "the reuse decision is missing evidence")
+	}
+	for _, v := range Arr(receipt, "deterministic_results") {
+		check, ok := v.(map[string]any)
+		if !ok {
+			return 0, Fail(400, "INVALID_REQUEST", "deterministic_results must be objects")
+		}
+		if check["status"] != "PASS" && check["status"] != "NOT_APPLICABLE" {
+			return 0, Fail(422, "GATE_FAILED", "a deterministic check failed, which no score can outweigh: "+Str(check, "check_id"))
+		}
+	}
+	best := 0.0
+	found := false
+	for _, v := range Arr(receipt, "signals") {
+		signal, ok := v.(map[string]any)
+		if !ok {
+			return 0, Fail(400, "INVALID_REQUEST", "signals must be objects")
+		}
+		called, _ := signal["jev_called"].(bool)
+		value, isNum := signal["value"].(float64)
+		// A value with no Jev call behind it is the fabricated-score case; it is refused even when other signals are
+		// legitimate, because the reader would be showing a number that nothing produced.
+		if !called && isNum {
+			return 0, Fail(422, "GATE_FAILED", "a signal presents score "+fmt.Sprint(value)+" without jev_called")
+		}
+		if called && isNum && (!found || value > best) {
+			best, found = value, true
+		}
+	}
+	if !found {
+		return 0, Fail(422, "GATE_FAILED", "no qualified candidate: the receipt carries no score produced by a Jev call")
+	}
+	return best, nil
+}
+
+// RecordReuseDecision is the only way a reuse decision becomes durable. mode is transport metadata (FIXTURE during
+// construction, LIVE only against a qualified provider) and deliberately not part of the payload, because the frozen
+// ReuseDecisionPayload forbids undeclared fields.
+func (s *Service) RecordReuseDecision(ctx context.Context, token, project string, b Object, mode string) (Object, error) {
+	if mode != "FIXTURE" && mode != "LIVE" {
+		return nil, Fail(400, "INVALID_REQUEST", "measurement_mode for a reuse decision must be FIXTURE or LIVE")
+	}
+	tx, e := s.DB.BeginTx(ctx, nil)
+	if e != nil {
+		return nil, e
+	}
+	defer tx.Rollback()
+	p, e := authenticate(tx, token)
+	if e != nil {
+		return nil, e
+	}
+	out, e := s.recordReuseDecision(ctx, tx, p, project, b, mode)
+	if e != nil {
+		return nil, e
+	}
+	return out, tx.Commit()
+}
+
+func (s *Service) recordReuseDecision(ctx context.Context, tx *sql.Tx, p Principal, project string, b Object, mode string) (Object, error) {
+	decision, e := ValidateReuseDecision(b)
+	if e != nil {
+		return nil, e
+	}
+	if Str(b, "project_id") != project {
+		return nil, Fail(403, "FORBIDDEN", "reuse decision is bound to a different project")
+	}
+	// Every cited artifact has to exist and be visible in this project. Without this a decision could name plausible
+	// ids that point at nothing, which would let a completed stage rest on an invented basis.
+	cited := append([]string{Str(b, "local_inventory_artifact_id")}, StrList(b["research_artifact_ids"])...)
+	cited = append(cited, StrList(b["evidence_artifact_ids"])...)
+	refs := []any{}
+	for _, id := range cited {
+		o, e := s.readObject(tx, p, project, "Artifact", id)
+		if e != nil {
+			return nil, e
+		}
+		refs = append(refs, Ref(o, "Artifact"))
+	}
+	ref := b["adoption_decision_ref"].(Object)
+	if e := s.effective(tx, project, ref); e != nil {
+		return nil, e
+	}
+	upload, e := s.upload(tx, p, project, Bytes(b))
+	if e != nil {
+		return nil, e
+	}
+	sealed, e := s.seal(tx, p, project, Object{"run_id": nil, "kind": "MANIFEST", "evidence_kind": "GENERATED",
+		"measurement_mode": mode, "content_hash": upload["content_hash"], "storage_key": upload["storage_key"],
+		"media_type": "application/json", "byte_size": upload["byte_size"],
+		"input_refs": refs, "source_refs": Empty(), "produced_by": p.ID, "access_class": "PROJECT"})
+	if e != nil {
+		return nil, e
+	}
+	// Promotion writes the stage row and nothing else: a decision may not quietly mark research or implementation
+	// finished, because each of those stages has its own evidence path.
+	id := "stage-" + project + "-" + strings.ToLower(StageReuseDecision)
+	rev, e := s.nextRevision(ctx, tx, project, KindBootstrapStage, id)
+	if e != nil {
+		return nil, e
+	}
+	stage := Object{"id": id, "project_id": project, "stage": StageReuseDecision, "status": StageCompleted,
+		"inventory_artifact_ref": sealed["id"], "file_failures": Empty(), "observed_at": Now(), "revision": rev}
+	if e := s.putOpaque(ctx, tx, project, KindBootstrapStage, id, stage); e != nil {
+		return nil, e
+	}
+	return Object{"decision": decision, "adoption_artifact": Ref(sealed, "Artifact"), "stage": stage}, nil
 }
