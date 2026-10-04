@@ -466,13 +466,16 @@ func setModel(command string, args []string) {
 	}
 	previous := c.Model
 	// The contract gives `config` the local operation host.configure, so a model switch is a command to the host,
-	// not only a file write. The epoch the caller observed travels in the envelope (cli_v2.go sets WriterEpoch for
-	// this method), which is the protocol-side half of "a model switch can never be silent": with no epoch anywhere
-	// the CLI refuses locally with MODEL_CHANGE_WITHOUT_EPOCH before building the request, and an epoch that is not
-	// the current writer's is refused by the core (client_protocol.go:152), so neither the CLI nor the host can land
-	// a quiet switch. The round-2 review proved the wire field was missing; the two rows
-	// W0503-MODEL-CHANGE-CARRIES-THE-OBSERVED-EPOCH and W0503-MODEL-CHANGE-WITHOUT-EPOCH-REFUSES-BEFORE-THE-HOST
-	// are what keep that claim measurable rather than asserted.
+	// not only a file write. What is actually true about the epoch, stated without more than the measurement supports
+	// (the round-3 review rejected the previous wording as a claim ahead of it):
+	//   * with no epoch anywhere the CLI refuses locally with MODEL_CHANGE_WITHOUT_EPOCH before building the request,
+	//     so a switch can never be sent without the field;
+	//   * the value sent is whatever the caller passed with --writer-epoch or the config file recorded - it is NOT
+	//     observed from the host, because nothing in this CLI ever records a writer epoch from a reply;
+	//   * the core only tests presence for this method (client_protocol.go:152). The current-writer comparison at
+	//     :800-808 sits on the session-attach path and is not reached by host.configure, so an invented epoch is
+	//     accepted by the shape gate. "A model switch can never be silent" therefore holds for absence only, and the
+	//     obligation to anchor it to an observed lease is recorded in receipts/W05/W05-03 as P-R3-2.
 	d, dpath, herr := hostDiscovery()
 	if herr != nil || d.URL == "" {
 		fail(command, exitNotImplemented, "MODEL_CHANGE_REQUIRES_HOST_CONFIGURE",

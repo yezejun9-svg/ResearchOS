@@ -168,9 +168,10 @@ func v2EnvelopeFor(ctx *v2Context, method string, payload map[string]any) (*v2En
 			return nil, "MODEL_CHANGE_WITHOUT_EPOCH"
 		}
 		if hasModel || hasProvider {
-			// Refusing locally is only half of it: client_protocol.go:152 rejects a configuration change that names
-			// a model while writer_epoch is absent, so the observed epoch has to travel on the wire, not merely be
-			// non-zero inside this process.
+			// client_protocol.go:152 rejects a configuration change that names a model while writer_epoch is absent,
+			// so the field has to travel. Presence is all the core requires here: the epoch this CLI sends is the
+			// caller's claim, not a value read back from the host, and the current-writer comparison at :800-808 is
+			// only on the session-attach path. Recorded as P-R3-2 rather than described as stronger than it is.
 			env.WriterEpoch = &ctx.epoch
 		}
 	}
