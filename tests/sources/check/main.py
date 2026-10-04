@@ -52,8 +52,10 @@ ACTION_TESTS = {
         "TestW07XOnlyPublicPostAndNoFalseComplete"],
 }
 KINDS = {
-    "GITHUB": ("W0701-GITHUB-LIVE-READ", "W0701-GITHUB-EVIDENCE-FIELDS", "W0701-GITHUB-CURSOR-ADVANCED"),
-    "PAPER": ("W0701-PAPER-LIVE-READ", "W0701-PAPER-EVIDENCE-FIELDS", "W0701-PAPER-CURSOR-ADVANCED"),
+    "GITHUB": ("W0701-GITHUB-LIVE-READ", "W0701-GITHUB-EVIDENCE-FIELDS", "W0701-GITHUB-CURSOR-ADVANCED",
+               "W0701-GITHUB-SEALED-BYTES-MATCH-THE-REPORTED-HASH"),
+    "PAPER": ("W0701-PAPER-LIVE-READ", "W0701-PAPER-EVIDENCE-FIELDS", "W0701-PAPER-CURSOR-ADVANCED",
+              "W0701-PAPER-SEALED-BYTES-MATCH-THE-REPORTED-HASH"),
 }
 
 
@@ -190,6 +192,39 @@ def cursor_persisted(db_path, cursor_id):
         con.close()
 
 
+def sealed_matches(db_path, items):
+    """Recompute sha256 over the sealed bytes the database holds and compare them to the report's claims."""
+    real = db_path if os.path.isabs(db_path) else os.path.join(ROOT, db_path)
+    out = {"checked": [], "mismatches": [], "missing": []}
+    if not items or not os.path.isfile(real):
+        out["missing"].append("no database or no items")
+        return out
+    con = sqlite3.connect("file:" + real.replace("\\", "/") + "?mode=ro", uri=True)
+    try:
+        for item in items:
+            ref = item.get("artifact_ref") or {}
+            art_id = ref.get("id") if isinstance(ref, dict) else ref
+            claimed = str(item.get("body_sha256") or "")
+            row = con.execute("SELECT content_hash, sealed, bytes FROM uploaded_content "
+                              "WHERE storage_key = ?", (art_id,)).fetchone()
+            if not row:
+                row = con.execute("SELECT content_hash, sealed, bytes FROM uploaded_content "
+                                  "WHERE content_hash = ?", (claimed,)).fetchone()
+            if not row:
+                out["missing"].append(str(art_id))
+                continue
+            content_hash, sealed_flag, blob = row
+            actual = "sha256:" + hashlib.sha256(bytes(blob)).hexdigest()
+            record = {"artifact": str(art_id), "claimed": claimed, "stored_hash": content_hash,
+                      "recomputed": actual, "sealed": bool(sealed_flag)}
+            out["checked"].append(record)
+            if actual != claimed or content_hash != claimed:
+                out["mismatches"].append(record)
+    finally:
+        con.close()
+    return out
+
+
 def main():
     task = os.environ.get("RESEARCHOS_TASK_ID", "")
     check = os.environ.get("RESEARCHOS_CHECK_ID", "")
@@ -314,10 +349,10 @@ def main():
             captures[kind] = attempts[-1] if not green(attempts[-1]) else next(a for a in attempts if green(a))
 
     blocked_kinds = []
-    for kind, (read_id, fields_id, cursor_id) in KINDS.items():
+    for kind, (read_id, fields_id, cursor_id, sealed_id) in KINDS.items():
         got = captures.get(kind)
         if not got:
-            for label in (read_id, fields_id, cursor_id):
+            for label in (read_id, fields_id, cursor_id, sealed_id):
                 skip(label, "the live probe binary did not build, so no capture was attempted")
             continue
         rep = got.get("report") or {}
@@ -332,14 +367,14 @@ def main():
             blocked_kinds.append((kind, [{"rc": a["rc"], "seconds": a["seconds"],
                                           "failure": str((a.get("report") or {}).get("failure") or "")[:160]}
                                          for a in attempts]))
-            for label in (read_id, fields_id, cursor_id):
+            for label in (read_id, fields_id, cursor_id, sealed_id):
                 skip(label, "all %d attempts were refused by the public endpoint before any item could be read; "
                             "the window did not move in any of them. Last message: %s" %
                             (len(attempts), reason_text[:180]))
             continue
         if rate_limited:
             blocked_kinds.append((kind, reason_text[:200]))
-            for label in (read_id, fields_id, cursor_id):
+            for label in (read_id, fields_id, cursor_id, sealed_id):
                 skip(label, "the public endpoint refused the request before any item could be read: %s" %
                      reason_text[:200])
             continue
@@ -357,6 +392,14 @@ def main():
                       ensure_ascii=False)[:400])
         stored = cursor_persisted(rep.get("db_path"), rep.get("cursor_id"))
         versions = stored.get("versions") or []
+        # Independent recomputation: the report claims a body hash, and the database holds sealed bytes. Comparing
+        # them here means the card does not have to take the product's own verifyArtifact on trust - and it is the
+        # only form of the claim a checker can actually evidence, because the product skipping its check would
+        # otherwise be invisible from outside.
+        sealed = sealed_matches(rep.get("db_path"), items)
+        ok(sealed_id, bool(items) and not sealed["mismatches"] and
+           not sealed["missing"] and all(s["sealed"] for s in sealed["checked"]),
+           json.dumps(sealed, ensure_ascii=False, default=str)[:400])
         # Three legitimate endings, and only these. A complete page moves the covered window; a page with more
         # pages left keeps the window pending; a read the service refused moves nothing at all. A fourth shape -
         # a covered window the probe did not finish reading - is the defect the card names.
