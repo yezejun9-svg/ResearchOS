@@ -143,6 +143,11 @@ func main() {
 	// Runs last and unconditionally: it is the floor that turns an assertion W04-02 declared but never
 	// emitted into a failure, so it must not be reachable only when both phases completed.
 	h.w0402Reconcile(ctx)
+	// W06-02 lands last and only for its own selector, so the answers already accepted for check_id W04-01 and
+	// W04-02 stay byte-identical instead of quietly growing another card's ids.
+	if os.Getenv("RESEARCHOS_CHECK_ID") == "W06-02" {
+		h.w0602Phase(ctx)
+	}
 }
 
 func repoRoot() string {

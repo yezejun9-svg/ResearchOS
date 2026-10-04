@@ -46,7 +46,7 @@ func routeLegacy() (int, bool) {
 // servedChecks is the complete list of check ids this program answers for itself, one per card in
 // this family. A selector outside it forwards, which is what keeps an already accepted binding from
 // turning into NOT_IMPLEMENTED because a later card registered the same key.
-var servedChecks = map[string]bool{"W04-01": true, "W04-02": true}
+var servedChecks = map[string]bool{"W04-01": true, "W04-02": true, "W06-02": true}
 
 // routesToLegacy is the whole routing rule, kept free of side effects so the truth table is an
 // assertion rather than a comment. This program owns exactly the selectors above, each with no case

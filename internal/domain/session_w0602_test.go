@@ -308,6 +308,40 @@ func TestW0602SessionSingleWriterHandoff(t *testing.T) {
 		[]any{w0602FaultCode(perr), w0602FaultStatus(perr), noGrant.Allowed(project, "", "", false)},
 		Object{"error": w0602ErrText(perr), "roles": noGrant.Roles})
 
+	// Two guards that the round-1 mutation matrix showed were asserted by no id: the grant check on the attach
+	// path, and the sealed-session gate on takeover. Each now has a refusal id and a control beside it.
+	_, attachNoGrant := f.s.AttachClientSession(ctx, noGrant, project, SessionClaim{SessionID: sessionLive, ClientID: clientA})
+	orchestrationAssert(t, "W06-02-ATTACH-BY-PRINCIPAL-WITHOUT-GRANT-REFUSED", []any{"FORBIDDEN", 403, "FORBIDDEN", 403},
+		[]any{w0602FaultCode(attachNoGrant), w0602FaultStatus(attachNoGrant), w0602FaultCode(perr), w0602FaultStatus(perr)},
+		Object{"attach_error": w0602ErrText(attachNoGrant), "read_error": w0602ErrText(perr),
+			"control": "the same stranger principal is refused on read too, so the two refusals share one cause"})
+	// The seal runs in its own transaction that is closed before any service call follows, because the store is a
+	// single SQLite connection: holding a write transaction open across AttachClientSession deadlocks the run.
+	liveRow, _ := f.s.GetClientSession(ctx, writer, project, sessionLive)
+	epoch, _ := liveRow["writer_epoch"].(int64)
+	rev, _ := liveRow["revision"].(int64)
+	sealErr := func() error {
+		sTx, e := f.db.BeginTx(ctx, nil)
+		if e != nil {
+			return e
+		}
+		if e = Seal(ctx, sTx, sessionLive, epoch, rev); e != nil {
+			sTx.Rollback()
+			return e
+		}
+		return sTx.Commit()
+	}()
+	if sealErr != nil {
+		t.Fatalf("seal the live session: %v", sealErr)
+	}
+	_, sealedTakeover := f.s.AttachClientSession(ctx, writer, project, SessionClaim{SessionID: sessionLive, ClientID: clientB,
+		Takeover: true, Reason: "must not overtake a sealed session"})
+	sealedRow, _ := f.s.GetClientSession(ctx, writer, project, sessionLive)
+	orchestrationAssert(t, "W06-02-TAKEOVER-OF-SEALED-SESSION-REFUSED", []any{"SESSION_SEALED", 409, true, int64(1)},
+		[]any{w0602FaultCode(sealedTakeover), w0602FaultStatus(sealedTakeover), sealedRow["sealed"], sealedRow["writer_epoch"]},
+		Object{"seal_error": w0602ErrText(sealErr), "takeover_error": w0602ErrText(sealedTakeover),
+			"control_row": liveRow})
+
 	list, le := f.s.ListClientSessions(ctx, writer, project, 3)
 	// The page must cap at the requested size AND say there is more, rather than reporting a short page as the whole set.
 	totalSessions := w0602Count(f.db, `SELECT count(*) FROM client_sessions WHERE project_id=?`, project)
