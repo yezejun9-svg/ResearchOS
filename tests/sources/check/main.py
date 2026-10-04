@@ -362,22 +362,23 @@ def main():
         rate_limited = bool(re.search(r"(?i)(rate[ _-]?limit|403|secondary rate|api rate)", reason_text))
         attempts = attempts_of.get(kind) or [got]
         if not any(green(a) for a in attempts):
-            # The service, not the product, refused: every attempt is reported with the message the endpoint
-            # actually returned, and the branch model below is not allowed to grade a product defect from it.
-            blocked_kinds.append((kind, [{"rc": a["rc"], "seconds": a["seconds"],
-                                          "failure": str((a.get("report") or {}).get("failure") or "")[:160]}
-                                         for a in attempts]))
-            for label in (read_id, fields_id, cursor_id, sealed_id):
-                skip(label, "all %d attempts were refused by the public endpoint before any item could be read; "
-                            "the window did not move in any of them. Last message: %s" %
-                            (len(attempts), reason_text[:180]))
+            # Every attempt was refused. This is NOT disclosed as a skip and then reported green: the card asks
+            # for two real sources, so a missing read fails the run and carries the endpoint's own message. The
+            # first version of this program skipped the rows here, and a matrix run where GitHub never answered
+            # still printed PASS 23 - the exact shape of laundering the plan refuses.
+            detail = json.dumps({"attempts": [{"rc": a["rc"], "seconds": a["seconds"],
+                                               "failure": str((a.get("report") or {}).get("failure") or "")[:200]}
+                                              for a in attempts], "last_reason": reason_text[:200]},
+                                ensure_ascii=False)
+            failures.append({"id": read_id, "detail": "no attempt produced a live read: " + detail[:480]})
+            failures.append({"id": fields_id, "detail": read_id + " failed: no live read to grade"})
+            failures.append({"id": sealed_id, "detail": read_id + " failed: no sealed bytes to recompute"})
+            failures.append({"id": cursor_id, "detail": read_id + " failed: no window transition to grade"})
+            blocked_kinds.append((kind, detail[:300]))
             continue
         if rate_limited:
+            # A refused read that still produced an item is contradictory; report rather than absorb it.
             blocked_kinds.append((kind, reason_text[:200]))
-            for label in (read_id, fields_id, cursor_id, sealed_id):
-                skip(label, "the public endpoint refused the request before any item could be read: %s" %
-                     reason_text[:200])
-            continue
         ok(read_id, got["rc"] == 0 and rep.get("status") == "PASS" and rep.get("scope") == "LIVE_SERVICE" and
            bool(items) and rep.get("window_from") and rep.get("window_to") and rep.get("cursor_id"),
            json.dumps({"rc": got["rc"], "status": rep.get("status"), "scope": rep.get("scope"),
