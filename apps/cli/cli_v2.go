@@ -167,6 +167,12 @@ func v2EnvelopeFor(ctx *v2Context, method string, payload map[string]any) (*v2En
 		if (hasModel || hasProvider) && ctx.epoch == 0 {
 			return nil, "MODEL_CHANGE_WITHOUT_EPOCH"
 		}
+		if hasModel || hasProvider {
+			// Refusing locally is only half of it: client_protocol.go:152 rejects a configuration change that names
+			// a model while writer_epoch is absent, so the observed epoch has to travel on the wire, not merely be
+			// non-zero inside this process.
+			env.WriterEpoch = &ctx.epoch
+		}
 	}
 	return env, ""
 }

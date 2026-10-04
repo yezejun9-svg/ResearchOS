@@ -1,0 +1,42 @@
+{
+  "record": "W05-03 P-R2-1 fix, with the mutation pair that pins it",
+  "written_by": "qoder-desktop:/root/construction",
+  "written_at": "2026-10-04T11:04:30Z",
+  "supersedes_in_part": "remediation_round2.json",
+  "superseded_sentence_kept_visible": "remediation_round2.json said 'the code fix is deliberately not half-landed here'. That was true when it was written and is kept byte-identical rather than rewritten; this file records what happened next: the fix landed, and the row that was missing coverage now has mutation teeth.",
+  "blocker": "P-R2-1 - host.configure left with writer_epoch absent while its payload named model_id, which internal/domain/client_protocol.go:152 refuses with MODEL_CHANGE_WITHOUT_EPOCH",
+  "reproduction_before_fix": "read-only trace: apps/cli/cli_v2.go set env.WriterEpoch only in the session.attach branch and the v2WriteMethods branch; host.configure is in neither, so the local guard could pass (ctx.epoch non-zero) while the field still left the envelope nil. The round-2 reviewer captured 5/5 such envelopes refused by the real core.",
+  "fix": {
+    "apps/cli/cli_v2.go": "the host.configure branch now also assigns env.WriterEpoch = &ctx.epoch when the payload names model_id or provider_id, keeping the existing local refusal for the zero case. host.configure was deliberately NOT added to v2WriteMethods: that would demand project_id and expected_revision on a host-level command, which is the reviewer's R2-M3 shape rather than the protocol's.",
+    "apps/cli/cli_contract.go": "the comment that claimed 'the epoch travels in the envelope' - the sentence the review proved false - now names the two rows that make the claim measurable instead of asserting it.",
+    "tests/runtime/cli_contract/v2verbs.go": "W0503-SETTLED-MODEL-CHANGE-SENDS-HOST-CONFIGURE additionally reads writer_epoch off the captured envelope, plus two new rows: W0503-MODEL-CHANGE-CARRIES-THE-OBSERVED-EPOCH (wire-level) and W0503-MODEL-CHANGE-WITHOUT-EPOCH-REFUSES-BEFORE-THE-HOST (zero envelopes, previous model still on disk)."
+  },
+  "measurement_after_fix": {
+    "check_program": "go run ./tests/runtime/cli_contract with RESEARCHOS_TASK_ID=W05 RESEARCHOS_CHECK_ID=W05-03, locked go toolchain",
+    "result": "PASS, 91 assertions, 0 failures (was 89; +2 rows)",
+    "repeated_runs": {"attempts": 4, "outcomes": "4/4 PASS at 91 assertions", "distribution": {"PASS 91": 4}},
+    "flakiness_note": "the round-2 review observed 6 of 24 runs FAIL on this program's own loopback fixture. Four consecutive clean runs do not establish that the flake family is gone; they establish only that it did not reproduce here. The instability stays disclosed rather than being re-described as fixed."
+  },
+  "mutation_pair": {
+    "driver": "mut_w0503_epoch_round1.py (this directory; re-runnable, restores bytes in a finally clause)",
+    "M-E1-wire-epoch-removed": {
+      "edit": "the new wire assignment guarded with `if false &&`",
+      "result": "FAIL 88 assertions, killed by W0503-MODEL-CHANGE-CARRIES-THE-OBSERVED-EPOCH, W0503-SETTLED-MODEL-CHANGE-SENDS-HOST-CONFIGURE, W0503-TABLE-ROWS-ALL-PROVEN",
+      "meaning": "the exact defect the review found is now caught by a named row, so R2-M3 is no longer a survivor"
+    },
+    "M-E2-local-refusal-removed": {
+      "edit": "the zero-epoch local refusal guarded with `if false &&`",
+      "result": "FAIL 90 assertions, killed by W0503-MODEL-CHANGE-WITHOUT-EPOCH-REFUSES-BEFORE-THE-HOST and nothing else",
+      "meaning": "each half of the gate has its own isolating row, so neither can substitute for the other"
+    },
+    "restore": "restored_byte_exact true; clean re-run after restore returned PASS 91 with 0 failures",
+    "mutant_shape_note": "both mutants use `&& false` rather than a return, so no variable is orphaned and every row still gets a report"
+  },
+  "still_owed_for_round_3": [
+    "a real-core positive control: the accepted apps/control core answering COMPLETED to a settled model switch. The probe host records the envelope; it does not enforce client_protocol.go, so the wire field is proven present but the end-to-end acceptance is proven only by the reviewer's counter-server so far.",
+    "the six round-2 survivors M1/M2/M4/M5/M8/M9 (session.get leg, IN_PROGRESS mapping, table method column, proven_by attribution, os/exec, launch-tree) with one isolating row each",
+    "the registered selector for this card is still unbound (measured NOT_IMPLEMENTED, exit 3, 0 assertions) and is reported as a non-pass, never as a pass",
+    "disclosure that the green set now depends on apps/desktop/main/lib/v2.js existing, a W13-02 file that did not exist at the parked commit"
+  ],
+  "registration_face": "nothing written to step_state.json or checkpoint.json; the card remains EXECUTION_REPORTED at revision 134 and needs a fresh verifier identity for round 3"
+}
