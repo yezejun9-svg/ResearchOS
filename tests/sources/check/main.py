@@ -120,6 +120,18 @@ ROUTING_TABLE = [
 
 def forward(task, check, case):
     env = dict(os.environ, RESEARCHOS_TASK_ID=task, RESEARCHOS_CHECK_ID=check, RESEARCHOS_CASE_ID=case)
+
+    # R3 from the W07-01 review: the child reads RESEARCHOS_SOURCE_MODE and refuses everything else, so a forwarded
+    # selection arrived with an empty mode and died at its selector gate. The mode is derived from the same selector
+    # the child validates, never from a default, so an unbound selection still refuses loudly instead of being run
+    # in whichever mode happened to be configured.
+    if check == 'W07-G01' and not case:
+        mode = 'fixture'
+    elif check == 'W07-G02' or (not check and case == 'A05'):
+        mode = 'live'
+    else:
+        mode = ''
+    env = dict(env, RESEARCHOS_SOURCE_MODE=mode)
     p = subprocess.run(LEGACY_ARGS, capture_output=True, text=True, timeout=1800, encoding="utf-8",
                        errors="replace", env=env, cwd=ROOT)
     lines = [l for l in (p.stdout or "").splitlines() if l.strip().startswith("{")]
