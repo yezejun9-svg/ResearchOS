@@ -34,27 +34,25 @@ func main() {
 	}
 	switch cmd {
 	case "version", "--version":
-		fmt.Printf("%s %s protocol=%s\n", productName, buildVersion, clientProtocol)
+		// W05-03 output contract: non-interactive stdout is JSONL only, so the human-readable line is a diagnostic.
+		diag("%s %s protocol=%s", productName, buildVersion, clientProtocol)
+		outJSON(map[string]any{"command": "version", "status": "COMPLETED", "exit_code": 0,
+			"product": productName, "version": buildVersion, "protocol": clientProtocol})
 	case "help", "--help", "":
-		fmt.Printf("%s %s (protocol %s)\n\nusage: researchos <command>\n\n", productName, buildVersion, clientProtocol)
-		fmt.Println("available now:")
-		fmt.Println("  version   product/protocol version")
-		fmt.Println("  help      this help")
-		fmt.Println("  doctor    host discovery + health + protocol handshake")
-		fmt.Println("  task      run one coding task: read, propose, real diff, real check, bounded repair")
-		fmt.Println("planned (owned by later cards; NOT_IMPLEMENTED here):")
-		for _, c := range []string{"init", "status", "resume", "cancel", "config", "chat (interactive TUI)", "run --output jsonl", "/goal"} {
-			fmt.Printf("  %-28s NOT_IMPLEMENTED\n", c)
-		}
+		cliHelpSurface(true)
 	case "doctor":
 		b, err := os.ReadFile(discoveryPath)
 		if err != nil {
-			fmt.Println("doctor: host discovery NOT_FOUND at", discoveryPath)
+			diag("doctor: host discovery NOT_FOUND at %s", discoveryPath)
+			outJSON(map[string]any{"command": "doctor", "status": "REJECTED", "exit_code": 3,
+				"reason": "NOT_FOUND", "detail": discoveryPath + ": " + err.Error()})
 			os.Exit(3)
 		}
 		var d discovery
 		if err := json.Unmarshal(b, &d); err != nil {
-			fmt.Println("doctor: discovery file INVALID_JSON")
+			diag("doctor: discovery file INVALID_JSON")
+			outJSON(map[string]any{"command": "doctor", "status": "REJECTED", "exit_code": 3,
+				"reason": "INVALID_JSON", "detail": discoveryPath})
 			os.Exit(3)
 		}
 		status := "DOWN"
@@ -87,7 +85,9 @@ func main() {
 			h(args[1:])
 			return
 		}
-		fmt.Printf("%s: NOT_IMPLEMENTED (%s is registered to a later card; no silent success)\n", cmd, cmd)
+		diag("%s: NOT_IMPLEMENTED (%s is registered to a later card; no silent success)", cmd, cmd)
+		outJSON(map[string]any{"command": cmd, "status": "REJECTED", "exit_code": 3,
+			"reason": "NOT_IMPLEMENTED", "detail": cmd + " is registered to a later card; no silent success"})
 		os.Exit(3)
 	}
 }
