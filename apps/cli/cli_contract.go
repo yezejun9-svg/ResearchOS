@@ -466,8 +466,14 @@ func setModel(command string, args []string) {
 	}
 	previous := c.Model
 	// The contract gives `config` the local operation host.configure, so a model switch is a command to the host,
-	// not only a file write. The epoch travels in the envelope, which is the protocol-side half of "a model switch
-	// can never be silent": MODEL_CHANGE_WITHOUT_EPOCH refuses a configuration change that names a model without one.
+	// not only a file write. OPEN DEFECT, recorded rather than claimed: the epoch does NOT yet travel in this
+	// envelope. v2EnvelopeFor only sets WriterEpoch on the session.attach and v2WriteMethods branches, and
+	// host.configure is in neither, so the command goes out with writer_epoch absent while its payload names
+	// model_id - which internal/domain/client_protocol.go:152 refuses with MODEL_CHANGE_WITHOUT_EPOCH. The real
+	// core therefore rejects a settled model switch; the positive control that would prove the switch completes
+	// does not exist yet, and mutation R2-M3 (adding host.configure to the epoch path) survives with all 89 rows
+	// green. Fix shape for the next round: read session.get first, adopt snapshot.writer.epoch, refuse with a
+	// named reason when there is no writer, and pin the wire-level epoch plus a real-core COMPLETED control.
 	d, dpath, herr := hostDiscovery()
 	if herr != nil || d.URL == "" {
 		fail(command, exitNotImplemented, "MODEL_CHANGE_REQUIRES_HOST_CONFIGURE",
