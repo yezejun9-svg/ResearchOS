@@ -220,6 +220,12 @@ func main() {
 		skip("W1201-LEDGER-COLUMNS-SEPARATED", "no run could be admitted: "+e.Error())
 		return
 	}
+	if os.Getenv("RESEARCHOS_CHECK_ID") == "W12-02" {
+		// A different selector on the same command key serves a different card; the accepted W12-01 phases
+		// stay untouched for their own selector and for a selector-less developer run.
+		w1202Phase(ctx, h, graph)
+		return
+	}
 	// the start-time refusal probe runs before the ledger probes: it needs the Goal policy still at its
 	// default so an unresolved liability can enter, and it restores that policy on the way out
 	startRefusalPhase(ctx, h, graph)
@@ -235,6 +241,7 @@ func routingTruthTableOK() {
 		serve               bool
 	}{
 		{"W12-01", "", "W12", true},
+		{"W12-02", "", "W12", true},
 		// a run with no selector at all is a developer run of this card, not a forward
 		{"", "", "", true},
 		{"W12-G01", "", "W12", false},
