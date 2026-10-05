@@ -137,6 +137,8 @@ def main():
             repo / "apps" / "desktop" / "main" / "main.js",
             repo / "apps" / "web" / "src" / "workbench.jsx", dist,
         ]})
+        save(receipt / "web-dist-hashes.json", {str(path.relative_to(repo)): sha256(path)
+                                               for path in sorted(dist.parent.rglob("*")) if path.is_file()})
         save(receipt / "tool-hashes.json", {name: sha256(binary) for name, binary in binaries.items()} |
              {"electron.exe": sha256(electron_exe), "vite.js": sha256(vite)})
         stage = "fixture_and_restore"
@@ -173,16 +175,31 @@ def main():
         cli_rows = [json.loads(line) for line in cli.stdout.splitlines() if line.strip()]
         operations = cli_rows[0].get("operations", []) if len(cli_rows) == 1 else []
         session_result = next((row.get("result", {}) for row in operations if row.get("method") == "session.get"), {})
+        continuation = cli_rows[0].get("continuation", {}) if len(cli_rows) == 1 else {}
+        next_step = continuation.get("next_step") or {}
+        unfinished = continuation.get("unfinished_tasks") or []
         cli_checks = {"session_id_exact": session_result.get("session_id") == meta["session_id"],
                       "project_id_exact": session_result.get("project_id") == meta["project_id"],
                       "goal_id_exact": session_result.get("goal_id") == meta["goal_id"],
                       "restored_event_cursor": session_result.get("event_sequence") == meta["event_cursor"],
+                      "continuation_available": continuation.get("status") == "AVAILABLE",
+                      "continuation_scope_exact": continuation.get("project_id") == meta["project_id"] and
+                      continuation.get("session_id") == meta["session_id"] and continuation.get("goal_id") == meta["goal_id"],
+                      "continuation_watermark_exact": continuation.get("event_watermark") == meta["event_cursor"],
+                      "continuation_goal_exact": continuation.get("goal", {}).get("id") == meta["goal_id"] and
+                      continuation.get("goal", {}).get("title") == meta["goal_title"],
+                      "only_unfinished_task_exact": len(unfinished) == 1 and unfinished[0].get("id") == meta["task_id"] and
+                      unfinished[0].get("title") == meta["task_title"],
+                      "next_step_original_task": continuation.get("selection") == "UNIQUE" and
+                      next_step.get("task_id") == meta["task_id"] and next_step.get("title") == meta["task_title"] and
+                      next_step.get("source") == "ONLY_UNFINISHED_TASK",
                       "host_url_matches_restored_discovery": cli_rows[0].get("host_url") == discovery["url"] if len(cli_rows) == 1 else False,
                       "status_completed": len(cli_rows) == 1 and cli_rows[0].get("status") == "COMPLETED" and
                       all(row.get("status") == "COMPLETED" for row in operations)}
         save(receipt / "cli-checks.json", cli_checks)
-        save(receipt / "cli-next-task-visibility.json", {"status": "GAP", "reason": "Frozen SessionSnapshot exposes goal_id and event cursor but not task_id; CLI status has no read-only Task operation.",
-                                                        "task_provenance": "restored Host typed Task plus authenticated Electron ros-app Task route"})
+        save(receipt / "cli-next-task-visibility.json", {"status": "PASS" if all(cli_checks.values()) else "FAIL",
+              "previous_gap": "Frozen SessionSnapshot has no task_id; earlier status only exposed session.get and host.status. Older receipts are unchanged.",
+              "continuation": continuation, "task_provenance": "CLI read-only public v1 continuation and authenticated Electron ros-app Task route"})
         if not all(cli_checks.values()):
             raise RuntimeError("CLI_ASSERTION_FAILED:" + json.dumps(cli_checks))
         stage = "electron"
