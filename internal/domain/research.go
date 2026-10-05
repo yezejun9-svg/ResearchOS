@@ -69,7 +69,7 @@ func (s *Service) coalescePendingResearchWindow(tx *sql.Tx, project string, acti
 	if revision != requested {
 		return Fail(412, "STALE_REVISION", "project profile changed")
 	}
-	_, to, err := parseCycleWindow(Str(b, "window_from"), Str(b, "window_to"))
+	requestedFrom, to, err := parseCycleWindow(Str(b, "window_from"), Str(b, "window_to"))
 	if err != nil {
 		return err
 	}
@@ -77,8 +77,15 @@ func (s *Service) coalescePendingResearchWindow(tx *sql.Tx, project string, acti
 	if err != nil {
 		return err
 	}
-	if !to.After(activeEnd) {
+	activeStart, err := time.Parse(time.RFC3339Nano, Str(active, "window_from"))
+	if err != nil {
+		return err
+	}
+	if !to.After(activeEnd) && !requestedFrom.Before(activeStart) {
 		return nil // This request is already contained in the active window.
+	}
+	if requestedFrom.Before(activeStart) && to.Before(activeEnd) {
+		to = activeEnd // Bridge the uncovered prefix through the frozen cycle.
 	}
 	var existingCycle, existingTrigger, existingFrom, existingTo string
 	var existingRevision int64
@@ -87,6 +94,9 @@ func (s *Service) coalescePendingResearchWindow(tx *sql.Tx, project string, acti
 		return err
 	}
 	from := activeEnd
+	if requestedFrom.Before(from) {
+		from = requestedFrom
+	}
 	trigger := Str(b, "trigger")
 	if err == nil {
 		if existingCycle != Str(active, "id") || existingRevision != revision {
@@ -159,7 +169,9 @@ func (s *Service) createResearchCycle(tx *sql.Tx, p Principal, project string, b
 		if e != nil {
 			return nil, e
 		}
-		from = priorFrom // The active cycle already covers everything before this boundary.
+		if priorFrom.Before(from) {
+			from = priorFrom
+		}
 		if priorTo.After(to) {
 			to = priorTo
 		}
@@ -187,7 +199,9 @@ func (s *Service) createResearchCycle(tx *sql.Tx, p Principal, project string, b
 			if to.Before(end.Add(time.Duration(period) * time.Second)) {
 				return nil, Fail(409, "STATE_CONFLICT", "next scheduled cycle is not due")
 			}
-			from = end // All missed ticks are one window, never many cycles.
+			if !pending || !from.Before(end) {
+				from = end // All missed ticks are one window, never many cycles.
+			}
 		} else if errors.Is(err, sql.ErrNoRows) {
 			from = to.Add(-time.Duration(lookback) * time.Second)
 		} else {
