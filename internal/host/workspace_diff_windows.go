@@ -19,10 +19,14 @@ import (
 
 const workspaceFullDiffLimit = 64 << 20
 
-type limitedGitOutput struct{ bytes.Buffer }
+type limitedGitOutput struct {
+	bytes.Buffer
+	exceeded bool
+}
 
 func (b *limitedGitOutput) Write(p []byte) (int, error) {
 	if b.Len()+len(p) > workspaceFullDiffLimit {
+		b.exceeded = true
 		return 0, errors.New("CONTENT_TOO_LARGE: Git output exceeds 64 MiB")
 	}
 	return b.Buffer.Write(p)
@@ -48,7 +52,10 @@ func gitLocal(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	cmd.Stdout = &out
 	err := cmd.Run()
 	if err != nil {
-		return out.Bytes(), fmt.Errorf("GIT_UNAVAILABLE: local Git operation failed: %w", err)
+		if out.exceeded {
+			return nil, errors.New("CONTENT_TOO_LARGE: Git output exceeds 64 MiB")
+		}
+		return out.Bytes(), fmt.Errorf("HOST_UNAVAILABLE: local Git operation failed: %w", err)
 	}
 	return out.Bytes(), nil
 }
@@ -61,25 +68,25 @@ type workspaceChange struct {
 func parseGitNames(raw []byte) ([]workspaceChange, error) {
 	parts := bytes.Split(raw, []byte{0})
 	if len(parts) == 0 || len(parts[len(parts)-1]) != 0 {
-		return nil, errors.New("GIT_UNAVAILABLE: malformed Git name-status output")
+		return nil, errors.New("HOST_UNAVAILABLE: malformed Git name-status output")
 	}
 	changes := make([]workspaceChange, 0, len(parts)/2)
 	for i := 0; i < len(parts)-1; {
 		if i+1 >= len(parts)-1 {
-			return nil, errors.New("GIT_UNAVAILABLE: malformed Git name-status pair")
+			return nil, errors.New("HOST_UNAVAILABLE: malformed Git name-status pair")
 		}
 		status := string(parts[i])
 		path := string(parts[i+1])
 		i += 2
 		if strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C") {
 			if i >= len(parts)-1 {
-				return nil, errors.New("GIT_UNAVAILABLE: malformed Git rename")
+				return nil, errors.New("HOST_UNAVAILABLE: malformed Git rename")
 			}
 			path = string(parts[i])
 			i++
 		}
 		if len(status) == 0 {
-			return nil, errors.New("GIT_UNAVAILABLE: empty Git status")
+			return nil, errors.New("HOST_UNAVAILABLE: empty Git status")
 		}
 		changes = append(changes, workspaceChange{path: path, status: status[:1]})
 	}
@@ -91,7 +98,7 @@ func gitNulPaths(raw []byte) ([]string, error) {
 		return nil, nil
 	}
 	if raw[len(raw)-1] != 0 {
-		return nil, errors.New("GIT_UNAVAILABLE: malformed Git path list")
+		return nil, errors.New("HOST_UNAVAILABLE: malformed Git path list")
 	}
 	items := strings.Split(string(raw[:len(raw)-1]), "\x00")
 	return items, nil
@@ -134,14 +141,14 @@ func (h *Host) WorkspaceDiff(ctx context.Context, workspacePath, access string, 
 	}
 	top, err := gitLocal(ctx, workspacePath, "rev-parse", "--show-toplevel")
 	if err != nil || !strings.EqualFold(filepath.Clean(strings.TrimSpace(string(top))), filepath.Clean(workspacePath)) {
-		return nil, nil, errors.New("GIT_UNAVAILABLE: workspace root must be the repository top level")
+		return nil, nil, errors.New("NOT_A_REPOSITORY: workspace root must be the repository top level")
 	}
 	var revision string
 	var diffArgs []string
 	if base == "HEAD" {
 		sha, shaErr := gitLocal(ctx, workspacePath, "rev-parse", "--verify", "HEAD")
 		if shaErr != nil {
-			return nil, nil, errors.New("GIT_UNAVAILABLE: HEAD is not available")
+			return nil, nil, errors.New("NOT_FOUND: HEAD revision is not available")
 		}
 		revision = strings.TrimSpace(string(sha))
 		diffArgs = []string{"diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-status", "-z", "HEAD", "--"}
@@ -195,7 +202,7 @@ func (h *Host) WorkspaceDiff(ctx context.Context, workspacePath, access string, 
 		}
 		status := map[string]string{"A": "ADDED", "M": "MODIFIED", "T": "MODIFIED", "D": "DELETED", "?": "UNTRACKED", "U": "CONFLICTED"}[change.status]
 		if status == "" {
-			return nil, nil, errors.New("GIT_UNAVAILABLE: unsupported Git status")
+			return nil, nil, errors.New("HOST_UNAVAILABLE: unsupported Git status")
 		}
 		var before, after any
 		if status != "UNTRACKED" && status != "ADDED" {
