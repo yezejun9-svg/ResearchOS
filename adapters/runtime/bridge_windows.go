@@ -253,11 +253,15 @@ func StartBridge(ctx context.Context, directory string, request BridgeRequest) (
 		args = append(args, arg)
 	}
 	seconds := bridgeNumber(profile, "timeout_seconds")
-	if seconds < 1 || seconds > 300 {
+	maxSeconds := int64(300)
+	if profile["backend"] == "mu-sdk-broker-v1" {
+		maxSeconds = 900
+	}
+	if seconds < 1 || seconds > maxSeconds {
 		return nil, errors.New("bounded profile timeout required")
 	}
 	command := sandbox.Command{Executable: filepath.Join(input, "worker.exe"), Args: args, InputDirectory: input, OutputDirectory: output, Timeout: time.Duration(seconds) * time.Second}
-	w.process, e = sandbox.Start(child, command, sandbox.StartOptions{Interactive: true, OnStream: w.consume, BeforeResume: func(identity sandbox.Identity) error {
+	w.process, e = sandbox.Start(child, command, sandbox.StartOptions{Interactive: true, AllowCodingTurnTimeout: profile["backend"] == "mu-sdk-broker-v1", OnStream: w.consume, BeforeResume: func(identity sandbox.Identity) error {
 		w.mu.Lock()
 		defer w.mu.Unlock()
 		w.journal.Identity = identity
