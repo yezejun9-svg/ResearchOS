@@ -169,8 +169,18 @@ func cliReadContinuation(c *v2Context, snapshot map[string]any) (map[string]any,
 			if run["id"] != runID || run["project_id"] != c.projectID || run["task_id"] != task["id"] {
 				return fail("CONTINUATION_SCOPE_MISMATCH")
 			}
-			active = append(active, next("ACTIVE_RUN"))
-		} else if bundleID := continuationString(task, "context_bundle_id"); bundleID != "" {
+			switch run["status"] {
+			case "QUEUED", "STARTING", "RUNNING", "CANCEL_REQUESTED", "LOST", "RECONCILING":
+				active = append(active, next("ACTIVE_RUN"))
+				continue
+			case "SETTLED", "FAILED", "CANCELLED":
+				// Unaccepted tasks retain terminal Run references. Their saved
+				// context remains useful but does not identify an active Run.
+			default:
+				return fail("CONTINUATION_INVALID_RUN_STATUS")
+			}
+		}
+		if bundleID := continuationString(task, "context_bundle_id"); bundleID != "" {
 			if !continuationID(bundleID) {
 				return fail("CONTINUATION_INVALID_CONTEXT")
 			}
