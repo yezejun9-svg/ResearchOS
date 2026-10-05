@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 )
 
 const (
@@ -232,19 +231,6 @@ var goalStatusMap = map[string]string{
 	"NEEDS_REVALIDATION": "NEEDS_REVALIDATION",
 }
 
-type messageAcc struct {
-	id      string
-	role    string
-	parts   map[int]*partAcc
-	order   []int
-	endSeen bool
-	lastSeq int64
-}
-
-type partAcc struct {
-	text string
-}
-
 // BuildSessionSnapshot assembles the typed SessionSnapshot for one session from the
 // authoritative index row plus the durable journal. Fields whose producing subsystem is
 // a later card are emitted as schema-legal nulls/empties; a missing non-null source
@@ -283,14 +269,24 @@ func BuildSessionSnapshot(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, proje
 			return nil, fmt.Errorf("%w:%s", ErrSnapshotIncomplete, name)
 		}
 	}
-	messages, earliest, err := snapshotMessages(ctx, tx, project, sessionID)
+	transcript, err := replaySessionTranscript(ctx, tx, doc, project, sessionID)
 	if err != nil {
 		return nil, err
 	}
-	hasEarlier := false
-	if len(messages) > MaxSnapshotMessages {
-		messages = messages[:MaxSnapshotMessages]
-		hasEarlier = true
+	transcriptRef, err := snapshotTranscriptRef(ctx, tx, project, sessionID, transcript)
+	if err != nil {
+		return nil, err
+	}
+	messages := transcript.messages
+	hasEarlier := len(messages) > MaxSnapshotMessages
+	start := 0
+	if hasEarlier {
+		start = len(messages) - MaxSnapshotMessages
+		messages = messages[start:]
+	}
+	earliest := int64(0)
+	if len(messages) > 0 {
+		earliest, _ = Num(transcript.sequences[start].(Object), "start_sequence")
 	}
 	writer := any(nil)
 	if leaseExpires.Valid {
@@ -325,7 +321,7 @@ func BuildSessionSnapshot(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, proje
 		"pending_permissions":           permissions,
 		"resume_requires_explicit_user": resumeExplicit == 1,
 		"messages":                      messages,
-		"transcript_artifact_ref":       nil,
+		"transcript_artifact_ref":       transcriptRef,
 		"has_earlier_messages":          hasEarlier,
 	}
 	if doc != nil {
@@ -334,78 +330,6 @@ func BuildSessionSnapshot(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, proje
 		}
 	}
 	return snap, nil
-}
-
-// snapshotMessages rebuilds message records from the durable MESSAGE events, so a client
-// that lost its local transcript recovers the same text from the journal alone.
-func snapshotMessages(ctx context.Context, tx *sql.Tx, project, sessionID string) ([]any, int64, error) {
-	rows, err := tx.QueryContext(ctx,
-		`SELECT json_extract(body,'$.sequence'), json_extract(body,'$.payload.message_id'),
-		        json_extract(body,'$.payload.role'), json_extract(body,'$.payload.part_index'),
-		        json_extract(body,'$.payload.phase'), json_extract(body,'$.payload.text')
-		 FROM outbox WHERE project=? AND json_extract(body,'$.session_id')=? AND json_extract(body,'$.kind')='MESSAGE'
-		 ORDER BY json_extract(body,'$.sequence') ASC`, project, sessionID)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-	byID := map[string]*messageAcc{}
-	var order []*messageAcc
-	earliest := int64(0)
-	for rows.Next() {
-		var seq int64
-		var msgID, role, phase, text sql.NullString
-		var partIdx sql.NullInt64
-		if err := rows.Scan(&seq, &msgID, &role, &partIdx, &phase, &text); err != nil {
-			return nil, 0, err
-		}
-		if earliest == 0 || seq < earliest {
-			earliest = seq
-		}
-		if !msgID.Valid {
-			continue
-		}
-		m := byID[msgID.String]
-		if m == nil {
-			m = &messageAcc{id: msgID.String, role: role.String, parts: map[int]*partAcc{}}
-			byID[msgID.String] = m
-			order = append(order, m)
-		}
-		if role.Valid {
-			m.role = role.String
-		}
-		idx := int(0)
-		if partIdx.Valid {
-			idx = int(partIdx.Int64)
-		}
-		acc := m.parts[idx]
-		if acc == nil {
-			acc = &partAcc{}
-			m.parts[idx] = acc
-			m.order = append(m.order, idx)
-		}
-		if text.Valid {
-			acc.text += text.String
-		}
-		if phase.Valid && phase.String == "END" {
-			m.endSeen = true
-		}
-		m.lastSeq = seq
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, err
-	}
-	out := []any{}
-	for _, m := range order {
-		parts := []any{}
-		idxs := append([]int(nil), m.order...)
-		sort.Ints(idxs)
-		for _, idx := range idxs {
-			parts = append(parts, map[string]any{"part_index": idx, "text": m.parts[idx].text, "complete": m.endSeen})
-		}
-		out = append(out, map[string]any{"message_id": m.id, "role": m.role, "parts": parts, "complete": m.endSeen})
-	}
-	return out, earliest, nil
 }
 
 func nullable(s sql.NullString) any {
