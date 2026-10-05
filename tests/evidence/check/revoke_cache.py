@@ -46,13 +46,14 @@ CARD_IDS = [
     "W0902-DELETED-SOURCE-SEALED-BODY-READ-IS-REFUSED",
     "W0902-HIT-SERVED-BEFORE-THE-SOURCE-WAS-DELETED",
     "W0902-INDEX-LEG-IS-A-COMPILE-TIME-CONSTANT",
-    "W0902-KEY-CHANGES-WHEN-SEALED-CONTENT-CHANGES",
+    "W0902-KEY-CHANGES-WHEN-A-SEALED-ARTIFACT-IDENTITY-MOVES",
+    "W0902-KEY-CHANGES-WHEN-THE-ACTING-PRINCIPAL-CHANGES",
+    "W0902-KEY-RESTORES-WHEN-THE-ORIGINAL-PRINCIPAL-RESUMES",
     "W0902-KEY-STABLE-FOR-IDENTICAL-INPUT",
     "W0902-KNOWN-GAP-HARD-LINK-INTO-A-ROOT-IS-SEALED-AND-SERVED",
     "W0902-KNOWN-GAP-THE-DOMAIN-COLLAPSES-EVERY-READ-REFUSAL-TO-ONE-MESSAGE",
     "W0902-LEXICAL-ESCAPE-REFUSED-BEFORE-THE-ROOT-IS-OPENED",
     "W0902-ORDINARY-REGULAR-FILE-STILL-SEALS-AFTER-THE-CLASSIFIER",
-    "W0902-PERMISSION-LEG-CANNOT-BE-ISOLATED-AT-THE-SEARCH-SURFACE",
     "W0902-REVOKED-CREDENTIAL-LOSES-THE-SEARCH-SURFACE",
     "W0902-SHARED-PROJECTION-CARRIES-EVIDENCE-AND-SOURCE-KIND",
 ]
@@ -70,24 +71,30 @@ CLASS_ROWS = {
                        "W0902-DELETED-SOURCE-DROPS-THE-CACHED-HIT-AND-SAYS-WHY",
                        "W0902-DELETED-SOURCE-SEALED-BODY-READ-IS-REFUSED"],
     "authority_changed": ["W0902-REVOKED-CREDENTIAL-LOSES-THE-SEARCH-SURFACE",
-                          "W0902-PERMISSION-LEG-CANNOT-BE-ISOLATED-AT-THE-SEARCH-SURFACE"],
+                          "W0902-KEY-CHANGES-WHEN-THE-ACTING-PRINCIPAL-CHANGES",
+                          "W0902-KEY-RESTORES-WHEN-THE-ORIGINAL-PRINCIPAL-RESUMES"],
     "path_escape": ["W0902-LEXICAL-ESCAPE-REFUSED-BEFORE-THE-ROOT-IS-OPENED",
                     "W0902-ADAPTER-NAMES-AN-ABSENT-FILE-AS-ABSENCE",
                     "W0902-KNOWN-GAP-THE-DOMAIN-COLLAPSES-EVERY-READ-REFUSAL-TO-ONE-MESSAGE"],
     "link_reshape": ["W0902-ADAPTER-NAMES-A-JUNCTION-ESCAPE-AS-A-LINK",
                      "W0902-KNOWN-GAP-HARD-LINK-INTO-A-ROOT-IS-SEALED-AND-SERVED",
                      "W0902-KNOWN-GAP-THE-DOMAIN-COLLAPSES-EVERY-READ-REFUSAL-TO-ONE-MESSAGE"],
-    "stale_reference": ["W0902-KEY-CHANGES-WHEN-SEALED-CONTENT-CHANGES",
+    "stale_reference": ["W0902-KEY-CHANGES-WHEN-A-SEALED-ARTIFACT-IDENTITY-MOVES",
                         "W0902-DELETED-SOURCE-DROPS-THE-CACHED-HIT-AND-SAYS-WHY",
                         "W0902-SHARED-PROJECTION-CARRIES-EVIDENCE-AND-SOURCE-KIND"],
 }
 NOT_COVERED = [
-    "the ContextBundle call site of currentAuthorizedSnapshots: a bundle needs a task, a task needs the accepted-"
-    "requirement chain, and a bare fixture requirement answers POST /tasks with 400 CreateTaskRequest schema",
+    "the ContextBundle call site of currentAuthorizedSnapshots is not asserted by THIS roster. The reason first "
+    "given here was wrong and an independent reviewer corrected it: a green pre-existing test in the same package "
+    "already exercises bundle creation, so the real gap is only that this handler's -run filter (^TestW0902) does "
+    "not select it. Calling a guard 'unreachable' while a passing test exists is the error this line punishes",
     "the event/journal surface (SessionEvents) after revocation, which is the 'events still return revoked content' "
     "half of the card's counter-example: it needs a live client-protocol session this card does not own",
     "source_coverage on the ResearchCycle projection: the field lives on a research cycle object behind W16's flow, "
     "so action 3's coverage half is only reachable here through the evidence summary aggregates",
+    "the lexical pre-check and the intermediate Lstat branch are asserted by nothing: removing !filepath.IsLocal "
+    "outright leaves the roster green because os.Root refuses the same escape anyway, so the escape row evidences "
+    "the collapsed constant rather than the pre-check",
 ]
 
 ROUTING_TABLE = [
@@ -96,6 +103,7 @@ ROUTING_TABLE = [
     {"task": "W09", "check": "W09-03", "case": "", "expected": "refuse"},
     {"task": "W09", "check": "W09-G02", "case": "A06", "expected": "refuse"},
     {"task": "W08", "check": "W08-01", "case": "", "expected": "refuse"},
+    {"task": "W17", "check": "W09-02", "case": "", "expected": "refuse"},
     {"task": "", "check": "", "case": "", "expected": "refuse"},
 ]
 FOREIGN_PROBE_CHECK = "W09-03"

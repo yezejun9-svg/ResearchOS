@@ -59,7 +59,43 @@ func TestW0902SearchKeyBindsEachComponent(t *testing.T) {
 	w09Assertion(t, "W0902-KEY-STABLE-FOR-IDENTICAL-INPUT", Object{"snapshot_hash": hashFirst,
 		"hits": len(Arr(first, "hits")), "note": "positive control: the rows below only mean something because the key does not move on its own"})
 
-	// Source leg: same principal, same project, same index; only the sealed bytes change.
+	// Permission leg, isolated on a snapshot nothing else has disturbed yet. The independent
+	// reviewer disproved the premise this row first carried: a granted second principal DOES see a
+	// CURRENT snapshot, so the leg is falsifiable - the earlier zero hits were stale state inherited
+	// from the refresh below, not a property of the search surface. It therefore runs before anything
+	// moves the manifest, and the ProjectState revision is pinned on both sides so a key movement has
+	// nowhere else to come from.
+	revisionBefore := Str(f.state(), "revision")
+	f.switchPrincipal("w0902_equal_reader", []string{"READER"})
+	afterPrincipal := w0902Search(f, marker, snapshotID, 10)
+	if len(Arr(afterPrincipal, "hits")) != 1 {
+		t.Fatalf("the granted second principal lost the hit, so this construction no longer isolates the permission leg: %v", afterPrincipal)
+	}
+	if Str(afterPrincipal, "snapshot_hash") == hashFirst {
+		t.Fatalf("a different principal with equal grants reused the key: %v", afterPrincipal)
+	}
+	if Str(f.state(), "revision") != revisionBefore {
+		t.Fatalf("the project state moved (%s -> %s) while only the caller changed, so the key difference is not attributable to the grant alone",
+			revisionBefore, Str(f.state(), "revision"))
+	}
+	w09Assertion(t, "W0902-KEY-CHANGES-WHEN-THE-ACTING-PRINCIPAL-CHANGES", Object{"before": hashFirst,
+		"after": Str(afterPrincipal, "snapshot_hash"), "hits_before": 1, "hits_after": len(Arr(afterPrincipal, "hits")),
+		"state_revision_held": revisionBefore,
+		"varied": "the acting principal, and with it the grant identity folded into the key; roles and grants were provisioned identically"})
+	f.switchPrincipal(f.owner, []string{"OWNER"})
+	restored := w0902Search(f, marker, snapshotID, 10)
+	if Str(restored, "snapshot_hash") != hashFirst {
+		t.Fatalf("switching back to the original principal did not restore the key, so one of these two rows measures the wrong thing: %s vs %s",
+			Str(restored, "snapshot_hash"), hashFirst)
+	}
+	w09Assertion(t, "W0902-KEY-RESTORES-WHEN-THE-ORIGINAL-PRINCIPAL-RESUMES", Object{
+		"hash_after_return": Str(restored, "snapshot_hash"), "equals_baseline": true,
+		"meaning": "the control that makes the previous row about the caller rather than about the passage of time"})
+
+	// Source leg, stated at its real strength. Refreshing a changed file moves the sealed content hash,
+	// that artifact's revision, its manifest membership and the ProjectState revision together, so no
+	// input here varies a single source operand. Saying so is the honest version of what an earlier
+	// draft of this row claimed as "source bytes only".
 	replaced := "the sealed body was replaced " + marker + " and now differs\n"
 	if err := os.WriteFile(filepath.Join(rootPath, "keyed.txt"), []byte(replaced), 0600); err != nil {
 		t.Fatal(err)
@@ -71,27 +107,10 @@ func TestW0902SearchKeyBindsEachComponent(t *testing.T) {
 	if Str(afterSource, "snapshot_hash") == hashFirst {
 		t.Fatalf("a changed source kept the same key: %v", afterSource)
 	}
-	w09Assertion(t, "W0902-KEY-CHANGES-WHEN-SEALED-CONTENT-CHANGES", Object{"before": hashFirst,
-		"after": Str(afterSource, "snapshot_hash"), "varied": "source bytes only",
-		"hits_after": len(Arr(afterSource, "hits"))})
-
-	// Permission leg. The construction this card hoped for does not isolate it, and the run
-	// says so: a second principal with equal roles and equal grants cannot see the artifact at
-	// all, so any key movement between those two calls is the manifest leg moving underneath it.
-	// Recording that as a row rather than quietly reporting a hash difference keeps the claim
-	// honest, and names what a real isolation would need.
-	f.switchPrincipal("w0902_equal_reader", []string{"READER"})
-	afterPrincipal := w0902Search(f, marker, snapshotID, 10)
-	if len(Arr(afterPrincipal, "hits")) != 0 {
-		t.Fatalf("the second principal unexpectedly still saw the snapshot, so this row's premise changed: %v", afterPrincipal)
-	}
-	if !strings.Contains(string(Bytes(afterPrincipal)), "snapshot changed or unavailable") {
-		t.Fatalf("the second principal lost the hit for some reason other than the one characterised here: %v", afterPrincipal)
-	}
-	w09Assertion(t, "W0902-PERMISSION-LEG-CANNOT-BE-ISOLATED-AT-THE-SEARCH-SURFACE", Object{
-		"before": hashFirst, "after": Str(afterPrincipal, "snapshot_hash"),
-		"hits_after": 0, "warning": "snapshot changed or unavailable",
-		"meaning": "visibility is bound to more than the grant set the key hashes, so no cross-principal construction here varies the permission leg alone; the row goes red if that stops being true"})
+	w09Assertion(t, "W0902-KEY-CHANGES-WHEN-A-SEALED-ARTIFACT-IDENTITY-MOVES", Object{"before": hashFirst,
+		"after": Str(afterSource, "snapshot_hash"), "hits_after": len(Arr(afterSource, "hits")),
+		"moved_together": []string{"content_hash", "artifact revision", "manifest membership", "ProjectState revision"},
+		"meaning": "this row proves the key follows the sealed identity, not that it follows the bytes alone"})
 
 	// Index leg, disclosed rather than faked: the revision the key carries is a compile-time
 	// constant, so no runtime input can move it and no row here can falsify it.
