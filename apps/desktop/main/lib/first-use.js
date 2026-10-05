@@ -46,7 +46,10 @@ async function chooseWorkspace({ host, native, callV2, deps, contextStore, sessi
       typeof result.workspace?.authorized_workspace_ref !== 'string') {
     return { ok: false, reason: bootstrapped.reason || bootstrapped.error_code || 'PROJECT_BOOTSTRAP_FAILED', protocol_status: bootstrapped.protocol_status };
   }
-  const next = { projectId: result.project_id, sessionId: null, expectedRevision: result.profile_ref?.revision ?? null, writerEpoch: null };
+  const profileRevision = result.project_profile_ref?.revision;
+  const next = { projectId: result.project_id, sessionId: null,
+    expectedRevision: Number.isSafeInteger(profileRevision) && profileRevision > 0 ? profileRevision : null,
+    writerEpoch: null };
   try { contextStore.save(next); }
   catch { return { ok: false, reason: 'CONTEXT_STORE_FAILED', project_id: result.project_id }; }
   Object.assign(sessionState, next);
