@@ -129,7 +129,7 @@ func New(cfg Config) (*Host, error) {
 	if err != nil {
 		return nil, err
 	}
-	svc, err := domain.New(cfg.DB, cfg.ContractsDir, cfg.MigrationFile)
+	svc, err := domain.NewCurrentMu(cfg.DB, cfg.ContractsDir, cfg.MigrationFile)
 	if err != nil {
 		return nil, err
 	}

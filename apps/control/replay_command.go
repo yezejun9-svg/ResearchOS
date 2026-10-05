@@ -163,7 +163,7 @@ func fixtureControlReplay(requestPath string) error {
 	if err != nil || state != request.Binding.ProjectionHash {
 		return fmt.Errorf("replay projection differs from frozen host binding")
 	}
-	service, err := domain.New(db, filepath.Join(input, "spec/v2.0/contracts"), filepath.Join(input, "migrations/sqlite/0002_domain.sql"))
+	service, err := domain.NewCurrentMu(db, filepath.Join(input, "spec/v2.0/contracts"), filepath.Join(input, "migrations/sqlite/0002_domain.sql"))
 	if err != nil {
 		return err
 	}

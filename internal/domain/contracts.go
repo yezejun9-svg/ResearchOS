@@ -159,6 +159,16 @@ func (c *Contracts) Validate(name string, v any) error {
 			return fmt.Errorf("v2.4 EvaluationReport schema unavailable")
 		}
 	}
+	selected, e := persistenceSchemaName(name, j)
+	if e != nil {
+		return e
+	}
+	if selected != name {
+		s, ok = c.Schemas[selected]
+		if !ok {
+			return fmt.Errorf("current persistence schema unavailable: %s", selected)
+		}
+	}
 	return s.Validate(j)
 }
 func LoadContracts(dir string) (*Contracts, error) {
@@ -240,6 +250,9 @@ func LoadContracts(dir string) (*Contracts, error) {
 		}
 	}
 	if e = c.bindEvaluationV24(); e != nil {
+		return nil, e
+	}
+	if e = c.bindPersistenceV24(compiler, doc, api); e != nil {
 		return nil, e
 	}
 	return c, nil

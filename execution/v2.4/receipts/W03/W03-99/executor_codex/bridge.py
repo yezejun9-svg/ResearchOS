@@ -27,8 +27,25 @@ def route(key, env):
     # different meaning. All historical non-parent tuples go to the old driver.
     if task == "W03" and check in ("W03-01", "W03-02"):
         raise ValueError("wrong W03 exact selector")
-    legacy = "ops/ci/contracts.py" if key == "contracts.validate" else "ops/ci/domain.py"
-    return "forward", [sys.executable, legacy]
+    import gate_driver
+    entry = gate_driver.plan()["legacy_entries"][key]
+    return "legacy", [sys.executable, *entry["argv"]]
+
+def legacy_environment(key, inherited):
+    import gate_driver as g
+    p = g.plan()
+    entry = p["legacy_entries"][key]
+    locked = g.read(p["toolchain_path"])
+    env = {name: inherited[name] for name in entry["allowed_env"] if name in inherited}
+    env.update(entry["fixed_env"])
+    for name in ("RESEARCHOS_TASK_ID", "RESEARCHOS_CHECK_ID", "RESEARCHOS_CASE_ID"):
+        if inherited.get(name):
+            env[name] = inherited[name]
+    for name, tool_name in entry["tool_env"].items():
+        record = locked["tools"][tool_name]
+        g.require(g.sha(record["path"]) == record["sha256"], "legacy tool changed: " + tool_name)
+        env[name] = record["path"]
+    return env
 
 def main():
     try:
@@ -37,6 +54,8 @@ def main():
         kind, target = route(sys.argv[1], os.environ)
         if kind == "forward":
             return subprocess.call(target, cwd=ROOT)
+        if kind == "legacy":
+            return subprocess.call(target, cwd=ROOT, env=legacy_environment(sys.argv[1], os.environ))
         # This local module is enrolled in the archived manifest; there is no
         # AST extraction, dynamically selected external module, or fallback run.
         import gate_driver
