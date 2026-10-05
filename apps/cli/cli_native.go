@@ -107,8 +107,8 @@ func cliNativeRequest(d discovery, clientID, kind string, payload map[string]any
 	return reply.Payload, nil
 }
 
-// A normal command only reads the private credential file. First-use renewal is
-// deliberately restricted to the explicit init command.
+// Read the current local credential. Renewal uses the authenticated native pipe;
+// neither this file nor a renewal asks the user to copy a short-lived token.
 func cliSessionCredential(d discovery) (string, error) {
 	if d.DataDir == "" {
 		return "", errors.New("HOST_DATA_DIR_ABSENT")
