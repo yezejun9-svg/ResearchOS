@@ -135,10 +135,16 @@ func verbSteps(name string, args []string, ctx *v2Context, cfg cliConfig) ([]v2S
 		if s, has := flagValue(args, "session"); has {
 			ctx.sessionID = s
 		}
-		return []v2Step{
-			{"session.send", map[string]any{"text": prompt, "attachment_artifact_ids": refs, "delivery": "QUEUE"}, ""},
+		steps := []v2Step{}
+		if ctx.sessionID == "" {
+			steps = append(steps, v2Step{"session.create", map[string]any{"workspace_ref": cfg.WorkspaceRef, "model_config_ref": cfg.Model, "title": clip(prompt, 60)}, ""})
+		} else {
+			steps = append(steps, v2Step{"session.get", map[string]any{}, ""})
+		}
+		return append(steps, []v2Step{
+			{"session.send", map[string]any{"text": prompt, "attachment_artifact_ids": refs, "delivery": "NORMAL"}, ""},
 			{"session.events", map[string]any{"after_sequence": intFlag(args, "after-sequence", 0), "limit": 200}, ""},
-		}, "", ""
+		}...), "", ""
 	default:
 		return nil, "NO_METHOD_BOUND", name
 	}
@@ -249,7 +255,7 @@ func cliInteractive(args []string) {
 			lines = append(lines, line)
 		}
 	}
-	steps := []v2Step{{"session.list", map[string]any{"cursor": "", "limit": 20}, ""}}
+	steps := []v2Step{{"session.list", map[string]any{"cursor": nil, "limit": 20}, ""}}
 	if sid, has := flagValue(args, "session"); has {
 		ctx.sessionID = sid
 		steps = append(steps, v2Step{"session.attach", map[string]any{"after_sequence": intFlag(args, "after-sequence", 0),
@@ -264,19 +270,24 @@ func cliInteractive(args []string) {
 	}
 	for _, line := range lines {
 		steps = append(steps, v2Step{"session.send", map[string]any{"text": line,
-			"attachment_artifact_ids": []any{}, "delivery": "QUEUE"}, ""})
+			"attachment_artifact_ids": []any{}, "delivery": "NORMAL"}, ""})
 	}
 	report := []map[string]any{}
 	worst := exitCompleted
 	stop := interruptGuard("interactive")
+	baseCommand := ctx.commandID
+	methodCalls := map[string]int{}
 	for _, s := range steps {
+		ctx.commandID = v2FlowCommandID(baseCommand, s.method, methodCalls[s.method])
+		methodCalls[s.method]++
+		previousSession := ctx.sessionID
 		reply, reason, code := v2Call(ctx, s.method, s.payload)
 		row := map[string]any{"method": s.method, "exit_code": code,
 			"status": orDefault(statusOf(reply), orDefault(reason, "NO_REPLY"))}
 		if reply != nil {
 			// Only session.create mints a session, so only its answer is adopted; an identity the caller named, or
 			// one a listing happened to echo, is never substituted for it.
-			if res, isMap := reply["result"].(map[string]any); isMap && ctx.sessionID == "" && s.method == "session.create" {
+			if res, isMap := reply["result"].(map[string]any); isMap && previousSession == "" && s.method == "session.create" {
 				// Only a flow that had no session adopts one; a --session the user typed is never overwritten by a
 				// reply, which is what made an attach report a session other than the one it attached to.
 				if sid, has := res["session_id"].(string); has && sid != "" {

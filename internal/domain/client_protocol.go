@@ -42,7 +42,8 @@ var methodsV2 = map[string]bool{
 // durable command methods may never carry native-only or secret-bearing payloads
 // write-class methods require full identity/CAS fields in the envelope
 var writeMethods = map[string]bool{
-	"session.send": true, "session.control": true, "session.update": true, "session.handoff": true,
+	"session.create": true,
+	"session.send":   true, "session.control": true, "session.update": true, "session.handoff": true,
 	"workspace.write": true, "artifact.import": true, "permission.respond": true, "goal.start": true,
 	"project.bootstrap": true,
 }
@@ -135,7 +136,7 @@ func DecodeEnvelope(raw []byte) (*Envelope, error) {
 			return nil, fmt.Errorf("MISSING_FIELD:writer_epoch")
 		}
 	}
-	if writeMethods[*e.Method] && *e.Method != "session.attach" {
+	if writeMethods[*e.Method] && *e.Method != "session.attach" && *e.Method != "session.create" {
 		if err := requiredString("project_id", e.ProjectID); err != nil {
 			return nil, err
 		}
@@ -620,8 +621,10 @@ type ClientHostInfo struct {
 
 // ClientService is the single typed command service shared by the CLI and the Desktop (W03-02).
 type ClientService struct {
-	Doc  *SchemaDoc
-	Host ClientHostInfo
+	Doc            *SchemaDoc
+	Host           ClientHostInfo
+	Domain         *Service
+	SessionRuntime ClientSessionRuntime
 }
 
 var (
@@ -679,6 +682,19 @@ type clientSessionRow struct {
 // normal response, while a non-nil error means the caller must roll the whole transaction
 // back so neither business state nor an event survives.
 func (s *ClientService) Execute(ctx context.Context, tx *sql.Tx, env *Envelope, principal string) (*Response, bool, error) {
+	if s.Doc != nil {
+		var request any
+		raw, err := json.Marshal(env)
+		if err != nil {
+			return nil, false, err
+		}
+		if err = json.Unmarshal(raw, &request); err != nil {
+			return nil, false, err
+		}
+		if err = s.Doc.ValidateDefInput("CommandEnvelope", request); err != nil {
+			return NewTypedRejection(env, "INVALID_REQUEST", "command violates the published request schema"), false, nil
+		}
+	}
 	hash, err := env.ContentHash()
 	if err != nil {
 		return nil, false, err
@@ -753,6 +769,20 @@ func (s *ClientService) dispatch(ctx context.Context, tx *sql.Tx, env *Envelope,
 	}
 	if !methodsV2[*env.Method] {
 		return reject(0, nil, "UNSUPPORTED_METHOD", "method is not part of researchos-client/2"), nil
+	}
+	if *env.Method == "session.create" {
+		if env.SessionID != nil || env.ExpectedRevision != nil || env.WriterEpoch != nil {
+			return reject(0, nil, "INVALID_REQUEST", "session creation must not claim a session revision or writer epoch"), nil
+		}
+		return s.createClientSession(ctx, tx, env, principal)
+	}
+	if *env.Method == "session.list" {
+		return s.listClientSessions(ctx, tx, env, principal)
+	}
+	if deref(env.SessionID) != "" {
+		if err := clientSessionOwner(ctx, tx, deref(env.ProjectID), deref(env.SessionID), principal); err != nil {
+			return reject(0, nil, "FORBIDDEN", "session belongs to another principal"), nil
+		}
 	}
 	// session.attach is dual-mode: reading a snapshot needs no writer claim, while
 	// request_write_owner is a write that must pass the full gate.
@@ -948,6 +978,8 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 			Status: strptr("COMPLETED"), SessionID: env.SessionID, Revision: revPtr(rev), Result: result}
 	}
 	switch *env.Method {
+	case "session.send":
+		return s.sendClientMessage(ctx, tx, env, principal, sess)
 	case "session.attach":
 		var p struct {
 			RequestWriteOwner bool `json:"request_write_owner"`
@@ -961,6 +993,16 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		if deref(env.ClientID) == sess.writerClientID {
 			return reject(sess.revision, sess.epoch, "WRITER_BUSY", "takeover needs a client id different from the current writer"), nil
 		}
+		if sess.runID != "" {
+			status, settled, err := runState(ctx, tx, sess.project, sess.runID)
+			if err != nil {
+				return nil, err
+			}
+			if liveRunStatuses[status] && !settled {
+				return reject(sess.revision, sess.epoch, "SESSION_BUSY", "previous runtime must settle before writer takeover"), nil
+			}
+		}
+		prevEpoch, prevClient := sess.epoch, sess.writerClientID
 		newEpoch, err := HandoffEpoch(ctx, tx, sess.sessionID, sess.epoch, sess.revision)
 		if err != nil {
 			code := "WRITER_BUSY"
@@ -977,13 +1019,12 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		}
 		// Writer attribution moves with the epoch inside this same transaction, so the old
 		// client cannot slip a command in between the transfer and the journal row.
-		if _, err := tx.ExecContext(ctx, `UPDATE client_sessions SET writer_client_id=? WHERE id=? AND writer_epoch=?`,
-			deref(env.ClientID), sess.sessionID, newEpoch); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE client_sessions SET writer_client_id=?,lease_expires_at=? WHERE id=? AND writer_epoch=?`,
+			deref(env.ClientID), nowT.Add(s.Host.LeaseTTL).Format(time.RFC3339Nano), sess.sessionID, newEpoch); err != nil {
 			return nil, err
 		}
 		sess.writerClientID = deref(env.ClientID)
 		now := nowT.Format(time.RFC3339Nano)
-		prevEpoch, prevClient := sess.epoch, sess.writerClientID
 		// the transfer already advanced epoch and revision; the journal row is written under
 		// the new ownership claim, so both CAS layers agree inside this one transaction
 		sess.epoch = newEpoch
@@ -1074,7 +1115,7 @@ func (s *ClientService) journal(ctx context.Context, tx *sql.Tx, env *Envelope, 
 		EventID:   strptr(fmt.Sprintf("ev-%s-%d", sess.sessionID, seq)),
 		SessionID: strptr(sess.sessionID), Sequence: int64ptr(seq),
 		CoreBuildID: strptr(s.Host.CoreBuildID), ProtocolVersion: strptr(ProtocolV2),
-		CommandID: env.CommandID, DomainEventID: strptr(fmt.Sprintf("de-%s", deref(env.CommandID))),
+		CommandID: env.CommandID, DomainEventID: nil,
 		Kind: strptr(kind), Payload: body,
 	}
 	if rs, ok := runID.(string); ok {

@@ -342,6 +342,16 @@ func (s *Service) event(tx *sql.Tx, project, kind string, o Object, actor, corre
 	if e != nil {
 		return e
 	}
+	// Typed session events share this outbox and allocate from its committed
+	// watermark. Continue the same sequence inside the existing transaction;
+	// ProjectState may predate intervening typed events.
+	var outboxSequence int64
+	if e = tx.QueryRow("SELECT COALESCE(MAX(sequence),0) FROM outbox WHERE project=?", project).Scan(&outboxSequence); e != nil {
+		return e
+	}
+	if outboxSequence > seq {
+		seq = outboxSequence
+	}
 	if seq == 1<<63-1 {
 		return Fail(409, "STATE_CONFLICT", "event sequence exhausted")
 	}
