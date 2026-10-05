@@ -51,7 +51,7 @@ def source_hashes():
     hashes = {}
     for folder in ["apps/web/src", "apps/desktop/main", "apps/desktop/preload",
                    "apps/control", "apps/cli", "internal", "adapters", "migrations/sqlite", "tests/ui/w1303",
-                   "tests/ui/provision"]:
+                   "tests/ui/provision", "tests/ui"]:
         for path in sorted((ROOT / folder).rglob("*")):
             if path.is_file() and path.suffix in {".go", ".js", ".jsx", ".cjs", ".mjs", ".css", ".py", ".sql", ".html", ".json"}:
                 hashes[path.relative_to(ROOT).as_posix()] = digest(path)
@@ -60,6 +60,10 @@ def source_hashes():
                  "apps/desktop/package.json", "apps/desktop/package-lock.json",
                  "tests/ui/browser_smoke.py"]:
         hashes[name] = digest(ROOT / name)
+    locked = json.loads((ROOT / "execution/toolchains/locked.json").read_text(encoding="utf-8-sig"))["tools"]
+    for tool in ["go", "node", "python"]:
+        hashes["runtime_tool_" + tool] = digest(Path(locked[tool]["path"]))
+    hashes["runtime_tool_electron"] = digest(ROOT / "apps/desktop/node_modules/electron/dist/electron.exe")
     bundle = Path(os.environ.get("RESEARCHOS_MU_BUNDLE") or ROOT / ".local/w1401-mu-worker/mu-worker.mjs")
     hashes["runtime_bundle"] = digest(bundle) if bundle.is_file() else "UNAVAILABLE"
     return hashes

@@ -53,8 +53,7 @@ async function main(){
   const actual=fs.readFileSync(source),expected=Buffer.from(input.expected_written_text);
   check('ALLOW_WRITES_EXACT_BYTES',actual.equals(expected),{actual_bytes:actual.toString('base64'),expected_bytes:expected.toString('base64')});
  }else{
-  // Verify replay refusal only after the original Run has settled its cancellation.
-  await waitRun(['CANCELLED','FAILED']);
+  await waitRun(['CANCELLED','FAILED','CANCEL_REQUESTED']);
   check('DENY_PRESERVES_PHYSICAL_BYTES',fs.readFileSync(source).equals(initial));
  }
  const observed=await page.evaluate(async({project,run,task})=>{
@@ -68,9 +67,18 @@ async function main(){
  check('ONE_REQUIRED_ONE_RESOLVED_EVENT',events.filter(e=>e.kind==='PERMISSION_REQUIRED').length===1&&events.filter(e=>e.kind==='PERMISSION_RESOLVED').length===1);
  const resolved=events.find(e=>e.kind==='PERMISSION_RESOLVED');
  check('DECISION_SEALED_AND_CONSUMED_ONCE',resolved.payload.decision===choice&&resolved.payload.consumed===(choice==='ALLOW_ONCE')&&resolved.payload.action_digest===input.prompt.action_digest&&resolved.payload.resolution_artifact_ref.entity_type==='Artifact');
- const repeat=await page.evaluate(prompt=>window.researchos.v2['permission.respond']({resource_request_id:prompt.request.id,resource_request_revision:prompt.request.revision,action_digest:prompt.action_digest,decision:'ALLOW_ONCE',reason:'Closed original action replay refusal probe'}),input.prompt);
+ const replay=()=>page.evaluate(prompt=>window.researchos.v2['permission.respond']({resource_request_id:prompt.request.id,resource_request_revision:prompt.request.revision,action_digest:prompt.action_digest,decision:'ALLOW_ONCE',reason:'Closed original action replay refusal probe'}),input.prompt);
+ let repeat=await replay(); report.closed_request_probe_replies=[repeat];
+ if(repeat.error_code==='VERSION_CONFLICT'){
+  check('STALE_SNAPSHOT_REFUSED_WITHOUT_WRITE',!repeat.ok&&repeat.protocol_status==='REJECTED'&&fs.readFileSync(source).equals(choice==='ALLOW_ONCE'?Buffer.from(input.expected_written_text):initial),repeat);
+  const refreshed=await page.evaluate(()=>window.researchos.v2['session.get']({}));
+  check('REFRESH_IS_SAME_ORIGINAL_SESSION',refreshed.ok&&refreshed.result.project_id===input.project_id&&refreshed.result.session_id===observed.session.result.session_id);
+  repeat=await replay();report.closed_request_probe_replies.push(repeat);
+ }
  check('CLOSED_REQUEST_CANNOT_WRITE_AGAIN',!repeat.ok&&['STALE_REVISION','RESOURCE_BLOCKED'].includes(repeat.error_code||repeat.reason),repeat);
  check('REJECTION_PRESERVES_PHYSICAL_BYTES',fs.readFileSync(source).equals(choice==='ALLOW_ONCE'?Buffer.from(input.expected_written_text):initial));
+ const afterEvents=await page.evaluate(()=>window.researchos.v2['session.events']({after_sequence:0,limit:200}));report.after_replay_events=afterEvents;
+ check('NO_REPLAY_PERMISSION_EVENT',afterEvents.ok&&(afterEvents.result.events||[]).filter(e=>e.kind==='PERMISSION_REQUIRED').length===1&&(afterEvents.result.events||[]).filter(e=>e.kind==='PERMISSION_RESOLVED').length===1);
  check('NO_RENDERER_ERRORS',errors.length===0,errors);
  await capture('original-action-after-'+choice.toLowerCase());report.status='PASS';
 }
