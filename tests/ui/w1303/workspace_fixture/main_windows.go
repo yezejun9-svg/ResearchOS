@@ -146,6 +146,7 @@ func run() error {
 	dirFlag := flag.String("dir", "", "new private fixture directory below .local")
 	webFlag := flag.String("web-dir", "apps/web/dist", "built web assets")
 	permissionFlag := flag.Bool("permission", false, "explicit loopback SDK fixture for an original tool permission")
+	transcriptFlag := flag.Bool("transcript", false, "explicit 201-message sealed transcript FIXTURE")
 	flag.Parse()
 	if *dirFlag == "" {
 		return errors.New("-dir is required")
@@ -283,6 +284,9 @@ func run() error {
 	session := snap["session_id"].(string)
 	if permission != nil {
 		return servePermissionFixture(ctx, db, coordinator, h, client, base, token, project, session, ref, root, dataDir, listener.Addr().String(), permission)
+	}
+	if *transcriptFlag {
+		return serveTranscriptFixture(ctx, db, h, client, base, token, project, session, ref, root, dataDir, listener.Addr().String())
 	}
 	tree, err := command(ctx, client, base, token, "workspace.tree", "probe-tree", &project, &session, nil, nil,
 		domain.Object{"workspace_ref": ref, "relative_path": ".", "cursor": nil, "limit": 100})
