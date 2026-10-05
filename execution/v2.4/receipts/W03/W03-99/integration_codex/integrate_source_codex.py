@@ -19,16 +19,23 @@ def sha(path):
 def git(*args, cwd=ROOT):
     return subprocess.check_output(['git', *args], cwd=cwd, text=True).strip()
 
-assert len(sys.argv) == 2, 'One exact implementation commit is required.'
-revision = sys.argv[1]
-assert git('rev-parse', revision) == revision
+assert len(sys.argv) >= 2, 'The ordered exact implementation commits are required.'
+revisions = sys.argv[1:]
+revision = revisions[-1]
+assert all(git('rev-parse', item) == item for item in revisions)
 assert git('rev-parse', 'HEAD', cwd=CANDIDATE) == revision
 assert git('branch', '--show-current', cwd=CANDIDATE) == 'work/codex-w0399'
 assert not git('status', '--porcelain', '--untracked-files=no', cwd=CANDIDATE)
 scope_path = HERE / 'source_repair_scope_codex.json'
 scope = load(scope_path)
 allowed = set(scope['existing_allowed_paths']) | set(scope['new_allowed_worker_paths'])
-files = git('diff-tree', '--no-commit-id', '--name-only', '-r', revision).splitlines()
+candidate_chain = git('rev-list', '--reverse', '--ancestry-path', scope['candidate_source_head'] + '..' + revision).splitlines()
+assert len(candidate_chain) >= 2 and candidate_chain[1:] == revisions
+projection_commit_files = git('diff-tree', '--no-commit-id', '--name-only', '-r', candidate_chain[0]).splitlines()
+assert projection_commit_files == [scope['root_owned_projection_path']]
+commit_files = {item: git('diff-tree', '--no-commit-id', '--name-only', '-r', item).splitlines() for item in revisions}
+assert all(names for names in commit_files.values())
+files = sorted({name for names in commit_files.values() for name in names})
 assert files and all(name in allowed or name.startswith(EXECUTOR_REL) for name in files)
 assert scope['root_owned_projection_path'] not in files
 assert any(name in allowed for name in files), 'Implementation commit must contain its concrete registered production repair.'
@@ -53,7 +60,7 @@ for gate in ['W03-G01', 'W03-G02', 'W03-G03']:
     report = load(CANDIDATE / EXECUTOR_REL / ('candidate_' + gate + '.json'))
     assert report['status'] == 'PASS' and report['assertion_ids'] == [gate]
     assert report['formal_product_acceptance'] == 'NOT_RUN' and report['owned_acceptance_ids'] == []
-subprocess.run(['git', 'cherry-pick', revision], cwd=ROOT, check=True)
+subprocess.run(['git', 'cherry-pick', *revisions], cwd=ROOT, check=True)
 assert all(sha(ROOT / name) == digest for name, digest in protected_before.items())
 input_hashes = {name: sha(ROOT / name) for name in files if (ROOT / name).is_file()}
 assert all((ROOT / name).read_bytes() == (CANDIDATE / name).read_bytes() for name in input_hashes)
@@ -82,7 +89,8 @@ for gate in ['W03-G01', 'W03-G02', 'W03-G03']:
         atoms.append({'gate': gate, 'kind': kind, 'receipt_sha256': reference['receipt_sha256'],
             'manifest_sha256': reference['manifest_sha256'], 'current_main_source_vector_equal': True})
 record = {'schema': 'researchos.scoped-source-integration.v1', 'actor': 'codex:/root',
-    'status': 'PASS_SCOPED_SOURCE_INTEGRATION', 'worker_commit': revision, 'main_commit': git('rev-parse', 'HEAD'),
+    'status': 'PASS_SCOPED_SOURCE_INTEGRATION', 'worker_commit': revision, 'worker_commits': revisions,
+    'per_commit_files': commit_files, 'main_commit': git('rev-parse', 'HEAD'),
     'production_repair_scope_sha256': sha(scope_path), 'allowed_integrated_files': files,
     'integrated_input_hashes': input_hashes, 'protected_hashes_unchanged': protected_before,
     'current_atoms': atoms, 'new_product_executions': 0, 'formal_case_count_delta': 0, 'parent_accepted': False}
