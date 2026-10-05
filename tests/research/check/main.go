@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -278,11 +279,14 @@ func main() {
 	ctx := context.Background()
 	root, _ := os.Getwd()
 
-	// Routing truth: the dispatcher injects RESEARCHOS_TASK_ID / RESEARCHOS_CHECK_ID. This program serves W08-01 and
-	// refuses any other binding, so binding this card cannot silently answer another card's selector.
+	// Routing truth: the dispatcher injects RESEARCHOS_TASK_ID / RESEARCHOS_CHECK_ID.
 	tid, cid := os.Getenv("RESEARCHOS_TASK_ID"), os.Getenv("RESEARCHOS_CHECK_ID")
+	if tid == "W08" && cid == "W08-02" {
+		runW0802(ctx, root)
+		return
+	}
 	ok("W0801-ROUTING-TRUTH-TABLE", tid == "W08" && cid == "W08-01",
-		fmt.Sprintf("task_id=%q check_id=%q; this handler only answers W08/W08-01", tid, cid))
+		fmt.Sprintf("task_id=%q check_id=%q; this handler only answers W08/W08-01 or W08/W08-02", tid, cid))
 	if tid != "W08" || cid != "W08-01" {
 		report("FAIL")
 		return
@@ -301,7 +305,7 @@ func main() {
 		defer cancel()
 		probe := exec.CommandContext(probeCtx, self)
 		probe.Dir = root
-		probe.Env = append(os.Environ(), "RESEARCHOS_TASK_ID=W08", "RESEARCHOS_CHECK_ID=W08-02",
+		probe.Env = append(os.Environ(), "RESEARCHOS_TASK_ID=W08", "RESEARCHOS_CHECK_ID=W08-99",
 			"W0801_PROBE_CHILD=1")
 		out, probeErr := probe.Output()
 		probeStatus := ""
@@ -642,6 +646,67 @@ func main() {
 		ok("W0801-RECORD-UNKNOWN-MODE-REFUSED", refusal(e, "must be FIXTURE or LIVE"), e)
 	}
 
+	sort.Strings(ids)
+	if len(failures) == 0 {
+		report("PASS")
+		return
+	}
+	report("FAIL")
+}
+
+// W08-02's selector runs the domain's HTTP+SQLite evidence fixtures. Go's JSON
+// test events prove every named witness actually executed, not merely that the
+// package returned zero after a misspelled -run filter.
+func runW0802(ctx context.Context, root string) {
+	tests := []string{
+		"TestW0802PendingWindowsCoalesceAcrossRestart",
+		"TestResearchMonitorAcceptedPlanBinding",
+		"TestResearchCycleBoundBeforeFirstTask",
+		"TestResearchDriverCreatesOneFiniteCycleAndTruthfulMissingReport",
+		"TestResearchMonitorPauseResumeCancelAndDrift",
+		"TestResearchTaskBoundAndPublicCloseGate",
+		"TestResearchOfflineCandidateStagesCurrentReceipts",
+		"TestResearchNativeSourceReceiptToIndependentClose",
+		"TestResearchNoProgressPersistsAcrossAcceptedReports",
+		"TestResearchOfflineNativeExperimentAndProgress",
+		"TestW08ManualDispositionCurrentBoundary",
+		"TestW08RequiredGates",
+		"TestW08CoverageGates",
+		"TestW08C06MissingXContinuesSources",
+		"TestW08C06RateLimitedXCoalesces",
+		"TestW08C05CompleteWithoutAdoption",
+		"TestW08G02SixHourAndMissedTicks",
+	}
+	goBinary := filepath.Join(runtime.GOROOT(), "bin", "go")
+	if runtime.GOOS == "windows" {
+		goBinary += ".exe"
+	}
+	deadline, cancel := context.WithTimeout(ctx, 4*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(deadline, goBinary, "test", "-json", "./internal/domain", "-run", "^("+strings.Join(tests, "|")+")$", "-count=1")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "RESEARCHOS_GO="+goBinary)
+	out, err := cmd.CombinedOutput()
+	passed := map[string]bool{}
+	for _, line := range bytes.Split(out, []byte{'\n'}) {
+		var event struct {
+			Action string `json:"Action"`
+			Test   string `json:"Test"`
+		}
+		if json.Unmarshal(line, &event) == nil && event.Action == "pass" {
+			passed[event.Test] = true
+		}
+	}
+	for _, name := range tests {
+		ok("W0802-"+strings.TrimPrefix(name, "Test"), passed[name], name+" did not pass")
+	}
+	if err != nil {
+		tail := out
+		if len(tail) > 3000 {
+			tail = tail[len(tail)-3000:]
+		}
+		ok("W0802-TEST-PROCESS", false, err, string(tail))
+	}
 	sort.Strings(ids)
 	if len(failures) == 0 {
 		report("PASS")

@@ -28,7 +28,13 @@ func (s *Service) researchOperation(tx *sql.Tx, p Principal, project, id string,
 		}
 		if active := Str(state, "active_cycle_id"); active != "" {
 			o, err := load(tx, project, "ResearchCycle", active)
-			return o, "", 200, err
+			if err != nil {
+				return nil, "", 0, err
+			}
+			if err = s.coalescePendingResearchWindow(tx, project, o, b); err != nil {
+				return nil, "", 0, err
+			}
+			return o, "ResearchCycle", 409, nil
 		}
 		o, err := s.createResearchCycle(tx, p, project, b)
 		return o, "ResearchCycle", 201, err
@@ -51,6 +57,67 @@ func parseCycleWindow(from, to string) (time.Time, time.Time, error) {
 	return a, b, nil
 }
 
+// Keep a single future window while the active cycle's immutable inputs remain
+// frozen. The HTTP conflict response is committed with this row in one transaction.
+func (s *Service) coalescePendingResearchWindow(tx *sql.Tx, project string, active, b Object) error {
+	profile, err := singleton(tx, project, "ProjectProfile")
+	if err != nil {
+		return err
+	}
+	revision, _ := Num(profile, "revision")
+	requested, _ := Num(b, "profile_revision")
+	if revision != requested {
+		return Fail(412, "STALE_REVISION", "project profile changed")
+	}
+	_, to, err := parseCycleWindow(Str(b, "window_from"), Str(b, "window_to"))
+	if err != nil {
+		return err
+	}
+	activeEnd, err := time.Parse(time.RFC3339Nano, Str(active, "window_to"))
+	if err != nil {
+		return err
+	}
+	if !to.After(activeEnd) {
+		return nil // This request is already contained in the active window.
+	}
+	var existingCycle, existingTrigger, existingFrom, existingTo string
+	var existingRevision int64
+	err = tx.QueryRow("SELECT active_cycle,profile_revision,trigger,window_from,window_to FROM research_pending_windows WHERE project=?", project).Scan(&existingCycle, &existingRevision, &existingTrigger, &existingFrom, &existingTo)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	from := activeEnd
+	trigger := Str(b, "trigger")
+	if err == nil {
+		if existingCycle != Str(active, "id") || existingRevision != revision {
+			return Fail(409, "STATE_CONFLICT", "pending window belongs to another cycle or profile")
+		}
+		priorFrom, e := time.Parse(time.RFC3339Nano, existingFrom)
+		if e != nil {
+			return e
+		}
+		priorTo, e := time.Parse(time.RFC3339Nano, existingTo)
+		if e != nil {
+			return e
+		}
+		if priorFrom.Before(from) {
+			from = priorFrom
+		}
+		if priorTo.After(to) {
+			to = priorTo
+		}
+		if existingTrigger == "USER" {
+			trigger = existingTrigger
+		}
+	}
+	now := Now()
+	_, err = tx.Exec(`INSERT INTO research_pending_windows(project,active_cycle,profile_revision,trigger,window_from,window_to,created_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(project) DO UPDATE SET trigger=excluded.trigger,window_from=excluded.window_from,
+		window_to=excluded.window_to,updated_at=excluded.updated_at`, project, active["id"], revision, trigger,
+		from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano), now, now)
+	return err
+}
+
 func (s *Service) createResearchCycle(tx *sql.Tx, p Principal, project string, b Object) (Object, error) {
 	state, err := singleton(tx, project, "ProjectState")
 	if err != nil {
@@ -71,6 +138,32 @@ func (s *Service) createResearchCycle(tx *sql.Tx, p Principal, project string, b
 	}
 	from, to, err := parseCycleWindow(Str(b, "window_from"), Str(b, "window_to"))
 	if err != nil {
+		return nil, err
+	}
+	var pendingCycle, pendingFrom, pendingTo string
+	var pendingRevision int64
+	pending := false
+	err = tx.QueryRow("SELECT active_cycle,profile_revision,window_from,window_to FROM research_pending_windows WHERE project=?", project).Scan(&pendingCycle, &pendingRevision, &pendingFrom, &pendingTo)
+	if err == nil {
+		pending = true
+		if pendingRevision > profileRevision {
+			return nil, Fail(412, "STALE_INPUT", "pending research window has a future profile revision")
+		}
+		// A newer approved profile may re-evaluate the missed time span using its
+		// own sources; the cycle records that exact current profile reference.
+		priorFrom, e := time.Parse(time.RFC3339Nano, pendingFrom)
+		if e != nil {
+			return nil, e
+		}
+		priorTo, e := time.Parse(time.RFC3339Nano, pendingTo)
+		if e != nil {
+			return nil, e
+		}
+		from = priorFrom // The active cycle already covers everything before this boundary.
+		if priorTo.After(to) {
+			to = priorTo
+		}
+	} else if err != sql.ErrNoRows {
 		return nil, err
 	}
 	policy, err := load(tx, project, "RunPolicy", Str(profile, "run_policy_id"))
@@ -114,6 +207,11 @@ func (s *Service) createResearchCycle(tx *sql.Tx, p Principal, project string, b
 		"follow_up_task_ids": Empty(), "checkpoint_artifact_id": nil, "outcome_summary": nil, "started_at": Now(), "closed_at": nil})
 	if err = s.put(tx, "ResearchCycle", o); err != nil {
 		return nil, err
+	}
+	if pending {
+		if _, err = tx.Exec("DELETE FROM research_pending_windows WHERE project=? AND active_cycle=?", project, pendingCycle); err != nil {
+			return nil, err
+		}
 	}
 	var monitorGoal string
 	if err = tx.QueryRow("SELECT compiled_goal FROM intent_plan_bindings WHERE project=? AND monitor_current=1", project).Scan(&monitorGoal); err == nil {
