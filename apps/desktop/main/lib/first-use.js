@@ -46,10 +46,9 @@ async function chooseWorkspace({ host, native, callV2, deps, contextStore, sessi
       typeof result.workspace?.authorized_workspace_ref !== 'string') {
     return { ok: false, reason: bootstrapped.reason || bootstrapped.error_code || 'PROJECT_BOOTSTRAP_FAILED', protocol_status: bootstrapped.protocol_status };
   }
-  const profileRevision = result.project_profile_ref?.revision;
-  const next = { projectId: result.project_id, sessionId: null,
-    expectedRevision: Number.isSafeInteger(profileRevision) && profileRevision > 0 ? profileRevision : null,
-    writerEpoch: null };
+  // expectedRevision belongs to a client session. A project profile revision
+  // is not a session CAS value; session.create requires both fields to be null.
+  const next = { projectId: result.project_id, sessionId: null, expectedRevision: null, writerEpoch: null };
   try { contextStore.save(next); }
   catch { return { ok: false, reason: 'CONTEXT_STORE_FAILED', project_id: result.project_id }; }
   Object.assign(sessionState, next);
