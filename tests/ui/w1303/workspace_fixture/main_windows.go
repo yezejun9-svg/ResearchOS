@@ -145,6 +145,7 @@ func writeDiscovery(path, addr, dataDir, instanceID string) error {
 func run() error {
 	dirFlag := flag.String("dir", "", "new private fixture directory below .local")
 	webFlag := flag.String("web-dir", "apps/web/dist", "built web assets")
+	permissionFlag := flag.Bool("permission", false, "explicit loopback SDK fixture for an original tool permission")
 	flag.Parse()
 	if *dirFlag == "" {
 		return errors.New("-dir is required")
@@ -259,7 +260,15 @@ func run() error {
 		return err
 	}
 	project := proj["project_id"].(string)
-	coordinator, err := fixtureModelProfile(ctx, svc, h, client, base, token, project, dataDir)
+	var permission *permissionProfile
+	if *permissionFlag {
+		permission, err = newPermissionProfile(source)
+		if err != nil {
+			return err
+		}
+		defer permission.server.Close()
+	}
+	coordinator, err := fixtureModelProfile(ctx, svc, h, client, base, token, project, dataDir, permission)
 	if err != nil {
 		return err
 	}
@@ -272,6 +281,9 @@ func run() error {
 		return err
 	}
 	session := snap["session_id"].(string)
+	if permission != nil {
+		return servePermissionFixture(ctx, db, coordinator, h, client, base, token, project, session, ref, root, dataDir, listener.Addr().String(), permission)
+	}
 	tree, err := command(ctx, client, base, token, "workspace.tree", "probe-tree", &project, &session, nil, nil,
 		domain.Object{"workspace_ref": ref, "relative_path": ".", "cursor": nil, "limit": 100})
 	if err != nil {
