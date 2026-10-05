@@ -59,6 +59,55 @@ func gitLocal(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
+func gitRepository(ctx context.Context, workspace string, args ...string) ([]byte, error) {
+	bound := []string{"--git-dir=" + filepath.Join(workspace, ".git"), "--work-tree=" + workspace}
+	return gitLocal(ctx, workspace, append(bound, args...)...)
+}
+
+// Git is intentionally confined to a conventional .git directory within the
+// authorized workspace. Linked worktrees, alternates, config includes and
+// reparse points would let Git read metadata outside that authority boundary.
+func safeGitMetadata(root *os.Root, workspace string) error {
+	info, err := root.Lstat(".git")
+	if err != nil || !info.IsDir() {
+		return errors.New("NOT_A_REPOSITORY: local .git directory required")
+	}
+	metadata := filepath.Join(workspace, ".git")
+	count := 0
+	return filepath.WalkDir(metadata, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		count++
+		if count > 200000 {
+			return errors.New("CONTENT_TOO_LARGE: Git metadata inventory exceeds bound")
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return errors.New("PATH_OUT_OF_SCOPE: Git metadata contains a link")
+		}
+		reparse, reparseErr := isReparsePoint(path)
+		if reparseErr != nil || reparse {
+			return errors.New("PATH_OUT_OF_SCOPE: Git metadata contains a reparse point")
+		}
+		name := strings.ToLower(entry.Name())
+		if name == "alternates" || name == "http-alternates" {
+			return errors.New("PATH_OUT_OF_SCOPE: Git object alternates are outside workspace authority")
+		}
+		if name == "config" || name == "config.worktree" {
+			meta, readErr := os.ReadFile(path)
+			if readErr != nil || len(meta) > 1<<20 {
+				return errors.New("HOST_UNAVAILABLE: Git configuration cannot be checked")
+			}
+			for _, line := range strings.Split(strings.ToLower(string(meta)), "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "[include") {
+					return errors.New("PATH_OUT_OF_SCOPE: Git configuration includes external files")
+				}
+			}
+		}
+		return nil
+	})
+}
+
 type gitFile struct {
 	mode       string
 	sha        string
@@ -135,15 +184,19 @@ func workspacePatch(ctx context.Context, temp, relative string, before, after []
 	// Only rewrite Git's headers, never hunk or binary-patch data. Control
 	// characters and quotes are excluded by workspaceRelativePath.
 	var output bytes.Buffer
+	header := true
 	for _, line := range bytes.SplitAfter(patch, []byte{'\n'}) {
+		if bytes.HasPrefix(line, []byte("@@ ")) || bytes.HasPrefix(line, []byte("GIT binary patch")) {
+			header = false
+		}
 		switch {
 		case bytes.HasPrefix(line, []byte("diff --git ")):
 			line = []byte("diff --git a/" + relative + " b/" + relative + "\n")
-		case bytes.HasPrefix(line, []byte("--- ")) && !bytes.HasPrefix(line, []byte("--- /dev/null")):
+		case header && bytes.HasPrefix(line, []byte("--- ")) && !bytes.HasPrefix(line, []byte("--- /dev/null")):
 			line = []byte("--- a/" + relative + "\n")
-		case bytes.HasPrefix(line, []byte("+++ ")) && !bytes.HasPrefix(line, []byte("+++ /dev/null")):
+		case header && bytes.HasPrefix(line, []byte("+++ ")) && !bytes.HasPrefix(line, []byte("+++ /dev/null")):
 			line = []byte("+++ b/" + relative + "\n")
-		case bytes.HasPrefix(line, []byte("Binary files ")):
+		case header && bytes.HasPrefix(line, []byte("Binary files ")):
 			line = []byte("Binary files a/" + relative + " and b/" + relative + " differ\n")
 		}
 		output.Write(line)
@@ -177,6 +230,9 @@ func (h *Host) WorkspaceDiff(ctx context.Context, workspacePath, access string, 
 		return nil, nil, err
 	}
 	defer root.Close()
+	if err = safeGitMetadata(root, workspacePath); err != nil {
+		return nil, nil, err
+	}
 	if filter != "" && filter != "." {
 		parts := strings.Split(filter, "/")
 		for i := 1; i < len(parts); i++ {
@@ -185,11 +241,11 @@ func (h *Host) WorkspaceDiff(ctx context.Context, workspacePath, access string, 
 			}
 		}
 	}
-	top, err := gitLocal(ctx, workspacePath, "rev-parse", "--show-toplevel")
+	top, err := gitRepository(ctx, workspacePath, "rev-parse", "--show-toplevel")
 	if err != nil || !strings.EqualFold(filepath.Clean(strings.TrimSpace(string(top))), filepath.Clean(workspacePath)) {
 		return nil, nil, errors.New("NOT_A_REPOSITORY: workspace root must be the repository top level")
 	}
-	stageRaw, err := gitLocal(ctx, workspacePath, "ls-files", "--stage", "-z")
+	stageRaw, err := gitRepository(ctx, workspacePath, "ls-files", "--stage", "-z")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -200,12 +256,12 @@ func (h *Host) WorkspaceDiff(ctx context.Context, workspacePath, access string, 
 	revision := domain.Digest(stageRaw)
 	baseFiles := indexFiles
 	if base == "HEAD" {
-		sha, shaErr := gitLocal(ctx, workspacePath, "rev-parse", "--verify", "HEAD")
+		sha, shaErr := gitRepository(ctx, workspacePath, "rev-parse", "--verify", "HEAD")
 		if shaErr != nil {
 			return nil, nil, errors.New("NOT_FOUND: HEAD revision is not available")
 		}
 		revision = strings.TrimSpace(string(sha))
-		headRaw, headErr := gitLocal(ctx, workspacePath, "ls-tree", "-r", "-z", "--full-tree", "HEAD")
+		headRaw, headErr := gitRepository(ctx, workspacePath, "ls-tree", "-r", "-z", "--full-tree", "HEAD")
 		if headErr != nil {
 			return nil, nil, headErr
 		}
@@ -214,7 +270,7 @@ func (h *Host) WorkspaceDiff(ctx context.Context, workspacePath, access string, 
 			return nil, nil, err
 		}
 	}
-	untrackedRaw, err := gitLocal(ctx, workspacePath, "ls-files", "--others", "--exclude-standard", "-z")
+	untrackedRaw, err := gitRepository(ctx, workspacePath, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -274,7 +330,7 @@ func (h *Host) WorkspaceDiff(ctx context.Context, workspacePath, access string, 
 		}
 		var before, after []byte
 		if hasBefore && !prior.conflicted {
-			before, err = gitLocal(ctx, workspacePath, "cat-file", "blob", prior.sha)
+			before, err = gitRepository(ctx, workspacePath, "cat-file", "blob", prior.sha)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -341,12 +397,12 @@ func (h *Host) WorkspaceDiff(ctx context.Context, workspacePath, access string, 
 	if err = h.workspacePlain(root, binding, ".", true); err != nil {
 		return nil, nil, err
 	}
-	latestStage, err := gitLocal(ctx, workspacePath, "ls-files", "--stage", "-z")
+	latestStage, err := gitRepository(ctx, workspacePath, "ls-files", "--stage", "-z")
 	if err != nil || !bytes.Equal(latestStage, stageRaw) {
 		return nil, nil, errors.New("CONTENT_CONFLICT: index changed during diff")
 	}
 	if base == "HEAD" {
-		latest, revErr := gitLocal(ctx, workspacePath, "rev-parse", "--verify", "HEAD")
+		latest, revErr := gitRepository(ctx, workspacePath, "rev-parse", "--verify", "HEAD")
 		if revErr != nil || strings.TrimSpace(string(latest)) != revision {
 			return nil, nil, errors.New("CONTENT_CONFLICT: HEAD changed during diff")
 		}

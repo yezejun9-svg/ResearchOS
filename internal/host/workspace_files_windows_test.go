@@ -202,6 +202,52 @@ func TestWorkspaceDiffTreatsFilterPathLiterally(t *testing.T) {
 	}
 }
 
+func TestWorkspaceDiffPreservesHunkLinesLikeHeaders(t *testing.T) {
+	h, workspace, _ := runtimeToolFixture(t, AccessReadWrite)
+	workspaceGit(t, workspace, "init", "-q")
+	workspaceGit(t, workspace, "config", "user.email", "test@example.invalid")
+	workspaceGit(t, workspace, "config", "user.name", "Test")
+	path := filepath.Join(workspace, "hunk.txt")
+	if err := os.WriteFile(path, []byte("-- user text\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	workspaceGit(t, workspace, "add", ".")
+	workspaceGit(t, workspace, "commit", "-qm", "baseline")
+	if err := os.WriteFile(path, []byte("++ user text\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, patch, err := h.WorkspaceDiff(context.Background(), workspace, AccessReadWrite, domain.Object{
+		"workspace_ref": "opaque", "base": "HEAD", "relative_path": "hunk.txt", "max_bytes": 4096})
+	if err != nil || !strings.Contains(string(patch), "\n--- user text\n") || !strings.Contains(string(patch), "\n+++ user text\n") {
+		t.Fatalf("content lines were rewritten as headers: %s %v", patch, err)
+	}
+}
+
+func TestWorkspaceDiffRefusesExternalGitMetadata(t *testing.T) {
+	t.Run("git_file", func(t *testing.T) {
+		h, workspace, _ := runtimeToolFixture(t, AccessReadWrite)
+		if err := os.WriteFile(filepath.Join(workspace, ".git"), []byte("gitdir: ../outside\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := h.WorkspaceDiff(context.Background(), workspace, AccessReadWrite, domain.Object{
+			"workspace_ref": "opaque", "base": "HEAD", "relative_path": nil, "max_bytes": 4096}); err == nil || !strings.Contains(err.Error(), "NOT_A_REPOSITORY") {
+			t.Fatalf("external gitdir was followed: %v", err)
+		}
+	})
+	t.Run("alternates", func(t *testing.T) {
+		h, workspace, _ := runtimeToolFixture(t, AccessReadWrite)
+		workspaceGit(t, workspace, "init", "-q")
+		alternates := filepath.Join(workspace, ".git", "objects", "info", "alternates")
+		if err := os.WriteFile(alternates, []byte("C:/outside/objects\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := h.WorkspaceDiff(context.Background(), workspace, AccessReadWrite, domain.Object{
+			"workspace_ref": "opaque", "base": "INDEX", "relative_path": nil, "max_bytes": 4096}); err == nil || !strings.Contains(err.Error(), "PATH_OUT_OF_SCOPE") {
+			t.Fatalf("object alternates were followed: %v", err)
+		}
+	})
+}
+
 type workspaceRaceContext struct {
 	context.Context
 	mutate func()
