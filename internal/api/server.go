@@ -27,7 +27,7 @@ func HandlerWithClientRuntime(db *sql.DB, webDir string, service *domain.Service
 
 // HandlerWithLocalHost supplies the same native host authority to first-use and
 // session execution. No HTTP handler can mint a native selection itself.
-func HandlerWithLocalHost(db *sql.DB, webDir string, service *domain.Service, runtime domain.ClientSessionRuntime, instanceID string, workspace domain.WorkspaceAuthority, inventory domain.LocalInventoryScanner) http.Handler {
+func HandlerWithLocalHost(db *sql.DB, webDir string, service *domain.Service, runtime domain.ClientSessionRuntime, instanceID string, workspace domain.WorkspaceAuthority, inventory domain.LocalInventoryScanner, workspaceFiles ...domain.ClientWorkspaceFiles) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
@@ -52,6 +52,9 @@ func HandlerWithLocalHost(db *sql.DB, webDir string, service *domain.Service, ru
 		v2.svc.SessionRuntime = runtime
 		v2.svc.WorkspaceAuthority = workspace
 		v2.svc.InventoryScanner = inventory
+		if len(workspaceFiles) == 1 {
+			v2.svc.WorkspaceFiles = workspaceFiles[0]
+		}
 		if instanceID != "" {
 			v2.svc.Host.InstanceID = instanceID
 		}

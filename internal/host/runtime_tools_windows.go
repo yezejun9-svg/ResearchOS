@@ -4,15 +4,12 @@ package host
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
-	"sync"
 	"unicode/utf8"
 
 	"researchos.local/research-os/internal/domain"
@@ -26,13 +23,24 @@ const runtimeToolByteLimit = 64 << 10
 // since JSON escaping can expand a requested byte slice substantially.
 const runtimeToolReplyLimit = 56 << 10
 
-// Serialize host writes, including the read/compare/replace interval. External
-// writers are not serialized by this mutex; callers still need a frozen,
-// host-authorized workspace and an expected content hash for every replacement.
-var runtimeToolWriteMu sync.Mutex
-
 func toolDenied(message string) error  { return domain.Fail(403, "FORBIDDEN", message) }
 func toolInvalid(message string) error { return domain.Fail(400, "INVALID_REQUEST", message) }
+
+func runtimeToolEarlyOutcome(h *Host, name, key string, cause error) error {
+	if name != "write" && name != "edit" {
+		return &domain.RuntimeToolFailure{Err: cause, Outcome: "NOT_APPLIED"}
+	}
+	if key == "" {
+		return cause // No durable identity can prove an older physical effect absent.
+	}
+	if h != nil && h.dir != "" {
+		prior, _, exists, lookupErr := priorWorkspaceWriteIntent(h.dir, key)
+		if lookupErr != nil || exists && prior.State != "CONFLICT" {
+			return writeError("WRITE_RECOVERY_REQUIRED", "UNKNOWN", cause)
+		}
+	}
+	return &domain.RuntimeToolFailure{Err: cause, Outcome: "NOT_APPLIED"}
+}
 
 func (h *Host) ExecuteRuntimeTool(ctx context.Context, request domain.RuntimeToolRequest) (result domain.Object, err error) {
 	// Validation and reads cannot mutate the workspace. Each mutating tool
@@ -40,7 +48,7 @@ func (h *Host) ExecuteRuntimeTool(ctx context.Context, request domain.RuntimeToo
 	beforeMutation := true
 	defer func() {
 		if err != nil && beforeMutation {
-			err = &domain.RuntimeToolFailure{Err: err, Outcome: "NOT_APPLIED"}
+			err = runtimeToolEarlyOutcome(h, request.Name, request.IntentKey, err)
 		}
 	}()
 	if err := ctx.Err(); err != nil {
@@ -172,24 +180,24 @@ func (h *Host) ExecuteRuntimeTool(ctx context.Context, request domain.RuntimeToo
 		return nil, err
 	}
 	defer root.Close()
-	if err := runtimeToolPlainPath(root, rel, request.Name != "read" && args["expected_hash"] == nil); err != nil {
-		return nil, err
-	}
 	switch request.Name {
 	case "read":
+		if err := runtimeToolPlainPath(root, rel, false); err != nil {
+			return nil, err
+		}
 		return runtimeToolRead(ctx, root, rel, args, readMax)
 	case "write", "edit":
-		runtimeToolWriteMu.Lock()
-		defer runtimeToolWriteMu.Unlock()
-		// Recheck current revocation, root pin and reparse state while serialized.
+		if request.IntentKey == "" || request.Revalidate == nil || h.dir == "" {
+			return nil, toolDenied("durable effect identity, host journal and authority revalidation required")
+		}
+		// Recheck current revocation and root pin before preparing the write.
+		// WriteWorkspaceFile repeats these checks while holding its cross-process
+		// path lock and immediately before publication.
 		if _, err := h.ResolveWorkspace(binding.Ref, rel, AccessReadWrite); err != nil {
 			return nil, err
 		}
-		if err := runtimeToolPlainPath(root, rel, request.Name == "write" && args["expected_hash"] == nil); err != nil {
-			return nil, err
-		}
 		beforeMutation = false
-		return runtimeToolWrite(ctx, root, rel, request.Name, args, writeMax)
+		return runtimeToolWrite(ctx, h, root, binding, rel, request.Name, args, writeMax, request)
 	}
 	panic("unreachable")
 }
@@ -369,11 +377,11 @@ func runtimeToolRead(ctx context.Context, root *os.Root, rel string, args domain
 	return reply, nil
 }
 
-func runtimeToolWrite(ctx context.Context, root *os.Root, rel, name string, args domain.Object, max int64) (result domain.Object, err error) {
+func runtimeToolWrite(ctx context.Context, h *Host, root *os.Root, binding *RootBinding, rel, name string, args domain.Object, max int64, request domain.RuntimeToolRequest) (result domain.Object, err error) {
 	beforeMutation := true
 	defer func() {
 		if err != nil && beforeMutation {
-			err = &domain.RuntimeToolFailure{Err: err, Outcome: "NOT_APPLIED"}
+			err = runtimeToolEarlyOutcome(h, name, request.IntentKey, err)
 		}
 	}()
 	allowed := map[string]bool{"path": true, "expected_hash": true}
@@ -395,26 +403,13 @@ func runtimeToolWrite(ctx context.Context, root *os.Root, rel, name string, args
 	if name == "edit" && create {
 		return nil, toolInvalid("edit requires an existing content hash")
 	}
-	var old []byte
-	if create {
-		if _, err := root.Lstat(rel); err == nil {
-			return nil, toolDenied("create target already exists")
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
-	} else {
+	var expectedHash *string
+	if !create {
 		oldHash, ok := expected.(string)
-		if !ok || len(oldHash) != len(domain.Digest(nil)) || !strings.HasPrefix(oldHash, "sha256:") {
+		if !ok || !validWriteHash(oldHash) {
 			return nil, toolInvalid("expected_hash must be sha256 digest")
 		}
-		var err error
-		old, err = runtimeToolBytes(root, rel)
-		if err != nil {
-			return nil, err
-		}
-		if domain.Digest(old) != oldHash {
-			return nil, domain.Fail(409, "STATE_CONFLICT", "stale expected_hash")
-		}
+		expectedHash = &oldHash
 	}
 	var next string
 	if name == "write" {
@@ -426,6 +421,21 @@ func runtimeToolWrite(ctx context.Context, root *os.Root, rel, name string, args
 	} else {
 		needle, okOld := args["old_text"].(string)
 		replacement, okNew := args["new_text"].(string)
+		old, oldErr := runtimeToolBytes(root, rel)
+		if oldErr != nil || domain.Digest(old) != *expectedHash {
+			// A confirmed write may have reached the file before the effect
+			// receipt was committed. Its original bytes are in the private
+			// journal; use them only to reconstruct the identical candidate.
+			// The shared writer then checks the same intent and current target.
+			old, oldErr = runtimeToolPriorPreimage(h.dir, request.IntentKey, *expectedHash)
+			if oldErr != nil {
+				if runtimeToolIntentExists(h.dir, request.IntentKey) {
+					beforeMutation = false
+					return nil, errors.New("durable write intent exists but original bytes cannot be reconstructed")
+				}
+				return nil, domain.Fail(409, "STATE_CONFLICT", "stale expected_hash")
+			}
+		}
 		if !okOld || !okNew || needle == "" || !utf8.Valid(old) || strings.Count(string(old), needle) != 1 {
 			return nil, toolInvalid("old_text must occur exactly once in UTF-8 file")
 		}
@@ -437,53 +447,49 @@ func runtimeToolWrite(ctx context.Context, root *os.Root, rel, name string, args
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	// A replacement can create a temporary file, publish via Link, or rename.
-	// Once entered, an error does not prove that the effect was absent.
+	// Once the writer has persisted PENDING, failures cannot be treated as a
+	// fresh NOT_APPLIED effect. Its error carries the physical outcome.
 	beforeMutation = false
-	if err := runtimeToolReplace(root, rel, []byte(next), create, expected); err != nil {
+	write, err := WriteWorkspaceFile(ctx, WorkspaceWriteInput{Root: root, RootPath: binding.RealPath, JournalRoot: h.dir,
+		RelativePath: rel, IntentKey: request.IntentKey, ScopeHash: domain.Hash(domain.Object{"name": name, "arguments": args, "policy": request.Policy}),
+		ExpectedHash: expectedHash, CreateIfMissing: create,
+		Content: []byte(next), Revalidate: func(checkCtx context.Context) error {
+			if _, e := h.ResolveWorkspace(binding.Ref, rel, AccessReadWrite); e != nil {
+				return e
+			}
+			return request.Revalidate(checkCtx)
+		}})
+	if err != nil {
+		var classified *WorkspaceWriteError
+		if errors.As(err, &classified) && classified.Outcome == "NOT_APPLIED" {
+			return nil, &domain.RuntimeToolFailure{Err: err, Outcome: "NOT_APPLIED"}
+		}
 		return nil, err
 	}
-	return runtimeToolReply(domain.Object{"path": rel, "content_hash": domain.Digest([]byte(next)), "size_bytes": len(next), "operation": name})
+	if !write.Applied || write.AfterHash != domain.Digest([]byte(next)) {
+		return nil, errors.New("workspace write did not return an applied hash proof")
+	}
+	return runtimeToolReply(domain.Object{"path": rel, "content_hash": write.AfterHash, "size_bytes": len(next), "operation": name})
 }
 
-func runtimeToolReplace(root *os.Root, rel string, next []byte, create bool, expected any) error {
-	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return err
-	}
-	tmp := path.Join(path.Dir(rel), ".researchos-"+hex.EncodeToString(nonce[:])+".tmp")
-	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+func runtimeToolPriorPreimage(hostDir, intentKey, expected string) ([]byte, error) {
+	keyHash := strings.TrimPrefix(writeHash([]byte(intentKey)), "sha256:")
+	path := filepath.Join(hostDir, "workspace-writes", "preimages", "before-"+keyHash+".bin")
+	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, errors.New("matching private preimage unavailable")
 	}
-	defer root.Remove(tmp)
-	_, writeErr := f.Write(next)
-	if writeErr == nil {
-		writeErr = f.Sync()
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, runtimeToolFileLimit+1))
+	if err != nil || len(data) > runtimeToolFileLimit || writeHash(data) != expected {
+		return nil, errors.New("matching private preimage unavailable")
 	}
-	closeErr := f.Close()
-	if writeErr != nil {
-		return writeErr
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if create {
-		// Link publishes complete bytes only if the name is still absent.
-		if err := root.Link(tmp, rel); err != nil {
-			return err
-		}
-		return nil
-	}
-	// The second check catches ordinary external edits before replacement. No
-	// cross-process mutex can make this an atomic compare-and-swap against a
-	// separately authorized external writer on Windows.
-	current, err := runtimeToolBytes(root, rel)
-	if err != nil {
-		return err
-	}
-	if domain.Digest(current) != expected {
-		return domain.Fail(409, "STATE_CONFLICT", "file changed before replacement")
-	}
-	return root.Rename(tmp, rel)
+	return data, nil
+}
+
+func runtimeToolIntentExists(hostDir, intentKey string) bool {
+	keyHash := strings.TrimPrefix(writeHash([]byte(intentKey)), "sha256:")
+	path := filepath.Join(hostDir, "workspace-writes", "intents", "intent-"+keyHash+".json")
+	_, err := os.Stat(path)
+	return err == nil || !errors.Is(err, os.ErrNotExist)
 }

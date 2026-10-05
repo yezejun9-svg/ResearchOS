@@ -7,11 +7,13 @@ import { Screen } from './screens'
 import { PairingGate, useDeviceSession } from './Pairing'
 import './style.css'
 
+const nativeDesktop = !!window.researchos?.desktop?.context
+
 export const stages = [['discovery', '发现'], ['verification', '核验'], ['experiment', '实验'], ['review', '评审'], ['delivery', '交付'], ['follow_up', '跟踪']]
 export const taskLabels = { DRAFT: '草稿', READY: '待执行', RUNNING: '执行中', EXECUTION_REPORTED: '结果已提交', VERIFYING: '验收中', ACCEPTED: '已验收', FAILED: '失败', BLOCKED: '受阻', CANCELLED: '已取消', NEEDS_REVALIDATION: '需重验', DEFERRED_NO_PROGRESS: '无进展延期' }
 export const runLabels = { QUEUED: '排队', STARTING: '启动中', RUNNING: '运行中', CANCEL_REQUESTED: '取消请求中', SETTLED: '执行已结束', FAILED: '执行失败', CANCELLED: '已取消', LOST: '连接丢失', RECONCILING: '恢复对账中' }
 
-const navigation = [['home', '工作台', 'workbench'], ['chat', '对话接续', 'continuity'], ['cycle', '研究周期', 'cycle'], ['release', '成果审查', 'release'], ['evidence', '来源证据', 'evidence'], ['experiment', '实验评测', 'experiment'], ['knowledge', '知识技能', 'knowledge'], ['team', '团队运行器', 'team'], ['resources', '费用资源', 'resources'], ['settings', '设置设备', 'settings']]
+const navigation = [['home', '工作台', 'workbench'], ...(!nativeDesktop ? [['chat', '对话接续', 'continuity']] : []), ['cycle', '研究周期', 'cycle'], ['release', '成果审查', 'release'], ['evidence', '来源证据', 'evidence'], ['experiment', '实验评测', 'experiment'], ['knowledge', '知识技能', 'knowledge'], ['team', '团队运行器', 'team'], ['resources', '费用资源', 'resources'], ['settings', '设置设备', 'settings']]
 
 function routeOf(path) {
   const p = path.split('/').filter(Boolean).map(decodeURIComponent)
@@ -19,7 +21,7 @@ function routeOf(path) {
   if (p[0] !== 'p' || !p[1]) return { kind: 'not-found', key: path }
   const projectId = p[1]
   if (p.length === 2) return { kind: 'workbench', projectId, key: path }
-  const kind = { cycles: 'cycle', tasks: 'task', releases: 'release', evidence: 'evidence', experiments: 'experiment', knowledge: 'knowledge', team: 'team', resources: 'resources', settings: 'settings', continuity: 'continuity' }[p[2]]
+  const kind = { cycles: 'cycle', tasks: 'task', releases: 'release', evidence: 'evidence', experiments: 'experiment', knowledge: 'knowledge', team: 'team', resources: 'resources', settings: 'settings', continuity: nativeDesktop ? 'workbench' : 'continuity' }[p[2]]
   if (!kind || (['evidence', 'knowledge', 'team', 'resources', 'settings'].includes(kind) && p.length > 3)) return { kind: 'not-found', projectId, key: path }
   if (['cycle', 'task', 'release', 'experiment'].includes(kind) && !p[3]) return { kind: 'selection', section: kind, projectId, key: path }
   return { kind, projectId, id: p[3], key: path }
@@ -94,7 +96,7 @@ function App() {
   const [feedback, setFeedback] = useState(null)
   const [refresh, setRefresh] = useState(0)
   const drawerOpener = useRef(null)
-  const api = useMemo(() => token ? createApi(() => token) : null, [token])
+  const api = useMemo(() => nativeDesktop || token ? createApi(() => token) : null, [token])
   const events = useProjectEvents(api, route.projectId)
   useEffect(() => { if (deviceSession.device && events.authExpired && !deviceSession.renewalPending) deviceSession.expire() }, [events.authExpired, deviceSession.device?.id, deviceSession.renewalPending])
   const shared = useQueries(api, route.projectId, route.projectId ? [{ op: 'getProjectProfile' }, { op: 'getProjectState' }, { op: 'getProgressProjection' }, { op: 'listMilestoneRelease' }, { op: 'listNotification' }] : [], refresh + events.refresh)
@@ -148,8 +150,8 @@ function App() {
     if (kind === 'experiment') return `/p/${projectId}/experiments`
     return `/p/${projectId}/${kind}`
   }
-  if (!token && (location.pathname === '/pair' || deviceSession.error || location.hostname.endsWith('.trycloudflare.com'))) return <PairingGate sessionError={deviceSession.error} onSession={session => { deviceSession.accept(session); navigate(`/p/${session.device.project_ids[0]}`) }}/>
-  if (!token) return <AuthGate onToken={setToken}/>
+  if (!nativeDesktop && !token && (location.pathname === '/pair' || deviceSession.error || location.hostname.endsWith('.trycloudflare.com'))) return <PairingGate sessionError={deviceSession.error} onSession={session => { deviceSession.accept(session); navigate(`/p/${session.device.project_ids[0]}`) }}/>
+  if (!nativeDesktop && !token) return <AuthGate onToken={setToken}/>
   return <>
     <header className="topbar" inert={!!drawer}><button className="icon-button menu-button" aria-label="打开导航" onClick={e => openDrawer('nav', e)}><Icon name="menu"/></button><Link to="/" navigate={navigate} className="brand"><span className="brandmark">R</span><span>ResearchOS</span></Link><span className="top-context">研究工作台</span><span className="top-spacer"/><span className={`connection-dot ${events.online ? '' : 'offline-dot'}`}/><span className="connection-text">{events.online ? '已连接' : '连接中断'}</span>{projectId && <button className="theme-button" aria-label={`打开通知，${unread} 条未读`} onClick={e => openDrawer('notice', e)}>通知{unread ? ` ${unread}` : ''}</button>}<button className="theme-button" onClick={() => setTheme(t => t === 'light' ? 'dark' : 'light')} aria-label={`切换为${theme === 'light' ? '深色' : '浅色'}主题`}>{theme === 'light' ? '深色' : '浅色'}</button><button className="icon-button progress-button" aria-label="打开阶段进度" onClick={e => openDrawer('rail', e)}><Icon name="cycle"/></button></header>
     {projectId && !events.online && <div className="connection-banner" role="status">连接已断开，状态可能过期。{events.lastSync ? `最后同步 ${events.lastSync.toLocaleString()}` : '尚未同步'}。</div>}

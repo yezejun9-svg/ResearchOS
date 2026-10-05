@@ -275,6 +275,13 @@ func (s *ClientService) sendClientMessage(ctx context.Context, tx *sql.Tx, env *
 		refs = append(refs, Ref(historyArtifact, "Artifact"))
 	}
 	refs = append(refs, Ref(req, "Requirement"))
+	if authority, ok := s.SessionRuntime.(ClientTaskInputAuthority); ok {
+		frozen, freezeErr := authority.FreezeClientTaskInputs(ctx, tx, sess.project, model)
+		if freezeErr != nil {
+			return clientFault(env, freezeErr)
+		}
+		refs = append(refs, frozen...)
+	}
 	contract, problem := clientTurnContract(), ID()
 	goal, err := s.Domain.createGoal(tx, sess.project, Object{"title": "Client message", "original_intent": payload.Text, "scope": "PROJECT", "requirement_refs": []any{Ref(req, "Requirement")}, "problem_ids": []any{problem}, "deliverables": []any{"One finite Mu response to the authenticated client message"}, "acceptance_contract": contract})
 	if err != nil {

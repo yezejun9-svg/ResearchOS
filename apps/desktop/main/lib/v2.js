@@ -105,7 +105,7 @@ function envelopeFor(identity, state, method, payload) {
     const claiming = payload.request_write_owner === true;
     if (claiming && env.writer_epoch !== null) return { ok: false, reason: 'ATTACKER_CLAIMED_EPOCH', method };
     if (!claiming && env.writer_epoch === null) return { ok: false, reason: 'MISSING_FIELD:writer_epoch', method };
-  } else if (WRITE_METHODS.indexOf(method) >= 0) {
+  } else if (WRITE_METHODS.indexOf(method) >= 0 && method !== 'project.bootstrap') {
     if (typeof env.project_id !== 'string') return { ok: false, reason: 'MISSING_FIELD:project_id', method };
     if (env.expected_revision === null) return { ok: false, reason: 'MISSING_FIELD:expected_revision', method };
     if (env.writer_epoch === null) return { ok: false, reason: 'MISSING_FIELD:writer_epoch', method };

@@ -7,7 +7,10 @@ export function useQueries(api, projectId, requests, revision = 0) {
   useEffect(() => {
     if (!api || !requests.length) { setResult({ api, scope, loading: false, data: {}, errors: {} }); return }
     const controller = new AbortController()
-    setResult(old => ({ api, scope, loading: true, data: old.api === api && old.scope === scope ? old.data : {}, errors: {} }))
+    setResult(old => {
+      const same = old.api === api && old.scope === scope
+      return { api, scope, loading: !same || !Object.keys(old.data).length, refreshing: true, data: same ? old.data : {}, errors: same ? old.errors : {} }
+    })
     Promise.allSettled(requests.map(({ op, id, params, query }) => api.call(op, { params: { projectId, id, ...params }, query, signal: controller.signal }))).then(values => {
       if (controller.signal.aborted) return
       const data = {}, errors = {}
