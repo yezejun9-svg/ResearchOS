@@ -145,6 +145,19 @@ class ValueCheckpointTest(unittest.TestCase):
         self.assertEqual(value["capabilities_observed"][0]["authority"], "DEVELOPMENT_OBSERVATION_ONLY")
         self.assertEqual(value["formal_gate"]["overall"], "OPEN_PENDING_INDEPENDENT_FORMAL_CASE_EVIDENCE")
 
+    def test_next_selection_consumes_priority_and_never_retries_failed_cards(self):
+        current = {"value_checkpoint": {"pause_nonblocking_expansion": True}}
+        plan = json.loads(self.plan.read_text(encoding="utf-8"))
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        delivery = json.loads(self.delivery.read_text(encoding="utf-8"))
+        _, statuses, plans = checkpoint.accepted_and_status(state, plan)
+        self.assertEqual(checkpoint.prioritized_step(current, statuses, plans, delivery, "W01-01"), "W17-02")
+        for blocked in ("FAILED", "CANCELLED", "BLOCKED", "EXECUTION_REPORTED"):
+            statuses["W17-02"] = blocked
+            self.assertIsNone(checkpoint.prioritized_step(current, statuses, plans, delivery, "W01-01"))
+        current["value_checkpoint"]["pause_nonblocking_expansion"] = False
+        self.assertEqual(checkpoint.prioritized_step(current, statuses, plans, delivery, "W01-01"), "W01-01")
+
 
 if __name__ == "__main__":
     cases = {
@@ -153,6 +166,7 @@ if __name__ == "__main__":
         "test_three_accepted_cards_trigger_one_checkpoint_without_formal_acceptance": "W1202-U09-THREE-CARDS",
         "test_two_rounds_make_checkpoint_two_scaffolding_checkpoints_reprioritize": "W1202-U09-TWO-ROUNDS-REPLAN",
         "test_real_observation_can_be_early_checkpoint_without_claiming_acceptance": "W1202-U09-EARLY-OBSERVATION",
+        "test_next_selection_consumes_priority_and_never_retries_failed_cards": "W1202-U09-PRIORITY-CONSUMED",
     }
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(ValueCheckpointTest)
     result = unittest.TextTestRunner(stream=sys.stderr, verbosity=2).run(suite)

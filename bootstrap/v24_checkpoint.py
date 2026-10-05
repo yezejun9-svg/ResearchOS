@@ -26,6 +26,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 
@@ -116,7 +117,7 @@ def ready_flows(statuses: dict[str, str], plans: dict[str, dict], delivery: dict
                      if row.get("parent_task") == task_id and row.get("phase") == "IMPLEMENTATION_SLICE"
                      and statuses.get(row["id"]) != "ACCEPTED"]
         ready = [row for row in remaining
-                 if statuses.get(row["id"], "NOT_STARTED") not in {"BLOCKED", "PAUSED"}
+                 if statuses.get(row["id"], "NOT_STARTED") in {"NOT_STARTED", "IN_PROGRESS"}
                  and all(statuses.get(dep) == "ACCEPTED" for dep in row.get("dependencies", []))]
         if not ready:
             continue
@@ -128,6 +129,63 @@ def ready_flows(statuses: dict[str, str], plans: dict[str, dict], delivery: dict
                        "evidence_basis": "frozen plan dependencies and current step_state statuses",
                        "formal_case_status": "NOT_VERIFIED_BY_THIS_CHECKPOINT"})
     return sorted(result, key=lambda row: (row["remaining_implementation_cards"], row["capability_id"]))
+
+
+def prioritized_step(current: dict, statuses: dict, plans: dict, delivery: dict,
+                     default_step_id: str | None) -> str | None:
+    """Consume U09 only at a card boundary; never reset or dispatch a blocked card."""
+    if not current.get("value_checkpoint", {}).get("pause_nonblocking_expansion"):
+        return default_step_id
+    candidates = ready_flows(statuses, plans, delivery)
+    return candidates[0]["next_step_id"] if candidates else None
+
+
+def next_packet(checkpoint_path: Path, state_path: Path, plan_path: Path,
+                delivery_path: Path) -> tuple[dict, int]:
+    current, original = read(checkpoint_path)
+    state, state_raw = read(state_path)
+    plan, plan_raw = read(plan_path)
+    delivery, _ = read(delivery_path)
+    if current.get("plan_sha256") != sha(plan_raw) or state.get("plan_sha256") != sha(plan_raw):
+        raise CheckpointError("frozen plan hash mismatch")
+    _, statuses, plans = accepted_and_status(state, plan)
+    tool = plan_path.resolve().parent.parent / "tools" / "task_packet.py"
+    if not tool.is_file():
+        raise CheckpointError("frozen task_packet.py missing")
+
+    def packet(command: str, step_id: str | None = None) -> tuple[dict, int]:
+        argv = [sys.executable, "-B", "-X", "utf8", str(tool), "--plan", str(plan_path), command]
+        if step_id is not None:
+            argv.append(step_id)
+        argv.extend(["--state", str(state_path)])
+        result = subprocess.run(argv, capture_output=True, encoding="utf-8", timeout=60)
+        if result.returncode not in (0, 3):
+            raise CheckpointError("frozen task packet rejected current state: " + result.stderr.strip())
+        body = strict_json(result.stdout.encode("utf-8"))
+        if body.get("state_source") != "VALIDATED_FILE":
+            raise CheckpointError("unvalidated task state is not actionable")
+        return body, result.returncode
+
+    result, code = packet("next")
+    default_id = (result.get("step") or {}).get("id")
+    selected = prioritized_step(current, statuses, plans, delivery, default_id)
+    if selected != default_id:
+        if selected is None:
+            result.update(step=None, status="NO_READY_USER_FLOW")
+            code = 3
+        else:
+            result, code = packet("show", selected)
+            if result.get("eligible") is not True:
+                raise CheckpointError("recommended user flow is not eligible")
+    if checkpoint_path.read_bytes() != original or state_path.read_bytes() != state_raw:
+        raise CheckpointError("checkpoint or state changed during selection")
+    value = current.get("value_checkpoint", {})
+    result["value_checkpoint_policy"] = {"checkpoint_revision": current["revision"],
+                                         "status": value.get("status"),
+                                         "priority_consumed": bool(value.get("pause_nonblocking_expansion")),
+                                         "default_step_id": default_id, "selected_step_id": selected,
+                                         "authority": "READ_ONLY_SELECTION_NOT_DISPATCH_OR_ACCEPTANCE"}
+    return result, code
 
 
 def validate_round(event: dict, event_path: Path, root: Path) -> dict:
@@ -325,20 +383,29 @@ def main() -> int:
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--delivery", type=Path, required=True)
-    parser.add_argument("--expected-revision", type=int, required=True)
+    parser.add_argument("--expected-revision", type=int)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--baseline", action="store_true")
     mode.add_argument("--round-event", type=Path)
+    mode.add_argument("--next-packet", action="store_true")
     parser.add_argument("--force-checkpoint", action="store_true")
     parser.add_argument("--reason")
     parser.add_argument("--actor", default="codex:construction")
     args = parser.parse_args()
     try:
+        if args.next_packet:
+            if args.expected_revision is not None or args.force_checkpoint or args.reason:
+                raise CheckpointError("next packet is read only; mutation options are invalid")
+            result, code = next_packet(args.checkpoint, args.state, args.plan, args.delivery)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return code
+        if args.expected_revision is None:
+            raise CheckpointError("checkpoint update requires --expected-revision")
         result = update_file(args.checkpoint, args.state, args.plan, args.delivery,
                              args.expected_revision, baseline=args.baseline,
                              event_path=args.round_event, force=args.force_checkpoint,
                              reason=args.reason, actor=args.actor)
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print(json.dumps({"status": "REJECTED", "reason": str(error)}, ensure_ascii=False), file=sys.stderr)
         return 1
     value = result["value_checkpoint"]
