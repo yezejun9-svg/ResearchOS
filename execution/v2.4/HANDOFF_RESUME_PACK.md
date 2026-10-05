@@ -1,35 +1,79 @@
-# ResearchOS v2.4 resume pack (written 系统无法接受输入的日期。
-输入新日期: (年月日), all figures recomputed from disk at HEAD 165078c0)
+# ResearchOS v2.4 resume pack (rewritten 2026-10-05 from disk at HEAD 377fc3f8)
 
-Read this first, then re-verify it: every number below is produced by the commands in section 5, and
-none of them should be trusted from this file alone.
+Read this first, then re-verify it. Every figure above was produced by `.local/rewrite_resume_pack.py`
+reading `execution/v2.4/step_state.json`, `checkpoint.json` and `commands.json` at run time; nothing here
+is carried over from the previous pack's numbers. If this file and the state files disagree, the state
+files are right and this file is the bug.
 
-## 1. Where the build stands
-- cards accepted: **17 of 71** (step_state rows: 17 ACCEPTED, 1 BLOCKED: W01-99)
-- parent gates run through the `Wxx-99` cards: accepted **W00-99**; the only gate whose dependencies are met is **W01-99**
-- formal cases accepted: **none**. Reachable by a v2.4 selector: 12 of 42; classes: {"selector_and_every_id_named_by_a_program": 6, "selector_and_only_some_ids_named": 5, "no_registered_selector": 30, "selector_but_ids_live_only_in_a_manifest": 1}
-- registry: revision 15, 10 keys BOUND and 8 not, readiness classes: {"BINDABLE": 1, "NEEDS_HANDLER": 2, "NEEDS_OWNER": 5}
-- protected-work audit just now: 196 registered evidence rows, 0 drifted, 0 missing, and 7 receipt-internal rows drifted with none uncovered by an erratum
+## 1. Where the build stands (measured)
 
-## 2. The one card in flight
-`W13-01` - round 1 REJECT (3 record blockers, all reproduced), round 2 REJECT (2 blockers, both fixed at commit c6dbc002), round 3 review requested and unfinished. Its receipt reports PASS 31 with 14 artifacts, a 10-case matrix with 0 survivors, and a self-audit with 0 inconsistencies at the tree the receipt names, not the live HEAD. Its own notes file and the round-3 brief describe what a reviewer must re-run. **step_state has no row for it and must not gain one unless a verdict arrives with an empty blocking_issues array.**
+- checkpoint revision **156** (expected_previous 155); `next_step_id` = **W10-01**; failure counters
+  and integrity events carried forward, never reset: 17
+- cards accepted: **28 of 71**; statuses {'ACCEPTED': 28, 'BLOCKED': 2, 'IN_PROGRESS': 1}
+- parent gates: accepted **1 of 22** (['W00-99']); BLOCKED: ['W01-99']
+- formal cases accepted: **none of 42**
+- registry: revision **22**, 24 keys, **16 BOUND**; the plan declares 33
+  distinct keys, of which **20 are absent from the v2.4 registry**: ['acceptance.audit', 'core.qualify', 'environment.verify', 'package.validate', 'release.reproduce', 'test.backup', 'test.contracts.security', 'test.cycle.live', 'test.evaluation.fixture', 'test.evaluation.security', 'test.evolution', 'test.experiments', 'test.jev.fixture', 'test.jev.live', 'test.overnight', 'test.skills', 'test.sources.fixture', 'test.ui', 'test.ui.preview', 'test.ui.visual']
+- protected-work audit just now: **585 registered evidence rows across 585 distinct files,
+  0 drifted, 0 missing**, and neither state file is registered as evidence
+- obligation register: **237 entries**, append-only; it is a queue to triage, not a list of failures
 
-## 3. Prepared, deliberately unapplied (each one refuses while a review request is unanswered)
-- `.local/prepare_cli_entry_binding.py [--apply]` - binds `cli.entry_run`, the only BINDABLE non-bound key and the neck of the 22-parent chain. Before-resolution, byte backup, refuses an unobservable change, and names the five accepted receipts that pin `commands.json` so their errata are refreshed.
-- `.local/apply_w1301_c23_frozen_ids.py [--apply]` - maps forwarded legacy rows onto C23-01..06 positionally through `tests/ui/expected.json`; refuses when counts or uniqueness disagree.
-- `.local/prepare_w1301_mutants_round3.py` - the coverage attempt that failed honestly: two candidates crashed the harness and one survived, so the runner was reverted; **13 assertion rows still have neither a mutant nor a stated reason** and the round-3 brief says so.
-- `.local/prepare_desktop_shell_launch_binding.py` - why `desktop.shell_launch` cannot bind as written (argv names a directory, the package has no scripts) and what a real binding must include.
+## 2. What is in flight, and what can be started
 
-## 4. Constraints that are easy to break by accident
-- A registered receipt is byte-frozen and still says `EXECUTION_REPORTED` inside: read acceptance from `step_state.json`, never from the receipt's status field.
-- Digests of evidence files must be hashed from raw bytes; newline-normalised text produced 20 unverifiable census digests that only looked correct because half were empty files.
-- `execution/v2.4/commands.json` is pinned by five accepted receipts. Drift there is answered with a computed erratum beside each one (`pin_drift_erratum_chain.json` today), never by editing a registered receipt or silently re-pinning.
-- After any commit, parity rows and captured command logs must be re-measured at the new HEAD before a receipt is regenerated; the generator refuses to mix trees.
-- No push, no deploy, no purchases, no reading secret values, no second construction session, never `git reset/clean/checkout .` against the tree, and explicit paths only in `git add`.
+**W10-01** (see its row note and receipt directory)
 
-## 5. Re-verify in one line each
-- `python .local/pin_audit.py` - the two pin sets, non-zero exit if registered evidence moved.
-- `python execution/v2.4/registry_binding_readiness.py` - why each unbound key is unbound.
-- `python execution/v2.4/formal_case_requirements.py` then `formal_case_work_orders.py` - case gate classes and who owns each case.
-- `python execution/v2.4/parent_gate_ledger.py` then `parent_gate_frontier.py` - per-parent state and the dependency frontier.
-- `python D:/作品集/ResearchOS/ResearchOS_Implementation_Package_v2.4/tools/task_packet.py next --state execution/v2.4/step_state.json` - the selector's own answer for the next card; expect `state_source: VALIDATED_FILE`.
+**Dependency-eligible now (3):** W12-02 (用途等价资源切换与用户可操作请求, prio 1390), W17-02 (数据出口与独立holdout权限隔离, prio 1500), W18-01 (一致性备份和迁移前快照, prio 1520). `task_packet next` selects by DAG then priority,
+so compare against its output rather than assuming the lowest card number.
+
+## 3. Route feasibility — the check that was missing until 2026-10-05
+
+A card is executable only if all three hold: its declared key is BOUND, the key's selectors resolve that
+card's `--task-id/--check-id/--case-id`, **and the program behind the key is inside that card's own
+`write_scope`.** The third was never checked before. Measured over the open slices: 1_key_absent_or_unbound: 20, 2_selector_not_routed: 3.
+
+**Nobody may write `migrations/sqlite/**`** — no card's write_scope covers it — so anything needing a new
+column or table must derive from existing tables.
+
+## 4. Corrections to earlier handoffs, so they are not re-inherited
+
+- **`cli.entry_run` is not the parent-gate neck.** No card's `verification_commands` names it. The gate
+  chain runs through `W01-99`, and `W01-99`'s blocker is not a missing dependency: all four deps are
+  ACCEPTED and the row's own reason is that **A02 and C10 have no registered selector at all**, nothing
+  emits `A02-02`/`A02-03`, `C11-04` has no emitter (it belongs to `W12-02`, which is eligible), `C04` is
+  already covered, and the LIVE dual-end run needs the resource `Windows_desktop_session`.
+- **`test.retrieval` is bound** (rev 21) and `test.retrieval.revocation` (rev 22) exists. The older note
+  "no Go key runs the domain suite" is false: `tests/evidence/check/main.py` runs
+  `go test -json -run '^TestW0901' ./internal/domain`.
+- **The product's own CLI builds and runs** (`go build -o .local/bin/researchos.exe ./apps/cli`, then
+  `version` → `researchos 0.2.4-w0203 protocol=researchos-client/2`, exit 0). `W01-G03`'s
+  `own_cli_entry_present` is false only because `qualification/v2.4/qualify.py:218` scans filenames under
+  `apps/cli`, while the accepted build step deliberately emits the binary to `.local/bin/`.
+- **`test.security` and `test.experiments` answer gate ids, not slice ids**, so W09-02 and W10-01 each had
+  to bind a new key to a handler in their own scope. Those two deviations are disclosed in their receipts;
+  `W09-99` still declares the dead `test.security` pair.
+
+## 5. How to re-verify every number in section 1
+
+    python -B .local/rewrite_resume_pack.py            # re-derives this file
+    python -B .local/protected_evidence_audit.py       # recomputes all registered digests
+    python -B .local/measure_route_feasibility.py      # the three-condition route audit
+    cd "D:/作品集/ResearchOS/ResearchOS_Implementation_Package_v2.4" && python tools/task_packet.py next --state "D:/作品集/ResearchOS/research-os/execution/v2.4/step_state.json"
+
+## 6. Constraints that are easy to break by accident
+
+- A registered receipt is byte-frozen. Corrections land in a **new** file (`claim_corrections_*`,
+  `post_review_actions_*`, `prerequisite_inventory_correction_*`), and the superseded sentence is struck
+  through in the row note rather than deleted.
+- Read acceptance from `step_state.json`, never from a receipt's `status` field.
+- `commands.json` is a shared append point: appending a key can silently re-route an existing selector.
+  Regress every selector accepted cards actually dispatch, and assert the pre-existing entries are
+  byte-identical before `os.replace`.
+- **Never append a selector to a key whose handler emits another card's roster** — that manufactures a PASS.
+- Hash raw bytes; a re-encoded or newline-normalised read hides drift in exactly the files that are empty.
+- Resolve toolchains from `execution/toolchains/locked.json`; set `RESEARCHOS_GO` or legacy domain reds are
+  misattributed (this has happened repeatedly, including while writing this pack).
+- Running a project's own verification driver is a **write**: `qualify.py` rewrites its own evidence file.
+- Mutation discipline: one mutant per operand, never one per condition; and a guard written to enforce that
+  must itself be exercised against a violating input before it is cited as evidence.
+- No push, no deploy, no purchases, no reading secret values, no second construction session, never
+  `git reset/clean/checkout .` against the tree, explicit paths only in `git add`.
