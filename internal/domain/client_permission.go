@@ -11,7 +11,7 @@ import (
 // The coordinator inspects the original dispatch in the caller's transaction.
 // It never launches a replacement run or treats a UI decision as a policy grant.
 type ClientPermissionAuthority interface {
-	CheckPermission(context.Context, *sql.Tx, string, string, Object, Object, Object) (bool, error)
+	CheckPermission(context.Context, *sql.Tx, string, string, Object, Object, Object) (waiting bool, resourcesReady bool, err error)
 }
 
 func permissionTaskInputs(task Object) []any {
@@ -252,13 +252,13 @@ func (s *ClientService) respondClientPermission(ctx context.Context, tx *sql.Tx,
 	if !ok {
 		return NewTypedRejection(env, "HOST_UNAVAILABLE", "original runtime permission authority unavailable"), nil
 	}
-	waiting, err := authority.CheckPermission(ctx, tx, sess.project, sess.sessionID, intent, record, scope)
+	waiting, resourcesReady, err := authority.CheckPermission(ctx, tx, sess.project, sess.sessionID, intent, record, scope)
 	if err != nil {
 		return clientFault(env, err)
 	}
 	decision := Str(body, "decision")
 	if decision == "ALLOW_ONCE" && !waiting {
-		return NewTypedRejection(env, "RESOURCE_BLOCKED", "original tool is no longer waiting or required resources are unavailable"), nil
+		return NewTypedRejection(env, "RESOURCE_BLOCKED", "original tool is no longer waiting"), nil
 	}
 	scopeRef, _ := record["scope_ref"].(map[string]any)
 	scopeArtifact, err := version(tx, sess.project, scopeRef)
@@ -294,7 +294,7 @@ func (s *ClientService) respondClientPermission(ctx context.Context, tx *sql.Tx,
 		}
 	}
 	result := Object{"request": request, "decision": decision, "resolution_artifact_ref": Ref(resolution, "Artifact"), "action_digest": record["action_digest"],
-		"consumed": decision == "ALLOW_ONCE", "resumption_scheduled": decision == "ALLOW_ONCE" && waiting}
+		"consumed": decision == "ALLOW_ONCE", "resumption_scheduled": decision == "ALLOW_ONCE" && waiting && resourcesReady}
 	if err = s.journal(ctx, tx, env, sess, "PERMISSION_RESOLVED", result); err != nil {
 		return nil, err
 	}
