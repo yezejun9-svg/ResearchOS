@@ -56,6 +56,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
   const [title, setTitle] = useState('')
   const [attachment, setAttachment] = useState('')
   const [selectedFile, setSelectedFile] = useState('')
+  const [fileDirty, setFileDirty] = useState(false)
   const [notice, setNotice] = useState('')
   const current = useRef({ projectId, generation: 0, snapshot: null, busy: false })
   const [online, setOnline] = useState(navigator.onLine)
@@ -139,6 +140,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
     finally { current.current.busy = false; setBusy('') }
   }
   async function open(sessionId) {
+    if (fileDirty && !confirm('文件有未保存草稿，切换会话会丢弃当前文件草稿。继续？')) return
     if (draft && !confirm('当前消息尚未发送，切换会话后会保留在输入框。继续？')) return
     await command('打开会话', async () => { adopt(unwrap(await window.researchos.desktop.openSession(sessionId))); setState(old => ({ ...old, events: [] })) })
   }
@@ -149,6 +151,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
     })
   }
   async function create() {
+    if (fileDirty && !confirm('文件有未保存草稿，新建会话会丢弃当前文件草稿。继续？')) return
     await command('创建会话', async () => {
       const value = unwrap(await window.researchos.v2['session.create']({ workspace_ref: workspace, model_config_ref: model, title: title.trim() || '新会话' }))
       adopt(unwrap(await window.researchos.desktop.openSession(value.session_id)))
@@ -194,11 +197,11 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
       {(snapshot?.pending_permissions || []).map(prompt => <PermissionDecision key={prompt.request.id} prompt={prompt} api={api} projectId={projectId} disabled={disabled || !writer} respond={decision => command('处理授权', async () => { unwrap(await window.researchos.v2['permission.respond']({ resource_request_id: prompt.request.id, resource_request_revision: prompt.request.revision, action_digest: prompt.action_digest, decision, reason: '用户在桌面明确选择' })); await readSnapshot() })}/>)}
       </div>
     </div>
-    {snapshot && <WorkspaceFiles snapshot={snapshot} api={api} projectId={projectId} writer={writer} disabled={disabled} command={command} readSnapshot={readSnapshot} setAttachment={setAttachment} selectedFile={selectedFile} setSelectedFile={setSelectedFile}/>}
+    {snapshot && <WorkspaceFiles snapshot={snapshot} api={api} projectId={projectId} writer={writer} disabled={disabled} command={command} readSnapshot={readSnapshot} setAttachment={setAttachment} selectedFile={selectedFile} setSelectedFile={setSelectedFile} setFileDirty={setFileDirty}/>}
   </>
 }
 
-function BoundArtifact({ reference, api, projectId }) {
+function BoundArtifact({ reference, api, projectId, label = '读取引用产物' }) {
   const [artifact, setArtifact] = useState(null), [error, setError] = useState(null)
   const controller = useRef(null)
   useEffect(() => { controller.current?.abort(); setArtifact(null); setError(null); return () => controller.current?.abort() }, [projectId, reference.id, reference.revision, reference.content_hash])
@@ -210,7 +213,7 @@ function BoundArtifact({ reference, api, projectId }) {
       if (!active.signal.aborted) { setArtifact(value); setError(null) }
     } catch (cause) { if (!active.signal.aborted) setError(cause) }
   }
-  return <div><button onClick={read}>读取引用产物</button><Failure error={error} retry={read}/>{artifact && <ArtifactPreview artifact={artifact} expectedRef={reference} api={api} projectId={projectId}/>}</div>
+  return <div><button onClick={read}>{label}</button><Failure error={error} retry={read}/>{artifact && <ArtifactPreview artifact={artifact} expectedRef={reference} api={api} projectId={projectId}/>}</div>
 }
 
 function PermissionDecision({ prompt, api, projectId, disabled, respond }) {
@@ -225,17 +228,19 @@ function PermissionDecision({ prompt, api, projectId, disabled, respond }) {
   </Panel>
 }
 
-function WorkspaceFiles({ snapshot, api, projectId, writer, disabled, command, readSnapshot, setAttachment, selectedFile, setSelectedFile }) {
+function WorkspaceFiles({ snapshot, api, projectId, writer, disabled, command, readSnapshot, setAttachment, selectedFile, setSelectedFile, setFileDirty }) {
   const [entries, setEntries] = useState([]), [directory, setDirectory] = useState(''), [cursor, setCursor] = useState(null)
   const [base, setBase] = useState(null), [text, setText] = useState(''), [diff, setDiff] = useState(null), [diffBase, setDiffBase] = useState('HEAD')
   const [tasks, setTasks] = useState([]), [task, setTask] = useState(''), [conflict, setConflict] = useState(null)
+  const [taskError, setTaskError] = useState(null), [taskRefresh, setTaskRefresh] = useState(0)
   const dirty = !!base && base.text !== text
-  useEffect(() => { setEntries([]); setBase(null); setText(''); setDiff(null); setConflict(null); setSelectedFile(''); setTask('') }, [snapshot.session_id])
+  useEffect(() => { setFileDirty(dirty); return () => setFileDirty(false) }, [dirty, setFileDirty])
+  useEffect(() => { setEntries([]); setDirectory(''); setCursor(null); setBase(null); setText(''); setDiff(null); setConflict(null); setSelectedFile(''); setTask('') }, [snapshot.session_id])
   useEffect(() => {
     const controller = new AbortController()
-    api.call('listTask', { params: { projectId }, signal: controller.signal }).then(value => { if (!controller.signal.aborted) setTasks(rows(value).filter(item => ['DRAFT', 'READY', 'RUNNING', 'BLOCKED', 'NEEDS_REVALIDATION'].includes(item.status))) }).catch(() => {})
+    api.call('listTask', { params: { projectId }, signal: controller.signal }).then(value => { if (!controller.signal.aborted) { setTasks(rows(value).filter(item => item.task_type === 'mu_turn' && item.candidate_id === snapshot.session_id && ['DRAFT', 'READY', 'BLOCKED', 'NEEDS_REVALIDATION'].includes(item.status))); setTaskError(null) } }).catch(error => { if (!controller.signal.aborted) { setTasks([]); setTaskError(error) } })
     return () => controller.abort()
-  }, [api, projectId, snapshot.active_run_id])
+  }, [api, projectId, snapshot.session_id, snapshot.active_run_id, snapshot.revision, taskRefresh])
   async function tree(path, append = false) {
     await command('读取目录', async () => { const value = unwrap(await window.researchos.v2['workspace.tree']({ workspace_ref: snapshot.workspace_ref, relative_path: path || '.', cursor: append ? cursor : null, limit: 100 })); setEntries(old => append ? [...old, ...value.entries] : value.entries); setCursor(value.next_cursor); setDirectory(path) })
   }
@@ -244,12 +249,13 @@ function WorkspaceFiles({ snapshot, api, projectId, writer, disabled, command, r
     await command('读取文件', async () => { const value = unwrap(await window.researchos.v2['workspace.read']({ workspace_ref: snapshot.workspace_ref, relative_path: path, max_bytes: 1048576 })); setBase(value); setText(value.text); setSelectedFile(path); setConflict(null) })
   }
   return <Panel title="工作区文件与差异" aside={<button disabled={disabled} onClick={() => tree('')}>读取文件树</button>}>
-    <div className="workspace-layout"><div><p className="small-muted break-all">{directory || '项目根目录'}</p>{directory && <button disabled={disabled} onClick={() => tree(directory.split('/').slice(0, -1).join('/'))}>上级目录</button>}<ul className="file-list">{entries.map(item => <li key={item.relative_path}><button disabled={disabled} onClick={() => item.kind === 'DIRECTORY' ? tree(item.relative_path) : open(item.relative_path)}>{item.name || item.relative_path}{item.kind === 'DIRECTORY' ? ' /' : ''}</button></li>)}</ul>{cursor && <button disabled={disabled} onClick={() => tree(directory, true)}>加载更多文件</button>}</div>
+    <div className="workspace-layout"><div><p className="small-muted break-all">{directory || '项目根目录'}</p>{directory && <button disabled={disabled} onClick={() => tree(directory.split('/').slice(0, -1).join('/'))}>上级目录</button>}<ul className="file-list">{entries.map(item => <li key={item.relative_path}><button disabled={disabled || !item.readable} onClick={() => item.kind === 'DIRECTORY' ? tree(item.relative_path) : open(item.relative_path)}>{item.name || item.relative_path}{item.kind === 'DIRECTORY' ? ' /' : ''}</button>{!item.readable && <small>{({ CONTENT_TOO_LARGE: '超过读取上限', UNSUPPORTED_CONTENT: '不支持预览', PATH_OUT_OF_SCOPE: '不在授权范围', FORBIDDEN: '无读取权限' })[item.reason_code] || '不可读取'}</small>}</li>)}</ul>{cursor && <button disabled={disabled} onClick={() => tree(directory, true)}>加载更多文件</button>}</div>
     <div><label>差异基线<select value={diffBase} onChange={event => setDiffBase(event.target.value)}><option value="HEAD">Git HEAD</option><option value="INDEX">Git 暂存区</option></select></label><button disabled={disabled} onClick={() => command('读取差异', async () => setDiff(unwrap(await window.researchos.v2['workspace.diff']({ workspace_ref: snapshot.workspace_ref, base: diffBase, relative_path: selectedFile || null, max_bytes: 1048576 }))))}>查看差异</button>
-      {diff && <><p>{diff.base} · {diff.files?.length || 0} 个文件{diff.truncated ? ' · 内容超限，已截断' : ''}</p><pre className="preview-text">{JSON.stringify(diff.files, null, 2)}</pre></>}
+      {diff && <><p>{diff.base} · {diff.files?.length || 0} / {diff.total_files} 个文件{diff.truncated ? ' · 内容超限，已截断' : ''}</p><pre className="preview-text">{JSON.stringify(diff.files, null, 2)}</pre>{diff.full_diff_artifact_ref && <BoundArtifact reference={diff.full_diff_artifact_ref} api={api} projectId={projectId} label="读取完整差异"/>}</>}
       {base && <><h3 className="break-all">{base.relative_path}</h3><label>文件草稿<textarea className="file-editor" value={text} onChange={event => setText(event.target.value)} readOnly={!base.editable || !writer}/></label>
         <label>关联任务<select value={task} onChange={event => setTask(event.target.value)}><option value="">选择已有可编辑任务</option>{tasks.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
-        <div className="button-row"><button disabled={disabled || !writer || !task || !base.editable || !dirty || !!conflict} onClick={() => command('保存文件草稿', async () => { try { unwrap(await window.researchos.v2['workspace.write']({ workspace_ref: snapshot.workspace_ref, relative_path: base.relative_path, task_id: task, expected_content_hash: base.content_hash, text, create_if_missing: false })); const next = unwrap(await window.researchos.v2['workspace.read']({ workspace_ref: snapshot.workspace_ref, relative_path: base.relative_path, max_bytes: 1048576 })); setBase(next); setText(next.text); await readSnapshot() } catch (error) { if (/CONFLICT|STALE|HASH|REVISION/.test(error.code || '')) setConflict(error.message); throw error } })}>保存草稿</button>
+        <Failure error={taskError} retry={() => setTaskRefresh(value => value + 1)}/>
+        <div className="button-row"><button disabled={disabled || !writer || !task || !base.editable || !dirty || !!conflict} onClick={() => command('保存文件草稿', async () => { try { unwrap(await window.researchos.v2['workspace.write']({ workspace_ref: snapshot.workspace_ref, relative_path: base.relative_path, task_id: task, expected_content_hash: base.content_hash, text, create_if_missing: false })); const next = unwrap(await window.researchos.v2['workspace.read']({ workspace_ref: snapshot.workspace_ref, relative_path: base.relative_path, max_bytes: 1048576 })); setBase(next); setText(next.text); await readSnapshot() } catch (error) { if (/CONFLICT|STALE|HASH|REVISION|EXTERNAL_WRITE_RACE/.test(error.code || '')) setConflict(error.message); throw error } })}>保存草稿</button>
         <button disabled={disabled || !writer || dirty} onClick={() => command('附加文件', async () => { const value = unwrap(await window.researchos.v2['artifact.import']({ workspace_ref: snapshot.workspace_ref, relative_path: base.relative_path, expected_content_hash: base.content_hash, purpose: 'ATTACHMENT' })); setAttachment(value.artifact_ref.id); await readSnapshot() })}>附加到消息</button></div>
         {!task && <p className="small-muted">选择已有任务后才能保存；封存产物不可原地编辑。</p>}
         {conflict && <div className="state-notice" role="alert"><p>外部版本已改变，当前草稿仍保留。请复制需要保留的内容，重新读取并手工合并。</p><button disabled={disabled} onClick={() => open(base.relative_path)}>核对外部版本</button></div>}
