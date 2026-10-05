@@ -3,6 +3,7 @@ package domain
 import (
 	"database/sql"
 	"errors"
+	"time"
 )
 
 func (s *Service) researchStageSnapshot(tx *sql.Tx, project string, task Object) (Object, error) {
@@ -264,7 +265,52 @@ func (s *Service) researchCycleFacts(tx *sql.Tx, project string, cycle Object, m
 			outcome = "BLOCKED"
 		}
 	}
-	return Object{"type": "research.cycle-report.v1", "cycle_id": cycle["id"], "window_from": cycle["window_from"], "window_to": cycle["window_to"], "profile_ref": cycle["profile_ref"], "source_coverage": coverage, "stage_work": stages, "candidates": candidates, "experiments": experiments, "cost_entries": costs, "gaps": gaps, "cycle_outcome": outcome}, nil
+	origin := Object{"intent": profile["intent"], "accepted_scope": profile["accepted_scope"], "profile_ref": cycle["profile_ref"], "trigger": cycle["trigger"]}
+	continuation := Object{"mode": "FINITE_CYCLE", "next_review_conditions": []any{"Owner must explicitly request another bounded cycle"}}
+	if monitorBindings != 0 {
+		var goalID, planRaw, acceptanceRaw string
+		if err = tx.QueryRow("SELECT goal,plan_ref FROM research_monitor_cycles WHERE project=? AND cycle=?", project, cycle["id"]).Scan(&goalID, &planRaw); err != nil {
+			return nil, err
+		}
+		if err = tx.QueryRow("SELECT acceptance_ref FROM intent_plan_bindings WHERE project=? AND compiled_goal=? AND plan_kind='MONITOR'", project, goalID).Scan(&acceptanceRaw); err != nil {
+			return nil, err
+		}
+		goal, e := load(tx, project, "Goal", goalID)
+		if e != nil {
+			return nil, e
+		}
+		planRef, e := Decode([]byte(planRaw))
+		if e != nil {
+			return nil, e
+		}
+		acceptanceRef, e := Decode([]byte(acceptanceRaw))
+		if e != nil {
+			return nil, e
+		}
+		value, e := s.artifactJSON(tx, project, planRef)
+		if e != nil {
+			return nil, e
+		}
+		brief, e := parseGoalBrief(Bytes(value))
+		if e != nil || brief.Monitor == nil {
+			return nil, Fail(422, "GATE_FAILED", "bound monitor plan unavailable")
+		}
+		to, e := time.Parse(time.RFC3339Nano, Str(cycle, "window_to"))
+		if e != nil {
+			return nil, e
+		}
+		origin["goal_id"] = goal["id"]
+		origin["owner_instruction"] = goal["original_intent"]
+		origin["requirement_refs"] = goal["requirement_refs"]
+		origin["accepted_plan_ref"] = planRef
+		origin["plan_acceptance_ref"] = acceptanceRef
+		continuation = Object{"mode": "ACCEPTED_MONITOR_PLAN", "next_window_from": cycle["window_to"],
+			"earliest_next_window_to": to.Add(time.Duration(brief.Monitor.PeriodSeconds) * time.Second).UTC().Format(time.RFC3339Nano),
+			"period_seconds":          brief.Monitor.PeriodSeconds, "next_review_conditions": []any{
+				"Accepted Owner monitor plan and profile remain current", "Goal remains active and NoProgressRecord permits continuation",
+				"Next bounded cycle reports source coverage, accepted stages, experiment outcomes and unresolved gaps"}}
+	}
+	return Object{"type": "research.cycle-report.v1", "cycle_id": cycle["id"], "window_from": cycle["window_from"], "window_to": cycle["window_to"], "profile_ref": cycle["profile_ref"], "origin": origin, "continuation": continuation, "source_coverage": coverage, "stage_work": stages, "candidates": candidates, "experiments": experiments, "cost_entries": costs, "gaps": gaps, "cycle_outcome": outcome}, nil
 }
 
 func (s *Service) researchSourceFacts(tx *sql.Tx, project string, w *researchWork) (Object, error) {
