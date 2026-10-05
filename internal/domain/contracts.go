@@ -151,6 +151,14 @@ func (c *Contracts) Validate(name string, v any) error {
 	if e := d.Decode(&j); e != nil {
 		return e
 	}
+	// v2.4 reports carry their own frozen version. Existing stored v2.0 reports
+	// continue through the original schema; SKILL_UP cannot be disguised as v2.0.
+	if o, object := j.(map[string]any); name == "EvaluationReport" && object && o["schema_version"] == "2.4.0" {
+		s, ok = c.Schemas["EvaluationReportV24"]
+		if !ok {
+			return fmt.Errorf("v2.4 EvaluationReport schema unavailable")
+		}
+	}
 	return s.Validate(j)
 }
 func LoadContracts(dir string) (*Contracts, error) {
@@ -230,6 +238,9 @@ func LoadContracts(dir string) (*Contracts, error) {
 			op.Implemented = implemented[op.ID]
 			c.Operations = append(c.Operations, op)
 		}
+	}
+	if e = c.bindEvaluationV24(); e != nil {
+		return nil, e
 	}
 	return c, nil
 }
