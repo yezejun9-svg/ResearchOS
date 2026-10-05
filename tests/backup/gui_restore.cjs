@@ -95,6 +95,15 @@ async function main() {
     if (!clicked) throw Error('SESSION_BUTTON_ABSENT');
     await waitFor(`document.querySelector('.conversation-transcript')?.textContent.includes('backup')`, 'restored transcript');
     const session = await capture('02-session-open');
+    const native = await evaluate(`(async () => {
+      const context = await window.researchos.desktop.context();
+      const reply = await window.researchos.v2['session.get']({});
+      const value = reply?.result || {};
+      return { context, ok: reply?.ok, status: reply?.protocol_status,
+        project_id: value.project_id, session_id: value.session_id, goal_id: value.goal_id,
+        task_id: value.task_id, event_sequence: value.event_sequence, title: value.title };
+    })()`);
+    save('native-session.json', native);
     await send('Page.navigate', { url: `ros-app://desktop/p/${pid}/tasks/${tid}` });
     await waitFor(`document.querySelector('h1')?.textContent.trim() === ${JSON.stringify(meta.task_title)}`, 'restored task detail');
     const task = await capture('03-task');
@@ -106,7 +115,13 @@ async function main() {
       session_open_title: session.body.includes(meta.session_title),
       restored_transcript: session.body.includes('backup'),
       task_detail_title: task.headings.includes(meta.task_title),
+      task_url_id: task.url.endsWith(`/tasks/${tid}`),
       goal_dashboard_title: goal.body.includes(meta.goal_title),
+      native_session_identity: native.ok === true && native.status === 'COMPLETED' &&
+        native.context?.session_id === meta.session_id && native.context?.project_id === meta.project_id &&
+        native.session_id === meta.session_id && native.project_id === meta.project_id &&
+        native.goal_id === meta.goal_id && native.task_id === meta.task_id,
+      restored_event_cursor: native.event_sequence === meta.event_cursor,
       renderer_errors_zero: rendererErrors.length === 0,
       native_bridge_present: [before, session, task, goal].every(item => item.root && item.bridge),
     };

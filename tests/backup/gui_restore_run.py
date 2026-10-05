@@ -115,6 +115,9 @@ def main():
             repo / "tests" / "backup" / "gui_fixture" / "main_windows.go",
             repo / "tests" / "backup" / "gui_restore.cjs",
             repo / "tests" / "backup" / "gui_restore_run.py",
+            repo / "ops" / "backup" / "main.go",
+            repo / "apps" / "control" / "main.go",
+            repo / "apps" / "cli" / "main.go",
             repo / "apps" / "desktop" / "main" / "main.js",
             repo / "apps" / "web" / "src" / "workbench.jsx", dist,
         ]})
@@ -135,7 +138,7 @@ def main():
         env = os.environ.copy()
         env.update(RESEARCHOS_DATA_DIR=str(restored), RESEARCHOS_WEB_DIR=str(repo / "apps" / "web" / "dist"),
                    RESEARCHOS_LISTEN="127.0.0.1:0", RESEARCHOS_CLI_DISCOVERY=str(discovery_path),
-                   RESEARCHOS_HOST_DISCOVERY=str(discovery_path))
+                   RESEARCHOS_HOST_DISCOVERY=str(discovery_path), RESEARCHOS_CLI_CONFIG=str(root / "cli-config.json"))
         out = open(receipt / "control.stdout.txt", "w", encoding="utf-8")
         err = open(receipt / "control.stderr.txt", "w", encoding="utf-8")
         control = subprocess.Popen([str(binaries["control"]), "--discovery-file", str(discovery_path)], cwd=repo,
@@ -151,11 +154,16 @@ def main():
         cli = command("cli-status", [binaries["researchos"], "status", "--project", meta["project_id"],
                                      "--session", meta["session_id"], "--output", "jsonl"], repo, receipt, env)
         cli_rows = [json.loads(line) for line in cli.stdout.splitlines() if line.strip()]
-        serialized_cli = json.dumps(cli_rows, ensure_ascii=False)
-        cli_checks = {"session_id_present": meta["session_id"] in serialized_cli,
-                      "goal_id_present": meta["goal_id"] in serialized_cli,
-                      "restored_host_data_root": str(restored).lower() in serialized_cli.lower(),
-                      "status_completed": all(row.get("status") == "COMPLETED" for row in cli_rows)}
+        operations = cli_rows[0].get("operations", []) if len(cli_rows) == 1 else []
+        session_result = next((row.get("result", {}) for row in operations if row.get("method") == "session.get"), {})
+        cli_checks = {"session_id_exact": session_result.get("session_id") == meta["session_id"],
+                      "project_id_exact": session_result.get("project_id") == meta["project_id"],
+                      "goal_id_exact": session_result.get("goal_id") == meta["goal_id"],
+                      "task_id_exact": session_result.get("task_id") == meta["task_id"],
+                      "restored_event_cursor": session_result.get("event_sequence") == meta["event_cursor"],
+                      "host_url_matches_restored_discovery": cli_rows[0].get("host_url") == discovery["url"] if len(cli_rows) == 1 else False,
+                      "status_completed": len(cli_rows) == 1 and cli_rows[0].get("status") == "COMPLETED" and
+                      all(row.get("status") == "COMPLETED" for row in operations)}
         save(receipt / "cli-checks.json", cli_checks)
         if not all(cli_checks.values()):
             raise RuntimeError("CLI_ASSERTION_FAILED:" + json.dumps(cli_checks))
