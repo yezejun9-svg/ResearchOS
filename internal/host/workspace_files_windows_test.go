@@ -246,6 +246,30 @@ func TestWorkspaceDiffRefusesExternalGitMetadata(t *testing.T) {
 			t.Fatalf("object alternates were followed: %v", err)
 		}
 	})
+	t.Run("commondir", func(t *testing.T) {
+		h, workspace, _ := runtimeToolFixture(t, AccessReadWrite)
+		external := t.TempDir()
+		workspaceGit(t, external, "init", "-q")
+		workspaceGit(t, external, "config", "user.email", "test@example.invalid")
+		workspaceGit(t, external, "config", "user.name", "Test")
+		if err := os.WriteFile(filepath.Join(external, "secret.txt"), []byte("EXTERNAL_COMMON_DIR_SECRET\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		workspaceGit(t, external, "add", ".")
+		workspaceGit(t, external, "commit", "-qm", "baseline")
+		workspaceGit(t, workspace, "init", "-q")
+		if err := os.WriteFile(filepath.Join(workspace, ".git", "commondir"), []byte(filepath.ToSlash(filepath.Join(external, ".git"))+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(workspace, "secret.txt"), []byte("public local text\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		result, patch, err := h.WorkspaceDiff(context.Background(), workspace, AccessReadWrite, domain.Object{
+			"workspace_ref": "opaque", "base": "HEAD", "relative_path": "secret.txt", "max_bytes": 4096})
+		if err == nil || !strings.Contains(err.Error(), "PATH_OUT_OF_SCOPE") || strings.Contains(string(patch), "EXTERNAL_COMMON_DIR_SECRET") {
+			t.Fatalf("external common dir was read: %v %s %v", result, patch, err)
+		}
+	})
 }
 
 type workspaceRaceContext struct {

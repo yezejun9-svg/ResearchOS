@@ -47,7 +47,7 @@ func gitLocal(ctx context.Context, dir string, args ...string) ([]byte, error) {
 		}
 		cmd.Env = append(cmd.Env, item)
 	}
-	cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=NUL", "GIT_OPTIONAL_LOCKS=0", "GIT_ATTR_NOSYSTEM=1", "GIT_NO_REPLACE_OBJECTS=1", "GIT_LITERAL_PATHSPECS=1")
+	cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=NUL", "GIT_OPTIONAL_LOCKS=0", "GIT_ATTR_NOSYSTEM=1", "GIT_NO_REPLACE_OBJECTS=1", "GIT_NO_LAZY_FETCH=1", "GIT_LITERAL_PATHSPECS=1")
 	var out limitedGitOutput
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
@@ -90,8 +90,8 @@ func safeGitMetadata(root *os.Root, workspace string) error {
 			return errors.New("PATH_OUT_OF_SCOPE: Git metadata contains a reparse point")
 		}
 		name := strings.ToLower(entry.Name())
-		if name == "alternates" || name == "http-alternates" {
-			return errors.New("PATH_OUT_OF_SCOPE: Git object alternates are outside workspace authority")
+		if name == "alternates" || name == "http-alternates" || name == "commondir" {
+			return errors.New("PATH_OUT_OF_SCOPE: Git metadata redirects outside workspace authority")
 		}
 		if name == "config" || name == "config.worktree" {
 			meta, readErr := os.ReadFile(path)
@@ -99,7 +99,7 @@ func safeGitMetadata(root *os.Root, workspace string) error {
 				return errors.New("HOST_UNAVAILABLE: Git configuration cannot be checked")
 			}
 			for _, line := range strings.Split(strings.ToLower(string(meta)), "\n") {
-				if strings.HasPrefix(strings.TrimSpace(line), "[include") {
+				if strings.HasPrefix(strings.TrimPrefix(strings.TrimSpace(line), "\ufeff"), "[include") {
 					return errors.New("PATH_OUT_OF_SCOPE: Git configuration includes external files")
 				}
 			}
