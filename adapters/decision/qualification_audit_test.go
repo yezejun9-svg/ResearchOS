@@ -1,6 +1,7 @@
 package decision
 
 import (
+	"encoding/json"
 	"math"
 	"slices"
 	"testing"
@@ -102,4 +103,19 @@ func TestW1102QualificationAudit(t *testing.T) {
 	x.NegativeLabels = 20
 	r = AuditQualification(x)
 	assert(t, "W1102-EXACT-5-PERCENT", "REVIEWABLE", r.Status)
+	for _, tc := range []struct {
+		id   string
+		cost float64
+	}{{"NAN", math.NaN()}, {"POS-INF", math.Inf(1)}, {"NEG-INF", math.Inf(-1)}} {
+		x := auditFixture()
+		x.ActualCost = &tc.cost
+		r := AuditQualification(x)
+		raw, encodeErr := json.Marshal(r)
+		var decoded map[string]any
+		decodeErr := json.Unmarshal(raw, &decoded)
+		assert(t, "W1102-NONFINITE-COST-"+tc.id,
+			[]any{"BLOCKED", true, true, true, "ADVISORY", "NONE"},
+			[]any{r.Status, slices.Contains(r.Reasons, "INVALID_COUNTS_OR_METRICS"), r.ActualCost == nil,
+				encodeErr == nil && decodeErr == nil && decoded["actual_cost"] == nil, r.MaximumMode, r.AutomaticAuthority})
+	}
 }
