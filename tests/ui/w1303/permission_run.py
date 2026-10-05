@@ -20,7 +20,7 @@ def main():
     temp = Path(tempfile.mkdtemp(prefix='researchos-w13-ui-permission-', dir=ROOT / '.local'))
     locked = json.loads((ROOT / 'execution/toolchains/locked.json').read_text(encoding='utf-8-sig'))['tools']
     go, node = Path(locked['go']['path']), Path(locked['node']['path'])
-    bundle = ROOT / '.local/w1401-mu-worker/mu-worker.mjs'
+    bundle = Path(os.environ.get('RESEARCHOS_MU_BUNDLE') or ROOT / '.local/w1401-mu-worker/mu-worker.mjs')
     report = {'schema':'researchos.permission-ui-observation.v1','run_id':run_id,'step_id':'W13-03','status':'EXECUTING','measurement_mode':'FIXTURE','external_provider_calls':0,'formal_cases_accepted':[],'commands':[],'source_hashes':{},'cases':[]}
     env = dict(os.environ, GOTOOLCHAIN='local', GOENV='off', RESEARCHOS_TASK_ID='W13', RESEARCHOS_NODE=str(node), RESEARCHOS_MU_BUNDLE=str(bundle))
     env.pop('ROS_DESKTOP_SMOKE',None)

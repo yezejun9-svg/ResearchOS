@@ -94,11 +94,13 @@ def main() -> int:
             report['tool_hashes'][name] = {'path': str(executable), 'sha256': digest(executable)}
         report['source_hashes'][lock_file.relative_to(ROOT).as_posix()] = digest(lock_file)
         for folder in ['tests/ui/w1303/workspace_fixture', 'apps/web/src', 'apps/desktop/main', 'apps/desktop/preload',
-                       'internal/domain', 'apps/cli']:
+                       'internal', 'adapters', 'migrations/sqlite', 'apps/cli']:
             for file in sorted((ROOT / folder).rglob('*')):
-                if file.is_file() and file.suffix in ('.go', '.js', '.jsx', '.cjs', '.css'):
+                if file.is_file() and file.suffix in ('.go', '.js', '.jsx', '.cjs', '.css', '.sql'):
                     report['source_hashes'][file.relative_to(ROOT).as_posix()] = digest(file)
-        for file in [ROOT / 'tests/ui/w1303/transcript.cjs', ROOT / 'tests/ui/w1303/transcript_run.py']:
+        for file in [ROOT / name for name in ['tests/ui/w1303/transcript.cjs', 'tests/ui/w1303/transcript_run.py',
+                    'go.mod', 'go.sum', 'apps/web/package.json', 'apps/web/package-lock.json',
+                    'apps/web/index.html', 'apps/desktop/package.json', 'apps/desktop/package-lock.json']]:
             report['source_hashes'][file.relative_to(ROOT).as_posix()] = digest(file)
         vite = ROOT / 'apps/web/node_modules/vite/bin/vite.js'
         check('INSTALLED_VITE', vite.is_file())
@@ -157,6 +159,15 @@ def main() -> int:
                 helper.kill(); helper.wait(timeout=5)
         if log:
             log.close()
+        report['source_hashes_after'] = {name: digest(ROOT / name) if (ROOT / name).is_file() else None
+                                         for name in report['source_hashes']}
+        report['source_drift'] = [name for name, expected in report['source_hashes'].items()
+                                  if report['source_hashes_after'][name] != expected]
+        if report['status'] == 'PASS':
+            try:
+                check('SOURCE_FROZEN_DURING_OBSERVATION', not report['source_drift'])
+            except RuntimeError as error:
+                report['status'], report['error'] = 'FAIL', str(error)
         report['temporary_data'], report['temporary_data_retained'] = str(temp), True
         report['finished_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
         save(out / 'run.json', report)

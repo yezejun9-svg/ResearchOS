@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -29,6 +30,19 @@ def save(path, obj):
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def source_hashes(repo):
+    result = {}
+    for folder in ("apps/cli", "apps/control", "apps/desktop/main", "apps/desktop/preload",
+                   "apps/web/src", "internal", "adapters", "migrations/sqlite", "ops/backup", "tests/backup"):
+        for path in sorted((repo / folder).rglob("*")):
+            if path.is_file() and path.suffix in {".go", ".js", ".jsx", ".cjs", ".py", ".sql", ".css", ".json"}:
+                result[path.relative_to(repo).as_posix()] = sha256(path)
+    for name in ("go.mod", "go.sum", "execution/toolchains/locked.json", "apps/web/index.html",
+                 "apps/web/package.json", "apps/web/package-lock.json", "apps/desktop/package.json", "apps/desktop/package-lock.json"):
+        result[name] = sha256(repo / name)
+    return result
+
+
 def command(label, argv, cwd, receipt, env=None, timeout=180):
     options = {"cwd": str(cwd), "env": env, "encoding": "utf-8", "errors": "replace", "capture_output": True, "timeout": timeout}
     if os.name == "nt":
@@ -46,6 +60,13 @@ def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+def business_counts(database, project):
+    with sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=10) as db:
+        return {"tasks": db.execute("SELECT count(*) FROM domain_objects WHERE project=? AND kind='Task'", (project,)).fetchone()[0],
+                "runs": db.execute("SELECT count(*) FROM domain_objects WHERE project=? AND kind='Run'", (project,)).fetchone()[0],
+                "effects": db.execute("SELECT count(*) FROM resource_effects WHERE project=?", (project,)).fetchone()[0]}
 
 
 def wait_host(discovery_path, proc):
@@ -95,8 +116,11 @@ def main():
         raise RuntimeError("launch gui_restore_run.py with locked Python interpreter")
     root = (repo / ".local" / "w1802-gui" / ("run-" + uuid.uuid4().hex[:12])).resolve()
     root.mkdir(parents=True, exist_ok=False)
-    receipt_base = (args.receipt_base or repo / "execution" / "v2.4" / "receipts" / "W18").resolve()
-    receipt = receipt_base / ("W18-02-gui-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6])
+    canonical_receipts = (repo / "execution/v2.4/receipts/W18/W18-02").resolve()
+    receipt_base = (args.receipt_base or canonical_receipts).resolve()
+    if not receipt_base.is_relative_to(canonical_receipts):
+        raise RuntimeError("receipt base must remain inside the canonical W18-02 evidence directory")
+    receipt = receipt_base / ("gui-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6])
     receipt.mkdir(parents=True, exist_ok=False)
     build = root / "build"
     build.mkdir()
@@ -109,12 +133,17 @@ def main():
     }
     stage = "build"
     control = electron = None
+    before = source_hashes(repo)
+    save(receipt / "source-hashes.json", before)
+    env = os.environ.copy()
+    env.update(GOTOOLCHAIN="local", GOENV="off", GOPATH=str(repo / ".local/gopath"),
+               GOCACHE=str(repo / ".local/gocache"))
     save(receipt / "provenance.json", {"mode": "FIXTURE", "scenario": "W18-02 restored new data root, same session/goal/next task", "source_repo": str(repo), "fixture_dir": str(root), "provider_calls_by_harness": 0})
     save(receipt / "locked-tools.json", {"source": str(locked_file), "source_sha256": sha256(locked_file),
                                          "verified": {name: {"path": str(exe), "sha256": sha256(exe)} for name, exe in tools.items()}})
     try:
         for name, source in sources.items():
-            command("build-" + name, [tools["go"], "build", "-o", binaries[name], source], repo, receipt)
+            command("build-" + name, [tools["go"], "build", "-o", binaries[name], source], repo, receipt, env)
         # The integrated React sources may be newer than an ignored local dist.
         vite = repo / "apps" / "web" / "node_modules" / "vite" / "bin" / "vite.js"
         if not vite.is_file():
@@ -126,17 +155,6 @@ def main():
         electron_exe = repo / "apps" / "desktop" / "node_modules" / "electron" / "dist" / "electron.exe"
         if not electron_exe.is_file():
             raise RuntimeError("installed Electron executable unavailable")
-        save(receipt / "source-hashes.json", {str(path.relative_to(repo)): sha256(path) for path in [
-            repo / "tests" / "backup" / "gui_fixture" / "main_windows.go",
-            repo / "tests" / "backup" / "gui_restore.cjs",
-            repo / "tests" / "backup" / "gui_restore_run.py",
-            locked_file, vite,
-            repo / "ops" / "backup" / "main.go",
-            repo / "apps" / "control" / "main.go",
-            repo / "apps" / "cli" / "main.go",
-            repo / "apps" / "desktop" / "main" / "main.js",
-            repo / "apps" / "web" / "src" / "workbench.jsx", dist,
-        ]})
         save(receipt / "web-dist-hashes.json", {str(path.relative_to(repo)): sha256(path)
                                                for path in sorted(dist.parent.rglob("*")) if path.is_file()})
         save(receipt / "tool-hashes.json", {name: sha256(binary) for name, binary in binaries.items()} |
@@ -152,9 +170,12 @@ def main():
         restored = Path(meta["restored_data_root"])
         if restored.resolve() == Path(meta["source_data_root"]).resolve() or restored.resolve() == Path(meta["source_workspace"]).resolve():
             raise RuntimeError("restore reused source directory")
+        original_paths = [Path(meta["source_data_root"]) / "researchos.sqlite", Path(meta["source_workspace"]) / "src/main.go"]
+        original_hashes = {str(path): sha256(path) for path in original_paths}
+        prior_counts = business_counts(restored / "researchos.sqlite", meta["project_id"])
+        save(receipt / "business-before.json", {"counts": prior_counts, "source_hashes": original_hashes})
         stage = "restored_control"
         discovery_path = root / "restored-discovery.json"
-        env = os.environ.copy()
         env.update(RESEARCHOS_DATA_DIR=str(restored), RESEARCHOS_WEB_DIR=str(repo / "apps" / "web" / "dist"),
                    RESEARCHOS_LISTEN="127.0.0.1:0", RESEARCHOS_CLI_DISCOVERY=str(discovery_path),
                    RESEARCHOS_HOST_DISCOVERY=str(discovery_path), RESEARCHOS_CLI_CONFIG=str(root / "cli-config.json"))
@@ -214,16 +235,35 @@ def main():
                                     stdout=out, stderr=err, creationflags=subprocess.CREATE_NO_WINDOW)
         try:
             command("gui-cdp", [tools["node"], repo / "tests" / "backup" / "gui_restore.cjs", str(cdp_port), meta_path, receipt],
-                    repo, receipt, env, timeout=120)
+                    repo, receipt, env, timeout=240)
         finally:
             out.close(); err.close()
+        gui_checks = json.loads((receipt / "gui-checks.json").read_text(encoding="utf-8"))
+        final_counts = business_counts(restored / "researchos.sqlite", meta["project_id"])
+        final_original_hashes = {str(path): sha256(path) for path in original_paths}
+        save(receipt / "business-after.json", {"counts": final_counts, "source_hashes": final_original_hashes})
+        gui_checks["no_new_task_run_or_effect"] = final_counts == prior_counts
+        gui_checks["original_source_bytes_unchanged"] = final_original_hashes == original_hashes
+        if not all(gui_checks.values()):
+            raise RuntimeError("RESTORE_CONTINUATION_MUTATED_ORIGINAL_BUSINESS_DATA")
+        after = source_hashes(repo)
+        save(receipt / "source-after.json", after)
+        drift = sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
+        if drift:
+            raise RuntimeError("SOURCE_CHANGED_DURING_OBSERVATION:" + json.dumps(drift))
+        assertion_ids = ["W18-02-CLI-" + name for name in cli_checks] + ["W18-02-GUI-" + name for name in gui_checks]
         save(receipt / "result.json", {"status": "PASS", "mode": "FIXTURE", "cli_checks": cli_checks,
-                                      "gui_checks": json.loads((receipt / "gui-checks.json").read_text(encoding="utf-8")),
+                                      "gui_checks": gui_checks, "assertion_ids": assertion_ids, "source_drift": drift,
+                                      "whole_card_accepted": False, "formal_cases_accepted": [],
                                       "provider_calls_by_harness": 0, "restored_data_root": str(restored)})
-        print(json.dumps({"status": "PASS", "receipt": str(receipt), "restored_data_root": str(restored)}))
+        print(json.dumps({"status": "PASS", "receipt": str(receipt / "result.json"), "restored_data_root": str(restored)}))
     except Exception as exc:
-        save(receipt / "result.json", {"status": "FAIL", "stage": stage, "error": str(exc), "mode": "FIXTURE"})
-        print(json.dumps({"status": "FAIL", "stage": stage, "error": str(exc), "receipt": str(receipt)}), file=sys.stderr)
+        after = source_hashes(repo)
+        save(receipt / "source-after.json", after)
+        save(receipt / "result.json", {"status": "FAIL", "stage": stage, "error": str(exc), "mode": "FIXTURE",
+                                      "source_drift": sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name)),
+                                      "whole_card_accepted": False, "formal_cases_accepted": []})
+        print(json.dumps({"status": "FAIL", "stage": stage, "error": str(exc), "receipt": str(receipt / "result.json")}), file=sys.stderr)
         return 1
     finally:
         stop_owned(electron)
