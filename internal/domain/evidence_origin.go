@@ -252,7 +252,7 @@ func (s *Service) evidenceSupportSummary(tx *sql.Tx, p Principal, project string
 		} else {
 			unknown++
 		}
-		records = append(records, Object{"evidence_id": id, "evidence_kind": kind, "origin_relation": relation, "root_evidence_id": rootID, "validity": ev["validity"], "origin_evidence_id": ev["origin_evidence_id"]})
+		records = append(records, Object{"evidence_id": id, "evidence_kind": kind, "source_kind": ev["source_kind"], "origin_relation": relation, "root_evidence_id": rootID, "validity": ev["validity"], "origin_evidence_id": ev["origin_evidence_id"]})
 	}
 	rootList := make([]string, 0, len(roots))
 	for id := range roots {

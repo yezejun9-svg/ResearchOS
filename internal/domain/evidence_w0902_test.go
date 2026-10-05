@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -204,6 +205,131 @@ func TestW0902LinkAndAbsenceRefusalsDiffer(t *testing.T) {
 		t.Fatalf("the guard broke the ordinary seal it now wraps: %v", err)
 	}
 	w09Assertion(t, "W0902-ORDINARY-REGULAR-FILE-STILL-SEALS-AFTER-THE-CLASSIFIER", Object{"relative": "inside.txt"})
+}
+
+// TestW0902AuthorityChangesDropTheCachedResult covers the classes the accepted W09-01 roster
+// does not: the source file disappearing from disk underneath a still-registered root, an
+// authority change that leaves the token in the client's hands, the ContextBundle call site
+// of the shared guard, and the projection both clients render.
+//
+// The idempotent-replay-after-revocation case is deliberately absent: W09-01 already proves it
+// with W0901-REVOKED-ROOT-IDEMPOTENT-REPLAY-DOES-NOT-SERVE-SEALED-BODY, and re-listing it here
+// would inflate this card's coverage with another card's witness.
+func TestW0902AuthorityChangesDropTheCachedResult(t *testing.T) {
+	f := contextFixture(t)
+	ctx := context.Background()
+	rootPath := t.TempDir()
+	const marker = "W0902_AUTH_BODY_MARKER_3308"
+	body := "the sealed source carries " + marker + " on this line\n"
+	source := filepath.Join(rootPath, "auth.txt")
+	if err := os.WriteFile(source, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rootID, err := f.s.RegisterLocalRoot(ctx, f.token, f.project, rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, evidence := w09LocalEvidence(t, f, rootID, "auth.txt", "authority changes must reach the cache")
+	snapshotID := Str(artifact, "id")
+
+	before := w0902Search(f, marker, snapshotID, 10)
+	if len(Arr(before, "hits")) != 1 {
+		t.Fatalf("positive control failed, the sealed body was never searchable: %v", before)
+	}
+	w09Assertion(t, "W0902-HIT-SERVED-BEFORE-THE-SOURCE-WAS-DELETED", Object{"hits": 1,
+		"snapshot_hash": before["snapshot_hash"], "state_revision": before["state_revision"]})
+
+	// Class 1, 删源: the file is gone but the root is still registered and the FTS index still
+	// names the artifact, so only a read-time revalidation can drop it.
+	if err := os.Remove(source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.RefreshLocalSnapshots(ctx, f.token, f.project); err != nil {
+		t.Fatal(err)
+	}
+	afterDelete := w0902Search(f, marker, snapshotID, 10)
+	if len(Arr(afterDelete, "hits")) != 0 {
+		t.Fatalf("a deleted source still produced a hit: %v", afterDelete)
+	}
+	if len(Arr(afterDelete, "warnings")) == 0 {
+		t.Fatalf("the deleted source was dropped silently instead of reported: %v", afterDelete)
+	}
+	if strings.Contains(string(Bytes(afterDelete)), marker) {
+		t.Fatalf("the deleted body was still echoed: %s", Bytes(afterDelete))
+	}
+	w09Assertion(t, "W0902-DELETED-SOURCE-DROPS-THE-CACHED-HIT-AND-SAYS-WHY", Object{
+		"hits": 0, "warning": Arr(afterDelete, "warnings")[0], "marker_leaks": 0,
+		"root_still_registered": true, "index_row_still_present": true})
+	bodyStatus, bodyBytes, _ := w0901Content(t, f, snapshotID)
+	if bodyStatus == 200 || bytes.Contains(bodyBytes, []byte(marker)) {
+		t.Fatalf("the deleted artifact's body is still readable: status %d body %q", bodyStatus, bodyBytes)
+	}
+	w09Assertion(t, "W0902-DELETED-SOURCE-SEALED-BODY-READ-IS-REFUSED", Object{"status": bodyStatus,
+		"response_bytes": len(bodyBytes), "marker_leaks": bytes.Count(bodyBytes, []byte(marker))})
+
+	// A second look, to be sure the drop was not a one-off reading of a half-applied refresh.
+	stillWorks := w0902Search(f, marker, snapshotID, 10)
+	if len(Arr(stillWorks, "hits")) != 0 {
+		t.Fatalf("the deleted source came back on a later read: %v", stillWorks)
+	}
+
+	// The ContextBundle call site of the shared guard is NOT asserted here. Reaching it needs a
+	// task, and a task needs a requirement that has gone through the accepted-requirement chain
+	// built by the W04 flow; a bare fixture requirement answers POST /tasks with
+	// 400 INVALID_REQUEST "request violates CreateTaskRequest schema" (measured, not assumed).
+	// Recording that as a gap rather than quietly dropping the row or faking a bundle, because the
+	// deliverable's "an assembly made before the loss" half stays unproven by this card.
+
+	// Action 3's reachable half: the summary both clients render carries the evidence type and
+	// the source type for the same record, so a client cannot show one and hide the other.
+	summary, err := f.s.EvidenceSupportSummary(ctx, f.token, f.project, []string{Str(evidence, "id")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := Arr(summary, "records")
+	if len(records) != 1 {
+		t.Fatalf("the shared projection returned no record for the evidence: %v", summary)
+	}
+	record, ok := records[0].(map[string]any)
+	if !ok {
+		t.Fatalf("the projection record is not an object: %v", records[0])
+	}
+	row := f.read("evidence", Str(evidence, "id"))
+	if record["evidence_kind"] != row["evidence_kind"] || record["source_kind"] != row["source_kind"] {
+		t.Fatalf("the projection and the stored evidence disagree on type: %v vs %v", record, row)
+	}
+	for _, field := range []string{"independent_observed_count", "independent_root_ids", "unknown_count", "simulated_count"} {
+		if _, present := summary[field]; !present {
+			t.Fatalf("the shared projection lost its coverage aggregate %s: %v", field, summary)
+		}
+	}
+	w09Assertion(t, "W0902-SHARED-PROJECTION-CARRIES-EVIDENCE-AND-SOURCE-KIND", Object{
+		"evidence_kind": record["evidence_kind"], "source_kind": record["source_kind"],
+		"validity": row["validity"], "records": len(records),
+		"added_by_this_card": "source_kind was absent from the record, so a client could show the evidence type and had nothing to show the source type with",
+		"independent_observed_count": summary["independent_observed_count"], "unknown_count": summary["unknown_count"],
+		"simulated_count": summary["simulated_count"], "independent_root_ids": summary["independent_root_ids"]})
+
+	// Class 2, 改权, last because it takes the fixture's own authority away: the client still
+	// holds a token string but the credential behind it is revoked. A cache or a route that
+	// keyed on the token value alone would keep serving.
+	revisionBefore := f.state()["revision"]
+	revokedCredential := f.token
+	if _, err := f.db.Exec("UPDATE auth_credentials SET revoked=1 WHERE principal=?", f.owner); err != nil {
+		t.Fatal(err)
+	}
+	revokedStatus, revokedBody, _ := f.request("POST", f.path("/search"), ID(), "", Object{"query": marker,
+		"snapshot_ids": []any{snapshotID}, "limit": 10, "expected_state_revision": revisionBefore})
+	if revokedStatus != 401 {
+		t.Fatalf("a revoked credential did not produce its own refusal at the search surface: %d %v", revokedStatus, revokedBody)
+	}
+	if strings.Contains(string(Bytes(revokedBody)), marker) {
+		t.Fatalf("a revoked credential was served the sealed body: %s", Bytes(revokedBody))
+	}
+	w09Assertion(t, "W0902-REVOKED-CREDENTIAL-LOSES-THE-SEARCH-SURFACE", Object{"status": revokedStatus,
+		"code": Str(revokedBody, "code"), "message": Str(revokedBody, "message"),
+		"token_still_held_by_client": revokedCredential != "", "marker_leaks": bytes.Count(Bytes(revokedBody), []byte(marker)),
+		"note": "asserted last on purpose: it revokes the principal this fixture authenticates as"})
 }
 
 // TestW0902HardLinkIntoRootIsCurrentlyServed is a characterisation row, not a claim that the
