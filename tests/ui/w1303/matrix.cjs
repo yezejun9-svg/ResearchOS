@@ -14,7 +14,7 @@ const report = { schema: 'researchos.electron-visual.v1', status: 'EXECUTING', c
   'Accessibility tree and keyboard checks are machine observations; physical screen-reader speech is not asserted.',
   'No provider inference, physical mobile device or installed-release acceptance is asserted.',
 ] };
-let electronApp, proxy, mode = 'ready', held = [], activeSockets = new Set();
+let electronApp, proxy, mode = 'ready', stateScreen = null, held = [], activeSockets = new Set(), upstreamRequests = new Set();
 const proxyLog = [];
 function check(id, okay, detail = null) {
   report.checks.push({ id, status: okay ? 'PASS' : 'FAIL', detail });
@@ -26,9 +26,9 @@ async function capture(page, name) {
   await page.screenshot({ path: file, fullPage: true, timeout: 15000 });
   report.screenshots.push({ path: name + '.png', sha256: hash(file) });
 }
-async function settle(page) {
+async function settle(page, allowError = false) {
   await page.locator('#main h1').waitFor({ timeout: 15000 });
-  await page.waitForFunction(() => !document.querySelector('#main .loading-state'), null, { timeout: 20000 });
+  await page.waitForFunction(allowError => !document.querySelector('#main .loading-state') && (allowError || !document.querySelector('#main .state-notice')), allowError, { timeout: 20000 });
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 }
 async function navigate(page, route) {
@@ -60,26 +60,41 @@ async function theme(page, value) {
 }
 async function proxyStart() {
   const upstream = new URL(input.base_url);
-  proxy = http.createServer((req, res) => {
+  proxy = http.createServer(async (req, res) => {
     const route = new URL(req.url, 'http://fixture').pathname;
     const business = /^\/v[12]\//.test(route);
-    if (business) proxyLog.push({ method: req.method, path: route, mode });
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    let operation = null; try { operation = JSON.parse(body.toString()).method || null; } catch {}
+    const entry = { method: req.method, path: route, operation, mode, status: null };
+    if (business) proxyLog.push(entry);
     function failure(status) { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ code: 'W1303_TRANSPORT_FIXTURE', message: 'FIXTURE transport response', correlation_id: 'w1303-fault' })); }
     const forward = () => {
       if (res.destroyed) return;
       const target = http.request({ hostname: upstream.hostname, port: upstream.port, path: req.url, method: req.method, headers: { ...req.headers, host: upstream.host }, agent: false }, response => {
-        res.writeHead(response.statusCode, response.headers); response.pipe(res);
+        entry.status = response.statusCode;
+        if (mode === 'empty' && response.statusCode === 200 && req.method === 'GET' && !/\/events\/(stream|poll)$/.test(route) && !route.endsWith('/events')) {
+          const pieces = []; response.on('data', piece => pieces.push(piece));
+          response.on('end', () => {
+            let bytes = Buffer.concat(pieces);
+            try { const value = JSON.parse(bytes.toString()); if (Array.isArray(value)) bytes = Buffer.from('[]'); else if (Array.isArray(value.items)) bytes = Buffer.from(JSON.stringify({ ...value, items: [], ...('next_cursor' in value ? { next_cursor: null } : {}) })); } catch {}
+            const headers = { ...response.headers }; delete headers['content-length'];
+            res.writeHead(response.statusCode, headers); res.end(bytes);
+          });
+        } else { res.writeHead(response.statusCode, response.headers); response.pipe(res); }
         res.on('close', () => response.destroy());
       });
+      upstreamRequests.add(target); target.on('close', () => upstreamRequests.delete(target));
       target.on('error', () => { if (!res.headersSent) failure(502); else res.destroy(); });
-      req.on('aborted', () => target.destroy()); req.pipe(target);
+      req.on('aborted', () => target.destroy()); target.end(body);
     };
     if (business && mode === 'loading') { held.push(forward); return; }
     if (business && mode === 'error') return failure(500);
     if (business && mode === 'forbidden') return failure(403);
     if (business && mode === 'stale') return failure(412);
     if (business && mode === 'offline') { req.socket.destroy(); return; }
-    if (business && mode === 'partial' && /\/(profile|experiments|artifacts)(\/|$)/.test(route)) return failure(503);
+    const partialPath = { S01: '/profile', S02: '/experiments', S03: '/artifacts', S04: '/artifacts', S05: '/evidence', S06: '/qualifications', S07: '/skills', S08: '/runs', S09: '/budget-ledger', S10: '/run-policy' }[stateScreen];
+    if (business && mode === 'partial' && ((stateScreen === 'S00' && operation === 'host.status') || (partialPath && (route.endsWith(partialPath) || (stateScreen === 'S04' && route.includes('/artifacts/')))))) { entry.status = 503; return failure(503); }
     forward();
   });
   proxy.on('connection', socket => { activeSockets.add(socket); socket.on('close', () => activeSockets.delete(socket)); });
@@ -105,6 +120,10 @@ async function main() {
   report.origin = new URL(page.url()).protocol + '//' + new URL(page.url()).host;
   check('NATIVE_REACT_ENTRY', report.origin === 'ros-app://desktop' && await page.locator('#access-token').count() === 0);
   check('CREDENTIAL_NOT_IN_RENDERER', await page.evaluate(() => !window.researchos?.credential && !Object.keys(localStorage).some(key => /token|credential/i.test(key))));
+  report.browser_origin = await page.evaluate(() => location.origin);
+  await page.locator('#main a[href="' + input.routes.S01 + '"]').click();
+  await settle(page);
+  check('ACTUAL_PROJECT_LINK_OPENS_WORKBENCH', new URL(page.url()).pathname === input.routes.S01 && await page.getByRole('heading', { name: '项目会话', exact: true }).count() === 1);
 
   const viewports = [[1440, 1000], [1024, 768], [768, 1024], [390, 844], [320, 780]];
   for (const [screen, route] of Object.entries(input.routes)) {
@@ -120,6 +139,7 @@ async function main() {
         check(name + '-NO_OVERFLOW', !overflow, { width: value.width, scroll: value.scroll });
         check(name + '-LABELS', value.inputs.every(item => !!item.label.trim()), value.inputs);
         report.matrix.push({ screen, route, theme: color, viewport: [width, height], title: value.title, measured: { width: value.width, height: value.height, scroll: value.scroll } });
+        if (width === 1440 && color === 'light') report.states.push({ screen, state: 'ready', source: 'REAL_LOCAL_API', text: value.mainText });
         await capture(page, name);
         fs.writeFileSync(path.join(out, name + '.dom.txt'), value.mainText);
       }
@@ -140,26 +160,41 @@ async function main() {
 
   await setViewport(1024, 768);
   for (const [screen, route] of Object.entries(input.routes)) {
+    stateScreen = screen;
+    mode = 'empty';
+    const emptyRoute = ['S02', 'S03', 'S04', 'S06'].includes(screen) ? route.substring(0, route.lastIndexOf('/')) : route;
+    await navigate(page, emptyRoute);
+    const emptyValue = await metrics(page);
+    report.states.push({ screen, state: 'empty', route: emptyRoute, source: 'CONTRACT_LIST_EMPTY_FIXTURE', text: emptyValue.mainText });
+    check(screen + '-EMPTY_SUCCESS', await page.locator('#main .empty-state').count() > 0 && await page.locator('#main .state-notice').count() === 0);
+    mode = 'ready';
     for (const state of ['loading', 'error', 'forbidden', 'stale', 'offline', 'partial']) {
       mode = state;
+      const before = proxyLog.length;
       await page.goto('ros-app://desktop' + route, { waitUntil: 'domcontentloaded' });
       await page.locator('#main h1').waitFor();
       if (state === 'loading') {
         await page.locator('#main .loading-state').first().waitFor();
       } else {
-        await page.waitForTimeout(state === 'offline' ? 1000 : 400);
+        await page.locator('#main .state-notice').first().waitFor({ timeout: 15000 });
       }
       const observed = await metrics(page);
       report.states.push({ screen, state, source: 'CONTROLLED_TRANSPORT_FIXTURE', text: observed.mainText });
-      if (state !== 'partial') check(`${screen}-${state}-NOTICE`, await page.locator(state === 'loading' ? '#main .loading-state' : '#main .state-notice').count() > 0);
+      check(`${screen}-${state}-NOTICE`, await page.locator(state === 'loading' ? '#main .loading-state' : '#main .state-notice').count() > 0);
+      if (state === 'partial') check(`${screen}-PARTIAL_SUCCESS_AND_FAILURE`, proxyLog.slice(before).some(row => row.status === 503) && proxyLog.slice(before).some(row => row.status === 200));
       if (screen === 'S09' && ['error', 'forbidden', 'stale', 'offline'].includes(state)) {
         check(`S09-${state}-NO_INVENTED_BUDGET`, !observed.mainText.includes('金额策略\n未设上限'));
       }
       if (['S01', 'S09'].includes(screen)) await capture(page, screen + '-' + state);
       mode = 'ready'; const release = held; held = []; release.forEach(resume => resume());
-      await navigate(page, route);
+      if (state !== 'loading') {
+        const retry = page.locator('#main .state-notice button').filter({ hasText: '重新读取' });
+        check(`${screen}-${state}-RETRY_AVAILABLE`, await retry.count() > 0);
+        if (await retry.count()) await retry.first().click();
+      }
+      await settle(page);
       report.states.push({ screen, state: 'RECOVERED_FROM_' + state, source: 'REAL_LOCAL_API', title: (await metrics(page)).title });
-      check(`${screen}-${state}-RECOVERY`, await page.locator('#main .loading-state').count() === 0);
+      check(`${screen}-${state}-RECOVERY`, await page.locator('#main .loading-state').count() === 0 && await page.locator('#main .state-notice').count() === 0 && proxyLog.slice(before).some(row => row.mode === 'ready' && row.status === 200));
     }
   }
   report.proxy_requests = proxyLog;
@@ -170,9 +205,9 @@ async function main() {
 main().catch(error => { report.status = 'FAIL'; report.error = error.stack || String(error); }).finally(async () => {
   mode = 'ready'; held.splice(0).forEach(resume => resume());
   if (electronApp) await electronApp.close().catch(() => {});
+  upstreamRequests.forEach(request => request.destroy());
   activeSockets.forEach(socket => socket.destroy());
   if (proxy) await new Promise(resolve => proxy.close(resolve));
   fs.writeFileSync(path.join(out, 'matrix.json'), JSON.stringify(report, null, 2));
-  console.log(JSON.stringify({ status: report.status, checks: report.checks.length, failures: report.failures, error: report.error || null }));
-  process.exitCode = report.status === 'PASS' ? 0 : 1;
+  process.stdout.write(JSON.stringify({ status: report.status, checks: report.checks.length, failures: report.failures, error: report.error || null }) + '\n', () => process.exit(report.status === 'PASS' ? 0 : 1));
 });

@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { ArtifactPreview } from './preview.jsx'
 
 const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
 const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
@@ -20,6 +21,12 @@ export function NativeProjectEntry({ navigate, onRefresh }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
   const [result, setResult] = useState(null)
+  const [host, setHost] = useState(null), [hostError, setHostError] = useState(null)
+  async function checkHost() {
+    try { setHost(unwrap(await window.researchos.v2['host.status']({}))); setHostError(null) }
+    catch (cause) { setHostError(cause) }
+  }
+  useEffect(() => { checkHost() }, [])
   async function choose() {
     setBusy(true); setError(null)
     try {
@@ -32,13 +39,14 @@ export function NativeProjectEntry({ navigate, onRefresh }) {
     finally { setBusy(false) }
   }
   return <Panel title="从本地目录开始"><p>选择项目目录后，主机会登记授权范围并盘点已有文件。已有项目会接续原身份。</p>
+    <Failure error={hostError} retry={checkHost}/>{host && <p className="small-muted">本地主机已连接 · {host.workspaces?.length || 0} 个已登记工作区</p>}
     <label>项目显示名称<input value={name} onChange={event => setName(event.target.value)} placeholder="留空时使用目录名称"/></label>
     <div className="button-row"><button className="primary" disabled={busy} onClick={choose}>{busy ? '等待目录选择与本地盘点…' : '选择本地项目目录'}</button></div>
     <Failure error={error}/>{result && <div role="status"><p>本地盘点已保存。后续调研和复用以任务回执为准。</p><p className="break-all">{result.workspace.display_path}</p><button onClick={() => navigate(`/p/${result.project_id}`)}>打开会话工作台</button></div>}
   </Panel>
 }
 
-export function NativeWorkbench({ projectId, profile, api, navigate }) {
+export function NativeWorkbench({ projectId, profile, api, navigate, shared, onRefresh }) {
   const [state, setState] = useState({ loading: true, sessions: [], host: null, snapshot: null, events: [], error: null })
   const [busy, setBusy] = useState('')
   const [draft, setDraft] = useState('')
@@ -72,16 +80,17 @@ export function NativeWorkbench({ projectId, profile, api, navigate }) {
       const selected = await window.researchos.desktop.selectProject(projectId)
       if (!selected?.ok) throw new Error(selected?.reason || '项目选择失败')
       const host = unwrap(await window.researchos.v2['host.status']({}))
+      if (active(generation)) setState(old => ({ ...old, host }))
       const sessions = unwrap(await window.researchos.v2['session.list']({ cursor: null, limit: 100 }))
       const context = await window.researchos.desktop.context()
       if (!active(generation)) return
       const values = rows(sessions)
-      setState(old => ({ ...old, host, sessions: values, loading: false, error: null }))
+      setState(old => ({ ...old, host, sessions: values, nextCursor: sessions.next_cursor, loading: false, error: null }))
       setModel(old => old || host?.model_configurations?.[0]?.model_config_ref || '')
       setWorkspace(old => old || host?.workspaces?.find(item => item.project_id === projectId && item.status === 'ACTIVE')?.authorized_workspace_ref || '')
       if (context.project_id === projectId && context.session_id) {
         const opened = unwrap(await window.researchos.desktop.openSession(context.session_id))
-        if (active(generation)) adopt(opened)
+        if (active(generation)) { adopt(opened); current.current.eventSequence = Math.max(0, opened.earliest_event_sequence - 1) }
       }
     } catch (error) { if (active(generation)) setState(old => ({ ...old, loading: false, error })) }
   }
@@ -113,7 +122,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate }) {
         }
       } catch (error) {
         if (stopped || !active(generation)) return
-        if (error.code === 'CURSOR_EXPIRED') { try { const fresh = await readSnapshot(generation); if (active(generation)) current.current.eventSequence = Math.max(0, fresh.earliest_event_sequence - 1) } catch (cause) { setState(old => ({ ...old, error: cause })) } }
+        if (['CURSOR_EXPIRED', 'CURSOR_INVALID'].includes(error.code)) { try { const fresh = await readSnapshot(generation); if (active(generation)) current.current.eventSequence = Math.max(0, fresh.earliest_event_sequence - 1) } catch (cause) { if (active(generation)) setState(old => ({ ...old, error: cause })) } }
         else setState(old => ({ ...old, error }))
       } finally { polling = false }
     }
@@ -133,6 +142,12 @@ export function NativeWorkbench({ projectId, profile, api, navigate }) {
     if (draft && !confirm('当前消息尚未发送，切换会话后会保留在输入框。继续？')) return
     await command('打开会话', async () => { adopt(unwrap(await window.researchos.desktop.openSession(sessionId))); setState(old => ({ ...old, events: [] })) })
   }
+  async function moreSessions() {
+    await command('读取更多会话', async () => {
+      const page = unwrap(await window.researchos.v2['session.list']({ cursor: state.nextCursor, limit: 100 }))
+      setState(old => ({ ...old, sessions: [...new Map([...old.sessions, ...rows(page)].map(item => [item.session_id, item])).values()], nextCursor: page.next_cursor }))
+    })
+  }
   async function create() {
     await command('创建会话', async () => {
       const value = unwrap(await window.researchos.v2['session.create']({ workspace_ref: workspace, model_config_ref: model, title: title.trim() || '新会话' }))
@@ -147,11 +162,13 @@ export function NativeWorkbench({ projectId, profile, api, navigate }) {
   return <>
     <header className="page-heading"><div><h1>{profile?.name || '会话工作台'}</h1><p>消息、工具结果和成果保留在当前项目中。</p></div><button disabled={!!busy} onClick={load}>刷新会话</button></header>
     <Failure error={state.error} retry={load}/>
+    {Object.values(shared?.errors || {}).map((error, index) => <Failure key={index} error={new Error(`部分项目资料尚未读取：${error.message}`)} retry={() => { onRefresh(); load() }}/>) }
     {!online && <p className="connection-banner" role="status">已离线，显示最后读取的会话；重新连接后核对最新状态。</p>}
     {state.loading && <div className="loading-state" role="status" aria-busy="true">正在读取本机会话…</div>}
     <div className="session-layout">
       <Panel title="项目会话"><ul className="session-picker">{state.sessions.map(item => <li key={item.session_id}><button aria-current={snapshot?.session_id === item.session_id ? 'page' : undefined} disabled={disabled} onClick={() => open(item.session_id)}>{item.title || '未命名会话'}<small>{item.run_status || (item.archived_at ? '已归档' : '等待消息')}</small></button></li>)}</ul>
-        {!state.sessions.length && !state.loading && <p className="empty-state">还没有会话，选择已配置模型后开始。</p>}
+        {state.nextCursor && <button disabled={disabled} onClick={moreSessions}>加载更多会话</button>}
+        {!state.sessions.length && !state.loading && <p className="empty-state">{state.error ? '会话列表尚未读取，请恢复连接或权限后重试。' : '还没有会话，选择已配置模型后开始。'}</p>}
         <details><summary>新建会话</summary><label>名称<input value={title} onChange={event => setTitle(event.target.value)}/></label>
           <label>工作区<select value={workspace} onChange={event => setWorkspace(event.target.value)}><option value="">选择已授权目录</option>{(state.host?.workspaces || []).filter(item => item.project_id === projectId && item.status === 'ACTIVE').map(item => <option key={item.authorized_workspace_ref} value={item.authorized_workspace_ref}>{item.display_name}</option>)}</select></label>
           <label>模型<select value={model} onChange={event => setModel(event.target.value)}><option value="">选择已配置模型</option>{(state.host?.model_configurations || []).map(item => <option key={item.model_config_ref} value={item.model_config_ref}>{item.provider_id} · {item.model_id}</option>)}</select></label>
@@ -162,7 +179,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate }) {
           {['PAUSE', 'RESUME', 'CANCEL'].map((action, index) => <button key={action} disabled={disabled || !writer || (action !== 'RESUME' && !snapshot.active_run_id)} onClick={() => command(action, async () => { unwrap(await window.researchos.v2['session.control']({ action, target_id: action === 'RESUME' ? snapshot.session_id : snapshot.active_run_id, reason: '用户从桌面会话操作' })); await readSnapshot() })}>{['暂停', '恢复', '取消'][index]}</button>)}</div>
           {snapshot.resume_requires_explicit_user && <p className="callout">会话等待明确恢复。查看上次结果后再继续。</p>}
           <div className="conversation-transcript" aria-label="会话记录">{(snapshot.messages || []).map(message => <article className={`conversation-message role-${message.role.toLowerCase()}`} key={message.message_id}><h3>{labels[message.role] || message.role}</h3><div className="message-text">{(message.parts || []).map(part => part.text).join('')}</div>{!message.complete && <small>正在接收…</small>}</article>)}{!snapshot.messages?.length && <p className="empty-state">发送第一条消息，说明希望完成的事。</p>}</div>
-          {snapshot.has_earlier_messages && <p>这里只显示最近记录，完整内容保留在会话记录产物中。</p>}
+          {snapshot.has_earlier_messages && <div><p>这里只显示最近记录，可读取已封存的完整会话记录。</p>{snapshot.transcript_artifact_ref ? <BoundArtifact reference={snapshot.transcript_artifact_ref} api={api} projectId={projectId}/> : <p role="status">完整记录尚未封存，请刷新后重试。</p>}</div>}
           {snapshot.pending_command_ids?.length > 0 && <p role="status">{snapshot.pending_command_ids.length} 条命令等待处理。</p>}
           <form className="session-composer" onSubmit={event => { event.preventDefault(); command('发送消息', async () => { unwrap(await window.researchos.v2['session.send']({ text: draft, attachment_artifact_ids: attachment ? [attachment] : [], delivery })); setDraft(''); setAttachment(''); await readSnapshot(); setNotice('消息已接收，等待运行结果。') }) }}>
             <label>发送给 Agent<textarea ref={composer} aria-label="会话消息" value={draft} onChange={event => setDraft(event.target.value)} placeholder="说明目标、约束或要修改的文件…" required/></label>
@@ -174,11 +191,38 @@ export function NativeWorkbench({ projectId, profile, api, navigate }) {
         <p className="small-muted" role="status" aria-live="polite">{busy ? `${busy}…` : notice}</p>
       </Panel>
       {tools.length > 0 && <Panel title="工具与结果"><ol className="event-list">{tools.map(event => <li key={event.event_id}><strong>{event.kind === 'TOOL_STARTED' ? '开始工具' : event.kind === 'TOOL_RESULT' ? '工具结果' : event.kind}</strong><span>{event.payload?.tool_name || event.payload?.summary || event.payload?.message || ''}</span><details><summary>查看完整回执</summary><pre>{JSON.stringify(event.payload, null, 2)}</pre></details></li>)}</ol></Panel>}
-      {(snapshot?.pending_permissions || []).map(prompt => <Panel key={prompt.request.id} title="工具等待授权"><p>{prompt.request.summary}</p>{prompt.allowed_responses.map(decision => <button key={decision} disabled={disabled || !writer || !prompt.policy_allows_user_decision} onClick={() => command('处理授权', async () => { unwrap(await window.researchos.v2['permission.respond']({ resource_request_id: prompt.request.id, resource_request_revision: prompt.request.revision, action_digest: prompt.action_digest, decision, reason: '用户在桌面明确选择' })); await readSnapshot() })}>{decision === 'DENY' ? '拒绝' : '允许本次'}</button>)}</Panel>)}
+      {(snapshot?.pending_permissions || []).map(prompt => <PermissionDecision key={prompt.request.id} prompt={prompt} api={api} projectId={projectId} disabled={disabled || !writer} respond={decision => command('处理授权', async () => { unwrap(await window.researchos.v2['permission.respond']({ resource_request_id: prompt.request.id, resource_request_revision: prompt.request.revision, action_digest: prompt.action_digest, decision, reason: '用户在桌面明确选择' })); await readSnapshot() })}/>)}
       </div>
     </div>
     {snapshot && <WorkspaceFiles snapshot={snapshot} api={api} projectId={projectId} writer={writer} disabled={disabled} command={command} readSnapshot={readSnapshot} setAttachment={setAttachment} selectedFile={selectedFile} setSelectedFile={setSelectedFile}/>}
   </>
+}
+
+function BoundArtifact({ reference, api, projectId }) {
+  const [artifact, setArtifact] = useState(null), [error, setError] = useState(null)
+  const controller = useRef(null)
+  useEffect(() => { controller.current?.abort(); setArtifact(null); setError(null); return () => controller.current?.abort() }, [projectId, reference.id, reference.revision, reference.content_hash])
+  async function read() {
+    controller.current?.abort(); const active = new AbortController(); controller.current = active
+    try {
+      const value = await api.call('getArtifact', { params: { projectId, id: reference.id }, signal: active.signal })
+      if (value.revision !== reference.revision || value.content_hash !== reference.content_hash) throw new Error('产物版本与会话固定引用不一致，请刷新会话')
+      if (!active.signal.aborted) { setArtifact(value); setError(null) }
+    } catch (cause) { if (!active.signal.aborted) setError(cause) }
+  }
+  return <div><button onClick={read}>读取引用产物</button><Failure error={error} retry={read}/>{artifact && <ArtifactPreview artifact={artifact} expectedRef={reference} api={api} projectId={projectId}/>}</div>
+}
+
+function PermissionDecision({ prompt, api, projectId, disabled, respond }) {
+  const scope = prompt.action_scope
+  return <Panel title="工具等待授权"><p>{prompt.request.summary}</p>
+    <dl><dt>工具</dt><dd>{scope.tool_name}</dd><dt>工作区</dt><dd className="break-all">{scope.workspace_ref}</dd><dt>允许路径</dt><dd>{scope.allowed_relative_paths.length ? scope.allowed_relative_paths.join('、') : '没有文件路径授权'}</dd><dt>有效期</dt><dd>{new Date(scope.expires_at).toLocaleString()}</dd></dl>
+    <p>授权仅对本次动作生效一次。可先查看冻结参数和输入版本。</p>
+    <BoundArtifact reference={scope.arguments_artifact_ref} api={api} projectId={projectId}/>
+    <details><summary>动作范围与输入版本</summary><pre>{JSON.stringify(scope, null, 2)}</pre></details>
+    {!prompt.policy_allows_user_decision && <p role="status">当前策略不允许用户授权此动作，请先处理策略限制。</p>}
+    {prompt.allowed_responses.filter(decision => decision !== 'ALLOW_ONCE' || prompt.policy_allows_user_decision).map(decision => <button key={decision} disabled={disabled || !prompt.policy_allows_user_decision} onClick={() => respond(decision)}>{decision === 'DENY' ? '拒绝' : '允许本次'}</button>)}
+  </Panel>
 }
 
 function WorkspaceFiles({ snapshot, api, projectId, writer, disabled, command, readSnapshot, setAttachment, selectedFile, setSelectedFile }) {
@@ -193,7 +237,7 @@ function WorkspaceFiles({ snapshot, api, projectId, writer, disabled, command, r
     return () => controller.abort()
   }, [api, projectId, snapshot.active_run_id])
   async function tree(path, append = false) {
-    await command('读取目录', async () => { const value = unwrap(await window.researchos.v2['workspace.tree']({ workspace_ref: snapshot.workspace_ref, relative_path: path, cursor: append ? cursor : null, limit: 100 })); setEntries(old => append ? [...old, ...value.entries] : value.entries); setCursor(value.next_cursor); setDirectory(path) })
+    await command('读取目录', async () => { const value = unwrap(await window.researchos.v2['workspace.tree']({ workspace_ref: snapshot.workspace_ref, relative_path: path || '.', cursor: append ? cursor : null, limit: 100 })); setEntries(old => append ? [...old, ...value.entries] : value.entries); setCursor(value.next_cursor); setDirectory(path) })
   }
   async function open(path) {
     if (dirty && !confirm('文件有未保存草稿，打开其他文件会丢弃当前草稿。继续？')) return
