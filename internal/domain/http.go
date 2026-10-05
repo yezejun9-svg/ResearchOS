@@ -448,6 +448,18 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		s.writeError(w, cid, Fail(403, "FORBIDDEN", "result references restricted content"))
 		return
 	}
+	responseSchema := op.Response
+	if op.ID == "createResearchCycle" && status == http.StatusConflict {
+		// A competing trigger was durably coalesced, but no new cycle was
+		// created. Commit its pending window and idempotency result together;
+		// keep the active cycle's inputs and event history unchanged.
+		active := result
+		result = Object{"code": "STATE_CONFLICT", "message": "An active research cycle already exists; the pending window was coalesced.",
+			"correlation_id": cid, "retryable": false, "current_revision": active["revision"],
+			"details": []any{Object{"field": "active_cycle_id", "message": Str(active, "id")},
+				Object{"field": "active_window", "message": Str(active, "window_from") + " / " + Str(active, "window_to")}}}
+		kind, responseSchema = "", "Error"
+	}
 	if write && kind != "" && (project != "" || op.ID == "createProject") {
 		ep := project
 		if op.ID == "createProject" {
@@ -480,8 +492,8 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 			return
 		}
 	}
-	if op.Response != "" {
-		if e = s.Contracts.Validate(op.Response, result); e != nil {
+	if responseSchema != "" {
+		if e = s.Contracts.Validate(responseSchema, result); e != nil {
 			s.writeError(w, cid, Fail(500, "INTERNAL_ERROR", "response contract mismatch"))
 			return
 		}
