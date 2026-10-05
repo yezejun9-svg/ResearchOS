@@ -29,5 +29,11 @@ for (const method of V2_METHODS) {
   v2api[method] = (body) => ipcRenderer.invoke('ros:v2:' + method, body);
 }
 api.v2 = Object.freeze(v2api);
+api.desktop = Object.freeze({
+  context: () => ipcRenderer.invoke('ros:desktop:context'),
+  selectProject: (projectId) => ipcRenderer.invoke('ros:desktop:selectProject', { project_id: projectId }),
+  openSession: (sessionId) => ipcRenderer.invoke('ros:desktop:openSession', { session_id: sessionId }),
+  readArtifact: (ref) => ipcRenderer.invoke('ros:desktop:readArtifact', ref),
+});
 
 contextBridge.exposeInMainWorld('researchos', Object.freeze(api));
