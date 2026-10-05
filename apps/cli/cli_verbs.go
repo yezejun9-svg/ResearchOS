@@ -174,6 +174,7 @@ func cliHostCommand(name string, args []string) {
 	report := []map[string]any{}
 	worst := exitCompleted
 	worstReason := ""
+	var snapshot map[string]any
 	stop := interruptGuard(name)
 	baseCommandID := ctx.commandID
 	for index, s := range steps {
@@ -190,6 +191,12 @@ func cliHostCommand(name string, args []string) {
 		}
 		ctx.commandID = v2FlowCommandID(baseCommandID, s.method, index)
 		reply, reason, code := v2Call(ctx, s.method, s.payload)
+		if code == exitCompleted && s.method == "session.get" {
+			snapshot, _ = reply["result"].(map[string]any)
+			if nested, ok := snapshot["snapshot"].(map[string]any); ok {
+				snapshot = nested
+			}
+		}
 		row := map[string]any{"method": s.method, "exit_code": code,
 			"status": orDefault(statusOf(reply), orDefault(reason, "NO_REPLY"))}
 		if reason != "" {
@@ -217,6 +224,16 @@ func cliHostCommand(name string, args []string) {
 	}
 	out := map[string]any{"command": name, "exit_code": worst, "operations": report,
 		"requests_sent": ctx.requestLog, "host_url": d.URL, "client_id": ctx.clientID}
+	if worst == exitCompleted && (name == "status" || name == "/status") {
+		continuation, reason, code := cliReadContinuation(ctx, snapshot)
+		if continuation != nil {
+			out["continuation"] = continuation
+		}
+		if code != exitCompleted {
+			worst, worstReason = code, reason
+		}
+		out["exit_code"], out["requests_sent"] = worst, ctx.requestLog
+	}
 	if worst == exitCompleted {
 		out["status"] = "COMPLETED"
 		outJSON(out)
