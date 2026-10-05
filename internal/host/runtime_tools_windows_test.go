@@ -30,7 +30,13 @@ func runtimeToolFixture(t *testing.T, access string) (*Host, string, *RootBindin
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Host{roots: registry}, workspace, binding
+	return &Host{roots: registry, dir: filepath.Join(base, "host")}, workspace, binding
+}
+
+func runtimeToolTestRequest(workspace, access, name string, args, policy domain.Object) domain.RuntimeToolRequest {
+	return domain.RuntimeToolRequest{WorkspacePath: workspace, Access: access, Name: name, Arguments: args, Policy: policy,
+		IntentKey:  "test/" + domain.Hash(domain.Object{"workspace": workspace, "name": name, "arguments": args}),
+		Revalidate: func(context.Context) error { return nil }}
 }
 
 func runtimeToolPolicy() domain.Object {
@@ -39,7 +45,7 @@ func runtimeToolPolicy() domain.Object {
 
 func runtimeToolCall(t *testing.T, host *Host, workspace, access, name string, args, policy domain.Object) domain.Object {
 	t.Helper()
-	result, err := host.ExecuteRuntimeTool(context.Background(), domain.RuntimeToolRequest{WorkspacePath: workspace, Access: access, Name: name, Arguments: args, Policy: policy})
+	result, err := host.ExecuteRuntimeTool(context.Background(), runtimeToolTestRequest(workspace, access, name, args, policy))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +68,7 @@ func runtimeToolCall(t *testing.T, host *Host, workspace, access, name string, a
 
 func runtimeToolReject(t *testing.T, host *Host, workspace, access, name string, args, policy domain.Object) {
 	t.Helper()
-	if result, err := host.ExecuteRuntimeTool(context.Background(), domain.RuntimeToolRequest{WorkspacePath: workspace, Access: access, Name: name, Arguments: args, Policy: policy}); err == nil {
+	if result, err := host.ExecuteRuntimeTool(context.Background(), runtimeToolTestRequest(workspace, access, name, args, policy)); err == nil {
 		t.Fatalf("unexpected tool success: %v", result)
 	}
 }
@@ -141,7 +147,7 @@ func TestRuntimeToolFailureOutcomeAtHostBoundary(t *testing.T) {
 		{"read", domain.Object{"path": "allowed.txt"}}, // Missing file has no effect.
 		{"write", domain.Object{"path": "forbidden.txt", "content": "x", "expected_hash": nil}},
 	} {
-		_, err := host.ExecuteRuntimeTool(context.Background(), domain.RuntimeToolRequest{WorkspacePath: workspace, Access: AccessReadWrite, Name: tc.name, Arguments: tc.args, Policy: policy})
+		_, err := host.ExecuteRuntimeTool(context.Background(), runtimeToolTestRequest(workspace, AccessReadWrite, tc.name, tc.args, policy))
 		var failure *domain.RuntimeToolFailure
 		if !errors.As(err, &failure) || failure.Outcome != "NOT_APPLIED" {
 			t.Fatalf("%s: expected NOT_APPLIED host witness, got %v", tc.name, err)
@@ -150,7 +156,7 @@ func TestRuntimeToolFailureOutcomeAtHostBoundary(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(workspace, "allowed.txt"), []byte("old"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := host.ExecuteRuntimeTool(context.Background(), domain.RuntimeToolRequest{WorkspacePath: workspace, Access: AccessReadWrite, Name: "write", Arguments: domain.Object{"path": "allowed.txt", "content": "new", "expected_hash": domain.Digest([]byte("stale"))}, Policy: policy})
+	_, err := host.ExecuteRuntimeTool(context.Background(), runtimeToolTestRequest(workspace, AccessReadWrite, "write", domain.Object{"path": "allowed.txt", "content": "new", "expected_hash": domain.Digest([]byte("stale"))}, policy))
 	var failure *domain.RuntimeToolFailure
 	if !errors.As(err, &failure) || failure.Outcome != "NOT_APPLIED" {
 		t.Fatalf("stale CAS should be NOT_APPLIED, got %v", err)

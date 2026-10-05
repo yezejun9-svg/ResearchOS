@@ -268,3 +268,20 @@ func TestWorkspaceWriteRevocationBeforePublishKeepsTarget(t *testing.T) {
 		t.Fatalf("revoked target changed: %q %v", got, err)
 	}
 }
+
+func TestWorkspaceWriteSameKeySameBytesDifferentScopeConflicts(t *testing.T) {
+	root, rootPath, journal := writeFixture(t)
+	input := writeInput(root, rootPath, journal, "scope.txt", "project/session/command-id", nil, "same bytes")
+	input.ScopeHash = writeHash([]byte("first command envelope"))
+	result, err := WriteWorkspaceFile(context.Background(), input)
+	if err != nil || !result.Applied {
+		t.Fatalf("initial command: %+v %v", result, err)
+	}
+	changed := input
+	changed.ScopeHash = writeHash([]byte("different task or epoch envelope"))
+	_, err = WriteWorkspaceFile(context.Background(), changed)
+	writeErrorCode(t, err, "COMMAND_ID_CONFLICT", "NOT_APPLIED")
+	if actual, err := os.ReadFile(filepath.Join(rootPath, "scope.txt")); err != nil || string(actual) != "same bytes" {
+		t.Fatalf("scope conflict changed target: %q %v", actual, err)
+	}
+}

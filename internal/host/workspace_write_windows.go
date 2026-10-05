@@ -35,6 +35,7 @@ type WorkspaceWriteInput struct {
 	JournalRoot     string
 	RelativePath    string
 	IntentKey       string
+	ScopeHash       string
 	ExpectedHash    *string
 	CreateIfMissing bool
 	Content         []byte
@@ -75,6 +76,7 @@ type workspaceWriteIntent struct {
 	Version       int    `json:"version"`
 	KeyHash       string `json:"key_hash"`
 	BodyHash      string `json:"body_hash"`
+	ScopeHash     string `json:"scope_hash,omitempty"`
 	RootIdentity  string `json:"root_identity"`
 	RelativePath  string `json:"relative_path"`
 	ExpectedHash  string `json:"expected_hash,omitempty"`
@@ -124,6 +126,9 @@ func validWriteHash(s string) bool {
 func validateWorkspaceWrite(in WorkspaceWriteInput) (string, error) {
 	if in.Root == nil || in.Revalidate == nil || in.IntentKey == "" || len(in.IntentKey) > 1024 {
 		return "", writeError("INVALID_REQUEST", "NOT_APPLIED", errors.New("root, authorization callback and bounded intent key required"))
+	}
+	if in.ScopeHash != "" && !validWriteHash(in.ScopeHash) {
+		return "", writeError("INVALID_REQUEST", "NOT_APPLIED", errors.New("scope hash must be sha256 digest"))
 	}
 	if in.CreateIfMissing != (in.ExpectedHash == nil) || in.ExpectedHash != nil && !validWriteHash(*in.ExpectedHash) {
 		return "", writeError("INVALID_REQUEST", "NOT_APPLIED", errors.New("create/expected hash contract mismatch"))
@@ -288,8 +293,8 @@ func writeIntentResult(v workspaceWriteIntent, p string) WorkspaceWriteResult {
 		PreimagePath: v.PreimagePath, BackupPath: v.BackupPath, IntentPath: p, State: v.State, Applied: v.State == "APPLIED"}
 }
 
-func intentBodyHash(rootIdentity, rel, expected, after string, create bool) string {
-	raw, _ := json.Marshal([]any{rootIdentity, strings.ToLower(rel), expected, after, create})
+func intentBodyHash(rootIdentity, rel, expected, after string, create bool, scopeHash string) string {
+	raw, _ := json.Marshal([]any{rootIdentity, strings.ToLower(rel), expected, after, create, scopeHash})
 	return writeHash(raw)
 }
 
@@ -347,13 +352,19 @@ func WriteWorkspaceFile(ctx context.Context, in WorkspaceWriteInput) (WorkspaceW
 		expected = *in.ExpectedHash
 	}
 	after := writeHash(in.Content)
-	bodyHash := intentBodyHash(rootIdentity, in.RelativePath, expected, after, in.CreateIfMissing)
+	bodyHash := intentBodyHash(rootIdentity, in.RelativePath, expected, after, in.CreateIfMissing, in.ScopeHash)
 	intentDir := filepath.Join(journal, "intents")
 	intentName := "intent-" + keyHash + ".json"
 	intentPath := filepath.Join(intentDir, intentName)
 	if raw, readErr := os.ReadFile(intentPath); readErr == nil {
 		var previous workspaceWriteIntent
-		if json.Unmarshal(raw, &previous) != nil || previous.Version != 1 || previous.KeyHash != keyHash || previous.BodyHash != bodyHash {
+		if json.Unmarshal(raw, &previous) != nil || previous.Version != 1 || previous.KeyHash != keyHash {
+			return out, writeError("INTENT_KEY_CONFLICT", "NOT_APPLIED", errors.New("intent key was used for different bytes or scope"))
+		}
+		if previous.ScopeHash != in.ScopeHash {
+			return out, writeError("COMMAND_ID_CONFLICT", "NOT_APPLIED", errors.New("intent key was used for a different request scope"))
+		}
+		if previous.BodyHash != bodyHash {
 			return out, writeError("INTENT_KEY_CONFLICT", "NOT_APPLIED", errors.New("intent key was used for different bytes or scope"))
 		}
 		out = writeIntentResult(previous, intentPath)
@@ -413,7 +424,7 @@ func WriteWorkspaceFile(ctx context.Context, in WorkspaceWriteInput) (WorkspaceW
 	parent := path.Dir(in.RelativePath)
 	stageRel := path.Join(parent, ".researchos-stage-"+nonce+".tmp")
 	backupRel := path.Join(parent, ".researchos-backup-"+nonce+".bin")
-	intent := workspaceWriteIntent{Version: 1, KeyHash: keyHash, BodyHash: bodyHash, RootIdentity: rootIdentity,
+	intent := workspaceWriteIntent{Version: 1, KeyHash: keyHash, BodyHash: bodyHash, ScopeHash: in.ScopeHash, RootIdentity: rootIdentity,
 		RelativePath: in.RelativePath, ExpectedHash: expected, AfterHash: after, Create: in.CreateIfMissing,
 		CandidatePath: candidate, PreimagePath: preimage, StagePath: filepath.Join(rootPath, filepath.FromSlash(stageRel)),
 		State: "PENDING"}
