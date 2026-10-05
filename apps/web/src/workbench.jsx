@@ -238,7 +238,7 @@ function WorkspaceFiles({ snapshot, api, projectId, writer, disabled, command, r
   useEffect(() => { setEntries([]); setDirectory(''); setCursor(null); setBase(null); setText(''); setDiff(null); setConflict(null); setSelectedFile(''); setTask('') }, [snapshot.session_id])
   useEffect(() => {
     const controller = new AbortController()
-    api.call('listTask', { params: { projectId }, signal: controller.signal }).then(value => { if (!controller.signal.aborted) { setTasks(rows(value).filter(item => item.task_type === 'mu_turn' && item.candidate_id === snapshot.session_id && ['DRAFT', 'READY', 'BLOCKED', 'NEEDS_REVALIDATION'].includes(item.status))); setTaskError(null) } }).catch(error => { if (!controller.signal.aborted) { setTasks([]); setTaskError(error) } })
+    api.call('listTask', { params: { projectId }, signal: controller.signal }).then(value => { if (!controller.signal.aborted) { setTasks(rows(value).filter(item => item.task_type === 'mu_turn' && item.goal_id === snapshot.goal_id && ['DRAFT', 'READY', 'BLOCKED', 'NEEDS_REVALIDATION'].includes(item.status))); setTaskError(null) } }).catch(error => { if (!controller.signal.aborted) { setTasks([]); setTaskError(error) } })
     return () => controller.abort()
   }, [api, projectId, snapshot.session_id, snapshot.active_run_id, snapshot.revision, taskRefresh])
   async function tree(path, append = false) {

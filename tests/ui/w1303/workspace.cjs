@@ -38,6 +38,7 @@ async function main() {
   });
   page = await app.firstWindow();
   page.on('pageerror', error => rendererErrors.push(String(error)));
+  await settle();
   await page.goto('ros-app://desktop/p/' + input.project_id, { waitUntil: 'domcontentloaded' });
   await settle();
   await page.locator('.session-picker li button').first().click();
@@ -67,9 +68,11 @@ async function main() {
   await page.locator('.file-list').getByRole('button', { name: input.source_path || 'source.txt', exact: true }).click();
   const editor = page.getByRole('textbox', { name: '文件草稿', exact: true });
   await editor.waitFor();
-  check('READ_EXACT_TEXT', await editor.inputValue() === initial);
+  const wire = await page.evaluate(workspace => window.researchos.v2['workspace.read']({ workspace_ref: workspace, relative_path: 'source.txt', max_bytes: 1048576 }), input.workspace_ref);
+  check('READ_EXACT_WIRE_TEXT', wire.ok && wire.result?.text === initial);
+  check('EDITOR_REPRESENTS_SOURCE_TEXT', await editor.inputValue() === initial.replace(/\r\n?/g, '\n'), 'HTML textarea exposes line endings as LF; the typed response preserves original CRLF bytes.');
   check('REAL_FROZEN_TASK_PRESENT', typeof input.task_id === 'string' && input.task_id.length > 0);
-  await page.getByLabel('关联任务', { exact: true }).selectOption(input.task_id);
+  await page.getByRole('combobox', { name: /^关联任务/ }).selectOption(input.task_id);
   const saved = 'Desktop 保存的实际文本\nsecond line\n';
   await editor.fill(saved);
   await page.getByRole('button', { name: '保存草稿', exact: true }).click();
