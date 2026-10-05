@@ -254,6 +254,13 @@ func (s *ClientService) sendClientMessage(ctx context.Context, tx *sql.Tx, env *
 		}
 		refs = append(refs, Ref(a, "Artifact"))
 	}
+	// Freeze every completed prior USER/ASSISTANT message before this turn's
+	// USER event exists. The bounded journal copy enters the new Task as a real
+	// sandbox artifact input; a first turn has no history ref.
+	historyArtifact, err := s.clientHistoryArtifact(ctx, tx, p, sess.project, sess.sessionID, sess.watermark)
+	if err != nil {
+		return clientFault(env, err)
+	}
 	// The authenticated NORMAL message authorizes precisely this finite response.
 	// It neither approves a model-created requirement nor enables goal continuation.
 	req, err := s.Domain.createRequirement(tx, sess.project, Object{"requirement_key": "SESSION-" + ID(), "text": payload.Text, "basis": "USER_STATED", "source_refs": refs, "rationale": "Authenticated Owner NORMAL message for one finite Mu turn", "supersedes_id": nil, "acceptance_check_ids": Empty()})
@@ -263,6 +270,9 @@ func (s *ClientService) sendClientMessage(ctx context.Context, tx *sql.Tx, env *
 	req, err = s.Domain.actRequirement(tx, sess.project, Str(req, "id"), Object{"action": "ACCEPT", "source_validation_refs": Empty()})
 	if err != nil {
 		return nil, err
+	}
+	if historyArtifact != nil {
+		refs = append(refs, Ref(historyArtifact, "Artifact"))
 	}
 	refs = append(refs, Ref(req, "Requirement"))
 	contract, problem := clientTurnContract(), ID()
