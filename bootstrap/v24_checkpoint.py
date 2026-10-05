@@ -136,8 +136,70 @@ def prioritized_step(current: dict, statuses: dict, plans: dict, delivery: dict,
     """Consume U09 only at a card boundary; never reset or dispatch a blocked card."""
     if not current.get("value_checkpoint", {}).get("pause_nonblocking_expansion"):
         return default_step_id
-    candidates = ready_flows(statuses, plans, delivery)
+    candidates = flow_priority(statuses, plans, delivery)["candidates"]
     return candidates[0]["next_step_id"] if candidates else None
+
+
+def flow_priority(statuses: dict, plans: dict, delivery: dict) -> dict:
+    """Prefer direct user slices, otherwise expose required parent frontiers only."""
+    direct = ready_flows(statuses, plans, delivery)
+    if direct:
+        return {"candidates": direct, "required_parent_closures": [], "blocking_reason": None}
+
+    def order(step_id):
+        if step_id not in plans:
+            raise CheckpointError("unknown dependency step: " + step_id)
+        return plans[step_id].get("priority", 9999), step_id
+
+    closures = []
+    for capability in delivery["capabilities"]:
+        if capability.get("id") not in {f"U{i:02d}" for i in range(1, 9)}:
+            continue
+        parent = capability["task_id"] + "-99"
+        if parent not in plans or plans[parent].get("phase") != "PARENT_FINAL_GATE":
+            raise CheckpointError("user capability owner parent missing: " + parent)
+        if statuses.get(parent) == "ACCEPTED":
+            continue
+        visiting, visited, remaining = set(), set(), []
+
+        def visit(step_id):
+            order(step_id)
+            if step_id in visiting:
+                raise CheckpointError("dependency cycle at: " + step_id)
+            if step_id in visited:
+                return
+            visiting.add(step_id)
+            for dependency in sorted(plans[step_id].get("dependencies", []), key=order):
+                visit(dependency)
+            visiting.remove(step_id)
+            visited.add(step_id)
+            if statuses.get(step_id) != "ACCEPTED":
+                remaining.append(step_id)
+
+        visit(parent)
+        blockers = [{"step_id": step_id, "status": statuses.get(step_id, "NOT_STARTED")}
+                    for step_id in remaining
+                    if statuses.get(step_id, "NOT_STARTED") not in {"NOT_STARTED", "IN_PROGRESS"}]
+        ready = [step_id for step_id in remaining
+                 if statuses.get(step_id, "NOT_STARTED") in {"NOT_STARTED", "IN_PROGRESS"}
+                 and all(statuses.get(dep) == "ACCEPTED"
+                         for dep in plans[step_id].get("dependencies", []))]
+        next_id = min(ready, key=order) if ready else None
+        closures.append({"capability_id": capability["id"], "title": capability.get("title"),
+                         "target_parent": parent, "scope": "PREREQUISITE_FOR_USER_FLOW",
+                         "unaccepted_dependency_closure": remaining,
+                         "remaining_required_cards": len(remaining), "blockers": blockers,
+                         "next_step_id": next_id,
+                         "next_step_status": statuses.get(next_id, "NOT_STARTED") if next_id else None,
+                         "ready_dependency_ids": list(plans[next_id].get("dependencies", [])) if next_id else [],
+                         "evidence_basis": "complete frozen owner-parent dependency closure and current step_state statuses",
+                         "formal_case_status": "NOT_VERIFIED_BY_THIS_CHECKPOINT"})
+    closures.sort(key=lambda row: (bool(row["blockers"]), row["remaining_required_cards"],
+                                  order(row["next_step_id"] or row["target_parent"]), row["capability_id"]))
+    candidates = [row for row in closures if row["next_step_id"] is not None]
+    reason = None if candidates else ("NO_ELIGIBLE_FRONTIER_IN_REQUIRED_PARENT_CLOSURES" if closures
+                                      else "ALL_USER_CAPABILITY_OWNER_PARENTS_ACCEPTED")
+    return {"candidates": candidates, "required_parent_closures": closures, "blocking_reason": reason}
 
 
 def next_packet(checkpoint_path: Path, state_path: Path, plan_path: Path,
@@ -168,8 +230,10 @@ def next_packet(checkpoint_path: Path, state_path: Path, plan_path: Path,
 
     result, code = packet("next")
     default_id = (result.get("step") or {}).get("id")
-    selected = prioritized_step(current, statuses, plans, delivery, default_id)
-    if selected != default_id:
+    value = current.get("value_checkpoint", {})
+    priority = flow_priority(statuses, plans, delivery) if value.get("pause_nonblocking_expansion") else None
+    selected = (priority["candidates"][0]["next_step_id"] if priority["candidates"] else None) if priority else default_id
+    if priority:
         if selected is None:
             result.update(step=None, status="NO_READY_USER_FLOW")
             code = 3
@@ -179,11 +243,11 @@ def next_packet(checkpoint_path: Path, state_path: Path, plan_path: Path,
                 raise CheckpointError("recommended user flow is not eligible")
     if checkpoint_path.read_bytes() != original or state_path.read_bytes() != state_raw:
         raise CheckpointError("checkpoint or state changed during selection")
-    value = current.get("value_checkpoint", {})
     result["value_checkpoint_policy"] = {"checkpoint_revision": current["revision"],
                                          "status": value.get("status"),
                                          "priority_consumed": bool(value.get("pause_nonblocking_expansion")),
                                          "default_step_id": default_id, "selected_step_id": selected,
+                                         "selection": priority,
                                          "authority": "READ_ONLY_SELECTION_NOT_DISPATCH_OR_ACCEPTANCE"}
     return result, code
 
@@ -231,7 +295,8 @@ def update_value(current: dict, accepted: set[str], statuses: dict[str, str], pl
             "no_value_checkpoints_before_replan": 2, "new_candidates_alone_count_as_value": False,
             "does_not_lower_product_acceptance": True}.items()):
         raise CheckpointError("frozen U09 thresholds changed")
-    candidates = ready_flows(statuses, plans, delivery)
+    priority = flow_priority(statuses, plans, delivery)
+    candidates = priority["candidates"]
     gate = gates(statuses, plans)
     if baseline:
         if old.get("status") != "NOT_RUN" or round_record is not None or force or reason:
@@ -244,6 +309,8 @@ def update_value(current: dict, accepted: set[str], statuses: dict[str, str], pl
                 "last_checkpoint_accepted_card_ids": sorted(accepted), "pending_rounds": [],
                 "history": [], "all_round_ids": [], "documentation_only_checkpoints": 0,
                 "capabilities_observed": [], "user_flow_candidates": candidates,
+                "required_parent_closures": priority["required_parent_closures"],
+                "selection_blocking_reason": priority["blocking_reason"],
                 "formal_gate": gate, "next_priority": "FOLLOW_FROZEN_PLAN"}
     if old.get("schema") != SCHEMA or not isinstance(old.get("history"), list):
         raise CheckpointError("baseline required; historical rounds are unknown")
@@ -253,6 +320,10 @@ def update_value(current: dict, accepted: set[str], statuses: dict[str, str], pl
     value["all_round_ids"].append(round_record["round_id"])
     value["pending_rounds"].append(round_record)
     value["user_flow_candidates"] = candidates
+    value["required_parent_closures"] = priority["required_parent_closures"]
+    value["selection_blocking_reason"] = priority["blocking_reason"]
+    if value.get("pause_nonblocking_expansion"):
+        value["recommended_flow"] = candidates[0] if candidates else None
     value["formal_gate"] = gate
     if round_record["delta"] == "USER_FLOW":
         value["capabilities_observed"].append({"round_id": round_record["round_id"],
