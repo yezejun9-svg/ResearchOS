@@ -125,6 +125,22 @@ func (c *RuntimeCoordinator) brokerTool(ctx context.Context, route RuntimeCoordi
 	if e != nil {
 		return notApplied("tool binding ended before host dispatch")
 	}
+	permissionGranted := false
+	selected, selectionErr := permissionSelection(request.Policy, request.Name)
+	if selectionErr != nil {
+		return notApplied("frozen confirmation policy is invalid")
+	}
+	if selected {
+		key, waiter, err := c.createToolPermission(ctx, route, runID, lease, epoch, frame, payload, request)
+		if err != nil {
+			return notApplied("frozen tool permission could not be requested")
+		}
+		if !c.waitToolPermission(ctx, route, key, waiter) {
+			c.closeToolPermission(context.Background(), route, key, waiter)
+			return notApplied("original tool permission was denied, expired or revoked")
+		}
+		permissionGranted = true
+	}
 	// Physical publication rechecks the original run and lease after acquiring
 	// its file guards. The child cannot supply or replace this callback.
 	request.Revalidate = func(checkCtx context.Context) error {
@@ -144,7 +160,24 @@ func (c *RuntimeCoordinator) brokerTool(ctx context.Context, route RuntimeCoordi
 		if current.IntentKey != request.IntentKey || current.WorkspacePath != request.WorkspacePath || current.Access != request.Access || Hash(current.Policy) != Hash(request.Policy) {
 			return Fail(403, "FORBIDDEN", "tool authority changed before physical publication")
 		}
+		if permissionGranted {
+			latest, err := latestEffect(checkTx, route.ProjectID, runID, frame.Key)
+			if err != nil || latest["state"] != "STARTED" {
+				return Fail(409, "RESOURCE_BLOCKED", "original permitted effect is no longer active")
+			}
+			record, _ := latest["permission"].(map[string]any)
+			if record == nil || record["decision"] != "ALLOW_ONCE" || record["consumed"] != true {
+				return Fail(403, "FORBIDDEN", "original one-use permission was not consumed")
+			}
+			blocked, err := otherBlockingPermissionResources(checkTx, route.ProjectID, runID, Str(Object(record), "request_id"))
+			if err != nil || blocked {
+				return Fail(409, "RESOURCE_BLOCKED", "another resource still blocks the original task")
+			}
+		}
 		return nil
+	}
+	if e = request.Revalidate(ctx); e != nil {
+		return notApplied("tool authority changed before host dispatch")
 	}
 	result, e := c.config.RunTool(ctx, request)
 	if e != nil {
