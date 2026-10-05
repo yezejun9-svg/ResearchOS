@@ -246,7 +246,7 @@ def g02(g):
     g.check('CURRENT_REAL_COMMAND_PATHS',bool(inventory) and all(not row['issues'] and row['registry_state'] in ('BOUND','UNBOUND') for row in inventory),
             {'count':len(inventory),'bound_count':sum(r['registry_state']=='BOUND' for r in inventory),'behavior_limit':'Paths checked; all formal selector behavior NOT_OBSERVED. Known C24/A12 child-handler case rejection and auto-routing legacy selector gaps stay unaccepted.'})
     entry=registry['commands']['build.check']
-    rel=(HERE/'dispatch_parent.py').relative_to(ROOT).as_posix()
+    rel=(HERE/'dispatch_parent_exact.py').relative_to(ROOT).as_posix()
     binding=entry.get('argv')==['-B',rel] and all(x in entry.get('selectors',{}).get('check_id',[]) for x in SELECTORS)
     g.pending=not binding
     g.check('EXACT_PARENT_BINDING',binding,{'expected_argv':['-B',rel],'actual_argv':entry.get('argv'),'state':'BOUND' if binding else 'PENDING_INTEGRATION'})
