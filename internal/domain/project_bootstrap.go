@@ -77,6 +77,22 @@ const (
 // BootstrapProject creates or continues the project identity behind an authorized workspace and
 // records the local inventory before any external query happens.
 func (s *Service) BootstrapProject(ctx context.Context, p Principal, a WorkspaceAuthority, g DefGrader, scan LocalInventoryScanner, in BootstrapProjectInput) (Object, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	result, err := s.bootstrapProjectTx(ctx, tx, p, a, g, scan, in)
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *Service) bootstrapProjectTx(ctx context.Context, tx *sql.Tx, p Principal, a WorkspaceAuthority, g DefGrader, scan LocalInventoryScanner, in BootstrapProjectInput) (Object, error) {
 	if a == nil || g == nil || scan == nil {
 		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "workspace authority, contract grader and inventory scanner are required")
 	}
@@ -90,12 +106,6 @@ func (s *Service) BootstrapProject(ctx context.Context, p Principal, a Workspace
 	if mode != "LIVE" {
 		mode = "FIXTURE"
 	}
-
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
 
 	// A command id belongs to the principal that first used it. Proving that before any workspace
 	// right is consulted means a colliding replay is refused as a collision, not as a generic
@@ -122,9 +132,6 @@ func (s *Service) BootstrapProject(ctx context.Context, p Principal, a Workspace
 	// A redelivery of the same command answers from the durable records instead of scanning again:
 	// no second project, no second artifact, no second revision.
 	if replay, e := s.bootstrapReplay(ctx, tx, p.ID, in.CommandID, binding); e == nil && replay != nil {
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
 		return replay, nil
 	} else if e != nil && !errors.Is(e, sql.ErrNoRows) {
 		return nil, e
@@ -247,6 +254,8 @@ func (s *Service) BootstrapProject(ctx context.Context, p Principal, a Workspace
 		if e := s.putOpaque(ctx, tx, "", KindWorkspaceBinding, binding.AuthorizedRef, binding.bindProject(projectID)); e != nil {
 			return nil, e
 		}
+		binding.ProjectID = &projectID
+		binding.Revision++
 	}
 	record := Object{"project_id": project, "command_id": in.CommandID, "principal_id": p.ID,
 		"authorized_workspace_ref": binding.AuthorizedRef, "stage_id": stageID,
@@ -260,9 +269,6 @@ func (s *Service) BootstrapProject(ctx context.Context, p Principal, a Workspace
 		"bootstrap_task_id": stageID, "bootstrap_run_id": nil}
 	if err := g.ValidateDef(inventoryDefBootstrap, reply); err != nil {
 		return nil, Fail(422, "CONTENT_HASH_MISMATCH", "bootstrap result violates the published definition: "+err.Error())
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
 	}
 	return reply, nil
 }

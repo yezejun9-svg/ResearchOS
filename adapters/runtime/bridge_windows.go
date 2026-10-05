@@ -144,8 +144,8 @@ func StartBridge(ctx context.Context, directory string, request BridgeRequest) (
 	}
 	admission, _ := manifest["admission"].(map[string]any)
 	profile, _ := admission["profile"].(map[string]any)
-	if profile["backend"] != "native-offline" || profile["model"] != "none" {
-		return nil, errors.New("host cannot attest requested backend/model identity")
+	if e = validateBridgeProgram(profile, request.Inputs); e != nil {
+		return nil, e
 	}
 	if request.WorkerID == "" || bridgeString(manifest, "dispatch_key") == "" || bridgeNumber(manifest, "epoch") < 1 || bridgeString(profile, "sandbox") != "appcontainer-zero-capabilities-v1" || bridgeString(profile, "adapter_revision") != BridgeRevision || request.BeforeResume == nil {
 		return nil, errors.New("complete bound profile and beforeResume required")
@@ -245,6 +245,8 @@ func StartBridge(ctx context.Context, directory string, request BridgeRequest) (
 			arg = output
 		case "{manifest}":
 			arg = filepath.Join(input, "request.json")
+		case "{bundle}":
+			arg = filepath.Join(input, "mu-worker.mjs")
 		case "{checkpoint}":
 			arg = filepath.Join(input, "checkpoint.json")
 		}
@@ -500,6 +502,9 @@ func (w *Bridge) Acknowledge(ctx context.Context, sequence int64, response any) 
 		raw, e := json.Marshal(response)
 		if e != nil {
 			return e
+		}
+		if len(raw) > 64*1024 {
+			return errors.New("protocol response exceeds frame limit")
 		}
 		return w.process.Write(ctx, append(raw, '\n'))
 	}

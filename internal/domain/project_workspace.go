@@ -172,6 +172,22 @@ func (b *WorkspaceBinding) record() Object {
 // Every refusal is typed so the caller can distinguish "the choice was already spent" from
 // "that reference was never minted here".
 func (s *Service) RegisterWorkspace(ctx context.Context, p Principal, a WorkspaceAuthority, g DefGrader, in RegisterWorkspaceInput) (Object, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	result, err := s.registerWorkspaceTx(ctx, tx, p, a, g, in)
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *Service) registerWorkspaceTx(ctx context.Context, tx *sql.Tx, p Principal, a WorkspaceAuthority, g DefGrader, in RegisterWorkspaceInput) (Object, error) {
 	if a == nil || g == nil {
 		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "workspace authority and contract grader are required")
 	}
@@ -184,11 +200,6 @@ func (s *Service) RegisterWorkspace(ctx context.Context, p Principal, a Workspac
 	if !p.HasRole("OWNER") && !p.CanCreateProject {
 		return nil, Fail(403, "FORBIDDEN", "project creation is not granted")
 	}
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
 
 	// The project-creation right is checked FIRST (a caller with no right must not learn that a
 	// command id exists), and only then the command-id namespace, so a caller that does have a
@@ -204,9 +215,6 @@ func (s *Service) RegisterWorkspace(ctx context.Context, p Principal, a Workspac
 	// selection: the reference is already spent, so asking the authority again would fail with
 	// SELECTION_ALREADY_USED for what is really a duplicate delivery.
 	if existing, e := s.bindingByCommand(ctx, tx, p.ID, in.CommandID); e == nil && existing != nil {
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
 		return existing.Reply(), nil
 	} else if e != nil && !errors.Is(e, errNoBinding) {
 		return nil, e
@@ -249,9 +257,6 @@ func (s *Service) RegisterWorkspace(ctx context.Context, p Principal, a Workspac
 		return nil, Fail(422, "CONTENT_HASH_MISMATCH", "workspace binding violates the published definition: "+err.Error())
 	}
 	if err := s.putOpaque(ctx, tx, "", KindWorkspaceBinding, ref, b.record()); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return reply, nil

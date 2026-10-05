@@ -36,21 +36,29 @@ type RuntimeProviderRoute struct {
 	SourceToken        string `json:"source_token,omitempty"`
 	BrowserActPath     string `json:"browser_act_path,omitempty"`
 	BrowserID          string `json:"browser_id,omitempty"`
+	ModelConfig        Object `json:"model_config,omitempty"`
+	CredentialRef      string `json:"credential_ref,omitempty"`
 }
 
 func (c *RuntimeCoordinator) providerRoute(tx *sql.Tx, route RuntimeCoordinatorRoute, run, dispatch Object, frame rt.BridgeFrame) (RuntimeProviderRoute, error) {
 	manifest := dispatch["manifest"].(map[string]any)
 	admission := manifest["admission"].(map[string]any)
 	profile := admission["profile"].(map[string]any)
-	if admission["qualification_bootstrap"] == true {
-		return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "qualification bootstrap grants no provider authority")
-	}
 	if c.service.Contracts.Validate("Idempotency-Key", frame.Key) != nil {
 		return RuntimeProviderRoute{}, Fail(400, "INVALID_REQUEST", "stable effect key required")
 	}
 	task, e := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
 	if e != nil {
 		return RuntimeProviderRoute{}, e
+	}
+	if admission["qualification_bootstrap"] == true {
+		if e = qualificationModelEffectAllowed(tx, route.ProjectID, task, Object{"capability": frame.Capability, "route": frame.Route}); e != nil {
+			return RuntimeProviderRoute{}, e
+		}
+		permission := profile["model_qualification"].(map[string]any)
+		if e = runtimeModelCallGate(tx, route.ProjectID, Str(run, "id"), frame.Key, permission); e != nil {
+			return RuntimeProviderRoute{}, e
+		}
 	}
 	for _, provider := range c.config.Providers {
 		if provider.ID != frame.Route || provider.ProjectID != route.ProjectID || provider.RuntimeID != route.RuntimeID || provider.Purpose != task["task_type"] || provider.Capability != frame.Capability || provider.MeasurementMode != admission["mode"] {
@@ -65,6 +73,24 @@ func (c *RuntimeCoordinator) providerRoute(tx *sql.Tx, route RuntimeCoordinatorR
 		}
 		if !bound {
 			return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "provider differs from frozen route permission")
+		}
+		if provider.Capability == "MODEL" {
+			if profile["backend"] != runtimeMuBackend || Hash(provider.ModelConfig) != Hash(profile["model_config"]) || provider.Endpoint != Str(provider.ModelConfig, "endpoint") || provider.ID != Str(provider.ModelConfig, "route") {
+				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "model route differs from frozen profile")
+			}
+			if provider.MeasurementMode == "LIVE" && (provider.CredentialRef == "" || provider.CredentialRef != provider.CredentialRevision || c.config.ModelCredential == nil || provider.BearerToken != "") {
+				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "LIVE model requires a current protected credential reference")
+			}
+		}
+		if provider.Capability == "TOOL" {
+			if profile["backend"] != runtimeMuBackend || provider.ID != Str(profile["model_config"].(map[string]any), "route") || c.config.RunTool == nil || provider.Endpoint != "" || provider.BearerToken != "" || provider.CredentialRef != "" {
+				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "local tool requires the frozen host-only route")
+			}
+			amount, err := moneyAmount(provider.UpperBound)
+			if err != nil || amount.Sign() != 0 {
+				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "local tool route requires an explicit zero monetary bound")
+			}
+			return provider, nil
 		}
 		if provider.Capability == "SOURCE" {
 			if provider.SourceID == "" || provider.SourceToken == "" {
@@ -120,6 +146,21 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		}
 	}
 	request := Object{"route": provider.ID, "capability": provider.Capability, "credential_revision": provider.CredentialRevision, "payload": payload}
+	if provider.Capability == "TOOL" {
+		if _, e = c.runtimeToolGate(ctx, tx, route, task, dispatch, frame, payload); e != nil {
+			tx.Rollback()
+			return nil, e
+		}
+	}
+	if provider.Capability == "MODEL" {
+		if _, e = validateRuntimeModelRequest(provider.ModelConfig, payload); e == nil {
+			e = runtimeModelCallGate(tx, route.ProjectID, runID, frame.Key, provider.ModelConfig)
+		}
+		if e != nil {
+			tx.Rollback()
+			return nil, e
+		}
+	}
 	if provider.Capability == "EXPERIMENT" {
 		if _, _, e = c.researchExperimentGate(tx, route.ProjectID, task, run, frame, payload); e != nil {
 			tx.Rollback()
@@ -159,6 +200,12 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		tx.Rollback()
 		return nil, e
 	}
+	if provider.Capability == "TOOL" {
+		if _, e = c.runtimeToolGate(ctx, tx, route, task, dispatch, frame, payload); e != nil {
+			tx.Rollback()
+			return nil, e
+		}
+	}
 	if provider.Capability == "SOURCE" {
 		if _, _, _, e = c.researchSourceGate(tx, route.ProjectID, task, provider, payload); e != nil {
 			tx.Rollback()
@@ -174,6 +221,12 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		return nil, e
 	}
 	c.boundary("effect_started", intent)
+	if provider.Capability == "TOOL" {
+		return c.brokerTool(ctx, route, provider, runID, lease, epoch, bridge, frame, payload, intent, dispatch)
+	}
+	if provider.Capability == "MODEL" {
+		return c.brokerModel(ctx, route, provider, runID, lease, epoch, bridge, frame, payload, intent, dispatch)
+	}
 	if provider.Capability == "SOURCE" {
 		return c.brokerResearchSource(ctx, route, provider, runID, lease, epoch, frame, payload, intent)
 	}
@@ -290,6 +343,18 @@ func (c *RuntimeCoordinator) ingestEffectFact(ctx context.Context, fact Object) 
 	}
 	if intent["state"] != "STARTED" && intent["state"] != "UNKNOWN" {
 		return Fail(409, "STATE_CONFLICT", "effect outcome cannot be rewritten")
+	}
+	request, _ := intent["payload"].(map[string]any)
+	if request["capability"] == "MODEL" && receipt["model_transport"] == true && receipt["actual_cost"] == nil && receipt["state"] == "CONFIRMED" {
+		result, ok := receipt["payload"].(map[string]any)
+		if !ok || Digest([]byte(Str(result, "body"))) != fact["provider_response_hash"] {
+			return Fail(422, "GATE_FAILED", "model response hash mismatch")
+		}
+		intent["state"], intent["receipt"] = receipt["state"], receipt
+		if e = effectAppend(tx, project, run, key, intent); e != nil {
+			return e
+		}
+		return tx.Commit()
 	}
 	ledger, e := load(tx, project, "BudgetLedgerEntry", Str(intent, "reservation_id"))
 	if e != nil {
