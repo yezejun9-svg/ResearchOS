@@ -29,7 +29,15 @@ var runtimeToolWriteMu sync.Mutex
 func toolDenied(message string) error  { return domain.Fail(403, "FORBIDDEN", message) }
 func toolInvalid(message string) error { return domain.Fail(400, "INVALID_REQUEST", message) }
 
-func (h *Host) ExecuteRuntimeTool(ctx context.Context, request domain.RuntimeToolRequest) (domain.Object, error) {
+func (h *Host) ExecuteRuntimeTool(ctx context.Context, request domain.RuntimeToolRequest) (result domain.Object, err error) {
+	// Validation and reads cannot mutate the workspace. Each mutating tool
+	// takes responsibility for classifying errors after this boundary.
+	beforeMutation := true
+	defer func() {
+		if err != nil && beforeMutation {
+			err = &domain.RuntimeToolFailure{Err: err, Outcome: "NOT_APPLIED"}
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -93,6 +101,7 @@ func (h *Host) ExecuteRuntimeTool(ctx context.Context, request domain.RuntimeToo
 				return nil, err
 			}
 		}
+		beforeMutation = false
 		return h.executeRuntimeCheck(ctx, request)
 	}
 	rel := domain.Str(args, "path")
@@ -174,6 +183,7 @@ func (h *Host) ExecuteRuntimeTool(ctx context.Context, request domain.RuntimeToo
 		if err := runtimeToolPlainPath(root, rel, request.Name == "write" && args["expected_hash"] == nil); err != nil {
 			return nil, err
 		}
+		beforeMutation = false
 		return runtimeToolWrite(ctx, root, rel, request.Name, args, writeMax)
 	}
 	panic("unreachable")
@@ -304,7 +314,13 @@ func runtimeToolRead(ctx context.Context, root *os.Root, rel string, args domain
 	return runtimeToolReply(domain.Object{"path": rel, "content_hash": domain.Digest(data), "text": string(data[offset:end]), "next_offset": end, "truncated": end < int64(len(data)), "size_bytes": len(data)})
 }
 
-func runtimeToolWrite(ctx context.Context, root *os.Root, rel, name string, args domain.Object, max int64) (domain.Object, error) {
+func runtimeToolWrite(ctx context.Context, root *os.Root, rel, name string, args domain.Object, max int64) (result domain.Object, err error) {
+	beforeMutation := true
+	defer func() {
+		if err != nil && beforeMutation {
+			err = &domain.RuntimeToolFailure{Err: err, Outcome: "NOT_APPLIED"}
+		}
+	}()
 	allowed := map[string]bool{"path": true, "expected_hash": true}
 	if name == "write" {
 		allowed["content"] = true
@@ -366,6 +382,9 @@ func runtimeToolWrite(ctx context.Context, root *os.Root, rel, name string, args
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// A replacement can create a temporary file, publish via Link, or rename.
+	// Once entered, an error does not prove that the effect was absent.
+	beforeMutation = false
 	if err := runtimeToolReplace(root, rel, []byte(next), create, expected); err != nil {
 		return nil, err
 	}
