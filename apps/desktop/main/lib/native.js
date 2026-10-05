@@ -76,25 +76,35 @@ function readSession(fsImpl, discovery, now = Date.now()) {
 
 function createCredentialProvider({ fsImpl = fs, dial = dialNative, now = Date.now, clientId = 'desktop-shell' } = {}) {
   let renewing = null;
+  function identityFor(discovery) {
+    const id = hostInstanceId(fsImpl, discovery);
+    // Copy the verified fields: a caller changing its discovery object while
+    // the pipe request is pending must not redirect the session-file read.
+    const bound = { host_instance_id: id, url: discovery.url, data_dir: discovery.data_dir, pid: discovery.pid };
+    return { id, bound, key: JSON.stringify([id, bound.url, bound.data_dir, bound.pid]) };
+  }
   return async function credentialFor(discovery, force = false) {
-    if (renewing) return renewing;
+    if (renewing) {
+      if (identityFor(discovery).key !== renewing.key) throw Error('HOST_CHANGED_DURING_RENEWAL');
+      return renewing.promise;
+    }
     if (!force) {
       try { return readSession(fsImpl, discovery, now()); } catch { /* bootstrap a new session */ }
     }
-    if (!renewing) {
-      renewing = (async () => {
-        const id = hostInstanceId(fsImpl, discovery);
-        const reply = await dial('\\\\.\\pipe\\ResearchOSHost-v1-' + id.slice(5),
-          { kind: 'NATIVE_USER_BOOTSTRAP_REQUEST', client_id: clientId, payload: {} });
-        if (reply?.kind === 'NATIVE_ERROR') throw Error('NATIVE_' + String(reply.error?.code || 'ERROR'));
-        if (reply?.kind !== 'NATIVE_USER_BOOTSTRAP_RESULT' || reply.payload?.host_instance_id !== id ||
-            reply.payload?.client_id !== clientId || reply.payload?.credential_exposed_to_renderer !== false) {
-          throw Error('NATIVE_WRONG_REPLY');
-        }
-        return readSession(fsImpl, discovery, now());
-      })().finally(() => { renewing = null; });
-    }
-    return renewing;
+    const identity = identityFor(discovery);
+    const promise = (async () => {
+      const reply = await dial('\\\\.\\pipe\\ResearchOSHost-v1-' + identity.id.slice(5),
+        { kind: 'NATIVE_USER_BOOTSTRAP_REQUEST', client_id: clientId, payload: {} });
+      if (reply?.kind === 'NATIVE_ERROR') throw Error('NATIVE_' + String(reply.error?.code || 'ERROR'));
+      if (reply?.kind !== 'NATIVE_USER_BOOTSTRAP_RESULT' || reply.payload?.host_instance_id !== identity.id ||
+          reply.payload?.client_id !== clientId || reply.payload?.credential_exposed_to_renderer !== false) {
+        throw Error('NATIVE_WRONG_REPLY');
+      }
+      return readSession(fsImpl, identity.bound, now());
+    })();
+    renewing = { key: identity.key, promise };
+    try { return await promise; }
+    finally { if (renewing?.promise === promise) renewing = null; }
   };
 }
 
