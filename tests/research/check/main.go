@@ -668,6 +668,7 @@ func runW0802(ctx context.Context, root string) {
 		"TestResearchOfflineCandidateStagesCurrentReceipts",
 		"TestResearchNativeSourceReceiptToIndependentClose",
 		"TestResearchNoProgressPersistsAcrossAcceptedReports",
+		"TestResearchRecompiledSameIntentKeepsNoProgress",
 		"TestResearchOfflineNativeExperimentAndProgress",
 		"TestW08ManualDispositionCurrentBoundary",
 		"TestW08RequiredGates",
