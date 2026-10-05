@@ -17,6 +17,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -165,8 +167,10 @@ func v2EnvelopeFor(ctx *v2Context, method string, payload map[string]any) (*v2En
 		if env.ProjectID == nil {
 			return nil, "MISSING_FIELD:project_id"
 		}
-		env.ExpectedRevision = &ctx.revision
-		env.WriterEpoch = &ctx.epoch
+		if method != "goal.start" || env.SessionID != nil {
+			env.ExpectedRevision = &ctx.revision
+			env.WriterEpoch = &ctx.epoch
+		}
 	}
 	if method == "host.configure" {
 		_, hasModel := keys["model_id"]
@@ -198,9 +202,18 @@ func sortedKeys(m map[string]json.RawMessage) []string {
 	return out
 }
 
-// v2Call sends the command and returns the host's own reply. A host that refuses is reported as a refusal: the exit
-// code follows the reply's status, so COMPLETED is the only answer allowed to exit 0.
+// The returned code classifies transport/admission only. Callers must inspect
+// status and follow the admitted operation; even session.send COMPLETED is not
+// an execution result. run and interactive use followCLIExecution for that gate.
 func v2Call(ctx *v2Context, method string, payload map[string]any) (map[string]any, string, int) {
+	return v2CallTransport(context.Background(), ctx, method, payload, false)
+}
+
+func v2CallContext(budget context.Context, ctx *v2Context, method string, payload map[string]any) (map[string]any, string, int) {
+	return v2CallTransport(budget, ctx, method, payload, true)
+}
+
+func v2CallTransport(budget context.Context, ctx *v2Context, method string, payload map[string]any, strictIdentity bool) (map[string]any, string, int) {
 	env, refusal := v2EnvelopeFor(ctx, method, payload)
 	if refusal != "" {
 		if refusal == "CREDENTIAL_ABSENT" {
@@ -212,8 +225,8 @@ func v2Call(ctx *v2Context, method string, payload map[string]any) (map[string]a
 	}
 	body, _ := json.Marshal(env)
 	ctx.requestLog = append(ctx.requestLog, method)
-	client := http.Client{Timeout: 8 * time.Second}
-	req, err := http.NewRequest("POST", ctx.baseURL+v2CommandPath, bytes.NewReader(body))
+	client := http.Client{Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, err := http.NewRequestWithContext(budget, "POST", ctx.baseURL+v2CommandPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, "REQUEST_UNBUILDABLE:" + err.Error(), exitFailed
 	}
@@ -224,10 +237,22 @@ func v2Call(ctx *v2Context, method string, payload map[string]any) (map[string]a
 		return nil, "HOST_UNREACHABLE:" + err.Error(), exitFailed
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if readErr != nil || len(raw) > 1<<20 {
+		return nil, "INCOMPLETE_OR_OVERSIZE_REPLY", exitFailed
+	}
 	var reply map[string]any
 	if e := json.Unmarshal(raw, &reply); e != nil {
 		return nil, "MALFORMED_REPLY", exitFailed
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return reply, "HOST_HTTP_" + strconv.Itoa(resp.StatusCode), exitNotImplemented
+	}
+	if strictIdentity && (reply["protocol_version"] != clientProtocol || reply["command_id"] != ctx.commandID || reply["method"] != method) {
+		return reply, "REPLY_IDENTITY_MISMATCH", exitFailed
+	}
+	if sid, ok := reply["session_id"].(string); strictIdentity && ok && ctx.sessionID != "" && sid != ctx.sessionID {
+		return reply, "REPLY_SESSION_MISMATCH", exitFailed
 	}
 	status, _ := reply["status"].(string)
 	switch status {
@@ -238,7 +263,14 @@ func v2Call(ctx *v2Context, method string, payload map[string]any) (map[string]a
 		return reply, "", exitCompleted
 	case "REJECTED":
 		code, _ := reply["error_code"].(string)
-		return reply, "HOST_REJECTED:" + orDefault(code, "UNSPECIFIED"), exitFailed
+		exit := exitFailed
+		switch code {
+		case "RESOURCE_BLOCKED", "RESOURCE_UNAVAILABLE", "MODEL_UNAVAILABLE", "HOST_UNAVAILABLE", "UNAUTHENTICATED", "FORBIDDEN", "LEASE_EXPIRED", "WRITER_BUSY", "STALE_WRITER_EPOCH", "CANCEL_UNCONFIRMED":
+			exit = exitNotImplemented
+		case "INVALID_REQUEST", "UNSUPPORTED_PROTOCOL", "UNSUPPORTED_METHOD":
+			exit = exitUsage
+		}
+		return reply, "HOST_REJECTED:" + orDefault(code, "UNSPECIFIED"), exit
 	case "NOT_IMPLEMENTED":
 		return reply, "HOST_NOT_IMPLEMENTED:" + method, exitNotImplemented
 	default:

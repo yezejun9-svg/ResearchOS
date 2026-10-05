@@ -23,7 +23,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 )
 
@@ -565,32 +564,12 @@ func modelProvider(model string) (string, string, string) {
 // measured it and named it the card's own 空stub negative, so it is gone; apps/cli/cli_verbs.go now sends the method
 // each verb is named after. Only the signal guard from that file is kept.
 
-// interruptGuard turns a real signal into the contract's 130. It is installed only while a host call is in flight,
-// because that is the only window in which a non-interactive command can be interrupted at all; a refusal that has
-// already been written exits before the guard matters.
-func interruptGuard(command string) func() {
+// interruptGuard records intent. The active host flow sends CANCEL and waits
+// for actual settlement; receiving a signal alone never claims tools stopped.
+func interruptGuard() (<-chan os.Signal, func()) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
-	stopped := false
-	var mu sync.Mutex
-	go func() {
-		<-ch
-		mu.Lock()
-		defer mu.Unlock()
-		if stopped {
-			return
-		}
-		stopped = true
-		outJSON(map[string]any{"command": command, "status": "INTERRUPTED", "exit_code": exitInterrupted,
-			"reason": "SIGNAL_RECEIVED_BEFORE_HOST_ANSWER"})
-		os.Exit(exitInterrupted)
-	}()
-	return func() {
-		mu.Lock()
-		stopped = true
-		mu.Unlock()
-		signal.Stop(ch)
-	}
+	return ch, func() { signal.Stop(ch) }
 }
 
 func clip(s string, n int) string {
