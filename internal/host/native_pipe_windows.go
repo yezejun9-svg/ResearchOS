@@ -74,6 +74,16 @@ func newNativePipe(pipeName string) (windows.Handle, error) {
 // ServeNative accepts one request/reply exchange per connection until ctx is cancelled. Message
 // mode means a frame boundary is enforced by the OS, so no length prefix negotiable by a client.
 func (h *Host) ServeNative(ctx context.Context, pipeName string) error {
+	return h.ServeNativeWithChooser(ctx, pipeName, chooseNativeFolderWindows)
+}
+
+// ServeNativeWithChooser is a trusted in-process composition seam. Production
+// ServeNative always supplies the Windows dialog; tests may supply a confirmed
+// selection without creating a second wire method or trusting the path hint.
+func (h *Host) ServeNativeWithChooser(ctx context.Context, pipeName string, chooser func(string) (string, error)) error {
+	if chooser == nil {
+		return ErrUntrustedPathChoice
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -91,7 +101,7 @@ func (h *Host) ServeNative(ctx context.Context, pipeName string) error {
 			}
 			continue
 		}
-		h.serveNativeConnection(ph)
+		h.serveNativeConnection(ph, chooser)
 		windows.FlushFileBuffers(ph)
 		windows.DisconnectNamedPipe(ph)
 		windows.CloseHandle(ph)
@@ -114,7 +124,7 @@ func connectPipe(ph windows.Handle, ctx context.Context) error {
 	return err
 }
 
-func (h *Host) serveNativeConnection(ph windows.Handle) {
+func (h *Host) serveNativeConnection(ph windows.Handle, chooser func(string) (string, error)) {
 	pid, err := namedPipeClientPID(ph)
 	if err != nil {
 		_ = writeNativeFrame(ph, errorFrame(ErrFrameUntrusted))
@@ -138,7 +148,7 @@ func (h *Host) serveNativeConnection(ph windows.Handle) {
 	}
 	// The path in a frame is only an initial suggestion. The Shell dialog runs
 	// in this trusted, same-user host process and requires an explicit choice.
-	reply, err := h.HandleNative(raw, true, chooseNativeFolderWindows)
+	reply, err := h.HandleNative(raw, true, chooser)
 	if err != nil {
 		reply = errorFrame(err)
 	}
