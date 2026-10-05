@@ -4,6 +4,7 @@ package host
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -195,11 +196,58 @@ func TestRuntimeCheckNativeGo(t *testing.T) {
 		t.Fatal(err)
 	}
 	details := result["details"].(domain.Object)
+	if _, duplicate := details["stdout_text"]; duplicate {
+		t.Fatal("check output duplicated in details")
+	}
+	part := result["content"].([]any)[0].(domain.Object)
+	var visible domain.Object
+	if err := json.Unmarshal([]byte(part["text"].(string)), &visible); err != nil {
+		t.Fatal(err)
+	}
 	full := result["host_evidence"].(domain.Object)
-	if details["exit_code"] != 0 || details["children_stopped"] != true || details["streams_drained"] != true || details["cleanup_complete"] != true || details["source_count"] != 2 || !strings.Contains(details["stdout_text"].(string), "ok") {
+	if details["exit_code"] != 0 || details["children_stopped"] != true || details["streams_drained"] != true || details["cleanup_complete"] != true || details["source_count"] != 2 || !strings.Contains(visible["stdout_text"].(string), "ok") {
 		t.Fatalf("native run_check failed: %v", details)
 	}
 	if details["job_total_processes"].(uint32) < 2 || full["source_manifest_hash"] != details["source_manifest_hash"] || len(full["source_manifest"].([]any)) != 2 || full["toolchain_hash"] != tree {
 		t.Fatalf("native check evidence incomplete: %v", details)
+	}
+	logs := full["sandbox_receipt"].(domain.Object)
+	if domain.Digest(logs["stdout_raw"].([]byte)) != details["stdout_hash"] || domain.Digest(logs["stderr_raw"].([]byte)) != details["stderr_hash"] {
+		t.Fatal("raw check logs do not match visible hashes")
+	}
+}
+
+func TestRuntimeCheckReplyFitsFrameAndReportsOmission(t *testing.T) {
+	stdout := []byte(strings.Repeat("中\"<\\\n", 4000))
+	stderr := []byte(strings.Repeat("\"\\<>&\n", 4000))
+	metadata := domain.Object{"check_id": "doctor-unit", "exit_code": 1, "stdout_hash": domain.Digest(stdout), "stderr_hash": domain.Digest(stderr), "children_stopped": true, "streams_drained": true, "cleanup_complete": true}
+	reply, err := runtimeCheckReply(metadata, stdout, stderr, 8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(domain.Bytes(reply)) > runtimeToolReplyLimit || len(domain.Bytes(domain.Object{"sequence": 12, "key": "task:run:1:tool:1", "state": "CONFIRMED", "payload": reply})) > 64<<10 {
+		t.Fatal("check reply exceeds bridge frame")
+	}
+	details := reply["details"].(domain.Object)
+	if _, duplicate := details["stdout_text"]; duplicate {
+		t.Fatal("check stdout duplicated in details")
+	}
+	part := reply["content"].([]any)[0].(domain.Object)
+	var visible domain.Object
+	if err := json.Unmarshal([]byte(part["text"].(string)), &visible); err != nil {
+		t.Fatal(err)
+	}
+	if visible["exit_code"] != float64(1) || visible["stdout_hash"] != domain.Digest(stdout) || visible["stderr_hash"] != domain.Digest(stderr) || visible["stdout_truncated"] != true || visible["stderr_truncated"] != true || visible["stdout_omitted_bytes"].(float64) <= 0 || visible["stderr_omitted_bytes"].(float64) <= 0 {
+		t.Fatalf("check output omission was not explicit: %v", visible)
+	}
+	if !strings.HasPrefix(string(stdout), visible["stdout_text"].(string)) || !strings.HasPrefix(string(stderr), visible["stderr_text"].(string)) {
+		t.Fatal("visible output is not an exact raw prefix")
+	}
+}
+
+func TestRuntimeCheckEvidenceRefusesOversizeRawLogs(t *testing.T) {
+	full := domain.Object{"source_manifest": []any{domain.Object{"path": "sample_test.go"}}, "sandbox_receipt": domain.Object{"stdout_raw": make([]byte, 4<<20), "stdout_raw_bytes": 4 << 20, "stdout_hash": domain.Digest(make([]byte, 4<<20))}}
+	if err := runtimeCheckEvidenceBound(full); err == nil || !strings.Contains(err.Error(), "raw logs and manifests exceed 4 MiB") {
+		t.Fatalf("oversize raw evidence must be explicit failure: %v", err)
 	}
 }

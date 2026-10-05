@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -353,15 +354,76 @@ func runtimeCheckSnapshot(ctx context.Context, root *os.Root, sources []runtimeC
 	return manifest, nil
 }
 
-func runtimeCheckText(raw []byte, max int) (string, bool) {
-	if len(raw) <= max {
-		return strings.ToValidUTF8(string(raw), "?"), false
-	}
-	end := max
+func runtimeCheckText(raw []byte, max int) (string, int) {
+	end := min(len(raw), max)
 	for end > 0 && end < len(raw) && !utf8.RuneStart(raw[end]) {
 		end--
 	}
-	return strings.ToValidUTF8(string(raw[:end]), "?"), true
+	return strings.ToValidUTF8(string(raw[:end]), "?"), end
+}
+
+// The model-visible result is bounded independently of the raw receipt. It
+// carries the test exit code and explicit omission counts; the full raw stream
+// bytes remain in host_evidence, subject to its separate 4 MiB total bound.
+func runtimeCheckReply(metadata domain.Object, stdout, stderr []byte, textLimit int) (domain.Object, error) {
+	outCap, errCap := min(len(stdout), textLimit), min(len(stderr), textLimit)
+	build := func() (domain.Object, error) {
+		outText, outBytes := runtimeCheckText(stdout, outCap)
+		errText, errBytes := runtimeCheckText(stderr, errCap)
+		details := make(domain.Object, len(metadata)+8)
+		for key, value := range metadata {
+			details[key] = value
+		}
+		details["stdout_truncated"] = outBytes < len(stdout)
+		details["stderr_truncated"] = errBytes < len(stderr)
+		details["stdout_omitted_bytes"] = len(stdout) - outBytes
+		details["stderr_omitted_bytes"] = len(stderr) - errBytes
+		details["stdout_raw_bytes"] = len(stdout)
+		details["stderr_raw_bytes"] = len(stderr)
+		details["stdout_utf8_replaced"] = !utf8.Valid(stdout[:outBytes])
+		details["stderr_utf8_replaced"] = !utf8.Valid(stderr[:errBytes])
+		visible := make(domain.Object, len(details)+2)
+		for key, value := range details {
+			visible[key] = value
+		}
+		visible["stdout_text"] = outText
+		visible["stderr_text"] = errText
+		encoded, err := json.Marshal(visible)
+		if err != nil {
+			return nil, err
+		}
+		return domain.Object{"content": []any{domain.Object{"type": "text", "text": string(encoded)}}, "details": details}, nil
+	}
+	for {
+		reply, err := build()
+		if err != nil {
+			return nil, err
+		}
+		if len(domain.Bytes(reply)) <= runtimeToolReplyLimit {
+			return reply, nil
+		}
+		if outCap == 0 && errCap == 0 {
+			return nil, toolDenied("run_check result cannot fit bridge frame")
+		}
+		// Shrink the larger encoded stream. Halving converges even when every
+		// byte needs multiple JSON escapes and never silently drops a suffix.
+		outText, _ := runtimeCheckText(stdout, outCap)
+		errText, _ := runtimeCheckText(stderr, errCap)
+		outJSON, _ := json.Marshal(outText)
+		errJSON, _ := json.Marshal(errText)
+		if outCap > 0 && (errCap == 0 || len(outJSON) >= len(errJSON)) {
+			outCap /= 2
+		} else {
+			errCap /= 2
+		}
+	}
+}
+
+func runtimeCheckEvidenceBound(full domain.Object) error {
+	if len(domain.Bytes(full)) > 4<<20 {
+		return toolDenied("run_check raw logs and manifests exceed 4 MiB evidence bound")
+	}
+	return nil
 }
 
 func runtimeCheckManifestBytes(manifest []any) int64 {
@@ -493,15 +555,13 @@ func (h *Host) executeRuntimeCheck(ctx context.Context, request domain.RuntimeTo
 	if !receipt.Stopped || !receipt.StreamsDrained || !receipt.CleanupComplete || !receipt.OutputCopied {
 		return nil, toolDenied("run_check did not complete sandbox cleanup")
 	}
-	stdout, outCut := runtimeCheckText(receipt.Stdout, check.textLimit)
-	stderr, errCut := runtimeCheckText(receipt.Stderr, check.textLimit)
-	details := domain.Object{"check_id": check.id, "exit_code": receipt.ExitCode, "timed_out": receipt.TimedOut, "stdout_hash": domain.Digest(receipt.Stdout), "stderr_hash": domain.Digest(receipt.Stderr), "stdout_text": stdout, "stderr_text": stderr, "stdout_truncated": outCut, "stderr_truncated": errCut, "source_manifest_hash": domain.Hash(sourceManifest), "source_count": len(sourceManifest), "frozen_policy_hash": domain.Hash(request.Policy), "toolchain_hash": toolchainHash, "vendor_hash": check.vendorHash, "job_total_processes": receipt.JobProcesses, "children_stopped": receipt.Stopped, "streams_drained": receipt.StreamsDrained, "cleanup_complete": receipt.CleanupComplete}
+	details := domain.Object{"check_id": check.id, "exit_code": receipt.ExitCode, "timed_out": receipt.TimedOut, "stdout_hash": domain.Digest(receipt.Stdout), "stderr_hash": domain.Digest(receipt.Stderr), "source_manifest_hash": domain.Hash(sourceManifest), "source_count": len(sourceManifest), "frozen_policy_hash": domain.Hash(request.Policy), "toolchain_hash": toolchainHash, "vendor_hash": check.vendorHash, "job_total_processes": receipt.JobProcesses, "children_stopped": receipt.Stopped, "streams_drained": receipt.StreamsDrained, "cleanup_complete": receipt.CleanupComplete}
 	full := domain.Object{"check_id": check.id, "workspace_path": request.WorkspacePath, "frozen_policy_hash": domain.Hash(request.Policy), "argv_template": check.argv, "source_manifest": sourceManifest, "source_manifest_hash": domain.Hash(sourceManifest), "toolchain_manifest": toolchainManifest, "toolchain_hash": toolchainHash, "build_hash": buildHash, "vendor_manifest": vendorManifest, "vendor_hash": check.vendorHash,
-		"sandbox_receipt": domain.Object{"pid": receipt.PID, "process_created_ns": receipt.Created, "job": receipt.Job, "profile": receipt.Profile, "appcontainer_sid": receipt.SID, "capabilities": receipt.Capabilities, "exit_code": receipt.ExitCode, "timed_out": receipt.TimedOut, "job_total_processes": receipt.JobProcesses, "children_stopped": receipt.Stopped, "streams_drained": receipt.StreamsDrained, "cleanup_complete": receipt.CleanupComplete, "output_copied": receipt.OutputCopied, "stdout_hash": domain.Digest(receipt.Stdout), "stderr_hash": domain.Digest(receipt.Stderr)}}
-	if len(domain.Bytes(full)) > 4<<20 {
-		return nil, toolDenied("run_check host evidence exceeds 4 MiB")
+		"sandbox_receipt": domain.Object{"pid": receipt.PID, "process_created_ns": receipt.Created, "job": receipt.Job, "profile": receipt.Profile, "appcontainer_sid": receipt.SID, "capabilities": receipt.Capabilities, "exit_code": receipt.ExitCode, "timed_out": receipt.TimedOut, "job_total_processes": receipt.JobProcesses, "children_stopped": receipt.Stopped, "streams_drained": receipt.StreamsDrained, "cleanup_complete": receipt.CleanupComplete, "output_copied": receipt.OutputCopied, "stdout_hash": domain.Digest(receipt.Stdout), "stderr_hash": domain.Digest(receipt.Stderr), "stdout_raw_bytes": len(receipt.Stdout), "stderr_raw_bytes": len(receipt.Stderr), "stdout_raw": receipt.Stdout, "stderr_raw": receipt.Stderr}}
+	if err := runtimeCheckEvidenceBound(full); err != nil {
+		return nil, err
 	}
-	result, err = runtimeToolReply(details)
+	result, err = runtimeCheckReply(details, receipt.Stdout, receipt.Stderr, check.textLimit)
 	if err != nil {
 		return nil, err
 	}

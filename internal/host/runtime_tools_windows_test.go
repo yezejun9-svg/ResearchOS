@@ -182,7 +182,7 @@ func TestRuntimeToolReadPagesEncodedTextWithinBridgeFrame(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(domain.Bytes(reply)) > runtimeToolReadReplyLimit {
+				if len(domain.Bytes(reply)) > runtimeToolReplyLimit {
 					t.Fatalf("payload exceeds read frame budget: %d", len(domain.Bytes(reply)))
 				}
 				frame := domain.Object{"sequence": 123, "key": "task:run:1:tool:1", "state": "CONFIRMED", "payload": reply}
