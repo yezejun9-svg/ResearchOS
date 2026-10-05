@@ -333,7 +333,7 @@ func backupIntegrityPolicy(db *sql.DB, policy *backupPolicy) error {
 func (s *Service) CreateBackup(ctx context.Context, destination string, key []byte) (BackupManifest, error) {
 	return s.createBackupPolicy(ctx, destination, key, nil)
 }
-func (s *Service) createBackupPolicy(ctx context.Context, destination string, key []byte, policy *backupPolicy) (BackupManifest, error) {
+func (s *Service) createBackupPolicy(ctx context.Context, destination string, key []byte, policy *backupPolicy, sources ...WorkspaceBackupSource) (BackupManifest, error) {
 	m := BackupManifest{Format: backupFormat(policy), ID: ID(), Started: Now(), KeyPolicy: "AES-256-GCM; key stored separately; credentials require fresh provisioning after restore", CachePolicy: "SQLite FTS cache included; external worker/context workspaces excluded and rebuilt from sealed content"}
 	if policy != nil {
 		m.Purpose = policy.purpose
@@ -401,6 +401,20 @@ func (s *Service) createBackupPolicy(ctx context.Context, destination string, ke
 			return m, e
 		}
 		files["portable.json"] = Bytes(Object{"format": "RESEARCHOS_PORTABLE_V1", "objects": objects, "authority": "state.sqlite; portable objects preserve IDs, revisions, source relationships and receipt hashes"})
+		var source WorkspaceBackupSource
+		if len(sources) != 0 {
+			source = sources[0]
+		}
+		workspaceFiles, count, err := backupWorkspaceFiles(ctx, db, source, destination)
+		if err != nil {
+			return m, err
+		}
+		for name, raw := range workspaceFiles {
+			files[name] = raw
+		}
+		if count != 0 {
+			m.CachePolicy = "SQLite FTS cache included; authorized workspaces encrypted and bounded; external worker/context caches rebuilt from sealed content"
+		}
 	}
 	if _, e = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); e != nil {
 		return m, e
@@ -494,6 +508,10 @@ type RestoreOptions struct {
 	Key                 []byte
 	SupportedMigrations []int
 	Contracts           *Contracts
+	WorkspaceTarget     WorkspaceRestoreTarget
+	// DatabaseName is the production data-root filename. The library default
+	// remains state.sqlite for callers that manage a standalone restore bundle.
+	DatabaseName string
 	// Migration executes only against the unpublished isolated copy. Irreversible
 	// migration is never promoted automatically; restore the old backup instead.
 	Migration    func(context.Context, *sql.DB) error
@@ -516,6 +534,11 @@ func RestoreBackup(ctx context.Context, directory, destination string, opt Resto
 func restoreBackupPolicy(ctx context.Context, directory, destination string, opt RestoreOptions, policy *backupPolicy) (RestoreReport, error) {
 	start := time.Now()
 	r := RestoreReport{Started: Now(), Status: "FAILED"}
+	absDestination, absErr := filepath.Abs(destination)
+	if absErr != nil {
+		return r, absErr
+	}
+	destination = absDestination
 	if opt.Contracts == nil || len(opt.SupportedMigrations) == 0 {
 		return r, fmt.Errorf("RESTORE_VERSION_POLICY_REQUIRED")
 	}
@@ -525,6 +548,11 @@ func restoreBackupPolicy(ctx context.Context, directory, destination string, opt
 	m, files, e := readBackupPolicy(directory, opt.Key, policy)
 	if e != nil {
 		return r, e
+	}
+	if policy == nil {
+		if e = backupWorkspaceRestorePaths(files, directory, destination); e != nil {
+			return r, e
+		}
 	}
 	r.BackupID = m.ID
 	if Hash(m.Migrations) != Hash(opt.SupportedMigrations) {
@@ -536,6 +564,12 @@ func restoreBackupPolicy(ctx context.Context, directory, destination string, opt
 	}
 	defer backupDiscard(stage)
 	databaseName := "state.sqlite"
+	if opt.DatabaseName != "" {
+		if filepath.Base(opt.DatabaseName) != opt.DatabaseName || strings.ContainsAny(opt.DatabaseName, "/\\:") {
+			return r, fmt.Errorf("RESTORE_DATABASE_NAME_INVALID")
+		}
+		databaseName = opt.DatabaseName
+	}
 	if policy != nil && policy.databaseName != "" {
 		if filepath.Base(policy.databaseName) != policy.databaseName || strings.ContainsAny(policy.databaseName, "/\\:") {
 			return r, fmt.Errorf("RESTORE_DATABASE_NAME_INVALID")
@@ -600,6 +634,13 @@ func restoreBackupPolicy(ctx context.Context, directory, destination string, opt
 	}
 	if Hash(r.Before) != Hash(m.Inventory) {
 		return r, fmt.Errorf("RESTORE_INVENTORY_MISMATCH")
+	}
+	workspaceRequests, e := backupPrepareWorkspaces(ctx, db, files, stage, destination)
+	if e != nil {
+		return r, e
+	}
+	if len(workspaceRequests) != 0 && opt.WorkspaceTarget == nil {
+		return r, fmt.Errorf("RESTORE_WORKSPACE_TARGET_REQUIRED")
 	}
 	rows, e := db.Query("SELECT storage_key,bytes FROM uploaded_content WHERE sealed=1")
 	if e != nil {
@@ -674,6 +715,10 @@ func restoreBackupPolicy(ctx context.Context, directory, destination string, opt
 		return r, e
 	}
 	r.Status = "RESTORED_RECONCILIATION_REQUIRED"
+	if len(workspaceRequests) != 0 {
+		r.Status = "RESTORE_WORKSPACE_PIN_PENDING"
+		r.Recovery["workspace_roots_pending"] = len(workspaceRequests)
+	}
 	r.Finished = Now()
 	r.DurationMS = time.Since(start).Milliseconds()
 	if e = backupWrite(filepath.Join(stage, "restore-report.json"), Bytes(r)); e != nil {
@@ -681,6 +726,38 @@ func restoreBackupPolicy(ctx context.Context, directory, destination string, opt
 	}
 	if e = os.Rename(stage, destination); e != nil {
 		return r, e
+	}
+	if len(workspaceRequests) != 0 {
+		pins, pinErr := opt.WorkspaceTarget(ctx, destination, workspaceRequests)
+		if pinErr != nil {
+			return r, fmt.Errorf("RESTORE_WORKSPACE_PIN_FAILED: restored copy remains non-active: %w", pinErr)
+		}
+		finalDB, openErr := store.Open(filepath.Join(destination, databaseName))
+		if openErr != nil {
+			return r, openErr
+		}
+		if e = backupActivateWorkspaces(ctx, finalDB, workspaceRequests, pins); e == nil {
+			r.After, e = backupInventory(finalDB)
+		}
+		closeErr := finalDB.Close()
+		if e != nil {
+			return r, e
+		}
+		if closeErr != nil {
+			return r, closeErr
+		}
+		r.Status = "RESTORED_RECONCILIATION_REQUIRED"
+		delete(r.Recovery, "workspace_roots_pending")
+		r.Recovery["workspace_roots_rebound"] = len(workspaceRequests)
+		r.Finished = Now()
+		r.DurationMS = time.Since(start).Milliseconds()
+		updatedReport := filepath.Join(destination, "restore-report-updated.json")
+		if e = backupWrite(updatedReport, Bytes(r)); e != nil {
+			return r, e
+		}
+		if e = os.Rename(updatedReport, filepath.Join(destination, "restore-report.json")); e != nil {
+			return r, e
+		}
 	}
 	return r, nil
 }
