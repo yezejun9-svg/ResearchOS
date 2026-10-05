@@ -230,7 +230,11 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 	if e != nil {
 		return nil, e
 	}
-	return Object{"task": t, "run": r, "contract": c, "artifacts": artifacts, "artifact_refs": refs, "policy_revision": state["policy_revision"], "runtime": rt, "authority": root, "observation": observation, "dependency_refs": dependencies, "runtime_qualification": qualification, "planning": planning, "research": research}, nil
+	muTurn, e := s.muTurnSnapshot(tx, project, t, r, c, observation)
+	if e != nil {
+		return nil, e
+	}
+	return Object{"task": t, "run": r, "contract": c, "artifacts": artifacts, "artifact_refs": refs, "policy_revision": state["policy_revision"], "runtime": rt, "authority": root, "observation": observation, "dependency_refs": dependencies, "runtime_qualification": qualification, "planning": planning, "research": research, "mu_turn": muTurn}, nil
 }
 
 type preparedAcceptance struct {
@@ -263,6 +267,12 @@ func (s *Service) prepareTaskAcceptance(ctx context.Context, token, project stri
 		var exit any
 		if check["kind"] == "DETERMINISTIC" && check["rubric_ref"] == nil && check["qualification_id"] == nil {
 			switch Str(check, "command_key") {
+			case "mu.turn-output-v1":
+				status, actual = verifyMuTurn(snap)
+				exit = 1
+				if status == "PASS" {
+					exit = 0
+				}
 			case "research.source-page-v1", "research.source-support-v1", "research.candidate-review-v1", "research.cycle-report-v1", "research.follow-up-v1":
 				status, actual = verifyResearchStage(snap, Str(check, "command_key"))
 				if status == "PASS" {
