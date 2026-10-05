@@ -77,6 +77,20 @@ func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
 			return nil, err
 		}
 	}
+	// W03's additive session schema has its own unnumbered, idempotent path.
+	// The production host must install it as well as the tests and import tools.
+	// Keep it in the same transaction so a missing or invalid schema cannot
+	// leave the business migrations committed with the typed client unusable.
+	sessionSchema, err := os.ReadFile(filepath.Join(filepath.Dir(migrationFile), "next_v24_sessions.sql"))
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(string(sessionSchema)); err != nil {
+		return nil, err
+	}
+	if err = installClientSessionFence(context.Background(), tx, false); err != nil {
+		return nil, err
+	}
 	if e = tx.Commit(); e != nil {
 		return nil, e
 	}
