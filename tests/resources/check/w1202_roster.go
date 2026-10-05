@@ -37,7 +37,7 @@ var w1202AnyLiteral = regexp.MustCompile(`"(W1202-[A-Z0-9_-]+)"`)
 
 func w1202DeclaredRows() (asserted map[string]bool, disclosed map[string]bool, declared map[string]bool) {
 	asserted, disclosed, declared = map[string]bool{}, map[string]bool{}, map[string]bool{}
-	for _, name := range []string{"w1202.go", "w1202_roster.go"} {
+	for _, name := range []string{"w1202.go", "w1202_roster.go", "w1202_recovery.go"} {
 		src, e := os.ReadFile(filepath.Join(repoRoot(), "tests", "resources", "check", name))
 		if e != nil {
 			return nil, nil, nil
@@ -59,7 +59,7 @@ func w1202DeclaredRows() (asserted map[string]bool, disclosed map[string]bool, d
 func w1202RosterOK() {
 	asserted, disclosed, declared := w1202DeclaredRows()
 	if len(asserted) < 20 {
-		ok("W1202-GUARD-SOURCE-UNREADABLE", true,
+		ok("W1202-GUARD-SOURCE-UNREADABLE", false,
 			itoa(len(asserted))+" assertion ids parsed from source; refusing to reconcile")
 		return
 	}

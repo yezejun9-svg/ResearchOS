@@ -229,6 +229,7 @@ func main() {
 		// A different selector on the same command key serves a different card; the accepted W12-01 phases
 		// stay untouched for their own selector and for a selector-less developer run.
 		w1202Phase(ctx, h, graph)
+		w1202RecoveryPhase()
 		return
 	}
 	// the start-time refusal probe runs before the ledger probes: it needs the Goal policy still at its

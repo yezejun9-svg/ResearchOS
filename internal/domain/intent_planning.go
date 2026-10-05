@@ -129,7 +129,7 @@ func (s *Service) intentResource(tx *sql.Tx, p Principal, project string, task O
 	if task["status"] == "ACCEPTED" {
 		blocked = Empty()
 	}
-	request, err := s.createResourceRequest(tx, project, Object{"category": category, "account_ref": nil, "reason_code": code + ":" + Str(task, "id"), "summary": summary, "blocked_task_ids": blocked, "continuable_task_ids": Empty(), "completed_artifact_refs": artifacts, "requested_capability": Str(task, "task_type"), "estimated_cost": nil, "cost_known": false, "resume_checkpoint_ref": nil})
+	request, err := s.createResourceRequest(tx, p, project, Object{"category": category, "account_ref": nil, "reason_code": code, "summary": summary, "blocked_task_ids": blocked, "continuable_task_ids": Empty(), "completed_artifact_refs": artifacts, "requested_capability": Str(task, "task_type"), "estimated_cost": nil, "cost_known": false, "resume_checkpoint_ref": nil})
 	if err != nil {
 		return err
 	}
