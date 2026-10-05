@@ -4,12 +4,14 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"researchos.local/research-os/internal/domain"
+	hostboundary "researchos.local/research-os/internal/host"
 	"researchos.local/research-os/internal/store"
 	"strconv"
 	"strings"
@@ -32,6 +34,7 @@ func run() error {
 	out := f.String("out", "", "new destination (must not exist)")
 	keyfile := f.String("key-file", "", "separate recovery key file; never command-line key bytes")
 	root := f.String("root", ".", "matching application repository root")
+	asDataRoot := f.Bool("as-data-root", false, "restore an operational data root (researchos.sqlite plus fresh Host bindings)")
 	sourceRoot := f.String("source-root", "", "upgrade: exact schema13 release root")
 	sourceProgram := f.String("source-program", "", "upgrade: preserved matching old program")
 	targetProgram := f.String("target-program", "", "upgrade: reviewed target program")
@@ -108,6 +111,12 @@ func run() error {
 		return e
 	}
 	ctx := context.Background()
+	hostConfig := func(db *sql.DB, dataRoot string) hostboundary.Config {
+		return hostboundary.Config{DB: db, Dir: filepath.Join(dataRoot, "host"),
+			ContractsDir:  filepath.Join(*root, "spec", "v2.0", "contracts"),
+			MigrationFile: filepath.Join(*root, "migrations", "sqlite", "0002_domain.sql"),
+			SchemaDir:     filepath.Join(*root, "internal", "api", "contracts")}
+	}
 	if command == "restore" {
 		if *backup == "" {
 			return fmt.Errorf("--backup required")
@@ -124,7 +133,35 @@ func run() error {
 			}
 			versions = append(versions, v)
 		}
-		r, e := domain.RestoreBackup(ctx, *backup, *out, domain.RestoreOptions{Key: key, SupportedMigrations: versions, Contracts: contracts})
+		target := func(ctx context.Context, destination string, requests []domain.WorkspaceRestoreRequest) ([]domain.WorkspaceRestorePin, error) {
+			restored, err := store.Open(filepath.Join(destination, "researchos.sqlite"))
+			if err != nil {
+				return nil, err
+			}
+			defer restored.Close()
+			h, err := hostboundary.New(hostConfig(restored, destination))
+			if err != nil {
+				return nil, err
+			}
+			if _, err := h.BootstrapOwner(ctx); err != nil {
+				return nil, err
+			}
+			pins := make([]domain.WorkspaceRestorePin, 0, len(requests))
+			for _, request := range requests {
+				pin, err := h.PinRestoredWorkspace(ctx, request)
+				if err != nil {
+					return nil, err
+				}
+				pins = append(pins, pin)
+			}
+			return pins, nil
+		}
+		options := domain.RestoreOptions{Key: key, SupportedMigrations: versions, Contracts: contracts}
+		if *asDataRoot {
+			options.WorkspaceTarget = target
+			options.DatabaseName = "researchos.sqlite"
+		}
+		r, e := domain.RestoreBackup(ctx, *backup, *out, options)
 		if e != nil {
 			return e
 		}
@@ -147,7 +184,21 @@ func run() error {
 	}
 	defer db.Close()
 	s := &domain.Service{DB: db, Contracts: contracts}
-	m, e := s.CreateBackup(ctx, *out, key)
+	var active int
+	if e := db.QueryRow(`SELECT count(*) FROM domain_objects WHERE project='' AND kind=? AND json_extract(body,'$.status')=?`,
+		domain.KindWorkspaceBinding, domain.WorkspaceActive).Scan(&active); e != nil {
+		return e
+	}
+	var m domain.BackupManifest
+	if active == 0 {
+		m, e = s.CreateBackup(ctx, *out, key)
+	} else {
+		h, hostErr := hostboundary.New(hostConfig(db, filepath.Dir(*source)))
+		if hostErr != nil {
+			return hostErr
+		}
+		m, e = s.CreateBackupWithWorkspaces(ctx, *out, key, h)
+	}
 	if e != nil {
 		return e
 	}
