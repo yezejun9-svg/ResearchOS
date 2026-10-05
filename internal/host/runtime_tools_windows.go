@@ -24,7 +24,7 @@ const runtimeToolByteLimit = 64 << 10
 // The broker adds sequence/key/state around this payload before sending its
 // 64 KiB bridge frame. Keep room for that envelope and measure encoded bytes,
 // since JSON escaping can expand a requested byte slice substantially.
-const runtimeToolReadReplyLimit = 56 << 10
+const runtimeToolReplyLimit = 56 << 10
 
 // Serialize host writes, including the read/compare/replace interval. External
 // writers are not serialized by this mutex; callers still need a frozen,
@@ -340,7 +340,7 @@ func runtimeToolRead(ctx context.Context, root *os.Root, rel string, args domain
 		if err != nil {
 			return nil, false, err
 		}
-		return reply, len(domain.Bytes(reply)) <= runtimeToolReadReplyLimit, nil
+		return reply, len(domain.Bytes(reply)) <= runtimeToolReplyLimit, nil
 	}
 	if reply, fits, err := build(len(ends) - 1); err != nil || fits {
 		return reply, err
