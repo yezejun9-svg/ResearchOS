@@ -90,6 +90,11 @@ func AuditQualification(in QualificationAuditInput) QualificationAudit {
 	if in.LatencyMS < 0 || in.ActualCost != nil && (math.IsNaN(*in.ActualCost) || math.IsInf(*in.ActualCost, 0) || *in.ActualCost < 0) {
 		valid = false
 	}
+	if in.ActualCost != nil && (math.IsNaN(*in.ActualCost) || math.IsInf(*in.ActualCost, 0)) {
+		// Keep the rejection serializable: JSON cannot represent nonfinite
+		// costs, and an invalid measurement must not prevent its own receipt.
+		r.ActualCost = nil
+	}
 	if valid && (in.Correct+in.FalseAccept+in.FalseReject+in.Abstain != in.Holdout || in.AcceptActions+in.RejectActions+in.Abstain != in.Holdout || in.CriticalFalseAccept > in.FalseAccept || in.FalseAccept > in.NegativeLabels || in.NegativeLabels > in.Holdout || in.Errors > in.Abstain || in.FalseAccept > in.AcceptActions || in.FalseReject > in.RejectActions || in.RecordedInvocations > in.Holdout) {
 		valid = false
 	}

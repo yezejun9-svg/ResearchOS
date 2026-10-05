@@ -1,7 +1,7 @@
 """Exact W11/W11-02 check: fixture negatives + pinned public readiness records.
 
 Exit 2 means genuine resource BLOCKED, never PASS or independent acceptance.
-The old test.jev.live selectors continue to use their existing handler.
+The old test.jev.live selectors forward to their unchanged, pinned handler.
 """
 import datetime as dt
 import hashlib
@@ -15,6 +15,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 GO_SHA256 = 'sha256:d3ccdb604eafa6031133aefe1a3db24f0bb7362b857bc2125ac4e4c178b4b490'
 PYTHON_SHA256 = 'sha256:cce21c0e8710e304273e98ac4b2b0f5aceb639acbcd2343cbaa5c4e81619c45b'
+LEGACY_SHA256 = 'sha256:efafca4f69077d52ef04360ebd30e4744bd3b5ef740861559391801eef495b3e'
 EXPECTED = {
     'REPORT-NEVER-GRANTS', 'UNKNOWN-COST-NULL', 'LATENCY', 'SMOKE12',
     'MODEL-VOTE', 'DEVELOPMENT-AS-HOLDOUT', 'FAMILY-OVERLAP', 'HOLDOUT-TUNING',
@@ -23,6 +24,7 @@ EXPECTED = {
     'INSUFFICIENT-DEV', 'INCOMPLETE-CALLS', 'CRITICAL-ERROR', 'FALSE-ACCEPT-OVER-5',
     'DISAGREEMENT-OVER-5', 'ALL-ABSTAIN', 'COUNT-MISMATCH', 'OVERFLOW',
     'NEGATIVE-COST', 'DENOMINATORS', 'LABEL-COUNTS', 'EXACT-5-PERCENT',
+    'NONFINITE-COST-NAN', 'NONFINITE-COST-POS-INF', 'NONFINITE-COST-NEG-INF',
     *('REUSE-' + n for n in ('license_unknown', 'platform_mismatch',
       'integration_unavailable', 'no_benefit', 'missing_evidence',
       'readme_injection', 'timeout', 'abstain', 'cross_scope_qualification')),
@@ -40,12 +42,7 @@ def save(path, value):
         handle.write('\n')
 
 
-def main():
-    selector = (os.getenv('RESEARCHOS_TASK_ID'), os.getenv('RESEARCHOS_CHECK_ID'),
-                os.getenv('RESEARCHOS_CASE_ID', ''))
-    if selector != ('W11', 'W11-02', '') or len(sys.argv) != 1:
-        print('UNBOUND: exact W11/W11-02 selector with no case/arguments required', file=sys.stderr)
-        return 1
+def owned():
     go = Path(os.getenv('RESEARCHOS_GO') or ROOT / '.local/tools/go1.27.1/go/bin/go.exe')
     if not go.is_file():
         print('pinned Go unavailable', file=sys.stderr)
@@ -146,6 +143,48 @@ def main():
     print(json.dumps(dict(status='BLOCKED' if good else 'FAIL', fixture_status='PASS' if fixture_ok else 'FAIL',
         assertion_count=len(rows), assertion_ids=actual_ids, receipt=str(out/'report.json')), ensure_ascii=False))
     return 2 if good else 1
+
+
+def forward_legacy():
+    legacy = ROOT / 'tests/jev/admit_frozen_live.py'
+    python_hash = digest(Path(sys.executable))
+    before_hash = digest(legacy)
+    if python_hash != PYTHON_SHA256 or before_hash != LEGACY_SHA256:
+        print('pinned legacy handler or Python binary hash mismatch', file=sys.stderr)
+        return 1
+    out = ROOT / 'execution/v2.4/receipts/W11/W11-02/legacy-forward' / str(uuid.uuid4())
+    out.mkdir(parents=True, exist_ok=False)
+    argv = [sys.executable, '-X', 'utf8', 'tests/jev/admit_frozen_live.py', *sys.argv[1:]]
+    save(out/'before.json', dict(argv=argv, cwd=str(ROOT), legacy_sha256=before_hash,
+        python_sha256=python_hash, selector={k: os.getenv(k) for k in
+        ('RESEARCHOS_TASK_ID', 'RESEARCHOS_CHECK_ID', 'RESEARCHOS_CASE_ID')},
+        scope='FORWARD_ONLY_PRESERVE_LEGACY_READ_ONLY_ADMISSION_SCOPE',
+        started_at=dt.datetime.now(dt.timezone.utc).isoformat()))
+    # Inherit standard streams and preserve the complete environment/arguments.
+    # The old handler owns its report and original historical measurement modes.
+    child = subprocess.run(argv, cwd=ROOT, env=os.environ.copy())
+    after_hash = digest(legacy)
+    save(out/'report.json', dict(legacy_sha256_before=before_hash, legacy_sha256_after=after_hash,
+        child_exit_code=child.returncode, source_unchanged=after_hash == before_hash,
+        scope='FORWARD_ONLY_PRESERVE_LEGACY_READ_ONLY_ADMISSION_SCOPE',
+        ended_at=dt.datetime.now(dt.timezone.utc).isoformat()))
+    if after_hash != before_hash:
+        print('legacy handler changed during forwarding', file=sys.stderr)
+        return 1
+    return child.returncode
+
+
+def main():
+    task = os.getenv('RESEARCHOS_TASK_ID', 'W11')
+    check = os.getenv('RESEARCHOS_CHECK_ID', '')
+    case = os.getenv('RESEARCHOS_CASE_ID', '')
+    if task == 'W11' and check == 'W11-02' and not case and len(sys.argv) == 1:
+        return owned()
+    if task == 'W11' and ((check in ('W11-G02', 'W11-G03', 'W11-G04') and not case)
+                         or (not check and case in ('', 'A08'))):
+        return forward_legacy()
+    print('UNBOUND: unknown or mixed W11 selector; W11-02 requires no case/arguments', file=sys.stderr)
+    return 1
 
 
 if __name__ == '__main__':

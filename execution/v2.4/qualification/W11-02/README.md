@@ -47,3 +47,11 @@
 `regression-20261006/report.json` 中的 7 个定向回归全部通过：typed adapter、transport、单次执行/不泄露进度、summary authority 拒绝、冻结资格导入、trusted admission 和 drift 拒绝。它们全部是 FIXTURE，不是新 LIVE 资格。`selector-rejection-20261006/report.json` 证明旧 W11-G02 selector 在 Go/provider 操作前被拒绝。
 
 执行者仅提交可复查产物；独立验收仍待其他身份完成。
+
+## 最终增量：非有限费用与旧入口兼容
+
+当前报告与资源结论见同目录 `resources_round2.json`。上文 35/37 项回执及旧 selector 拒绝属于变更前的历史版本；原始文件保留。当前资格审计为 40 项，新增 NaN、正无穷、负无穷费用的拒绝，并将不可编码费用输出为 `null`。另外 12 项仅使用替身子进程验证转发，不计入资格样本或上述 40 项。
+
+AUTO dispatcher 按 command key 选择 v2.4 registry；因此当前 wrapper 将 W11-G02/G03/G04、A08 和旧空 selector 默认路径转交未修改、固定 hash 的旧 handler，保留原参数、环境、输出、退出码及历史评测语义。W11-02 仍只接受空 case、无参数；混合或未知 selector 拒绝。旧 selector 拒绝回执不再代表当前行为。本轮没有实际运行旧 admission，没有服务刷新或 provider 调用。
+
+初轮真实评测的基线是每用途整体至少 60 开发与 30 独立留出，两种语言的留出各至少 15；只有**申请自动化资格**的完整键才分别要求 60/30。旧 evidence-validity 的 30/15 语言键不足以授予自动化资格，但不否定其完整失败评测与 ADVISORY 降级的有效性。当前整卡 BLOCKED 的依据是 reuse_selection 的真实调用、独立标签和本次 provider 授权未建立，以及服务控制权限受限；不是要求旧语言键为了安全降级交付而晋升。
