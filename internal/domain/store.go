@@ -38,6 +38,9 @@ func Fail(status int, code, msg string) error {
 // remains the legacy constructor so existing stored projects and fixtures keep
 // their historical binding semantics. Children inherit their stored parent.
 func NewCurrentMu(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
+	if err := validateProjectRules(projectRulesBytes, projectRulesMetadata); err != nil {
+		return nil, err
+	}
 	s, err := New(db, contractsDir, migrationFile)
 	if err != nil {
 		return nil, err

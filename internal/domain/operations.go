@@ -98,7 +98,13 @@ func (s *Service) createProject(tx *sql.Tx, p Principal, b Object) (Object, erro
 		}
 	}
 	_, e := tx.Exec("INSERT INTO auth_grants(principal,project) VALUES(?,?)", p.ID, project)
-	return profile, e
+	if e != nil {
+		return nil, e
+	}
+	if e = s.installCurrentProjectRules(tx, p, profile, state); e != nil {
+		return nil, e
+	}
+	return profile, nil
 }
 func (s *Service) createRequirement(tx *sql.Tx, project string, b Object) (Object, error) {
 	o := Merge(Base(project), b)

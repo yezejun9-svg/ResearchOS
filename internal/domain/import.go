@@ -57,6 +57,9 @@ func (s *Service) ImportSpecification(ctx context.Context, token, root, expected
 		return nil, e
 	}
 	allowed := " package_id package_version specification_date user_timezone status product_implementation_status product_test_status entrypoint execution_goal source_snapshot requirement_ids task_ids case_ids generated_report integrity_note files ui_screen_ids document_count additional_sources "
+	if manifest["package_version"] == "2.4.0" {
+		allowed += " harness_capability_ids supersedes short_goal change_summary product_capability_ids adoption_capability_ids source_package_revision execution_plan execution_step_count construction_model built_at scope_notice delivery_revision construction_host updated_at "
+	}
 	for k := range manifest {
 		if !strings.Contains(allowed, " "+k+" ") {
 			return nil, Fail(400, "INVALID_REQUEST", "manifest field is not a package field")
@@ -147,7 +150,11 @@ func (s *Service) ImportSpecification(ctx context.Context, token, root, expected
 		return nil, e
 	}
 	project := Str(profile, "project_id")
-	refs := Empty()
+	refs := append(Empty(), Arr(profile, "source_document_refs")...)
+	refKeys := map[string]bool{}
+	for _, ref := range refs {
+		refKeys[Hash(ref)] = true
+	}
 	byPath := map[string]Object{}
 	inventory := Empty()
 	var manifestArtifact Object
@@ -156,12 +163,19 @@ func (s *Service) ImportSpecification(ctx context.Context, token, root, expected
 		if file.path == "PACKAGE_MANIFEST.json" {
 			kind = "MANIFEST"
 		}
-		a, e := s.serverArtifact(tx, project, p.ID, kind, file.raw, Empty())
+		a, e := s.importedProjectRules(tx, project, profile, file)
+		if e == nil && a == nil {
+			a, e = s.serverArtifact(tx, project, p.ID, kind, file.raw, Empty())
+		}
 		if e != nil {
 			return nil, e
 		}
 		byPath[file.path] = a
-		refs = append(refs, Ref(a, "Artifact"))
+		ref := Ref(a, "Artifact")
+		if key := Hash(ref); !refKeys[key] {
+			refs = append(refs, ref)
+			refKeys[key] = true
+		}
 		inventory = append(inventory, Object{"path": file.path, "artifact_ref": Ref(a, "Artifact"), "sha256": a["content_hash"]})
 		if kind == "MANIFEST" {
 			manifestArtifact = a
