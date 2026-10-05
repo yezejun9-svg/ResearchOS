@@ -21,7 +21,9 @@ import (
 
 // servedChecks are the selectors this program owns. Everything else on this command key must
 // reach the accepted harness, so the whitelist is the only thing allowed to be served locally.
-var servedChecks = map[string]bool{"W12-01": true}
+// W12-02 is served here rather than forwarded because ops/ci/resources.py parser.errors on any check
+// outside W12-G01/W12-G02, and that file is outside W12-02's write_scope.
+var servedChecks = map[string]bool{"W12-01": true, "W12-02": true}
 
 // routesToLegacy is the whole routing rule, kept free of side effects so the truth table in
 // main.go is an assertion rather than a comment.
