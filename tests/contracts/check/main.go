@@ -8,9 +8,10 @@
 package main
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -243,17 +244,49 @@ func main() {
 	tx.ExecContext(ctx, `INSERT INTO schema_migrations(version) VALUES (9021)`)
 	tx.Commit()
 
+	// CANCEL is now delegated to the canonical domain Service. Build that real
+	// service and provision current project Owners; a client writer lease alone
+	// does not grant permission to change a Run.
+	domainSvc, domainErr := domain.New(db, filepath.Join(root, "spec", "v2.0", "contracts"),
+		filepath.Join(root, "migrations", "sqlite", "0002_domain.sql"))
+	ok("CANCEL-DOMAIN-SERVICE-READY", domainErr == nil, domainErr)
+	if domainErr != nil {
+		return
+	}
+	for _, principalID := range []string{"os-user-a", "os-user-b"} {
+		err := domainSvc.ProvisionPrincipal(ctx, domain.Principal{ID: principalID, Roles: []string{"OWNER"},
+			Grants: []domain.Grant{{ProjectID: "p1"}}})
+		ok("CANCEL-OWNER-"+principalID, err == nil, err)
+		if err != nil {
+			return
+		}
+	}
+	readerErr := domainSvc.ProvisionPrincipal(ctx, domain.Principal{ID: "os-reader", Roles: []string{"READER"},
+		Grants: []domain.Grant{{ProjectID: "p1"}}})
+	ok("CANCEL-READER-SEEDED", readerErr == nil, readerErr)
+	if readerErr != nil {
+		return
+	}
+
 	db.ExecContext(ctx, `INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('p1','Project','p1',1,'{}',0)`)
 	now := time.Now().UTC()
-	seedRun := func(id, body string, rev int64) {
-		db.ExecContext(ctx, `INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('p1','Run',?,?,?,0)`, id, rev, body)
+	stateErr := seedFixtureProjectState(ctx, db, domainSvc, "p1", now)
+	ok("CANCEL-PROJECT-STATE-READY", stateErr == nil, stateErr)
+	if stateErr != nil {
+		return
 	}
-	seedRun("run-live", `{"status":"RUNNING","children_stopped":false,"queue_empty":false}`, 4)
-	seedRun("run-cancelling", `{"status":"CANCEL_REQUESTED","children_stopped":false,"queue_empty":false,"cancel_requested_at":"`+now.Add(-time.Minute).Format(time.RFC3339Nano)+`"}`, 5)
-	seedRun("run-settled", `{"status":"CANCEL_REQUESTED","children_stopped":true,"queue_empty":true,"cancel_requested_at":"`+now.Add(-3*time.Minute).Format(time.RFC3339Nano)+`","cancel_confirmed_at":"`+now.Add(-time.Minute).Format(time.RFC3339Nano)+`"}`, 7)
-	seedRun("run-failed", `{"status":"FAILED","children_stopped":true,"queue_empty":true}`, 3)
+	seedRun := func(project, id, body string, rev int64) {
+		err := seedFixtureRun(ctx, db, domainSvc, project, id, body, rev, now)
+		ok("CANCEL-RUN-SEED-"+id, err == nil, err)
+	}
+	seedRun("p1", "run-live", `{"status":"RUNNING","children_stopped":false,"queue_empty":false}`, 4)
+	seedRun("p1", "run-live-2", `{"status":"RUNNING","children_stopped":false,"queue_empty":false}`, 4)
+	seedRun("p1", "run-cancelling", `{"status":"CANCEL_REQUESTED","children_stopped":false,"queue_empty":false,"cancel_requested_at":"`+now.Add(-time.Minute).Format(time.RFC3339Nano)+`"}`, 5)
+	seedRun("p1", "run-settled", `{"status":"CANCEL_REQUESTED","children_stopped":true,"queue_empty":true,"cancel_requested_at":"`+now.Add(-3*time.Minute).Format(time.RFC3339Nano)+`","cancel_confirmed_at":"`+now.Add(-time.Minute).Format(time.RFC3339Nano)+`"}`, 7)
+	seedRun("p1", "run-settled-7", `{"status":"CANCEL_REQUESTED","children_stopped":true,"queue_empty":true,"cancel_requested_at":"`+now.Add(-3*time.Minute).Format(time.RFC3339Nano)+`","cancel_confirmed_at":"`+now.Add(-time.Minute).Format(time.RFC3339Nano)+`"}`, 7)
+	seedRun("p1", "run-failed", `{"status":"FAILED","children_stopped":true,"queue_empty":true}`, 3)
 	// a foreign-project run must never be reachable through p1's session
-	db.ExecContext(ctx, `INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('p2','Run','run-other',1,'{"status":"RUNNING"}',0)`)
+	seedRun("p2", "run-other", `{"status":"RUNNING","children_stopped":false,"queue_empty":false}`, 1)
 
 	seedSession := func(id string, withLease bool) {
 		s := domain.ClientSession{ID: id, ProjectID: "p1", Revision: 1, CreatedAt: now, UpdatedAt: now,
@@ -261,6 +294,10 @@ func main() {
 			WorkspaceRef: strptr("ws-p1"), Title: strptr("qualification session"),
 			ModelConfigRef: strptr("model-deepseek-flash"), CoreBuildID: strptr("core-build-w0302"),
 			Protocol: domain.ClientSessionProtocol, ResumeExplicit: 1}
+		if runID := map[string]string{"s1": "run-live", "s2": "run-live-2", "s3": "run-settled",
+			"s4": "run-cancelling", "s5": "run-failed", "s6": "run-other", "s7": "run-settled-7"}[id]; runID != "" {
+			s.RunID = strptr(runID)
+		}
 		if withLease {
 			s.LeaseExpiresAt = tmptr(now.Add(2 * time.Hour))
 		}
@@ -270,11 +307,11 @@ func main() {
 		}
 		t.Commit()
 	}
-	for i := 1; i <= 9; i++ {
-		seedSession(fmt.Sprintf("s%d", i), i != 9)
+	for i := 1; i <= 11; i++ {
+		seedSession(fmt.Sprintf("s%d", i), i != 9 && i != 11)
 	}
 
-	svc := &domain.ClientService{Doc: schemaDoc, Host: domain.ClientHostInfo{
+	svc := &domain.ClientService{Doc: schemaDoc, Domain: domainSvc, Host: domain.ClientHostInfo{
 		InstanceID: "host-w0302", CoreBuildID: "core-build-w0302", OperatingMode: "LOCAL_USER_HOST",
 		ConfigRevision: 3, LeaseTTL: 2 * time.Hour}}
 
@@ -342,7 +379,14 @@ func main() {
 	}
 	journalRows := func(project string) int {
 		var n int
-		db.QueryRowContext(ctx, `SELECT count(*) FROM outbox WHERE project=?`, project).Scan(&n)
+		// The canonical domain event and the typed session event share outbox;
+		// these assertions count only session events by their session_id.
+		db.QueryRowContext(ctx, `SELECT count(*) FROM outbox WHERE project=? AND json_extract(body,'$.session_id') IS NOT NULL`, project).Scan(&n)
+		return n
+	}
+	domainRunEvents := func(project string) int {
+		var n int
+		db.QueryRowContext(ctx, `SELECT count(*) FROM outbox WHERE project=? AND json_extract(body,'$.event_type')='RUN_CHANGED'`, project).Scan(&n)
 		return n
 	}
 	seqList := func(project, sessionID string) []int64 {
@@ -394,6 +438,15 @@ func main() {
 	}
 	c1, _, err := run(env("cmd-cancel-live", "cli-a", "s1", "session.control", ctrlPayload("run-live"), 1, 1), "os-user-a")
 	ok("CANCEL-ACKNOWLEDGED", err == nil && statusOf(c1) == "ACKNOWLEDGED", err, c1)
+	var canonicalRaw string
+	var canonicalRev int64
+	canonicalErr := db.QueryRowContext(ctx, `SELECT body,revision FROM domain_objects WHERE project='p1' AND kind='Run' AND id='run-live'`).Scan(&canonicalRaw, &canonicalRev)
+	var canonicalRun domain.Object
+	json.Unmarshal([]byte(canonicalRaw), &canonicalRun)
+	ok("CANCEL-CANONICAL-RUN-UPDATED", canonicalErr == nil && canonicalRev == 5 &&
+		canonicalRun["status"] == "CANCEL_REQUESTED" && canonicalRun["cancel_requested_at"] != nil,
+		canonicalErr, canonicalRev, canonicalRun["status"], canonicalRun["cancel_requested_at"])
+	ok("CANCEL-DOMAIN-EVENT-1", domainRunEvents("p1") == 1, domainRunEvents("p1"))
 	ok("CANCEL-WATERMARK-1", sessionCol("s1", "event_watermark") == 1, sessionCol("s1", "event_watermark"))
 	ok("CANCEL-REVISION-BUMPED", sessionCol("s1", "revision") == 2, sessionCol("s1", "revision"))
 	ok("CANCEL-JOURNAL-1", journalRows("p1") == 1, journalRows("p1"))
@@ -404,14 +457,20 @@ func main() {
 	ok("REPLAY-SAME-ANSWER", err == nil && replayed && statusOf(c1b) == "ACKNOWLEDGED", err, replayed, c1b)
 	ok("REPLAY-ZERO-SECOND-EFFECT", sessionCol("s1", "event_watermark") == 1 && sessionCol("s1", "revision") == 2 && journalRows("p1") == 1,
 		sessionCol("s1", "event_watermark"), sessionCol("s1", "revision"), journalRows("p1"))
+	ok("REPLAY-ZERO-SECOND-DOMAIN-EVENT", domainRunEvents("p1") == 1, domainRunEvents("p1"))
 	// same key, different request body -> conflict, and nothing was written
 	_, _, errConflict := run(env("cmd-cancel-live", "cli-a", "s1", "session.control", ctrlPayload("run-settled"), 1, 1), "os-user-a")
 	ok("CONFLICT-SAME-KEY-DIFFERENT-REQUEST", errConflict == domain.ErrIdemConflict, errConflict)
 	ok("CONFLICT-NO-STATE-DRIFT", journalRows("p1") == 1 && sessionCol("s1", "revision") == 2, journalRows("p1"), sessionCol("s1", "revision"))
 	// a second principal is evaluated in its own idempotency namespace, not served another
 	// user's stored answer
-	other, otherReplay, errOther := run(env("cmd-cancel-live", "cli-a", "s2", "session.control", ctrlPayload("run-live"), 1, 1), "os-user-b")
+	other, otherReplay, errOther := run(env("cmd-cancel-live", "cli-a", "s2", "session.control", ctrlPayload("run-live-2"), 1, 1), "os-user-b")
 	ok("PRINCIPAL-SCOPED-IDEMPOTENCY", errOther == nil && !otherReplay && statusOf(other) == "ACKNOWLEDGED", errOther, otherReplay, other)
+	busy, _, errBusy := run(env("cmd-tk-live", "cli-b", "s2", "session.attach",
+		`{"after_sequence":1,"request_write_owner":true}`, nil, 2), "os-user-b")
+	ok("TAKEOVER-LIVE-RUN-BUSY", errBusy == nil && statusOf(busy) == "REJECTED" && codeOf(busy) == "SESSION_BUSY", errBusy, busy)
+	ok("TAKEOVER-LIVE-RUN-NO-MOVE", sessionCol("s2", "writer_epoch") == 1 && sessionCol("s2", "revision") == 2,
+		sessionCol("s2", "writer_epoch"), sessionCol("s2", "revision"))
 	// cancel already confirmed and settled by the runtime -> COMPLETED with settlement truth
 	c2, _, err := run(env("cmd-cancel-settled", "cli-a", "s3", "session.control", ctrlPayload("run-settled"), 1, 1), "os-user-a")
 	ok("CANCEL-SETTLED-COMPLETED", err == nil && statusOf(c2) == "COMPLETED", err, c2)
@@ -420,6 +479,11 @@ func main() {
 			c2.Result["queue_empty"] == true && c2.Result["snapshot"] != nil, c2.Result)
 	}
 	// cancel requested but not yet confirmed is never reported as settled
+	readerCancel, _, readerCancelErr := run(env("cmd-cancel-reader", "cli-a", "s4", "session.control", ctrlPayload("run-cancelling"), 1, 1), "os-reader")
+	ok("CANCEL-READER-WRITER-LEASE-INSUFFICIENT", readerCancelErr == nil && statusOf(readerCancel) == "REJECTED" && codeOf(readerCancel) == "FORBIDDEN",
+		readerCancelErr, readerCancel)
+	ok("CANCEL-READER-NO-STATE-DRIFT", sessionCol("s4", "revision") == 1 && rowsFor("p1", "s4") == 0,
+		sessionCol("s4", "revision"), rowsFor("p1", "s4"))
 	c3, _, err := run(env("cmd-cancel-unconfirmed", "cli-a", "s4", "session.control", ctrlPayload("run-cancelling"), 1, 1), "os-user-a")
 	ok("CANCEL-UNCONFIRMED-NOT-SETTLED", err == nil && statusOf(c3) == "ACKNOWLEDGED" && codeOf(c3) == "", err, c3)
 	if c3 != nil {
@@ -451,11 +515,11 @@ func main() {
 	if stale != nil {
 		ok("TAKEOVER-STALE-REPORTS-CURRENT", stale.Revision != nil && *stale.Revision == 1, stale.Revision)
 	}
-	sameClient, _, _ := run(env("cmd-tk-same", "cli-a", "s7", "session.attach",
+	sameClient, _, _ := run(env("cmd-tk-same", "cli-a", "s10", "session.attach",
 		`{"after_sequence":0,"request_write_owner":true}`, nil, 1), "os-user-a")
-	ok("TAKEOVER-SAME-CLIENT-BUSY", statusOf(sameClient) == "REJECTED" && codeOf(sameClient) == "WRITER_BUSY", sameClient)
-	ok("TAKEOVER-SAME-CLIENT-NO-MOVE", sessionCol("s7", "writer_epoch") == 1 && sessionCol("s7", "revision") == 1,
-		sessionCol("s7", "writer_epoch"), sessionCol("s7", "revision"))
+	ok("TAKEOVER-SAME-CLIENT-RENEWS", statusOf(sameClient) == "ACKNOWLEDGED", sameClient)
+	ok("TAKEOVER-SAME-CLIENT-MOVES-ONCE", sessionCol("s10", "writer_epoch") == 2 && sessionCol("s10", "revision") == 3 && rowsFor("p1", "s10") == 1,
+		sessionCol("s10", "writer_epoch"), sessionCol("s10", "revision"), rowsFor("p1", "s10"))
 	tk, _, err := run(env("cmd-tk-real", "cli-b", "s7", "session.attach",
 		`{"after_sequence":0,"request_write_owner":true}`, nil, 1), "os-user-a")
 	ok("TAKEOVER-ACKNOWLEDGED", err == nil && statusOf(tk) == "ACKNOWLEDGED", err, tk)
@@ -475,8 +539,9 @@ func main() {
 	ok("OLD-EPOCH-REJECTED", errOld == nil && statusOf(oldEpoch) == "REJECTED" && codeOf(oldEpoch) == "STALE_WRITER_EPOCH", errOld, oldEpoch)
 	// the new writer continues on the current revision and epoch
 	newRev, newEpoch, _ := sessionState("s7")
-	newWrite, _, errNew := run(env("cmd-new-writer", "cli-b", "s7", "session.control", ctrlPayload("run-live"), newEpoch, newRev), "os-user-a")
-	ok("NEW-WRITER-WRITE-OK", errNew == nil && statusOf(newWrite) == "ACKNOWLEDGED", errNew, newWrite, newRev, newEpoch)
+	newWrite, _, errNew := run(env("cmd-new-writer", "cli-b", "s7", "session.control", ctrlPayload("run-settled-7"), newEpoch, newRev), "os-user-a")
+	ok("NEW-WRITER-CONTROL-AUTHORIZED", errNew == nil && statusOf(newWrite) == "COMPLETED" && newWrite != nil && newWrite.Result != nil && newWrite.Result["settled"] == true,
+		errNew, newWrite, newRev, newEpoch)
 	// a session id from another project never resolves
 	proj2 := map[string]any{"protocol_version": "researchos-client/2", "command_id": "cmd-cross-proj2", "client_id": "cli-a",
 		"project_id": "p2", "session_id": "s1", "expected_revision": newRev, "writer_epoch": 1,
@@ -539,10 +604,10 @@ func main() {
 		w, _ := snap["writer"].(map[string]any)
 		ok("SNAPSHOT-WRITER-LEASE", w != nil && w["client_id"] == "cli-a" && w["epoch"] == float64(1), snap["writer"])
 	}
-	s9snap, _, _ := run(env("cmd-snapshot-9", "cli-a", "s9", "session.get", `{}`, nil, 0), "os-user-a")
+	s9snap, _, _ := run(env("cmd-snapshot-11", "cli-a", "s11", "session.get", `{}`, nil, 0), "os-user-a")
 	if s9snap != nil && s9snap.Result != nil {
 		snap := s9snap.Result
-		// s9 has no lease expiry: writer must be reported as null, never fabricated
+		// s11 has no lease expiry: writer must be reported as null, never fabricated
 		ok("SNAPSHOT-NULL-WRITER", snap["writer"] == nil, snap["writer"])
 		ok("SNAPSHOT-NULLABLE-REFS", snap["goal_id"] == nil && snap["active_run_id"] == nil &&
 			snap["checkpoint_artifact_ref"] == nil && snap["run_status"] == nil, snap["goal_id"], snap["active_run_id"])
@@ -551,11 +616,11 @@ func main() {
 	// --- stream reconstruction and gap detection straight on the journal
 	rev2, ep2, wm2 := sessionState("s2")
 	type pending struct {
-		seq   int64
-		rev   int64
-		kind  string
-		pay   string
-		id    string
+		seq  int64
+		rev  int64
+		kind string
+		pay  string
+		id   string
 	}
 	kindOf := func(seq, rev int64, kind, pay, id string) pending {
 		return pending{seq: seq, rev: rev, kind: kind, pay: pay, id: id}
@@ -846,7 +911,7 @@ func main() {
 			// the protocol answer comes before any credential question
 			ok("HTTP-OLD-PROTOCOL-BEFORE-AUTH", stOld == 400 && bytes.Contains(bodyOld, []byte("UNSUPPORTED_PROTOCOL")), stOld, string(bodyOld))
 
-			perr := svc2.ProvisionPrincipal(ctx, domain.Principal{ID: "qual-w0302", Roles: []string{"READER"},
+			perr := svc2.ProvisionPrincipal(ctx, domain.Principal{ID: "qual-w0302", Roles: []string{"OWNER"},
 				Grants: []domain.Grant{{ProjectID: "p1"}}})
 			ok("HTTP-PRINCIPAL-PROVISIONED", perr == nil, perr)
 			token, terr := svc2.IssueCredential(ctx, "qual-w0302", 5*time.Minute)
@@ -865,7 +930,11 @@ func main() {
 			}
 
 			hdb.ExecContext(ctx, `INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('p1','Project','p1',1,'{}',0)`)
-			hdb.ExecContext(ctx, `INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES('p1','Run','run-http',1,'{"status":"RUNNING","children_stopped":false,"queue_empty":false}',0)`)
+			hstateErr := seedFixtureProjectState(ctx, hdb, svc2, "p1", now)
+			ok("HTTP-CANCEL-PROJECT-STATE", hstateErr == nil, hstateErr)
+			hrunErr := seedFixtureRun(ctx, hdb, svc2, "p1", "run-http",
+				`{"status":"RUNNING","children_stopped":false,"queue_empty":false}`, 1, now)
+			ok("HTTP-CANCEL-RUN-SEED", hrunErr == nil, hrunErr)
 			tsession := domain.ClientSession{ID: "shttp", ProjectID: "p1", Revision: 1, CreatedAt: now, UpdatedAt: now,
 				WriterEpoch: 1, WriterClientID: "cli-http", UpstreamSession: "up-shttp", RunID: strptr("run-http"),
 				WorkspaceRef: strptr("ws-p1"), Title: strptr("http session"), ModelConfigRef: strptr("model-http"),
@@ -884,6 +953,14 @@ func main() {
 				status2, _ = wire2["status"].(string)
 			}
 			ok("HTTP-CANCEL-ACKNOWLEDGED", st2 == 200 && status2 == "ACKNOWLEDGED", st2, string(body2))
+			var httpRunRaw string
+			var httpRunRev int64
+			httpRunErr := hdb.QueryRowContext(ctx, `SELECT body,revision FROM domain_objects WHERE project='p1' AND kind='Run' AND id='run-http'`).Scan(&httpRunRaw, &httpRunRev)
+			var httpRun domain.Object
+			json.Unmarshal([]byte(httpRunRaw), &httpRun)
+			ok("HTTP-CANCEL-CANONICAL-RUN-UPDATED", httpRunErr == nil && httpRunRev == 2 &&
+				httpRun["status"] == "CANCEL_REQUESTED" && httpRun["cancel_requested_at"] != nil,
+				httpRunErr, httpRunRev, httpRun["status"], httpRun["cancel_requested_at"])
 			if wire2 != nil {
 				verr2 := schemaDoc.ValidateDef("CommandResponse", wire2)
 				ok("HTTP-CANCEL-TYPED", verr2 == nil, verr2)
@@ -906,6 +983,70 @@ func main() {
 			ok("HTTP-TRANSPORT-BOUNDED-RETRY", httpRetries <= 3, httpRetries)
 		}
 	}
+}
+
+func seedFixtureProjectState(ctx context.Context, db *sql.DB, svc *domain.Service, project string, now time.Time) error {
+	state := domain.Object{
+		"id": "state-" + project, "project_id": project, "revision": 1,
+		"created_at": now.Format(time.RFC3339Nano), "updated_at": now.Format(time.RFC3339Nano),
+		"profile_revision": 1, "current_requirement_refs": domain.Empty(), "current_decision_refs": domain.Empty(),
+		"active_goal_ids": domain.Empty(), "active_cycle_id": nil, "blocking_conflict_ids": domain.Empty(),
+		"pending_change_ids": domain.Empty(), "latest_release_id": nil, "event_sequence": 0,
+		"policy_revision": 1, "binding": domain.Object{"route": "THIN_CORE", "upstream_project_id": nil,
+			"upstream_goal_id": nil, "upstream_task_id": nil},
+	}
+	if err := svc.Contracts.Validate("ProjectState", state); err != nil {
+		return err
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES(?,?,?,?,?,0)`,
+		project, "ProjectState", state["id"], 1, string(domain.Bytes(state)))
+	return err
+}
+
+func seedFixtureRun(ctx context.Context, db *sql.DB, svc *domain.Service, project, id, fragment string, rev int64, now time.Time) error {
+	// The published Run shape is validated before it enters the fixture. The
+	// reference rows are present so the production domain put() path must still
+	// resolve them; this check does not execute Task or runtime registration.
+	for _, ref := range []struct{ kind, id string }{
+		{"Task", "task-" + id}, {"RuntimeRegistration", "runtime-" + id}, {"ContextBundle", "context-" + id},
+	} {
+		seed := domain.Object{"id": ref.id, "project_id": project, "revision": 1}
+		if _, err := db.ExecContext(ctx, `INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES(?,?,?,?,?,0)`,
+			project, ref.kind, ref.id, 1, string(domain.Bytes(seed))); err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO domain_versions(project,kind,id,revision,body) VALUES(?,?,?,?,?)`,
+			project, ref.kind, ref.id, 1, string(domain.Bytes(seed))); err != nil {
+			return err
+		}
+	}
+	runBody := domain.Object{
+		"id": id, "project_id": project, "revision": rev,
+		"created_at": now.Format(time.RFC3339Nano), "updated_at": now.Format(time.RFC3339Nano),
+		"task_id": "task-" + id, "runtime_id": "runtime-" + id,
+		"executor_principal_id": "os-user-a", "attempt": 1, "status": "RUNNING",
+		"input_refs": domain.Empty(), "context_bundle_id": "context-" + id,
+		"external_run_id": nil, "workspace_snapshot_id": "snapshot-" + id,
+		"lease_token_hash": domain.Digest([]byte("fixture-lease-" + id)),
+		"lease_expires_at": now.Add(2 * time.Hour).Format(time.RFC3339Nano),
+		"heartbeat_at":     nil, "checkpoint_artifact_id": nil, "result_artifact_ids": domain.Empty(),
+		"execution_report": nil, "exit_code": nil, "runtime_settled_at": nil,
+		"cancel_requested_at": nil, "cancel_confirmed_at": nil, "children_stopped": nil,
+		"queue_empty": nil, "started_at": nil, "ended_at": nil, "lease_epoch": 1,
+	}
+	var state domain.Object
+	if err := json.Unmarshal([]byte(fragment), &state); err != nil {
+		return err
+	}
+	for key, value := range state {
+		runBody[key] = value
+	}
+	if err := svc.Contracts.Validate("Run", runBody); err != nil {
+		return err
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO domain_objects(project,kind,id,revision,body,immutable) VALUES(?,?,?,?,?,0)`,
+		project, "Run", id, rev, string(domain.Bytes(runBody)))
+	return err
 }
 
 func jsonGeneric(raw []byte) any {
