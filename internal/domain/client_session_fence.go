@@ -17,6 +17,12 @@ type fenceExec interface {
 // Open sessions with a run are seeded into the barriers so restored snapshots cannot
 // silently re-handoff writers. Returns nil (no-op) when client_sessions does not exist.
 func EnsureClientSessionFence(ctx context.Context, ex fenceExec) error {
+	return installClientSessionFence(ctx, ex, true)
+}
+
+// Ordinary startup installs the invariant triggers without marking active runs
+// as restored. Only the restore path may advance the reconciliation barrier.
+func installClientSessionFence(ctx context.Context, ex fenceExec, restored bool) error {
 	var present int
 	row := ex.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='client_sessions'`)
 	if err := row.Scan(&present); err != nil {
@@ -28,13 +34,15 @@ func EnsureClientSessionFence(ctx context.Context, ex fenceExec) error {
 	if _, err := ex.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS backup_restore_barriers(project TEXT NOT NULL,run TEXT NOT NULL,restored_at TEXT NOT NULL,PRIMARY KEY(project,run))`); err != nil {
 		return err
 	}
-	if _, err := ex.ExecContext(ctx, `INSERT INTO backup_restore_barriers(project,run,restored_at)
+	if restored {
+		if _, err := ex.ExecContext(ctx, `INSERT INTO backup_restore_barriers(project,run,restored_at)
 		SELECT s.project_id, s.run_id, ? FROM client_sessions s
 		JOIN domain_objects r ON r.kind='Run' AND r.project=s.project_id AND r.id=s.run_id
 		WHERE s.sealed_at IS NULL AND s.run_id IS NOT NULL
 		AND json_extract(r.body,'$.status') IN ('QUEUED','STARTING','RUNNING','CANCEL_REQUESTED','RECONCILING','LOST')
 		ON CONFLICT(project,run) DO UPDATE SET restored_at=excluded.restored_at`, Now()); err != nil {
-		return err
+			return err
+		}
 	}
 	if _, err := ex.ExecContext(ctx, `CREATE TRIGGER IF NOT EXISTS client_session_epoch_no_regression BEFORE UPDATE OF writer_epoch ON client_sessions
 		WHEN NEW.writer_epoch < OLD.writer_epoch BEGIN SELECT RAISE(ABORT,'SESSION_EPOCH_REGRESSION'); END;`); err != nil {
