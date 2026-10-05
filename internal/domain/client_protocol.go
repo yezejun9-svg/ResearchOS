@@ -232,8 +232,8 @@ func (e *Envelope) validatePayload() error {
 		if err := requiredString("task_id", p.TaskID); err != nil {
 			return err
 		}
-		if err := requiredString("text", p.Text); err != nil {
-			return err
+		if p.Text == nil {
+			return fmt.Errorf("MISSING_FIELD:text")
 		}
 		lp := strings.ToLower(*p.RelativePath)
 		if strings.HasPrefix(*p.RelativePath, "/") || strings.Contains(lp, ":") {
@@ -626,6 +626,7 @@ type ClientService struct {
 	Domain             *Service
 	SessionRuntime     ClientSessionRuntime
 	WorkspaceAuthority WorkspaceAuthority
+	WorkspaceFiles     ClientWorkspaceFiles
 	InventoryScanner   LocalInventoryScanner
 }
 
@@ -919,6 +920,8 @@ func (s *ClientService) handleRead(ctx context.Context, tx *sql.Tx, env *Envelop
 			"credentials": nulls(s.Host.CredentialSumm), "workspaces": nulls(s.Host.WorkspaceBind),
 			"supported_methods": support, "operating_mode": mode,
 		}), nil
+	case "workspace.tree", "workspace.read", "workspace.diff":
+		return s.readClientWorkspace(ctx, tx, env, principal)
 	case "session.get", "session.attach":
 		sess, err := loadClientSession(ctx, tx, deref(env.SessionID), deref(env.ProjectID))
 		if err == sql.ErrNoRows {
@@ -1000,6 +1003,10 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		return s.clientFirstUse(ctx, tx, env, principal)
 	case "session.send":
 		return s.sendClientMessage(ctx, tx, env, principal, sess)
+	case "artifact.import":
+		return s.importClientArtifact(ctx, tx, env, principal, sess)
+	case "workspace.write":
+		return s.writeClientWorkspace(ctx, tx, env, principal, sess)
 	case "session.attach":
 		var p struct {
 			RequestWriteOwner bool `json:"request_write_owner"`

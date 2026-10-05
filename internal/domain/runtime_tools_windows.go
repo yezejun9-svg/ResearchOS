@@ -97,7 +97,8 @@ func (c *RuntimeCoordinator) runtimeToolGate(ctx context.Context, tx *sql.Tx, ro
 	if e != nil {
 		return request, e
 	}
-	request = RuntimeToolRequest{WorkspacePath: binding.RealPath, Access: binding.Access, Name: Str(payload, "name"), Arguments: payload["arguments"].(map[string]any), Policy: policy}
+	request = RuntimeToolRequest{WorkspacePath: binding.RealPath, Access: binding.Access, Name: Str(payload, "name"), Arguments: payload["arguments"].(map[string]any), Policy: policy,
+		IntentKey: "runtime-tool/" + Hash(Object{"project_id": route.ProjectID, "run_id": runID, "effect_key": frame.Key})}
 	return request, nil
 }
 
@@ -123,6 +124,27 @@ func (c *RuntimeCoordinator) brokerTool(ctx context.Context, route RuntimeCoordi
 	tx.Rollback()
 	if e != nil {
 		return notApplied("tool binding ended before host dispatch")
+	}
+	// Physical publication rechecks the original run and lease after acquiring
+	// its file guards. The child cannot supply or replace this callback.
+	request.Revalidate = func(checkCtx context.Context) error {
+		checkTx, checkRun, checkDispatch, err := c.dispatchGate(checkCtx, route, runID, lease, epoch)
+		if err != nil {
+			return err
+		}
+		defer checkTx.Rollback()
+		checkTask, err := load(checkTx, route.ProjectID, "Task", Str(checkRun, "task_id"))
+		if err != nil {
+			return err
+		}
+		current, err := c.runtimeToolGate(checkCtx, checkTx, route, checkTask, checkDispatch, frame, payload)
+		if err != nil {
+			return err
+		}
+		if current.IntentKey != request.IntentKey || current.WorkspacePath != request.WorkspacePath || current.Access != request.Access || Hash(current.Policy) != Hash(request.Policy) {
+			return Fail(403, "FORBIDDEN", "tool authority changed before physical publication")
+		}
+		return nil
 	}
 	result, e := c.config.RunTool(ctx, request)
 	if e != nil {
