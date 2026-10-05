@@ -1,6 +1,6 @@
-# ResearchOS v2.4 resume pack (rewritten 2026-10-05 from disk at HEAD 377fc3f8)
+# ResearchOS v2.4 resume pack (rewritten 2026-10-05 from disk at HEAD b6ac2d69)
 
-Read this first, then re-verify it. Every figure above was produced by `.local/rewrite_resume_pack.py`
+Read this first, then re-verify it. Every figure below was produced by `.local/rewrite_resume_pack.py`
 reading `execution/v2.4/step_state.json`, `checkpoint.json` and `commands.json` at run time; nothing here
 is carried over from the previous pack's numbers. If this file and the state files disagree, the state
 files are right and this file is the bug.
