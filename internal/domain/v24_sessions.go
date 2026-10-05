@@ -12,29 +12,29 @@ import (
 // this-domain project/goal/task/run plus the upstream worker session log, watermark
 // and lease attribution. Business truth remains in the existing tables.
 type ClientSession struct {
-	ID               string
-	ProjectID        string
-	Revision         int64
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	GoalID           *string
-	TaskID           *string
-	RunID            *string
-	WriterEpoch      int64
-	WriterClientID   string
-	LeaseExpiresAt   *time.Time
-	EventWatermark   int64
-	UpstreamSession  string
-	UpstreamLogID    *string
-	UpstreamLogHash  *string
-	WorkspaceRef     *string
-	Title            *string
-	ModelConfigRef   *string
-	CoreBuildID      *string
-	ResumeExplicit   int
-	SealedAt         *time.Time
-	ArchivedAt       *time.Time
-	Protocol         string
+	ID              string
+	ProjectID       string
+	Revision        int64
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	GoalID          *string
+	TaskID          *string
+	RunID           *string
+	WriterEpoch     int64
+	WriterClientID  string
+	LeaseExpiresAt  *time.Time
+	EventWatermark  int64
+	UpstreamSession string
+	UpstreamLogID   *string
+	UpstreamLogHash *string
+	WorkspaceRef    *string
+	Title           *string
+	ModelConfigRef  *string
+	CoreBuildID     *string
+	ResumeExplicit  int
+	SealedAt        *time.Time
+	ArchivedAt      *time.Time
+	Protocol        string
 }
 
 var (
@@ -92,7 +92,7 @@ func MapClientSession(ctx context.Context, tx *sql.Tx, s ClientSession) error {
 		return fmt.Errorf("INVALID_SESSION_FIELDS")
 	}
 	var n int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM domain_objects WHERE kind='Project' AND id=?`, s.ProjectID).Scan(&n); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT count(DISTINCT id) FROM domain_objects WHERE kind IN ('Project','ProjectProfile') AND id=?`, s.ProjectID).Scan(&n); err != nil {
 		return err
 	}
 	if n != 1 {

@@ -17,7 +17,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -46,12 +48,12 @@ var v2Contract = map[string]struct {
 	"session.list": {"ListSessionsPayload", "SessionListResult", []string{"cursor", "limit"}},
 	"session.create": {"CreateSessionPayload", "SessionSnapshot",
 		[]string{"workspace_ref", "model_config_ref", "title"}},
-	"session.get": {"EmptyPayload", "SessionSnapshot", nil},
+	"session.get":    {"EmptyPayload", "SessionSnapshot", nil},
 	"session.attach": {"AttachPayload", "AttachResult", []string{"after_sequence", "request_write_owner"}},
 	"session.send": {"SendMessagePayload", "SendMessageResult",
 		[]string{"text", "attachment_artifact_ids", "delivery"}},
 	"session.control": {"ControlPayload", "ControlResult", []string{"action", "target_id", "reason"}},
-	"session.events": {"ReadEventsPayload", "ReadEventsResult", []string{"after_sequence", "limit"}},
+	"session.events":  {"ReadEventsPayload", "ReadEventsResult", []string{"after_sequence", "limit"}},
 	"session.handoff": {"HandoffPayload", "HandoffResult", []string{"target_client_id", "handoff_mode"}},
 	"goal.start": {"StartGoalPayload", "StartGoalResult",
 		[]string{"objective", "contract_artifact_ids", "start_as_draft"}},
@@ -90,15 +92,15 @@ type v2Envelope struct {
 }
 
 type v2Context struct {
-	clientID    string
-	credential  string
-	projectID   string
-	sessionID   string
-	revision    int64
-	epoch       int64
-	commandID   string
-	baseURL     string
-	requestLog  []string
+	clientID   string
+	credential string
+	projectID  string
+	sessionID  string
+	revision   int64
+	epoch      int64
+	commandID  string
+	baseURL    string
+	requestLog []string
 }
 
 var commandIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
@@ -225,6 +227,7 @@ func v2Call(ctx *v2Context, method string, payload map[string]any) (map[string]a
 	status, _ := reply["status"].(string)
 	switch status {
 	case "COMPLETED", "ACKNOWLEDGED":
+		adoptV2Snapshot(ctx, reply)
 		return reply, "", exitCompleted
 	case "IN_PROGRESS":
 		return reply, "", exitCompleted
@@ -236,6 +239,52 @@ func v2Call(ctx *v2Context, method string, payload map[string]any) (map[string]a
 	default:
 		return reply, "UNKNOWN_STATUS:" + orDefault(status, "<absent>"), exitFailed
 	}
+}
+
+// A successful response supplies the next revision/epoch. Never infer either
+// from the request, and never replace an explicitly selected session.
+func adoptV2Snapshot(ctx *v2Context, reply map[string]any) {
+	result, _ := reply["result"].(map[string]any)
+	snapshot := result
+	if nested, ok := result["snapshot"].(map[string]any); ok {
+		snapshot = nested
+	}
+	replySession, _ := reply["session_id"].(string)
+	if ctx.sessionID != "" && replySession != "" && replySession != ctx.sessionID {
+		return
+	}
+	if replySession != "" && replySession == ctx.sessionID {
+		if revision, ok := reply["revision"].(float64); ok && revision >= 1 {
+			ctx.revision = int64(revision)
+		}
+	}
+	if sid, ok := snapshot["session_id"].(string); ok && sid != "" {
+		if ctx.sessionID != "" && ctx.sessionID != sid {
+			return
+		}
+		if ctx.sessionID == "" && reply["method"] == "session.create" {
+			ctx.sessionID = sid
+		}
+		if ctx.sessionID != sid {
+			return
+		}
+		if revision, ok := snapshot["revision"].(float64); ok && revision >= 1 {
+			ctx.revision = int64(revision)
+		}
+		if writer, ok := snapshot["writer"].(map[string]any); ok && writer["client_id"] == ctx.clientID {
+			if epoch, ok := writer["epoch"].(float64); ok && epoch >= 1 {
+				ctx.epoch = int64(epoch)
+			}
+		}
+	}
+}
+
+func v2FlowCommandID(base, method string, ordinal int) string {
+	if ordinal == 0 {
+		return base
+	}
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d", base, method, ordinal)))
+	return fmt.Sprintf("flow-%x", digest[:28])
 }
 
 func orDefault(s, d string) string {

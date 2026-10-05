@@ -11,9 +11,9 @@ package api
 
 import (
 	"context"
-	_ "embed"
 	"crypto/sha256"
 	"database/sql"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -42,21 +42,27 @@ const (
 
 // v2Service carries the typed service plus the host facts it is allowed to report.
 type v2Service struct {
-	svc    *domain.ClientService
-	db     *sql.DB
+	svc     *domain.ClientService
+	db      *sql.DB
 	loadErr error
 }
 
-func newV2Service(db *sql.DB) *v2Service {
+// ClientProtocolDocument exposes the same pinned schema used by the HTTP
+// boundary, so host runtime projections validate typed events identically.
+func ClientProtocolDocument() (*domain.SchemaDoc, error) {
 	if got := sha256.Sum256(protocolSchemaJSON); hex.EncodeToString(got[:]) != protocolSchemaSHA256 {
-		return &v2Service{db: db, loadErr: ErrContractDigest}
+		return nil, ErrContractDigest
 	}
 	if got := sha256.Sum256(domainSchemaJSON); hex.EncodeToString(got[:]) != domainSchemaSHA256 {
-		return &v2Service{db: db, loadErr: ErrContractDigest}
+		return nil, ErrContractDigest
 	}
-	doc, err := domain.LoadSchemaWithExternals(protocolSchemaJSON, map[string][]byte{
+	return domain.LoadSchemaWithExternals(protocolSchemaJSON, map[string][]byte{
 		"domain.schema.json": domainSchemaJSON,
 	})
+}
+
+func newV2Service(db *sql.DB) *v2Service {
+	doc, err := ClientProtocolDocument()
 	if err != nil {
 		return &v2Service{db: db, loadErr: err}
 	}

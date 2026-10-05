@@ -16,6 +16,12 @@ import (
 )
 
 func Handler(db *sql.DB, webDir string, service *domain.Service) http.Handler {
+	return HandlerWithClientRuntime(db, webDir, service, nil)
+}
+
+// HandlerWithClientRuntime injects the host-owned model/workspace admission port.
+// The typed service retains the caller's one SQLite transaction and coordinator.
+func HandlerWithClientRuntime(db *sql.DB, webDir string, service *domain.Service, runtime domain.ClientSessionRuntime) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
@@ -35,6 +41,10 @@ func Handler(db *sql.DB, webDir string, service *domain.Service) http.Handler {
 	// The typed v2 boundary is served from this process, so the CLI and the Desktop reach the
 	// same command service, the same transaction and the same journal.
 	v2 := newV2Service(db)
+	if v2.svc != nil {
+		v2.svc.Domain = service
+		v2.svc.SessionRuntime = runtime
+	}
 	mux.HandleFunc("POST /v2/command", v2.serve)
 	if v2.loadErr != nil {
 		log.Printf("v2 typed service closed: %v", v2.loadErr)
