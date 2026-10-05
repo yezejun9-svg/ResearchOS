@@ -135,57 +135,66 @@ func workspaceNumber(payload domain.Object, name string, maximum int64) (int64, 
 }
 
 func (h *Host) WorkspaceContent(ctx context.Context, workspacePath, access, relativePath string, maxBytes int64) ([]byte, error) {
+	data, _, err := h.workspaceContent(ctx, workspacePath, access, relativePath, maxBytes)
+	return data, err
+}
+
+func (h *Host) workspaceContent(ctx context.Context, workspacePath, access, relativePath string, maxBytes int64) ([]byte, os.FileInfo, error) {
 	if maxBytes < 1 || maxBytes > workspaceContentLimit {
-		return nil, errors.New("INVALID_REQUEST: content limit must be 1..67108864")
+		return nil, nil, errors.New("INVALID_REQUEST: content limit must be 1..67108864")
 	}
 	rel, err := workspaceRelativePath(relativePath, false)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	binding, root, err := h.workspaceRoot(workspacePath, access)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer root.Close()
 	if err = h.workspacePlain(root, binding, rel, false); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	file, err := root.Open(rel)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, ErrPathReparsePoint
+		return nil, nil, ErrPathReparsePoint
 	}
 	if info.Size() > maxBytes {
-		return nil, errors.New("CONTENT_TOO_LARGE: file exceeds bounded read")
+		return nil, nil, errors.New("CONTENT_TOO_LARGE: file exceeds bounded read")
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if int64(len(data)) > maxBytes {
-		return nil, errors.New("CONTENT_TOO_LARGE: file grew during bounded read")
+		return nil, nil, errors.New("CONTENT_TOO_LARGE: file grew during bounded read")
 	}
 	after, err := file.Stat()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if after.Size() != int64(len(data)) || !after.ModTime().Equal(info.ModTime()) {
-		return nil, errors.New("CONTENT_CONFLICT: file changed during read")
+		return nil, nil, errors.New("CONTENT_CONFLICT: file changed during read")
 	}
 	if err = ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err = h.workspacePlain(root, binding, rel, false); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return data, nil
+	current, err := root.Stat(rel)
+	if err != nil || !os.SameFile(after, current) {
+		return nil, nil, errors.New("CONTENT_CONFLICT: file identity changed during read")
+	}
+	return data, after, nil
 }
 
 func (h *Host) WorkspaceRead(ctx context.Context, workspacePath, access string, payload domain.Object) (domain.Object, error) {
@@ -197,29 +206,12 @@ func (h *Host) WorkspaceRead(ctx context.Context, workspacePath, access string, 
 	if err != nil {
 		return nil, err
 	}
-	data, err := h.WorkspaceContent(ctx, workspacePath, access, rel, limit)
+	data, info, err := h.workspaceContent(ctx, workspacePath, access, rel, limit)
 	if err != nil {
 		return nil, err
 	}
 	if !utf8.Valid(data) {
 		return nil, errors.New("UNSUPPORTED_CONTENT: file is not UTF-8")
-	}
-	// Read metadata from the same pinned root again. A concurrent replacement is
-	// refused instead of pairing old bytes with a new modified_at timestamp.
-	binding, root, err := h.workspaceRoot(workspacePath, access)
-	if err != nil {
-		return nil, err
-	}
-	defer root.Close()
-	if err = h.workspacePlain(root, binding, rel, false); err != nil {
-		return nil, err
-	}
-	info, err := root.Stat(rel)
-	if err != nil {
-		return nil, err
-	}
-	if info.Size() != int64(len(data)) {
-		return nil, errors.New("CONTENT_CONFLICT: file changed after read")
 	}
 	return domain.Object{"workspace_ref": payload["workspace_ref"], "relative_path": rel,
 		"content_hash": domain.Digest(data), "byte_size": len(data), "encoding": "UTF-8",

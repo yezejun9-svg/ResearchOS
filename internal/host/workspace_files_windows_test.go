@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"researchos.local/research-os/internal/domain"
 )
@@ -136,5 +138,135 @@ func TestWorkspacePathRejectsWindowsEscapes(t *testing.T) {
 		if value, err := workspaceRelativePath(rel, false); err == nil {
 			t.Fatalf("unsafe path %q accepted as %q", rel, value)
 		}
+	}
+}
+
+func workspaceGit(t *testing.T, directory string, args ...string) {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = directory
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, output)
+	}
+}
+
+func TestWorkspaceDiffDoesNotRunRepositoryFilters(t *testing.T) {
+	h, workspace, _ := runtimeToolFixture(t, AccessReadWrite)
+	workspaceGit(t, workspace, "init", "-q")
+	workspaceGit(t, workspace, "config", "user.email", "test@example.invalid")
+	workspaceGit(t, workspace, "config", "user.name", "Test")
+	path := filepath.Join(workspace, "tracked.txt")
+	if err := os.WriteFile(path, []byte("before\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	workspaceGit(t, workspace, "add", "tracked.txt")
+	workspaceGit(t, workspace, "commit", "-qm", "baseline")
+	if err := os.WriteFile(filepath.Join(workspace, ".gitattributes"), []byte("tracked.txt filter=review\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	workspaceGit(t, workspace, "config", "filter.review.clean", "echo FILTER_EXECUTED > review-executed.txt; cat")
+	if err := os.WriteFile(path, []byte("after\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, patch, err := h.WorkspaceDiff(context.Background(), workspace, AccessReadWrite, domain.Object{
+		"workspace_ref": "opaque", "base": "HEAD", "relative_path": "tracked.txt", "max_bytes": 4096})
+	if err != nil || result["total_files"] != 1 || !strings.Contains(string(patch), "+after") {
+		t.Fatalf("safe diff failed: %v %s %v", result, patch, err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "review-executed.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("repository filter executed: %v", err)
+	}
+}
+
+func TestWorkspaceDiffTreatsFilterPathLiterally(t *testing.T) {
+	h, workspace, _ := runtimeToolFixture(t, AccessReadWrite)
+	workspaceGit(t, workspace, "init", "-q")
+	workspaceGit(t, workspace, "config", "user.email", "test@example.invalid")
+	workspaceGit(t, workspace, "config", "user.name", "Test")
+	for _, name := range []string{"a[1].txt", "a1.txt"} {
+		if err := os.WriteFile(filepath.Join(workspace, name), []byte("before\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workspaceGit(t, workspace, "add", ".")
+	workspaceGit(t, workspace, "commit", "-qm", "baseline")
+	for _, name := range []string{"a[1].txt", "a1.txt"} {
+		if err := os.WriteFile(filepath.Join(workspace, name), []byte("after\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, patch, err := h.WorkspaceDiff(context.Background(), workspace, AccessReadWrite, domain.Object{
+		"workspace_ref": "opaque", "base": "HEAD", "relative_path": "a[1].txt", "max_bytes": 4096})
+	if err != nil || result["total_files"] != 1 || !strings.Contains(string(patch), "diff --git a/a[1].txt b/a[1].txt") || strings.Contains(string(patch), "diff --git a/a1.txt") {
+		t.Fatalf("literal filename was not preserved: %v %s %v", result, patch, err)
+	}
+}
+
+type workspaceRaceContext struct {
+	context.Context
+	mutate func()
+	done   bool
+}
+
+func (c *workspaceRaceContext) Err() error {
+	_, file, _, _ := runtime.Caller(1)
+	if !c.done && strings.HasSuffix(file, "workspace_files_windows.go") {
+		c.done = true
+		c.mutate()
+	}
+	return nil
+}
+
+func TestWorkspaceReadRejectsSameSizeReplacement(t *testing.T) {
+	h, workspace, _ := runtimeToolFixture(t, AccessReadWrite)
+	path := filepath.Join(workspace, "race.txt")
+	if err := os.WriteFile(path, []byte("before\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	ctx := &workspaceRaceContext{Context: context.Background(), mutate: func() {
+		if err := os.Rename(path, path+".old"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("second\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	result, err := h.WorkspaceRead(ctx, workspace, AccessReadWrite, domain.Object{
+		"workspace_ref": "opaque", "relative_path": "race.txt", "max_bytes": 4096})
+	if err == nil || !strings.Contains(err.Error(), "CONTENT_CONFLICT") {
+		t.Fatalf("replacement paired old bytes with new metadata: %v %v", result, err)
+	}
+}
+
+func TestWorkspaceDiffKeepsHashAndPatchOnOneSnapshot(t *testing.T) {
+	h, workspace, _ := runtimeToolFixture(t, AccessReadWrite)
+	workspaceGit(t, workspace, "init", "-q")
+	workspaceGit(t, workspace, "config", "user.email", "test@example.invalid")
+	workspaceGit(t, workspace, "config", "user.name", "Test")
+	path := filepath.Join(workspace, "tracked.txt")
+	if err := os.WriteFile(path, []byte("baseline\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	workspaceGit(t, workspace, "add", ".")
+	workspaceGit(t, workspace, "commit", "-qm", "baseline")
+	if err := os.WriteFile(path, []byte("snapshot-A\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := &workspaceRaceContext{Context: context.Background(), mutate: func() {
+		if err := os.Rename(path, path+".old"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("snapshot-B\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	result, patch, err := h.WorkspaceDiff(ctx, workspace, AccessReadWrite, domain.Object{
+		"workspace_ref": "opaque", "base": "HEAD", "relative_path": "tracked.txt", "max_bytes": 4096})
+	if err == nil || !strings.Contains(err.Error(), "CONTENT_CONFLICT") {
+		t.Fatalf("changed worktree was not refused: %v %s %v", result, patch, err)
 	}
 }

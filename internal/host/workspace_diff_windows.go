@@ -32,14 +32,14 @@ func (b *limitedGitOutput) Write(p []byte) (int, error) {
 	return b.Buffer.Write(p)
 }
 
-// gitLocal runs local, read-only Git operations with user/system configuration
-// disabled. In particular, a repository cannot supply an external diff driver,
-// textconv program, fsmonitor, or hook to execute during a workspace read.
+// gitLocal is used against a repository only for metadata and immutable blobs.
+// Worktree comparisons run against copies in a fresh directory outside the
+// repository: Git's ordinary diff can execute repository clean/process filters.
 func gitLocal(ctx context.Context, dir string, args ...string) ([]byte, error) {
-	base := []string{"-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL", "-c", "diff.external=", "-c", "diff.noprefix=false"}
+	base := []string{"-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL", "-c", "diff.external=", "-c", "core.quotePath=false"}
 	cmd := exec.CommandContext(ctx, "git", append(base, args...)...)
 	cmd.Dir = dir
-	cmd.Env = make([]string, 0, len(os.Environ())+5)
+	cmd.Env = make([]string, 0, len(os.Environ())+6)
 	for _, item := range os.Environ() {
 		key, _, _ := strings.Cut(item, "=")
 		if strings.HasPrefix(strings.ToUpper(key), "GIT_") {
@@ -47,11 +47,10 @@ func gitLocal(ctx context.Context, dir string, args ...string) ([]byte, error) {
 		}
 		cmd.Env = append(cmd.Env, item)
 	}
-	cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=NUL", "GIT_OPTIONAL_LOCKS=0", "GIT_ATTR_NOSYSTEM=1")
+	cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=NUL", "GIT_OPTIONAL_LOCKS=0", "GIT_ATTR_NOSYSTEM=1", "GIT_NO_REPLACE_OBJECTS=1", "GIT_LITERAL_PATHSPECS=1")
 	var out limitedGitOutput
 	cmd.Stdout = &out
-	err := cmd.Run()
-	if err != nil {
+	if err := cmd.Run(); err != nil {
 		if out.exceeded {
 			return nil, errors.New("CONTENT_TOO_LARGE: Git output exceeds 64 MiB")
 		}
@@ -60,37 +59,10 @@ func gitLocal(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-type workspaceChange struct {
-	path   string
-	status string
-}
-
-func parseGitNames(raw []byte) ([]workspaceChange, error) {
-	parts := bytes.Split(raw, []byte{0})
-	if len(parts) == 0 || len(parts[len(parts)-1]) != 0 {
-		return nil, errors.New("HOST_UNAVAILABLE: malformed Git name-status output")
-	}
-	changes := make([]workspaceChange, 0, len(parts)/2)
-	for i := 0; i < len(parts)-1; {
-		if i+1 >= len(parts)-1 {
-			return nil, errors.New("HOST_UNAVAILABLE: malformed Git name-status pair")
-		}
-		status := string(parts[i])
-		path := string(parts[i+1])
-		i += 2
-		if strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C") {
-			if i >= len(parts)-1 {
-				return nil, errors.New("HOST_UNAVAILABLE: malformed Git rename")
-			}
-			path = string(parts[i])
-			i++
-		}
-		if len(status) == 0 {
-			return nil, errors.New("HOST_UNAVAILABLE: empty Git status")
-		}
-		changes = append(changes, workspaceChange{path: path, status: status[:1]})
-	}
-	return changes, nil
+type gitFile struct {
+	mode       string
+	sha        string
+	conflicted bool
 }
 
 func gitNulPaths(raw []byte) ([]string, error) {
@@ -100,8 +72,83 @@ func gitNulPaths(raw []byte) ([]string, error) {
 	if raw[len(raw)-1] != 0 {
 		return nil, errors.New("HOST_UNAVAILABLE: malformed Git path list")
 	}
-	items := strings.Split(string(raw[:len(raw)-1]), "\x00")
-	return items, nil
+	return strings.Split(string(raw[:len(raw)-1]), "\x00"), nil
+}
+
+func gitFileList(raw []byte, staged bool) (map[string]gitFile, error) {
+	paths, err := gitNulPaths(raw)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]gitFile, len(paths))
+	for _, record := range paths {
+		meta, path, ok := strings.Cut(record, "\t")
+		fields := strings.Fields(meta)
+		if !ok || path == "" || (staged && len(fields) != 3) || (!staged && (len(fields) != 3 || fields[1] != "blob" && fields[1] != "commit")) {
+			return nil, errors.New("HOST_UNAVAILABLE: malformed Git file inventory")
+		}
+		file := gitFile{mode: fields[0], sha: fields[1]}
+		if staged {
+			file.sha = fields[1]
+			if fields[2] != "0" {
+				file.conflicted = true
+			}
+		} else {
+			file.sha = fields[2]
+		}
+		if previous, exists := result[path]; exists && previous.conflicted {
+			continue
+		}
+		result[path] = file
+	}
+	return result, nil
+}
+
+func workspacePatch(ctx context.Context, temp, relative string, before, after []byte, hasBefore, hasAfter bool) ([]byte, error) {
+	oldName, newName := "before", "after"
+	for _, name := range []string{oldName, newName} {
+		if err := os.Remove(filepath.Join(temp, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+	if hasBefore {
+		if err := os.WriteFile(filepath.Join(temp, oldName), before, 0600); err != nil {
+			return nil, err
+		}
+	} else {
+		oldName = "NUL"
+	}
+	if hasAfter {
+		if err := os.WriteFile(filepath.Join(temp, newName), after, 0600); err != nil {
+			return nil, err
+		}
+	} else {
+		newName = "NUL"
+	}
+	patch, err := gitLocal(ctx, temp, "diff", "--no-index", "--binary", "--no-ext-diff", "--no-textconv", "--", oldName, newName)
+	if err != nil {
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+			return nil, err
+		}
+	}
+	// Only rewrite Git's headers, never hunk or binary-patch data. Control
+	// characters and quotes are excluded by workspaceRelativePath.
+	var output bytes.Buffer
+	for _, line := range bytes.SplitAfter(patch, []byte{'\n'}) {
+		switch {
+		case bytes.HasPrefix(line, []byte("diff --git ")):
+			line = []byte("diff --git a/" + relative + " b/" + relative + "\n")
+		case bytes.HasPrefix(line, []byte("--- ")) && !bytes.HasPrefix(line, []byte("--- /dev/null")):
+			line = []byte("--- a/" + relative + "\n")
+		case bytes.HasPrefix(line, []byte("+++ ")) && !bytes.HasPrefix(line, []byte("+++ /dev/null")):
+			line = []byte("+++ b/" + relative + "\n")
+		case bytes.HasPrefix(line, []byte("Binary files ")):
+			line = []byte("Binary files a/" + relative + " and b/" + relative + " differ\n")
+		}
+		output.Write(line)
+	}
+	return output.Bytes(), nil
 }
 
 func (h *Host) WorkspaceDiff(ctx context.Context, workspacePath, access string, payload domain.Object) (domain.Object, []byte, error) {
@@ -131,7 +178,6 @@ func (h *Host) WorkspaceDiff(ctx context.Context, workspacePath, access string, 
 	}
 	defer root.Close()
 	if filter != "" && filter != "." {
-		// A deleted path need not exist, so check only its present ancestors.
 		parts := strings.Split(filter, "/")
 		for i := 1; i < len(parts); i++ {
 			if err = h.workspacePlain(root, binding, strings.Join(parts[:i], "/"), true); err != nil {
@@ -143,110 +189,124 @@ func (h *Host) WorkspaceDiff(ctx context.Context, workspacePath, access string, 
 	if err != nil || !strings.EqualFold(filepath.Clean(strings.TrimSpace(string(top))), filepath.Clean(workspacePath)) {
 		return nil, nil, errors.New("NOT_A_REPOSITORY: workspace root must be the repository top level")
 	}
-	var revision string
-	var diffArgs []string
+	stageRaw, err := gitLocal(ctx, workspacePath, "ls-files", "--stage", "-z")
+	if err != nil {
+		return nil, nil, err
+	}
+	indexFiles, err := gitFileList(stageRaw, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	revision := domain.Digest(stageRaw)
+	baseFiles := indexFiles
 	if base == "HEAD" {
 		sha, shaErr := gitLocal(ctx, workspacePath, "rev-parse", "--verify", "HEAD")
 		if shaErr != nil {
 			return nil, nil, errors.New("NOT_FOUND: HEAD revision is not available")
 		}
 		revision = strings.TrimSpace(string(sha))
-		diffArgs = []string{"diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-status", "-z", "HEAD", "--"}
-	} else {
-		stage, stageErr := gitLocal(ctx, workspacePath, "ls-files", "--stage", "-z")
-		if stageErr != nil {
-			return nil, nil, stageErr
+		headRaw, headErr := gitLocal(ctx, workspacePath, "ls-tree", "-r", "-z", "--full-tree", "HEAD")
+		if headErr != nil {
+			return nil, nil, headErr
 		}
-		revision = domain.Digest(stage)
-		diffArgs = []string{"diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-status", "-z", "--"}
+		baseFiles, err = gitFileList(headRaw, false)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
-	raw, err := gitLocal(ctx, workspacePath, diffArgs...)
+	untrackedRaw, err := gitLocal(ctx, workspacePath, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
 		return nil, nil, err
 	}
-	changes, err := parseGitNames(raw)
+	untracked, err := gitNulPaths(untrackedRaw)
 	if err != nil {
 		return nil, nil, err
 	}
-	untracked, err := gitLocal(ctx, workspacePath, "ls-files", "--others", "--exclude-standard", "-z", "--")
-	if err != nil {
-		return nil, nil, err
+	all := map[string]bool{}
+	for name := range baseFiles {
+		all[name] = true
 	}
-	paths, err := gitNulPaths(untracked)
-	if err != nil {
-		return nil, nil, err
+	for name := range indexFiles {
+		all[name] = true
 	}
-	for _, path := range paths {
-		changes = append(changes, workspaceChange{path: path, status: "?"})
+	for _, name := range untracked {
+		all[name] = true
 	}
-	selected := make([]workspaceChange, 0, len(changes))
-	for _, change := range changes {
-		rel, pathErr := workspaceRelativePath(filepath.ToSlash(change.path), false)
-		if pathErr != nil {
+	selected := make([]string, 0, len(all))
+	for name := range all {
+		rel, pathErr := workspaceRelativePath(filepath.ToSlash(name), false)
+		if pathErr != nil || rel != name {
 			return nil, nil, errors.New("PATH_OUT_OF_SCOPE: unsafe Git path")
 		}
-		if filter != "" && filter != "." && rel != filter && !strings.HasPrefix(rel, filter+"/") {
-			continue
+		if filter == "" || filter == "." || rel == filter || strings.HasPrefix(rel, filter+"/") {
+			selected = append(selected, rel)
 		}
-		change.path = rel
-		selected = append(selected, change)
 	}
-	sort.Slice(selected, func(i, j int) bool { return selected[i].path < selected[j].path })
+	sort.Strings(selected)
+	temp, err := os.MkdirTemp("", "researchos-diff-")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		_ = os.Remove(filepath.Join(temp, "before"))
+		_ = os.Remove(filepath.Join(temp, "after"))
+		_ = os.Remove(temp)
+	}()
+	absTemp, err := filepath.Abs(temp)
+	if err != nil {
+		return nil, nil, err
+	}
+	if relative, relErr := filepath.Rel(workspacePath, absTemp); relErr == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, nil, errors.New("HOST_UNAVAILABLE: temporary diff directory lies within workspace")
+	}
 	files := make([]any, 0, min(len(selected), 500))
 	full := make([]byte, 0)
 	previewUsed := int64(0)
-	truncated := len(selected) > 500
-	for i, change := range selected {
+	truncated := false
+	total := 0
+	for _, name := range selected {
 		if err = ctx.Err(); err != nil {
 			return nil, nil, err
 		}
-		status := map[string]string{"A": "ADDED", "M": "MODIFIED", "T": "MODIFIED", "D": "DELETED", "?": "UNTRACKED", "U": "CONFLICTED"}[change.status]
-		if status == "" {
-			return nil, nil, errors.New("HOST_UNAVAILABLE: unsupported Git status")
+		prior, hasBefore := baseFiles[name]
+		if hasBefore && prior.mode != "100644" && prior.mode != "100755" {
+			return nil, nil, errors.New("PATH_OUT_OF_SCOPE: unsupported tracked file type")
 		}
-		var before, after any
-		if status != "UNTRACKED" && status != "ADDED" {
-			blob := ":" + change.path
-			if base == "HEAD" {
-				blob = "HEAD:" + change.path
-			}
-			content, blobErr := gitLocal(ctx, workspacePath, "cat-file", "blob", blob)
-			if blobErr == nil {
-				before = domain.Digest(content)
-			} else if status != "CONFLICTED" {
-				return nil, nil, blobErr
-			}
-		}
-		if status != "DELETED" {
-			content, readErr := h.WorkspaceContent(ctx, workspacePath, access, change.path, workspaceContentLimit)
-			if readErr != nil {
-				return nil, nil, readErr
-			}
-			after = domain.Digest(content)
-		}
-		var patch []byte
-		if status == "UNTRACKED" {
-			patch, err = gitLocal(ctx, workspacePath, "diff", "--no-index", "--binary", "--no-ext-diff", "--no-textconv", "--", "NUL", filepath.FromSlash(change.path))
-			// git diff --no-index returns 1 for an ordinary difference.
-			if err != nil && !strings.Contains(err.Error(), "exit status 1") {
-				return nil, nil, err
-			}
-		} else {
-			args := []string{"diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames"}
-			if base == "HEAD" {
-				args = append(args, "HEAD")
-			}
-			args = append(args, "--", filepath.FromSlash(change.path))
-			patch, err = gitLocal(ctx, workspacePath, args...)
+		var before, after []byte
+		if hasBefore && !prior.conflicted {
+			before, err = gitLocal(ctx, workspacePath, "cat-file", "blob", prior.sha)
 			if err != nil {
 				return nil, nil, err
 			}
+		}
+		after, err = h.WorkspaceContent(ctx, workspacePath, access, name, workspaceContentLimit)
+		hasAfter := err == nil
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, nil, err
+		}
+		if !hasBefore && !hasAfter || hasBefore && hasAfter && bytes.Equal(before, after) && !prior.conflicted {
+			continue
+		}
+		status := "MODIFIED"
+		if prior.conflicted {
+			status = "CONFLICTED"
+		} else if !hasBefore {
+			status = "UNTRACKED"
+			if _, tracked := indexFiles[name]; tracked {
+				status = "ADDED"
+			}
+		} else if !hasAfter {
+			status = "DELETED"
+		}
+		patch, patchErr := workspacePatch(ctx, temp, name, before, after, hasBefore && !prior.conflicted, hasAfter)
+		if patchErr != nil {
+			return nil, nil, patchErr
 		}
 		if len(full)+len(patch) > workspaceFullDiffLimit {
 			return nil, nil, errors.New("CONTENT_TOO_LARGE: full diff exceeds 64 MiB")
 		}
 		full = append(full, patch...)
-		binary := bytes.Contains(patch, []byte("GIT binary patch")) || bytes.Contains(patch, []byte("Binary files")) || !utf8.Valid(patch)
+		binary := bytes.IndexByte(before, 0) >= 0 || bytes.IndexByte(after, 0) >= 0 || !utf8.Valid(before) || !utf8.Valid(after) || bytes.Contains(patch, []byte("GIT binary patch"))
 		var preview any
 		if !binary && previewUsed+int64(len(patch)) <= maxBytes {
 			preview = string(patch)
@@ -254,25 +314,43 @@ func (h *Host) WorkspaceDiff(ctx context.Context, workspacePath, access string, 
 		} else if len(patch) > 0 {
 			truncated = true
 		}
-		if i < 500 {
-			files = append(files, domain.Object{"relative_path": change.path, "previous_path": nil,
-				"status": status, "before_hash": before, "after_hash": after, "binary": binary, "patch": preview})
+		if len(files) < 500 {
+			var beforeHash, afterHash any
+			if hasBefore && !prior.conflicted {
+				beforeHash = domain.Digest(before)
+			}
+			if hasAfter {
+				afterHash = domain.Digest(after)
+			}
+			files = append(files, domain.Object{"relative_path": name, "previous_path": nil,
+				"status": status, "before_hash": beforeHash, "after_hash": afterHash, "binary": binary, "patch": preview})
+		} else {
+			truncated = true
+		}
+		total++
+		// Catch edits during patch generation. The advertised hash and patch always
+		// describe the same bytes even if a later independent edit follows.
+		latest, checkErr := h.WorkspaceContent(ctx, workspacePath, access, name, workspaceContentLimit)
+		if hasAfter && (checkErr != nil || !bytes.Equal(latest, after)) || !hasAfter && checkErr == nil {
+			return nil, nil, errors.New("CONTENT_CONFLICT: worktree changed during diff")
+		}
+		if !hasAfter && checkErr != nil && !errors.Is(checkErr, os.ErrNotExist) {
+			return nil, nil, checkErr
 		}
 	}
 	if err = h.workspacePlain(root, binding, ".", true); err != nil {
 		return nil, nil, err
+	}
+	latestStage, err := gitLocal(ctx, workspacePath, "ls-files", "--stage", "-z")
+	if err != nil || !bytes.Equal(latestStage, stageRaw) {
+		return nil, nil, errors.New("CONTENT_CONFLICT: index changed during diff")
 	}
 	if base == "HEAD" {
 		latest, revErr := gitLocal(ctx, workspacePath, "rev-parse", "--verify", "HEAD")
 		if revErr != nil || strings.TrimSpace(string(latest)) != revision {
 			return nil, nil, errors.New("CONTENT_CONFLICT: HEAD changed during diff")
 		}
-	} else {
-		latest, revErr := gitLocal(ctx, workspacePath, "ls-files", "--stage", "-z")
-		if revErr != nil || domain.Digest(latest) != revision {
-			return nil, nil, errors.New("CONTENT_CONFLICT: index changed during diff")
-		}
 	}
 	return domain.Object{"workspace_ref": payload["workspace_ref"], "base": base, "base_revision": revision,
-		"files": files, "total_files": len(selected), "truncated": truncated, "full_diff_artifact_ref": nil}, full, nil
+		"files": files, "total_files": total, "truncated": truncated, "full_diff_artifact_ref": nil}, full, nil
 }
