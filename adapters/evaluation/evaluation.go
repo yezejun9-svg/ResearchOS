@@ -51,7 +51,7 @@ func (m Manifest) Validate() error {
 	if m.ProjectID == "" || m.ExperimentID == "" || m.RunID == "" || len(m.Expected) == 0 {
 		return errors.New("nonempty identity and expected IDs required")
 	}
-	if m.Engine["name"] != "NATIVE" && m.Engine["name"] != "PROMPTFOO" {
+	if m.Engine["name"] != "NATIVE" && m.Engine["name"] != "PROMPTFOO" && m.Engine["name"] != "SKILL_UP" {
 		return errors.New("unqualified engine")
 	}
 	if s, ok := m.Engine["version"].(string); !ok || s == "" {
@@ -80,6 +80,9 @@ func (m Manifest) Validate() error {
 func Normalize(m Manifest, observed Manifest, rawExport []byte, rawHash string, exit *int, duration int64) (Object, error) {
 	if e := m.Validate(); e != nil {
 		return nil, e
+	}
+	if m.Engine["name"] == "SKILL_UP" {
+		return nil, errors.New("skill-up requires native result.json normalization")
 	}
 	if !reflect.DeepEqual(m, observed) {
 		return nil, errors.New("observed invocation differs from frozen manifest")
