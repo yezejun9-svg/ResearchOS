@@ -718,8 +718,21 @@ func (s *ClientService) Execute(ctx context.Context, tx *sql.Tx, env *Envelope, 
 	case err != sql.ErrNoRows:
 		return nil, false, err
 	}
+	// A typed rejection is committed for idempotency, but must not preserve any
+	// intermediate business writes made before a handler discovers the refusal.
+	if _, err = tx.ExecContext(ctx, "SAVEPOINT client_command"); err != nil {
+		return nil, false, err
+	}
 	res, err := s.dispatch(ctx, tx, env, principal)
 	if err != nil {
+		return nil, false, err
+	}
+	if res != nil && (deref(res.Status) == "REJECTED" || deref(res.Status) == "NOT_IMPLEMENTED") {
+		if _, err = tx.ExecContext(ctx, "ROLLBACK TO client_command"); err != nil {
+			return nil, false, err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, "RELEASE client_command"); err != nil {
 		return nil, false, err
 	}
 	if res.ProtocolVersion == nil || *res.ProtocolVersion != ProtocolV2 {
@@ -995,11 +1008,8 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		if !p.RequestWriteOwner {
 			return reject(sess.revision, sess.epoch, "INVALID_REQUEST", "attach without write ownership is a read path"), nil
 		}
-		// Takeover moves the single writer only when the same authenticated user presents a
-		// different client id; it reserves the handoff and admits no business write yet.
-		if deref(env.ClientID) == sess.writerClientID {
-			return reject(sess.revision, sess.epoch, "WRITER_BUSY", "takeover needs a client id different from the current writer"), nil
-		}
+		// Reacquisition by the current client renews the writer lease through the
+		// same CAS and epoch rotation as a handoff. Any queued old claim expires.
 		if sess.runID != "" {
 			status, settled, err := runState(ctx, tx, sess.project, sess.runID)
 			if err != nil {
@@ -1060,6 +1070,9 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		if p.Action == nil || *p.Action != "CANCEL" {
 			return reject(sess.revision, sess.epoch, "NOT_IMPLEMENTED", "only CANCEL control is implemented on this host build"), nil
 		}
+		if sess.runID == "" || sess.runID != deref(p.TargetID) {
+			return reject(sess.revision, sess.epoch, "NOT_FOUND", "target is not the current session run"), nil
+		}
 		run, err := loadClientRun(ctx, tx, sess.project, deref(p.TargetID))
 		if err == sql.ErrNoRows {
 			return reject(sess.revision, sess.epoch, "NOT_FOUND", "target run is not in this project"), nil
@@ -1082,9 +1095,23 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		if run.terminal() {
 			return reject(sess.revision, sess.epoch, "ALREADY_TERMINAL", "run reached a terminal state without a confirmed cancel"), nil
 		}
-		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if s.Domain == nil {
+			return reject(sess.revision, sess.epoch, "HOST_UNAVAILABLE", "canonical runtime service unavailable"), nil
+		}
+		owner, err := clientPrincipal(ctx, tx, principal, sess.project, true)
+		if err != nil {
+			return clientFault(env, err)
+		}
+		canonical, _, _, err := s.Domain.runtimeOperation(tx, owner, sess.project, run.id, Object{"reason": "Authenticated client cancellation"}, "cancelRun", deref(env.CommandID))
+		if err != nil {
+			return clientFault(env, err)
+		}
+		if err = s.Domain.event(tx, sess.project, "Run", canonical, principal, deref(env.CommandID), "RUN_CHANGED"); err != nil {
+			return nil, err
+		}
+		now := Str(canonical, "cancel_requested_at")
 		if err := s.journal(ctx, tx, env, sess, "RUN_STATE", map[string]any{
-			"run_id": run.id, "status": "CANCEL_REQUESTED", "revision": run.revision,
+			"run_id": run.id, "status": "CANCEL_REQUESTED", "revision": canonical["revision"],
 			"cancel_requested_at": now, "cancel_confirmed_at": nil, "settled_at": nil,
 			"children_stopped": run.childrenStopped, "queue_empty": run.queueEmpty,
 		}); err != nil {

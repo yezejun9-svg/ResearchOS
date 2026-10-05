@@ -9,3 +9,14 @@ type RuntimeToolRequest struct {
 	Arguments     Object
 	Policy        Object
 }
+
+// RuntimeToolFailure is a host witness, never a model-provided claim. Only a
+// failure proved to precede side effects may carry NOT_APPLIED. Unclassified
+// errors remain UNKNOWN at the broker boundary.
+type RuntimeToolFailure struct {
+	Err     error
+	Outcome string
+}
+
+func (e *RuntimeToolFailure) Error() string { return e.Err.Error() }
+func (e *RuntimeToolFailure) Unwrap() error { return e.Err }

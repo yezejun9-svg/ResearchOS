@@ -184,7 +184,7 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 	c.boundary("effect_prepared", intent)
 	if intent["state"] == "CONFIRMED" || intent["state"] == "NOT_APPLIED" {
 		receipt, _ := intent["receipt"].(map[string]any)
-		return Object{"sequence": frame.Sequence, "key": frame.Key, "state": intent["state"], "payload": receipt["payload"]}, nil
+		return runtimeEffectWireReply(frame, receipt)
 	}
 	if intent["state"] != "PREPARED" {
 		if provider.Capability == "EXPERIMENT" {
@@ -286,7 +286,12 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 	return Object{"sequence": frame.Sequence, "key": frame.Key, "state": receipt["state"], "payload": receipt["payload"]}, nil
 }
 
+const runtimeFactMaxBytes = 4*1024*1024 + 128*1024
+
 func writeRuntimeFact(path string, raw []byte) error {
+	if len(raw) == 0 || len(raw) > runtimeFactMaxBytes {
+		return errors.New("encoded host fact exceeds persistence bound")
+	}
 	temp := path + ".pending"
 	f, e := os.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if e != nil {
@@ -311,6 +316,9 @@ func writeRuntimeFact(path string, raw []byte) error {
 // A late receipt settles the original reservation and recorded epoch, without
 // acquiring execution authority or extending any lease.
 func (c *RuntimeCoordinator) ingestEffectFact(ctx context.Context, fact Object) error {
+	if len(Bytes(fact)) > runtimeFactMaxBytes {
+		return errors.New("encoded host fact exceeds persistence bound")
+	}
 	project, run, key := Str(fact, "project_id"), Str(fact, "run_id"), Str(fact, "effect_key")
 	tx, e := c.service.DB.BeginTx(ctx, nil)
 	if e != nil {
@@ -338,13 +346,48 @@ func (c *RuntimeCoordinator) ingestEffectFact(ctx context.Context, fact Object) 
 	if !ok {
 		return errors.New("trusted effect receipt required")
 	}
+	if receipt["key"] != key || receipt["run_id"] != run || Hash(receipt["epoch"]) != Hash(fact["epoch"]) || Str(receipt, "receipt_id") == "" || (receipt["state"] != "CONFIRMED" && receipt["state"] != "NOT_APPLIED") {
+		return Fail(422, "GATE_FAILED", "effect receipt identity or outcome mismatch")
+	}
+	request, _ := intent["payload"].(map[string]any)
+	if request["capability"] == "MODEL" || request["capability"] == "TOOL" {
+		result, valid := receipt["payload"].(map[string]any)
+		if !valid {
+			return Fail(422, "GATE_FAILED", "host effect result missing")
+		}
+		wantHash := Digest(Bytes(result))
+		if request["capability"] == "MODEL" && receipt["state"] == "CONFIRMED" {
+			raw := []byte(Str(result, "body"))
+			if receipt["model_transport"] != true || receipt["actual_cost"] != nil || result["content_type"] != "text/event-stream" || Hash(result["status"]) != Hash(200) || len(raw) > runtimeModelMaxSSEBytes || !completeRuntimeModelSSE(raw) {
+				return Fail(422, "GATE_FAILED", "model transport receipt invalid")
+			}
+			wantHash = Digest(raw)
+		}
+		if wantHash != fact["provider_response_hash"] || wantHash != receipt["receipt_id"] {
+			return Fail(422, "GATE_FAILED", "host effect response hash mismatch")
+		}
+		if receipt["state"] == "NOT_APPLIED" {
+			money, _ := receipt["actual_cost"].(map[string]any)
+			amount, err := moneyAmount(money)
+			if result["dispatched"] != false || result["witness"] != "HOST_PRE_EFFECT_REFUSAL" || err != nil || amount.Sign() != 0 {
+				return Fail(422, "GATE_FAILED", "known unissued effect witness required")
+			}
+		} else if request["capability"] == "TOOL" {
+			payload, _ := request["payload"].(map[string]any)
+			if receipt["host_tool"] != payload["name"] {
+				return Fail(422, "GATE_FAILED", "host tool receipt name mismatch")
+			}
+		}
+	}
+	if evidence := fact["host_tool_evidence"]; evidence != nil && (request["capability"] != "TOOL" || len(Bytes(evidence)) > 4*1024*1024 || fact["host_tool_evidence_hash"] != Hash(evidence)) {
+		return Fail(422, "GATE_FAILED", "host tool evidence hash or bound mismatch")
+	}
 	if intent["state"] == receipt["state"] && Hash(intent["receipt"]) == Hash(receipt) {
 		return nil
 	}
 	if intent["state"] != "STARTED" && intent["state"] != "UNKNOWN" {
 		return Fail(409, "STATE_CONFLICT", "effect outcome cannot be rewritten")
 	}
-	request, _ := intent["payload"].(map[string]any)
 	if request["capability"] == "MODEL" && receipt["model_transport"] == true && receipt["actual_cost"] == nil && receipt["state"] == "CONFIRMED" {
 		result, ok := receipt["payload"].(map[string]any)
 		if !ok || Digest([]byte(Str(result, "body"))) != fact["provider_response_hash"] {
