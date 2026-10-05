@@ -400,13 +400,20 @@ func cliInit(args []string) {
 	if projectID == "" {
 		fail("init", exitFailed, "BOOTSTRAP_REPLY_MISSING_PROJECT_ID")
 	}
-	c.WorkspaceRef, c.ProjectID = workspaceRef, projectID
+	boundWorkspace, _ := result["workspace"].(map[string]any)
+	finalWorkspaceRef, _ := boundWorkspace["authorized_workspace_ref"].(string)
+	boundProjectID, _ := boundWorkspace["project_id"].(string)
+	status, _ := boundWorkspace["status"].(string)
+	if finalWorkspaceRef == "" || boundProjectID != projectID || status != "ACTIVE" {
+		fail("init", exitFailed, "BOOTSTRAP_REPLY_WORKSPACE_UNBOUND")
+	}
+	c.WorkspaceRef, c.ProjectID = finalWorkspaceRef, projectID
 	c.SessionID, c.Revision, c.WriterEpoch = "", 0, 0
 	if err := writeConfig(c); err != nil {
 		fail("init", exitFailed, "CONFIG_WRITE_FAILED", err.Error())
 	}
 	base["status"], base["exit_code"], base["project_id"] = "COMPLETED", exitCompleted, projectID
-	base["workspace_ref"] = workspaceRef
+	base["workspace_ref"] = finalWorkspaceRef
 	base["result"] = reply["result"]
 	outJSON(base)
 }
