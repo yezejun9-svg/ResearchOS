@@ -33,7 +33,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 LOCKED = ROOT / "execution" / "toolchains" / "locked.json"
 GO_TEST_FILE = ROOT / "internal" / "domain" / "evidence_w0902_test.go"
 PACKAGES = ["./internal/domain"]
-SUITE_TIMEOUT_SECONDS = 900
+# Inside the registry's 600s budget on purpose: if the outer timeout fired first the dispatcher
+# would kill the child and no report line would exist to say why.
+SUITE_TIMEOUT_SECONDS = 540
 OWNED_TASK, OWNED_CHECK = "W09", "W09-02"
 RECEIPT_ROOT = ROOT / "execution" / "v2.4" / "receipts" / "W09" / "W09-02" / "dispatched"
 
@@ -260,8 +262,10 @@ def probe_foreign_binding():
     environment = dict(os.environ, RESEARCHOS_TASK_ID=OWNED_TASK, RESEARCHOS_CHECK_ID=FOREIGN_PROBE_CHECK,
                        RESEARCHOS_CASE_ID="", W0902_PROBE_DEPTH="1")
     try:
+        # A refusal must be fast by definition, so a generous budget here would only hide a build
+        # whose routing guard is gone by spending the parent's whole timeout on it.
         completed = subprocess.run([sys.executable, "-X", "utf8", str(pathlib.Path(__file__))],
-                                   cwd=str(ROOT), env=environment, capture_output=True, timeout=600)
+                                   cwd=str(ROOT), env=environment, capture_output=True, timeout=120)
     except Exception as exc:
         return {"ran": False, "reason": "%s: %s" % (type(exc).__name__, exc)}
     stdout = (completed.stdout or b"").decode("utf-8", errors="replace").strip()
