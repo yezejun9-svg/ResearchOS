@@ -10,6 +10,9 @@ const runtimeSandboxProfile = "appcontainer-zero-capabilities-v1"
 const runtimeBridgeRevision = "windows-appcontainer-v1"
 
 func validateRuntimeDispatchProfile(profile Object) error {
+	if e := validateRuntimeModelConfig(profile); e != nil {
+		return e
+	}
 	if profile["sandbox"] != runtimeSandboxProfile || profile["adapter_revision"] != runtimeBridgeRevision || profile["platform"] != "windows-amd64" || Str(profile, "command_id") == "" || Str(profile, "build_hash") == "" {
 		return Fail(503, "RESOURCE_UNAVAILABLE", "runtime profile has no supported AppContainer command binding")
 	}

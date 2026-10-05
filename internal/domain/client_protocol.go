@@ -136,7 +136,7 @@ func DecodeEnvelope(raw []byte) (*Envelope, error) {
 			return nil, fmt.Errorf("MISSING_FIELD:writer_epoch")
 		}
 	}
-	if writeMethods[*e.Method] && *e.Method != "session.attach" && *e.Method != "session.create" {
+	if writeMethods[*e.Method] && *e.Method != "session.attach" && *e.Method != "session.create" && *e.Method != "project.bootstrap" && *e.Method != "workspace.register" {
 		if err := requiredString("project_id", e.ProjectID); err != nil {
 			return nil, err
 		}
@@ -621,10 +621,12 @@ type ClientHostInfo struct {
 
 // ClientService is the single typed command service shared by the CLI and the Desktop (W03-02).
 type ClientService struct {
-	Doc            *SchemaDoc
-	Host           ClientHostInfo
-	Domain         *Service
-	SessionRuntime ClientSessionRuntime
+	Doc                *SchemaDoc
+	Host               ClientHostInfo
+	Domain             *Service
+	SessionRuntime     ClientSessionRuntime
+	WorkspaceAuthority WorkspaceAuthority
+	InventoryScanner   LocalInventoryScanner
 }
 
 var (
@@ -778,6 +780,9 @@ func (s *ClientService) dispatch(ctx context.Context, tx *sql.Tx, env *Envelope,
 	}
 	if *env.Method == "session.list" {
 		return s.listClientSessions(ctx, tx, env, principal)
+	}
+	if *env.Method == "workspace.register" || *env.Method == "project.bootstrap" {
+		return s.clientFirstUse(ctx, tx, env, principal)
 	}
 	if deref(env.SessionID) != "" {
 		if err := clientSessionOwner(ctx, tx, deref(env.ProjectID), deref(env.SessionID), principal); err != nil {
@@ -978,6 +983,8 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 			Status: strptr("COMPLETED"), SessionID: env.SessionID, Revision: revPtr(rev), Result: result}
 	}
 	switch *env.Method {
+	case "workspace.register", "project.bootstrap":
+		return s.clientFirstUse(ctx, tx, env, principal)
 	case "session.send":
 		return s.sendClientMessage(ctx, tx, env, principal, sess)
 	case "session.attach":

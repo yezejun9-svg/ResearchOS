@@ -1,0 +1,147 @@
+//go:build windows
+
+package domain
+
+import (
+	"context"
+	"database/sql"
+	"path/filepath"
+	"strings"
+
+	rt "researchos.local/research-os/adapters/runtime"
+)
+
+func validateRuntimeToolArguments(config, payload Object) error {
+	args, ok := payload["arguments"].(map[string]any)
+	if len(payload) != 2 || !ok {
+		return Fail(400, "INVALID_REQUEST", "tool request requires only name and arguments")
+	}
+	name := Str(payload, "name")
+	if name != "read" && name != "write" && name != "edit" && name != "run_check" {
+		return Fail(403, "FORBIDDEN", "tool is not implemented by this host")
+	}
+	var schema any
+	for _, item := range Arr(config, "tools") {
+		tool, _ := item.(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		if fn["name"] == name {
+			if schema != nil {
+				return Fail(403, "FORBIDDEN", "duplicate frozen tool definition")
+			}
+			schema = fn["parameters"]
+		}
+	}
+	if schema == nil {
+		return Fail(403, "FORBIDDEN", "tool absent from frozen model schema")
+	}
+	doc, e := LoadSchema(Bytes(Object{"$id": "https://researchos.local/runtime-tool.json", "$defs": Object{"Arguments": schema}}))
+	if e != nil || doc.ValidateDefInput("Arguments", args) != nil {
+		return Fail(400, "INVALID_REQUEST", "arguments do not match the frozen tool schema")
+	}
+	return nil
+}
+
+func (c *RuntimeCoordinator) runtimeToolGate(ctx context.Context, tx *sql.Tx, route RuntimeCoordinatorRoute, task, dispatch Object, frame rt.BridgeFrame, payload Object) (RuntimeToolRequest, error) {
+	var request RuntimeToolRequest
+	profile := dispatch["manifest"].(map[string]any)["admission"].(map[string]any)["profile"].(map[string]any)
+	config, _ := profile["model_config"].(map[string]any)
+	if task["task_type"] != "mu_turn" || c.config.WorkspaceAuthority == nil {
+		return request, Fail(403, "FORBIDDEN", "tools require a current authenticated session workspace")
+	}
+	if e := validateRuntimeToolArguments(config, payload); e != nil {
+		return request, e
+	}
+	policy, ok := profile["tool_policy"].(map[string]any)
+	if !ok {
+		return request, Fail(403, "FORBIDDEN", "frozen tool policy required")
+	}
+	limit, e := Num(policy, "max_calls")
+	if e != nil || limit < 1 || limit > 32 {
+		return request, Fail(403, "FORBIDDEN", "bounded tool calls required")
+	}
+	var calls int64
+	runID := Str(dispatch["manifest"].(map[string]any), "run_id")
+	if e = tx.QueryRow(`SELECT count(DISTINCT effect_key) FROM resource_effects WHERE project=? AND run=? AND effect_key<>? AND json_extract(body,'$.payload.capability')='TOOL'`, route.ProjectID, runID, frame.Key).Scan(&calls); e != nil {
+		return request, e
+	}
+	if calls >= limit {
+		return request, Fail(403, "FORBIDDEN", "frozen tool call limit exhausted")
+	}
+	var workspace, model, principal string
+	if e = tx.QueryRow(`SELECT s.workspace_ref,s.model_config_ref,i.principal FROM client_sessions s JOIN idempotency i ON i.project=s.project_id AND i.operation='v2:session.create' AND json_extract(i.body,'$.result.session_id')=s.id WHERE s.project_id=? AND s.task_id=? AND s.run_id=? AND s.archived_at IS NULL AND s.sealed_at IS NULL`, route.ProjectID, task["id"], runID).Scan(&workspace, &model, &principal); e != nil {
+		return request, Fail(403, "FORBIDDEN", "tool session provenance unavailable")
+	}
+	if model != Str(config, "ref") {
+		return request, Fail(403, "FORBIDDEN", "session model changed")
+	}
+	if _, e = clientPrincipal(ctx, tx, principal, route.ProjectID, true); e != nil {
+		return request, e
+	}
+	if e = c.ValidateBinding(ctx, tx, principal, route.ProjectID, workspace, model); e != nil {
+		return request, e
+	}
+	binding, e := c.service.binding(ctx, tx, workspace)
+	if e != nil {
+		return request, e
+	}
+	request = RuntimeToolRequest{WorkspacePath: binding.RealPath, Access: binding.Access, Name: Str(payload, "name"), Arguments: payload["arguments"].(map[string]any), Policy: policy}
+	return request, nil
+}
+
+func (c *RuntimeCoordinator) brokerTool(ctx context.Context, route RuntimeCoordinatorRoute, provider RuntimeProviderRoute, runID, lease string, epoch int64, bridge *rt.Bridge, frame rt.BridgeFrame, payload, intent, dispatch Object) (Object, error) {
+	unknown := func(reason string) (Object, error) {
+		if e := c.service.ObserveEffect(context.Background(), route.ProjectID, runID, frame.Key, "UNKNOWN", Object{"dispatch_key": dispatch["dispatch_key"], "epoch": epoch, "reason": reason}); e != nil {
+			return nil, e
+		}
+		return nil, Fail(409, "STATE_CONFLICT", "tool outcome UNKNOWN; automatic retry prohibited")
+	}
+	tx, run, current, e := c.dispatchGate(ctx, route, runID, lease, epoch)
+	if e != nil {
+		return unknown("tool authority ended before host dispatch")
+	}
+	task, e := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
+	var request RuntimeToolRequest
+	if e == nil {
+		request, e = c.runtimeToolGate(ctx, tx, route, task, current, frame, payload)
+	}
+	tx.Rollback()
+	if e != nil {
+		return unknown("tool binding ended before host dispatch")
+	}
+	result, e := c.config.RunTool(ctx, request)
+	if e != nil {
+		return unknown("host tool did not return a complete result")
+	}
+	evidence := result["host_evidence"]
+	delete(result, "host_evidence")
+	if evidence != nil && len(Bytes(evidence)) > 4*1024*1024 {
+		return unknown("host tool evidence exceeds persistence bound")
+	}
+	reply := Object{"sequence": frame.Sequence, "key": frame.Key, "state": "CONFIRMED", "payload": result}
+	raw := Bytes(result)
+	if len(Bytes(reply)) > 64*1024 {
+		return unknown("tool reply exceeds bridge frame limit")
+	}
+	for _, secret := range []string{c.config.SchedulerToken, route.ExecutorToken} {
+		if secret != "" && strings.Contains(string(raw), secret) {
+			return unknown("tool result contained host credential material")
+		}
+	}
+	receipt := Object{"key": frame.Key, "epoch": epoch, "run_id": runID, "receipt_id": Digest(raw), "state": "CONFIRMED", "host_tool": request.Name, "actual_cost": provider.UpperBound, "payload": result}
+	fact := Object{"version": 1, "project_id": route.ProjectID, "run_id": runID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "effect_key": frame.Key, "request_hash": intent["request_hash"], "reservation_id": intent["reservation_id"], "provider_response_hash": Digest(raw), "receipt": receipt}
+	if evidence != nil {
+		fact["host_tool_evidence"] = evidence
+	}
+	if e = writeRuntimeFact(filepath.Join(bridge.Directory(), "effect-"+strings.TrimPrefix(Digest([]byte(frame.Key)), "sha256:")+".json"), Bytes(fact)); e != nil {
+		return unknown("tool result persistence failed")
+	}
+	if e = c.ingestEffectFact(context.Background(), fact); e != nil {
+		return nil, e
+	}
+	tx, _, _, e = c.dispatchGate(ctx, route, runID, lease, epoch)
+	if e != nil {
+		return nil, e
+	}
+	tx.Rollback()
+	return reply, nil
+}

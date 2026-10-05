@@ -61,6 +61,9 @@ func (s *Service) RegisterRuntimeQualificationPlan(ctx context.Context, token, p
 	if profileBody["runtime_id"] != runtimeID || profileBody["technical_hash"] != runtimeTechnicalHash(r) || profileBody["adapter"] != r["adapter"] || profileBody["adapter_revision"] != r["adapter_revision"] || profileBody["platform"] != r["platform"] || Str(profileBody, "build_hash") == "" || Str(profileBody, "sandbox") == "" || Str(profileBody, "credential_revision") == "" || Str(profileBody, "backend") == "" || Str(profileBody, "model") == "" {
 		return Fail(422, "GATE_FAILED", "profile lacks frozen runtime identity or permission boundary")
 	}
+	if e = validateRuntimeModelConfig(profileBody); e != nil {
+		return e
+	}
 	if r["measurement_mode"] == "LIVE" {
 		cost, err := moneyAmount(profileBody["max_cost"])
 		if err != nil || cost.Sign() <= 0 || Str(profileBody["max_cost"].(map[string]any), "currency") == "" {
@@ -103,6 +106,12 @@ func (s *Service) RegisterRuntimeQualificationPlan(ctx context.Context, token, p
 		return e
 	}
 	plan := Object{"runtime_id": runtimeID, "profile_ref": profileRef, "task_hash": qualificationTaskHash(t), "required_capabilities": requiredCapabilities, "max_validity_seconds": int64(maxValidity.Seconds()), "resume_check_id": resumeCheckID}
+	if permission, ok := profileBody["model_qualification"].(map[string]any); ok {
+		if profileBody["backend"] != runtimeMuBackend {
+			return Fail(422, "GATE_FAILED", "model qualification requires the frozen Mu backend")
+		}
+		plan["model_qualification"] = permission
+	}
 	if _, e = tx.Exec("INSERT INTO runtime_bindings(project,runtime,profile_ref,profile_hash,technical_hash,owner) VALUES(?,?,?,?,?,?)", project, runtimeID, string(Bytes(profileRef)), Hash(profileRef), runtimeTechnicalHash(r), p.ID); e != nil {
 		return e
 	}
