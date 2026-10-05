@@ -98,7 +98,10 @@ async function proxyStart() {
     if (business && mode === 'stale') return failure(412);
     if (business && mode === 'offline') { req.socket.destroy(); return; }
     const partialPath = { S01: '/profile', S02: '/experiments', S03: '/artifacts', S04: '/artifacts', S05: '/evidence', S06: '/qualifications', S07: '/skills', S08: '/runs', S09: '/budget-ledger', S10: '/run-policy' }[stateScreen];
-    if (business && mode === 'partial' && ((stateScreen === 'S00' && operation === 'host.status') || (partialPath && (route.endsWith(partialPath) || (stateScreen === 'S04' && route.includes('/artifacts/')))))) { entry.status = 503; return failure(503); }
+    const partialMatches = ['S05', 'S07'].includes(stateScreen)
+      ? route.includes(partialPath + '/')
+      : partialPath && (route.endsWith(partialPath) || (stateScreen === 'S04' && route.includes('/artifacts/')));
+    if (business && mode === 'partial' && ((stateScreen === 'S00' && operation === 'host.status') || partialMatches)) { entry.status = 503; return failure(503); }
     forward();
   });
   proxy.on('connection', socket => { activeSockets.add(socket); socket.on('close', () => activeSockets.delete(socket)); });
@@ -188,6 +191,11 @@ async function main() {
       const before = proxyLog.length;
       await page.goto('ros-app://desktop' + route, { waitUntil: 'domcontentloaded' });
       await page.locator('#main h1').waitFor();
+      if (state === 'partial' && ['S05', 'S07'].includes(screen)) {
+        // Keep the successful list visible while the selected detail fails.
+        // Failing the sole collection request would exercise a total outage.
+        await page.locator('#main button.record-row').first().click();
+      }
       if (state === 'loading') {
         await page.locator('#main .loading-state').first().waitFor();
       } else {
@@ -205,7 +213,11 @@ async function main() {
       if (state !== 'loading') {
         const retry = page.locator('#main .state-notice button').filter({ hasText: '重新读取' });
         check(`${screen}-${state}-RETRY_AVAILABLE`, await retry.count() > 0);
-        for (const button of await retry.elementHandles()) if (await button.isVisible()) await button.click();
+        for (let attempt = 0; attempt < 4 && await retry.count(); attempt++) {
+          try { await retry.first().click({ timeout: 2000 }); }
+          catch (error) { if (await page.locator('#main .state-notice').count()) throw error; }
+          await page.waitForTimeout(150);
+        }
       }
       await settle(page);
       report.states.push({ screen, state: 'RECOVERED_FROM_' + state, source: 'REAL_LOCAL_API', title: (await metrics(page)).title });
