@@ -207,12 +207,18 @@ func cliHostCommand(name string, args []string) {
 	os.Exit(worst)
 }
 
-// newV2Context mints the identity the envelope needs. Nothing here is invented on the user's behalf: the credential
-// comes from the environment, and the references come from the flags or the recorded configuration.
+// newV2Context reads the current short local credential without opening a UI.
+// Explicit init is the only verb permitted to renew it through the native bridge.
 func newV2Context(name string, args []string, cfg cliConfig, baseURL string) *v2Context {
+	credential := os.Getenv("RESEARCHOS_CLI_CREDENTIAL")
+	if credential == "" {
+		if d, _, err := hostDiscovery(); err == nil && d.URL == baseURL {
+			credential, _ = cliSessionCredential(d)
+		}
+	}
 	ctx := &v2Context{
 		clientID:   cliEnv("RESEARCHOS_CLI_CLIENT_ID", defaultClientID()),
-		credential: os.Getenv("RESEARCHOS_CLI_CREDENTIAL"),
+		credential: credential,
 		projectID:  cfg.ProjectID,
 		sessionID:  cfg.SessionID,
 		// A slash alias would otherwise put "/" inside the command id, which the published identifier pattern

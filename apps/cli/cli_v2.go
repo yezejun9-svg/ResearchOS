@@ -139,7 +139,9 @@ func v2EnvelopeFor(ctx *v2Context, method string, payload map[string]any) (*v2En
 	}
 	env := &v2Envelope{ProtocolVersion: clientProtocol, CommandID: ctx.commandID, ClientID: ctx.clientID,
 		Method: method, Payload: raw}
-	if ctx.projectID != "" {
+	// These two first-use methods are host-level. The host returns the durable
+	// project identity only after a selected workspace has been registered.
+	if ctx.projectID != "" && method != "workspace.register" && method != "project.bootstrap" {
 		env.ProjectID = &ctx.projectID
 	}
 	if ctx.sessionID != "" {
@@ -156,7 +158,7 @@ func v2EnvelopeFor(ctx *v2Context, method string, payload map[string]any) (*v2En
 		if !claim {
 			env.WriterEpoch = &ctx.epoch
 		}
-	} else if v2WriteMethods[method] {
+	} else if v2WriteMethods[method] && method != "project.bootstrap" {
 		if env.ProjectID == nil {
 			return nil, "MISSING_FIELD:project_id"
 		}

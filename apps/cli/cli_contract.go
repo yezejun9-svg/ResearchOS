@@ -15,8 +15,6 @@ package main
 //   * a model change is a config write with a revision and a settled confirmation, so a silent switch cannot happen.
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -30,11 +28,11 @@ import (
 )
 
 const (
-	exitCompleted    = 0
-	exitFailed       = 1
-	exitUsage        = 2
+	exitCompleted      = 0
+	exitFailed         = 1
+	exitUsage          = 2
 	exitNotImplemented = 3
-	exitInterrupted  = 130
+	exitInterrupted    = 130
 )
 
 // contractCommands is the product-contract surface. Each row names the handler that answers, the check that proves
@@ -74,7 +72,7 @@ var contractCommands = map[string]struct {
 	// W05-01, W05-02, W05-03 and W05-99, and the accepted W05-02 check pins this very refusal on stdout, so the
 	// surface stays as delivered and the open question belongs to the W05 gate card and case A04.
 	"interactive": {"cliInteractive", "W0503-INTERACTIVE-COMMAND-DELIVERED", "host + stdin", "W05-03", "session.list + session.create + session.send", []string{"W0503-INTERACTIVE-SENDS-LIST-CREATE-SEND", "W0503-INTERACTIVE-WITHOUT-HOST-REFUSES"}},
-	"chat": {"", "W0503-INTERACTIVE-TUI-KEEPS-NOT-IMPLEMENTED", "terminal", "accepted W02-03 refusal, pinned by W05-02; undecided owner is W05-99/A04", "", []string{"W0503-CHAT-KEEPS-THE-ACCEPTED-REFUSAL"}},
+	"chat":        {"", "W0503-INTERACTIVE-TUI-KEEPS-NOT-IMPLEMENTED", "terminal", "accepted W02-03 refusal, pinned by W05-02; undecided owner is W05-99/A04", "", []string{"W0503-CHAT-KEEPS-THE-ACCEPTED-REFUSAL"}},
 }
 
 // registeredHere reports whether this card's table owns the verb, which is what the non-shadowing rule turns on: a
@@ -312,9 +310,8 @@ func cliHelpSurface(human bool) {
 	}
 }
 
-// cliInit performs the contract's `researchos init <path>`, whose local operation is project.bootstrap. The path is
-// validated locally first (spaces and non-ASCII are ordinary here), then the bootstrap command is sent: a local
-// record of a workspace nobody bootstrapped a project in would be the 空stub shape the card forbids.
+// cliInit performs the published first-use chain. A path is a picker hint, never
+// an authorized workspace reference; only the host may mint that reference.
 func cliInit(args []string) {
 	path, ok := flagValue(args, "workspace")
 	if !ok {
@@ -336,31 +333,61 @@ func cliInit(args []string) {
 	if err != nil {
 		c = cliConfig{ConfigRevision: 0}
 	}
-	c.WorkspaceRef = abs
-	if err := writeConfig(c); err != nil {
-		fail("init", exitFailed, "CONFIG_WRITE_FAILED", err.Error())
-	}
 	d, dpath, herr := hostDiscovery()
-	base := map[string]any{"command": "init", "workspace_ref": abs, "config_path": configPath(),
+	base := map[string]any{"command": "init", "config_path": configPath(),
 		"config_revision": c.ConfigRevision, "path_contains_non_ascii": !isASCII(abs),
-		"path_contains_space": strings.ContainsAny(abs, " \t"), "local_leg": "WORKSPACE_VALIDATED_AND_RECORDED"}
+		"path_contains_space": strings.ContainsAny(abs, " \t"), "local_leg": "WORKSPACE_PATH_VALIDATED"}
 	if herr != nil || d.URL == "" {
-		// The local leg is reported, but the command is not a success: its contract operation needs the host.
 		base["status"], base["exit_code"], base["reason"] = "REJECTED", exitNotImplemented, "INIT_REQUIRES_HOST_PROJECT_BOOTSTRAP"
 		base["detail"] = dpath + ": host discovery unavailable, and project.bootstrap is the operation init performs"
 		outJSON(base)
 		os.Exit(exitNotImplemented)
 	}
 	ctx := newV2Context("init", args, c, d.URL)
-	if ctx.projectID == "" {
-		// A brand-new project has no id to look up, so the client mints one from the workspace path and the host is
-		// the authority on whether it is accepted. The initial CAS values are named rather than defaulted silently.
-		ctx.projectID = "proj-" + digest8(abs)
-		ctx.revision, ctx.epoch = 0, 1
+	ctx.projectID, ctx.sessionID = "", ""
+	ctx.revision, ctx.epoch = 0, 0
+	credential, err := cliInitCredential(d, ctx.clientID)
+	if err != nil {
+		base["status"], base["exit_code"], base["reason"] = "REJECTED", exitNotImplemented, "NATIVE_BOOTSTRAP_FAILED"
+		base["detail"] = err.Error()
+		outJSON(base)
+		os.Exit(exitNotImplemented)
 	}
-	reply, reason, code := v2Call(ctx, "project.bootstrap", map[string]any{
-		"authorized_workspace_ref": abs, "display_name": filepath.Base(abs)})
-	base["method_sent"], base["requests_sent"], base["host_url"] = "project.bootstrap", ctx.requestLog, d.URL
+	ctx.credential = credential
+	selection, chosenPath, err := cliChooseWorkspace(d, ctx.clientID, abs)
+	if err != nil {
+		base["status"], base["exit_code"], base["reason"] = "REJECTED", exitFailed, "NATIVE_WORKSPACE_CHOICE_FAILED"
+		base["detail"] = err.Error()
+		outJSON(base)
+		os.Exit(exitFailed)
+	}
+	registerID, err := cliFirstUseCommandID("register")
+	if err != nil {
+		fail("init", exitFailed, "COMMAND_ID_UNAVAILABLE")
+	}
+	ctx.commandID = registerID
+	reply, reason, code := v2Call(ctx, "workspace.register", map[string]any{
+		"selection_ref": selection, "display_name": filepath.Base(chosenPath), "requested_access": "READ_WRITE"})
+	base["requests_sent"], base["host_url"] = ctx.requestLog, d.URL
+	if code != exitCompleted {
+		base["status"], base["exit_code"], base["reason"] = "REJECTED", code, orDefault(reason, "REGISTER_REFUSED_WITHOUT_CODE")
+		base["detail"] = replyView(reply)
+		outJSON(base)
+		os.Exit(code)
+	}
+	registered, _ := reply["result"].(map[string]any)
+	workspaceRef, _ := registered["authorized_workspace_ref"].(string)
+	if workspaceRef == "" {
+		fail("init", exitFailed, "REGISTER_REPLY_MISSING_WORKSPACE_REF")
+	}
+	bootstrapID, err := cliFirstUseCommandID("bootstrap")
+	if err != nil {
+		fail("init", exitFailed, "COMMAND_ID_UNAVAILABLE")
+	}
+	ctx.commandID = bootstrapID
+	reply, reason, code = v2Call(ctx, "project.bootstrap", map[string]any{
+		"authorized_workspace_ref": workspaceRef, "display_name": filepath.Base(chosenPath)})
+	base["requests_sent"] = ctx.requestLog
 	if code != exitCompleted {
 		base["status"], base["exit_code"] = "REJECTED", code
 		base["reason"] = orDefault(reason, "BOOTSTRAP_REFUSED_WITHOUT_CODE")
@@ -368,17 +395,20 @@ func cliInit(args []string) {
 		outJSON(base)
 		os.Exit(code)
 	}
-	c.ProjectID = ctx.projectID
-	_ = writeConfig(c)
-	base["status"], base["exit_code"], base["project_id"] = "COMPLETED", exitCompleted, ctx.projectID
+	result, _ := reply["result"].(map[string]any)
+	projectID, _ := result["project_id"].(string)
+	if projectID == "" {
+		fail("init", exitFailed, "BOOTSTRAP_REPLY_MISSING_PROJECT_ID")
+	}
+	c.WorkspaceRef, c.ProjectID = workspaceRef, projectID
+	c.SessionID, c.Revision, c.WriterEpoch = "", 0, 0
+	if err := writeConfig(c); err != nil {
+		fail("init", exitFailed, "CONFIG_WRITE_FAILED", err.Error())
+	}
+	base["status"], base["exit_code"], base["project_id"] = "COMPLETED", exitCompleted, projectID
+	base["workspace_ref"] = workspaceRef
 	base["result"] = reply["result"]
 	outJSON(base)
-}
-
-// digest8 mints a stable project id from an absolute workspace path.
-func digest8(s string) string {
-	sum := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(sum[:])[:12]
 }
 
 func isASCII(s string) bool {
