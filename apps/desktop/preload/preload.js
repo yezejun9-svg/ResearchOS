@@ -34,6 +34,7 @@ api.desktop = Object.freeze({
   selectProject: (projectId) => ipcRenderer.invoke('ros:desktop:selectProject', { project_id: projectId }),
   openSession: (sessionId) => ipcRenderer.invoke('ros:desktop:openSession', { session_id: sessionId }),
   readArtifact: (ref) => ipcRenderer.invoke('ros:desktop:readArtifact', ref),
+  chooseWorkspace: (body) => ipcRenderer.invoke('ros:desktop:chooseWorkspace', body),
 });
 
 contextBridge.exposeInMainWorld('researchos', Object.freeze(api));

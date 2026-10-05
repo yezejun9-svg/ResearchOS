@@ -25,7 +25,7 @@ function hostInstanceId(fsImpl, discovery) {
   return id;
 }
 
-function dialNative(pipeName, frame) {
+function dialNative(pipeName, frame, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     const request = Buffer.from(JSON.stringify(frame));
     if (!request.length || request.length > MAX_FRAME) return reject(Error('NATIVE_FRAME_TOO_LARGE'));
@@ -39,7 +39,7 @@ function dialNative(pipeName, frame) {
       socket.destroy();
       if (error) reject(error); else resolve(reply);
     }
-    socket.setTimeout(5000, () => finish(Error('NATIVE_TRANSPORT_TIMEOUT')));
+    socket.setTimeout(timeoutMs, () => finish(Error('NATIVE_TRANSPORT_TIMEOUT')));
     socket.on('connect', () => socket.write(request));
     socket.on('data', part => {
       size += part.length;

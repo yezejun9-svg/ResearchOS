@@ -2,6 +2,7 @@ import { operations } from './operations.js'
 
 let remoteTransport
 async function transportMode() {
+  if (window.researchos?.desktop?.context) return 'sse'
   remoteTransport ||= fetch('/remote-info', { cache: 'no-store', signal: AbortSignal.timeout(5000) }).then(response => response.ok && response.headers.get('Content-Type')?.includes('application/json') ? response.json() : null).then(info => info?.events === 'poll' ? 'poll' : 'sse').catch(() => { remoteTransport = null; return location.hostname.endsWith('.trycloudflare.com') ? 'poll' : 'sse' })
   return remoteTransport
 }
@@ -25,6 +26,7 @@ function pathFor(pattern, params) {
 }
 
 export function createApi(getToken) {
+  const nativeDesktop = !!window.researchos?.desktop?.context
   let principalId = null
   let deviceRole = null
   async function call(operation, { params = {}, query, body, signal, etag, key, raw = false } = {}) {
@@ -32,7 +34,8 @@ export function createApi(getToken) {
     if (!spec) throw new Error(`未知操作 ${operation}`)
     const url = new URL(pathFor(spec.path, params), window.location.origin)
     if (query) Object.entries(query).forEach(([name, value]) => { if (value != null && value !== '') url.searchParams.set(name, String(value)) })
-    const headers = { Authorization: `Bearer ${getToken()}`, Accept: raw ? '*/*' : 'application/json' }
+    const headers = { Accept: raw ? '*/*' : 'application/json' }
+    if (!nativeDesktop) headers.Authorization = `Bearer ${getToken()}`
     if (body != null) headers['Content-Type'] = body instanceof Blob ? 'application/octet-stream' : 'application/json'
     if (etag) headers['If-Match'] = etag
     if (spec.method !== 'GET') headers['Idempotency-Key'] = key || crypto.randomUUID()
@@ -81,7 +84,8 @@ export function createApi(getToken) {
       return
     }
     const url = new URL(pathFor(operations.streamEvents.path, { projectId }), window.location.origin)
-    const headers = { Authorization: `Bearer ${getToken()}`, Accept: 'text/event-stream' }
+    const headers = { Accept: 'text/event-stream' }
+    if (!nativeDesktop) headers.Authorization = `Bearer ${getToken()}`
     if (afterSequence != null) headers['Last-Event-ID'] = String(afterSequence)
     // The server sends a comment heartbeat every 15 seconds. Three missed
     // heartbeats also bound a fetch which never returns response headers.
