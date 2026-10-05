@@ -127,6 +127,21 @@ func (s *Service) sealDecisionEnvelope(tx *sql.Tx, p Principal, project string, 
 	return s.seal(tx, p, project, Object{"run_id": nil, "kind": "REPORT", "evidence_kind": "OBSERVED", "measurement_mode": envelope.MeasurementMode, "content_hash": u["content_hash"], "storage_key": u["storage_key"], "media_type": "application/json", "byte_size": len(raw), "input_refs": refs, "source_refs": Empty(), "produced_by": p.ID, "access_class": "PROJECT"})
 }
 
+// The planner's judgment is captured before the model call. It is sealed with
+// the raw envelope in the same transaction as the final DecisionReceipt, so a
+// reader can compare all three without trusting a rewritten rationale.
+func (s *Service) sealOriginalDecision(tx *sql.Tx, p Principal, project string, b Object, raw []byte, measurementMode string) (Object, error) {
+	u, e := s.upload(tx, p, project, raw)
+	if e != nil {
+		return nil, e
+	}
+	refs := Empty()
+	for _, ref := range semanticReferences("DecisionReceipt", b) {
+		refs = append(refs, ref)
+	}
+	return s.seal(tx, p, project, Object{"run_id": nil, "kind": "REPORT", "evidence_kind": "OBSERVED", "measurement_mode": measurementMode, "content_hash": u["content_hash"], "storage_key": u["storage_key"], "media_type": "application/json", "byte_size": len(raw), "input_refs": refs, "source_refs": Empty(), "produced_by": p.ID, "access_class": "PROJECT"})
+}
+
 func (s *Service) decisionRubric(tx *sql.Tx, project string, b Object) (DecisionRubric, error) {
 	var rubric DecisionRubric
 	v, e := s.artifactJSON(tx, project, b["rubric_ref"].(map[string]any))
@@ -178,6 +193,7 @@ func (s *Service) prepareDecision(tx *sql.Tx, p Principal, project string, b Obj
 		}
 	}
 	reasons := decisionHardFailures(b)
+	modelReasons := []string{}
 	signals := Empty()
 	selected := ""
 	if qid := Str(b, "qualification_id"); qid != "" {
@@ -215,11 +231,11 @@ func (s *Service) prepareDecision(tx *sql.Tx, p Principal, project string, b Obj
 				result = decision.Evaluate(env, rubric.ConfidenceThreshold)
 			}
 			if result.Abstained {
-				reasons = append(reasons, result.Reasons...)
+				modelReasons = append(modelReasons, result.Reasons...)
 			}
 			if result.Selected != "" {
 				if selected != "" && selected != result.Selected {
-					reasons = append(reasons, "CONTRADICTORY_MODEL_ACTIONS")
+					modelReasons = append(modelReasons, "CONTRADICTORY_MODEL_ACTIONS")
 				}
 				selected = result.Selected
 			}
@@ -229,7 +245,7 @@ func (s *Service) prepareDecision(tx *sql.Tx, p Principal, project string, b Obj
 				mode = "LIVE"
 				called = true
 			} else if env.MeasurementMode == "LIVE" {
-				reasons = append(reasons, "UNVERIFIED_IMPORTED_INVOCATION")
+				modelReasons = append(modelReasons, "UNVERIFIED_IMPORTED_INVOCATION")
 			}
 			if len(result.Signals) == 0 {
 				signals = append(signals, Object{"adapter": decision.Adapter, "provider": scope["provider"], "model_revision": scope["model_revision"], "jev_called": called, "measurement_mode": mode, "operation": "CHOICE", "raw_artifact_ref": ref, "value": nil, "probability": nil, "host_abstained": true, "abstain_reason": strings.Join(result.Reasons, ";")})
@@ -243,10 +259,18 @@ func (s *Service) prepareDecision(tx *sql.Tx, p Principal, project string, b Obj
 			}
 		}
 		if selected == "" {
-			reasons = append(reasons, "ACTION_NOT_MEASURED")
+			modelReasons = append(modelReasons, "ACTION_NOT_MEASURED")
 		} else if selected != b["selected"] {
-			reasons = append(reasons, "SELECTED_DIFFERS_FROM_MEASURED_ACTION")
+			modelReasons = append(modelReasons, "SELECTED_DIFFERS_FROM_MEASURED_ACTION")
 		}
+	}
+	if b["mode"] == "SHADOW" {
+		if len(modelReasons) > 0 {
+			sort.Strings(modelReasons)
+			b["rationale"] = Str(b, "rationale") + "; shadow comparison: " + strings.Join(modelReasons, ";")
+		}
+	} else {
+		reasons = append(reasons, modelReasons...)
 	}
 	if b["status"] != "DECIDED" {
 		reasons = append(reasons, "CALLER_ABSTAIN_OR_ERROR")
@@ -264,9 +288,21 @@ func (s *Service) prepareDecision(tx *sql.Tx, p Principal, project string, b Obj
 // Client, never in an Artifact. Imported envelopes are advisory evidence only;
 // this method does not confer qualification or acceptance authority.
 func (s *Service) InvokeJev(ctx context.Context, token, project string, b Object, client decision.Client) (Object, error) {
+	encoded, err := json.Marshal(b)
+	if err != nil {
+		return nil, Fail(400, "INVALID_REQUEST", "decision request must be JSON")
+	}
+	b, err = Decode(encoded)
+	if err != nil {
+		return nil, Fail(400, "INVALID_REQUEST", "decision request must be lossless JSON")
+	}
+	if _, supplied := b["mode"]; !supplied {
+		b["mode"] = "SHADOW"
+	}
 	var principal string
 	var binding decision.Binding
 	var request decision.Request
+	var original []byte
 	tx, e := s.DB.BeginTx(ctx, nil)
 	if e != nil {
 		return nil, e
@@ -302,6 +338,7 @@ func (s *Service) InvokeJev(ctx context.Context, token, project string, b Object
 		binding.RubricHash = Str(b["rubric_ref"].(map[string]any), "content_hash")
 		request = decision.Request{Model: binding.Scope.ModelRevision, State: Object{"binding": binding, "inputs": inputs}, Questions: rubric.Questions}
 		principal = p.ID
+		original = Bytes(Object{"schema": "researchos.original-decision.v1", "decision_point": binding.Scope.TaskType, "subject_ref": b["subject_ref"], "input_refs": b["input_refs"], "input_hash": b["input_hash"], "scope": b["scope"], "mode": b["mode"], "rubric_ref": b["rubric_ref"], "options": b["options"], "selected": b["selected"], "status": b["status"], "rationale": b["rationale"], "deterministic_results": b["deterministic_results"], "missing_evidence": b["missing_evidence"], "evidence_refs": b["evidence_refs"], "recorded_by": p.ID})
 	}
 	tx.Rollback()
 	if e != nil {
@@ -335,10 +372,14 @@ func (s *Service) InvokeJev(ctx context.Context, token, project string, b Object
 	if e != nil {
 		return nil, e
 	}
+	originalArtifact, e := s.sealOriginalDecision(tx, p, project, b, original, envelope.MeasurementMode)
+	if e != nil {
+		return nil, e
+	}
 	b = copyObject(b)
 	b["_host_invocation"] = decisionInvocationProof{RawHash: Str(artifact, "content_hash")}
 	b["signals"] = []any{Object{"raw_artifact_ref": Ref(artifact, "Artifact")}}
-	b["evidence_refs"] = append(Arr(b, "evidence_refs"), Ref(artifact, "Artifact"))
+	b["evidence_refs"] = append(Arr(b, "evidence_refs"), Ref(originalArtifact, "Artifact"), Ref(artifact, "Artifact"))
 	receipt, e := s.recordDecision(tx, p, project, b)
 	if e != nil {
 		return nil, e
