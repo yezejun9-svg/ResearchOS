@@ -595,30 +595,45 @@ func (s *Service) ConsumeEvent(ctx context.Context, consumer, project, eventID s
 		if e != nil {
 			return nil, e
 		}
-		r := ev["aggregate_ref"].(map[string]any)
-		obj, e := version(tx, project, r)
-		if e != nil {
-			return nil, e
-		}
-		revision, e := Num(r, "revision")
-		if e != nil {
-			return nil, e
-		}
-		_, e = tx.Exec("INSERT INTO context_projection(consumer,project,kind,id,revision,body) VALUES(?,?,?,?,?,?) ON CONFLICT(consumer,project,kind,id) DO UPDATE SET revision=excluded.revision,body=excluded.body WHERE excluded.revision>context_projection.revision", consumer, project, r["entity_type"], r["id"], revision, string(Bytes(obj)))
-		if e != nil {
-			return nil, e
-		}
-		var stateRaw string
-		var stateRevision int64
-		if e = tx.QueryRow("SELECT revision,body FROM event_state_snapshots WHERE project=? AND event_id=?", project, id).Scan(&stateRevision, &stateRaw); e != nil {
-			return nil, e
-		}
-		state, e := Decode([]byte(stateRaw))
-		if e != nil {
-			return nil, e
-		}
-		if _, e = tx.Exec("INSERT INTO context_projection(consumer,project,kind,id,revision,body) VALUES(?,?,?,?,?,?) ON CONFLICT(consumer,project,kind,id) DO UPDATE SET revision=excluded.revision,body=excluded.body WHERE excluded.revision>context_projection.revision", consumer, project, "ProjectState", state["id"], stateRevision, stateRaw); e != nil {
-			return nil, e
+		if _, typed := ev["protocol_version"]; typed {
+			clientEvent, err := DecodeEvent(Bytes(ev))
+			if err != nil {
+				return nil, err
+			}
+			if *clientEvent.EventID != id {
+				return nil, Fail(500, "INTERNAL_ERROR", "session event identity differs from outbox")
+			}
+			// Typed session events advance the shared inbox cursor but do not carry
+			// a domain aggregate or ProjectState snapshot to project.
+		} else {
+			r, ok := ev["aggregate_ref"].(map[string]any)
+			if !ok {
+				return nil, Fail(500, "INTERNAL_ERROR", "domain event aggregate unavailable")
+			}
+			obj, e := version(tx, project, r)
+			if e != nil {
+				return nil, e
+			}
+			revision, e := Num(r, "revision")
+			if e != nil {
+				return nil, e
+			}
+			_, e = tx.Exec("INSERT INTO context_projection(consumer,project,kind,id,revision,body) VALUES(?,?,?,?,?,?) ON CONFLICT(consumer,project,kind,id) DO UPDATE SET revision=excluded.revision,body=excluded.body WHERE excluded.revision>context_projection.revision", consumer, project, r["entity_type"], r["id"], revision, string(Bytes(obj)))
+			if e != nil {
+				return nil, e
+			}
+			var stateRaw string
+			var stateRevision int64
+			if e = tx.QueryRow("SELECT revision,body FROM event_state_snapshots WHERE project=? AND event_id=?", project, id).Scan(&stateRevision, &stateRaw); e != nil {
+				return nil, e
+			}
+			state, e := Decode([]byte(stateRaw))
+			if e != nil {
+				return nil, e
+			}
+			if _, e = tx.Exec("INSERT INTO context_projection(consumer,project,kind,id,revision,body) VALUES(?,?,?,?,?,?) ON CONFLICT(consumer,project,kind,id) DO UPDATE SET revision=excluded.revision,body=excluded.body WHERE excluded.revision>context_projection.revision", consumer, project, "ProjectState", state["id"], stateRevision, stateRaw); e != nil {
+				return nil, e
+			}
 		}
 		if _, e = tx.Exec("UPDATE consumer_inbox SET applied=1 WHERE consumer=? AND event_id=?", consumer, id); e != nil {
 			return nil, e

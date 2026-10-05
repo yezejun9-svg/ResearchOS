@@ -34,15 +34,11 @@ func (s *Service) workbenchEvents(ctx context.Context, token, project string, op
 	if !p.Allowed(project, "", "", false) {
 		return nil, after, Fail(404, "NOT_FOUND", "project unavailable")
 	}
-	state, e := singleton(tx, project, "ProjectState")
-	if e != nil {
+	var watermark int64
+	if e = tx.QueryRow("SELECT COALESCE(MAX(sequence),0) FROM outbox WHERE project=?", project).Scan(&watermark); e != nil {
 		return nil, after, e
 	}
-	watermark, e := Num(state, "event_sequence")
-	if e != nil {
-		return nil, after, e
-	}
-	// Absence of Last-Event-ID starts at the current snapshot watermark, so an
+	// Absence of Last-Event-ID starts at the current journal watermark, so an
 	// initial subscription cannot replay unbounded historical activity.
 	if after == -1 {
 		return []Object{}, watermark, nil
@@ -53,14 +49,20 @@ func (s *Service) workbenchEvents(ctx context.Context, token, project string, op
 	if after == watermark {
 		return []Object{}, after, nil
 	}
-	rows, e := tx.Query("SELECT body FROM outbox WHERE project=? AND sequence>? ORDER BY sequence LIMIT 128", project, after)
+	rows, e := tx.Query("SELECT sequence,id,body FROM outbox WHERE project=? AND sequence>? ORDER BY sequence LIMIT 128", project, after)
 	if e != nil {
 		return nil, after, e
 	}
-	batch := []Object{}
+	type entry struct {
+		sequence int64
+		id       string
+		body     Object
+	}
+	batch := []entry{}
 	for rows.Next() {
 		var raw string
-		if e = rows.Scan(&raw); e != nil {
+		var row entry
+		if e = rows.Scan(&row.sequence, &row.id, &raw); e != nil {
 			rows.Close()
 			return nil, after, e
 		}
@@ -69,7 +71,8 @@ func (s *Service) workbenchEvents(ctx context.Context, token, project string, op
 			rows.Close()
 			return nil, after, err
 		}
-		batch = append(batch, ev)
+		row.body = ev
+		batch = append(batch, row)
 	}
 	e = rows.Err()
 	rows.Close()
@@ -80,7 +83,24 @@ func (s *Service) workbenchEvents(ctx context.Context, token, project string, op
 		return nil, after, Fail(410, "CURSOR_EXPIRED", "fetch current state/progress then resume from its event sequence")
 	}
 	visible := []Object{}
-	for _, ev := range batch {
+	for _, row := range batch {
+		if row.sequence != after+1 {
+			return nil, after, Fail(410, "CURSOR_EXPIRED", "fetch current state/progress then resume from its event sequence")
+		}
+		ev := row.body
+		if _, typed := ev["protocol_version"]; typed {
+			// Session events use a separate local sequence and have no v1 timestamp.
+			// Consume their global positions without emitting a different wire schema.
+			clientEvent, err := DecodeEvent(Bytes(ev))
+			if err != nil {
+				return nil, after, err
+			}
+			if *clientEvent.EventID != row.id {
+				return nil, after, Fail(500, "INTERNAL_ERROR", "session event identity differs from outbox")
+			}
+			after = row.sequence
+			continue
+		}
 		sequence, err := Num(ev, "sequence")
 		if err != nil {
 			return nil, after, err
@@ -89,7 +109,7 @@ func (s *Service) workbenchEvents(ctx context.Context, token, project string, op
 		if err != nil {
 			return nil, after, err
 		}
-		if sequence != after+1 || time.Since(at) > workbenchReplayWindow {
+		if sequence != row.sequence || time.Since(at) > workbenchReplayWindow {
 			return nil, after, Fail(410, "CURSOR_EXPIRED", "fetch current state/progress then resume from its event sequence")
 		}
 		after = sequence
