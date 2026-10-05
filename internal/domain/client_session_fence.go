@@ -31,6 +31,18 @@ func installClientSessionFence(ctx context.Context, ex fenceExec, restored bool)
 	if present == 0 {
 		return nil
 	}
+	// CREATE TABLE IF NOT EXISTS cannot extend a database created by an older
+	// client. The nullable reference indexes a sealed journal projection; it
+	// neither replaces the message journal nor changes session or writer state.
+	var transcriptColumn int
+	if err := ex.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('client_sessions') WHERE name='transcript_artifact_id'`).Scan(&transcriptColumn); err != nil {
+		return err
+	}
+	if transcriptColumn == 0 {
+		if _, err := ex.ExecContext(ctx, `ALTER TABLE client_sessions ADD COLUMN transcript_artifact_id TEXT`); err != nil {
+			return err
+		}
+	}
 	if _, err := ex.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS backup_restore_barriers(project TEXT NOT NULL,run TEXT NOT NULL,restored_at TEXT NOT NULL,PRIMARY KEY(project,run))`); err != nil {
 		return err
 	}
