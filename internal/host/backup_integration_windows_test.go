@@ -328,6 +328,112 @@ func TestW1802ProductionBackupCLIWorkspaceContinuation(t *testing.T) {
 		snapshot["model_config_ref"] != modelRef || snapshot["core_build_id"] != buildID || snapshot["goal_id"] != goalID {
 		t.Fatalf("typed session snapshot incomplete after restore: %v %+v", err, snapshot)
 	}
+	// A restored data root must itself be a valid production backup source. The
+	// second backup lives outside both data roots, then restores into a third,
+	// empty location without consulting the original Host or workspace.
+	originalDB, err := os.ReadFile(filepath.Join(sourceData, "researchos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBackup := filepath.Join(root, "second-encrypted-backup")
+	if output, err := backupCLI(t, backupBinary, repo, "create", "--db", filepath.Join(restoredRoot, "researchos.sqlite"),
+		"--out", secondBackup, "--key-file", key, "--root", repo); err != nil {
+		t.Fatalf("production rebackup after restore: %v\n%s", err, output)
+	}
+	secondRoot := filepath.Join(root, "second-restored-data")
+	if output, err := backupCLI(t, backupBinary, repo, "restore", "--as-data-root", "--backup", secondBackup,
+		"--out", secondRoot, "--key-file", key, "--root", repo); err != nil {
+		t.Fatalf("production second restore: %v\n%s", err, output)
+	}
+	secondDB, err := store.Open(filepath.Join(secondRoot, "researchos.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondDB.Close()
+	secondHost := backupTestHost(t, secondDB, secondRoot, repo)
+	secondPath := domain.BackupWorkspaceDestination(secondRoot, ref)
+	if len(secondHost.Roots()) != 1 || secondHost.Roots()[0].Ref != ref || secondHost.Roots()[0].RealPath != secondPath ||
+		secondPath == binding.RealPath || secondPath == workspace {
+		t.Fatalf("second Host root did not move to a fresh pin: %+v", secondHost.Roots())
+	}
+	if _, err := secondHost.ResolveWorkspace(ref, "src/main.go", host.AccessReadWrite); err != nil {
+		t.Fatalf("second Host cannot use recovered root: %v", err)
+	}
+	secondContent, err := os.ReadFile(filepath.Join(secondPath, "src", "main.go"))
+	if err != nil || string(secondContent) != "package continued\n" {
+		t.Fatalf("second restore changed source bytes: %v %q", err, secondContent)
+	}
+	var secondProject, secondWorkspace, secondGoal, secondTask string
+	if err := secondDB.QueryRow(`SELECT project_id,workspace_ref,goal_id,task_id FROM client_sessions WHERE id=?`, sessionID).
+		Scan(&secondProject, &secondWorkspace, &secondGoal, &secondTask); err != nil ||
+		secondProject != projectID || secondWorkspace != ref || secondGoal != goalID || secondTask != taskID {
+		t.Fatalf("second restore lost session/Goal/Task identity: %q %q %q %q %v", secondProject, secondWorkspace, secondGoal, secondTask, err)
+	}
+	secondService, err := domain.New(secondDB, filepath.Join(repo, "spec", "v2.0", "contracts"), filepath.Join(repo, "migrations", "sqlite", "0002_domain.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBinding, err := secondService.WorkspaceBindingFor(ctx, principal, localworkspace.NewAuthority(secondHost), ref)
+	if err != nil || secondBinding.RealPath != secondPath || secondBinding.ProjectID == nil || *secondBinding.ProjectID != projectID {
+		t.Fatalf("second restore binding points outside fresh root: %+v %v", secondBinding, err)
+	}
+	secondTx, err := secondDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSnapshot, err := domain.BuildSessionSnapshot(ctx, secondTx, doc, projectID, sessionID)
+	secondTx.Rollback()
+	if err != nil || secondSnapshot["session_id"] != snapshot["session_id"] ||
+		secondSnapshot["goal_id"] != snapshot["goal_id"] || secondSnapshot["model_config_ref"] != snapshot["model_config_ref"] ||
+		secondSnapshot["core_build_id"] != snapshot["core_build_id"] || secondSnapshot["workspace_ref"] != ref {
+		t.Fatalf("second typed session snapshot changed: %v %+v", err, secondSnapshot)
+	}
+	stillOriginalDB, err := os.ReadFile(filepath.Join(sourceData, "researchos.sqlite"))
+	if err != nil || domain.Digest(stillOriginalDB) != domain.Digest(originalDB) {
+		t.Fatalf("rebackup changed original source DB: %v", err)
+	}
+	stillOriginalWorkspace, err := os.ReadFile(filepath.Join(workspace, "src", "main.go"))
+	if err != nil || string(stillOriginalWorkspace) != "source changed after backup\n" {
+		t.Fatalf("rebackup changed original source workspace: %v %q", err, stillOriginalWorkspace)
+	}
+	// A real second Host/domain registration under the data root is not the
+	// restored workspace path. Its matching pin must still be refused.
+	unrelatedPath := filepath.Join(restoredRoot, "unrelated-workspace")
+	if err := os.Mkdir(unrelatedPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	otherFrame, err := json.Marshal(map[string]any{"kind": host.KindWorkspaceChooseRequest,
+		"client_id": "backup-smoke-cli", "payload": map[string]any{"requested_path": unrelatedPath, "requested_access": host.AccessReadWrite}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherReply, err := restoredHost.HandleNative(otherFrame, true, func(string) (string, error) { return unrelatedPath, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var otherChoice struct {
+		Payload struct {
+			Ref string `json:"selection_ref"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(otherReply, &otherChoice); err != nil || otherChoice.Payload.Ref == "" {
+		t.Fatalf("nonmatching Host path was not genuinely pinned: %v", err)
+	}
+	otherRegistered, err := restoredService.RegisterWorkspace(ctx, principal, localworkspace.NewAuthority(restoredHost), doc,
+		domain.RegisterWorkspaceInput{SelectionRef: otherChoice.Payload.Ref, DisplayName: "nonmatching data-root child",
+			RequestedAccess: host.AccessReadWrite, ClientID: "backup-smoke-cli", CommandID: "backup-smoke-other-register"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRef := domain.Str(otherRegistered, "authorized_workspace_ref")
+	otherBinding, err := restoredService.WorkspaceBindingFor(ctx, principal, localworkspace.NewAuthority(restoredHost), otherRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoredHost.SnapshotWorkspace(ctx, *otherBinding, filepath.Join(root, "outside-backup"),
+		domain.BackupWorkspaceLimits{MaxFiles: 1, MaxDirs: 1, MaxBytes: 1024, MaxFileBytes: 1024}); err == nil || !strings.Contains(err.Error(), "BACKUP_WORKSPACE_RECURSION") {
+		t.Fatalf("nonmatching pinned data-root child gained backup exception: %v", err)
+	}
 	// A failed target pin publishes no active authorization to either the old
 	// path or the new one. The original backup remains available for recovery.
 	keyBytes, err := os.ReadFile(key)
@@ -374,4 +480,8 @@ func TestW1802ProductionBackupCLIWorkspaceContinuation(t *testing.T) {
 	t.Logf("W18_ASSERTION %s", domain.Bytes(domain.Object{"assertion_id": "W18-02-NEW-HOST-PIN", "expected": true, "actual": true,
 		"status": "PASS", "evidence": domain.Object{"root_ref": ref, "new_path": binding.RealPath,
 			"old_path_used": binding.RealPath == workspace, "old_credential_status": host.StatusMissing}}))
+	t.Logf("W18_ASSERTION %s", domain.Bytes(domain.Object{"assertion_id": "W18-02-REBACKUP-ROUNDTRIP", "expected": true, "actual": true,
+		"status": "PASS", "evidence": domain.Object{"workspace_ref": ref, "project_id": projectID, "session_id": sessionID,
+			"goal_id": goalID, "task_id": taskID, "first_restored_path": binding.RealPath, "second_restored_path": secondPath,
+			"source_db_unchanged": true, "source_workspace_unchanged": true, "nonmatching_child_rejected": true}}))
 }
