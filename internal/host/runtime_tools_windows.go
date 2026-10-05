@@ -21,6 +21,11 @@ import (
 const runtimeToolFileLimit = 2 << 20
 const runtimeToolByteLimit = 64 << 10
 
+// The broker adds sequence/key/state around this payload before sending its
+// 64 KiB bridge frame. Keep room for that envelope and measure encoded bytes,
+// since JSON escaping can expand a requested byte slice substantially.
+const runtimeToolReadReplyLimit = 56 << 10
+
 // Serialize host writes, including the read/compare/replace interval. External
 // writers are not serialized by this mutex; callers still need a frozen,
 // host-authorized workspace and an expected content hash for every replacement.
@@ -268,6 +273,18 @@ func runtimeToolReply(details domain.Object) (domain.Object, error) {
 	return domain.Object{"content": []any{domain.Object{"type": "text", "text": string(text)}}, "details": details}, nil
 }
 
+func runtimeToolReadReply(rel, hash string, data []byte, offset, end int64) (domain.Object, error) {
+	metadata := domain.Object{"path": rel, "content_hash": hash, "next_offset": end, "truncated": end < int64(len(data)), "size_bytes": len(data)}
+	visible := domain.Object{"path": rel, "content_hash": hash, "text": string(data[offset:end]), "next_offset": end, "truncated": end < int64(len(data)), "size_bytes": len(data)}
+	encoded, err := json.Marshal(visible)
+	if err != nil {
+		return nil, err
+	}
+	// The model sees the text and pagination metadata in content. The SDK's
+	// details copy carries only metadata, so the text is encoded just once.
+	return domain.Object{"content": []any{domain.Object{"type": "text", "text": string(encoded)}}, "details": metadata}, nil
+}
+
 func runtimeToolRead(ctx context.Context, root *os.Root, rel string, args domain.Object, max int64) (domain.Object, error) {
 	for key := range args {
 		if key != "path" && key != "offset" && key != "limit" {
@@ -298,20 +315,58 @@ func runtimeToolRead(ctx context.Context, root *os.Root, rel string, args domain
 	if offset < int64(len(data)) && !utf8.RuneStart(data[offset]) {
 		return nil, toolInvalid("offset must be a UTF-8 boundary")
 	}
-	end := offset + limit
-	if end > int64(len(data)) {
-		end = int64(len(data))
+	wantEnd := offset + limit
+	if wantEnd > int64(len(data)) {
+		wantEnd = int64(len(data))
 	}
-	for end < int64(len(data)) && !utf8.RuneStart(data[end]) {
-		end--
+	for wantEnd < int64(len(data)) && !utf8.RuneStart(data[wantEnd]) {
+		wantEnd--
 	}
-	if end == offset && offset < int64(len(data)) {
+	if wantEnd == offset && offset < int64(len(data)) {
 		return nil, toolInvalid("limit cannot fit the next UTF-8 rune")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return runtimeToolReply(domain.Object{"path": rel, "content_hash": domain.Digest(data), "text": string(data[offset:end]), "next_offset": end, "truncated": end < int64(len(data)), "size_bytes": len(data)})
+	hash := domain.Digest(data)
+	ends := []int64{offset}
+	for end := offset; end < wantEnd; {
+		_, size := utf8.DecodeRune(data[end:])
+		end += int64(size)
+		ends = append(ends, end)
+	}
+	build := func(index int) (domain.Object, bool, error) {
+		reply, err := runtimeToolReadReply(rel, hash, data, offset, ends[index])
+		if err != nil {
+			return nil, false, err
+		}
+		return reply, len(domain.Bytes(reply)) <= runtimeToolReadReplyLimit, nil
+	}
+	if reply, fits, err := build(len(ends) - 1); err != nil || fits {
+		return reply, err
+	}
+	lo, hi := 0, len(ends)-1
+	for lo < hi {
+		mid := lo + (hi-lo+1)/2
+		if _, fits, err := build(mid); err != nil {
+			return nil, err
+		} else if fits {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	if lo == 0 && offset < int64(len(data)) {
+		return nil, toolDenied("read result cannot fit bridge frame")
+	}
+	reply, fits, err := build(lo)
+	if err != nil {
+		return nil, err
+	}
+	if !fits {
+		return nil, toolDenied("read result cannot fit bridge frame")
+	}
+	return reply, nil
 }
 
 func runtimeToolWrite(ctx context.Context, root *os.Root, rel, name string, args domain.Object, max int64) (result domain.Object, err error) {
