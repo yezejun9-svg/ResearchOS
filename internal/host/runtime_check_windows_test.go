@@ -4,6 +4,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -156,6 +157,11 @@ func TestRuntimeCheckDispatcherUsesCheckOnlyPolicy(t *testing.T) {
 	request := domain.RuntimeToolRequest{WorkspacePath: workspace, Access: AccessReadOnly, Name: "run_check", Arguments: domain.Object{"check_id": "doctor-unit"}, Policy: policy}
 	if _, err := host.ExecuteRuntimeTool(context.Background(), request); err == nil || !strings.Contains(err.Error(), "frozen Go toolchain changed") {
 		t.Fatalf("check_id-only dispatcher did not reach toolchain pin: %v", err)
+	} else {
+		var failure *domain.RuntimeToolFailure
+		if !errors.As(err, &failure) || failure.Outcome != "NOT_APPLIED" {
+			t.Fatalf("frozen check prelaunch failure should be NOT_APPLIED: %v", err)
+		}
 	}
 	if err := host.RevokeWorkspace(binding.Ref); err != nil {
 		t.Fatal(err)

@@ -4,6 +4,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,5 +116,34 @@ func TestRuntimeToolRejectsUnboundAndReparsePaths(t *testing.T) {
 	data, err := os.ReadFile(outside)
 	if err != nil || string(data) != "outside" {
 		t.Fatalf("escaped file changed: %q %v", data, err)
+	}
+}
+
+func TestRuntimeToolFailureOutcomeAtHostBoundary(t *testing.T) {
+	host, workspace, _ := runtimeToolFixture(t, AccessReadWrite)
+	policy := runtimeToolPolicy()
+	for _, tc := range []struct {
+		name string
+		args domain.Object
+	}{
+		{"read", domain.Object{"path": "allowed.txt"}}, // Missing file has no effect.
+		{"write", domain.Object{"path": "forbidden.txt", "content": "x", "expected_hash": nil}},
+	} {
+		_, err := host.ExecuteRuntimeTool(context.Background(), domain.RuntimeToolRequest{WorkspacePath: workspace, Access: AccessReadWrite, Name: tc.name, Arguments: tc.args, Policy: policy})
+		var failure *domain.RuntimeToolFailure
+		if !errors.As(err, &failure) || failure.Outcome != "NOT_APPLIED" {
+			t.Fatalf("%s: expected NOT_APPLIED host witness, got %v", tc.name, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "allowed.txt"), []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := host.ExecuteRuntimeTool(context.Background(), domain.RuntimeToolRequest{WorkspacePath: workspace, Access: AccessReadWrite, Name: "write", Arguments: domain.Object{"path": "allowed.txt", "content": "new", "expected_hash": domain.Digest([]byte("stale"))}, Policy: policy})
+	var failure *domain.RuntimeToolFailure
+	if !errors.As(err, &failure) || failure.Outcome != "NOT_APPLIED" {
+		t.Fatalf("stale CAS should be NOT_APPLIED, got %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(workspace, "allowed.txt")); err != nil || string(data) != "old" {
+		t.Fatalf("stale CAS modified target: %q %v", data, err)
 	}
 }

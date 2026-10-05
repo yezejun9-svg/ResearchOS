@@ -378,6 +378,12 @@ func runtimeCheckManifestBytes(manifest []any) int64 {
 // the current workspace binding and read access. Keep that authority check in
 // the shared dispatcher; this method enforces the independent check registry.
 func (h *Host) executeRuntimeCheck(ctx context.Context, request domain.RuntimeToolRequest) (result domain.Object, err error) {
+	beforeLaunch := true
+	defer func() {
+		if err != nil && beforeLaunch {
+			err = &domain.RuntimeToolFailure{Err: err, Outcome: "NOT_APPLIED"}
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -476,6 +482,9 @@ func (h *Host) executeRuntimeCheck(ctx context.Context, request domain.RuntimeTo
 	}
 	argv := append([]string(nil), check.argv...)
 	argv[1] = sourceDir
+	// A failed launch may still have started a process. Keep it UNKNOWN unless
+	// the sandbox returns a complete receipt.
+	beforeLaunch = false
 	receipt, err := sandbox.Run(ctx, sandbox.Command{Executable: filepath.Join(goDir, "bin", "go.exe"), Args: argv, InputDirectory: input, OutputDirectory: output, Timeout: check.timeout, ProcessLimit: check.processLimit, MemoryMiB: check.memoryMiB,
 		Env: map[string]string{"GOROOT": goDir, "GOPATH": filepath.Join(output, "gopath"), "GOCACHE": filepath.Join(output, "gocache"), "GOTMPDIR": output, "GOTOOLCHAIN": "local", "GOPROXY": "off", "GOSUMDB": "off", "GOENV": "off", "GOWORK": "off", "CGO_ENABLED": "0"}})
 	if err != nil {
