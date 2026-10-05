@@ -54,10 +54,13 @@ def now():
 
 
 def emit(status, rows, failures, extra=None):
+    ids = [r["assertion_id"] for r in rows]
+    # dispatch.py has an invariant: if a report carries a key named `assertions`, that key must be the
+    # integer count of assertion ids, so the ids live in `assertion_ids` and the count in `assertions`.
     payload = {"check_id": CARD_ID, "task_id": "W10", "case_id": "A07", "mode": "FIXTURE",
                "status": status, "run_at": now(),
-               "assertions": [r["assertion_id"] for r in rows],
-               "assertion_field": [r["assertion_id"] for r in rows],
+               "assertion_ids": ids,
+               "assertions": len(ids),
                "assertions_total": len(rows), "assertions_failed": len(failures),
                "checks": {c: {"rows": sum(1 for r in rows if r["check"] == c),
                               "failed": sum(1 for r in failures if r["check"] == c)} for c in CHECKS},
