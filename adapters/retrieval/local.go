@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const MaxSnapshotBytes = 8 << 20
@@ -55,7 +56,7 @@ func readFile(rootPath, expectedIdentity, relative string) ([]byte, error) {
 	}
 	file, err := root.Open(relative)
 	if err != nil {
-		return nil, err
+		return nil, classifyOpen(root, relative, err)
 	}
 	defer file.Close()
 	info, err := file.Stat()
@@ -73,4 +74,38 @@ func readFile(rootPath, expectedIdentity, relative string) ([]byte, error) {
 		return nil, fmt.Errorf("snapshot grew beyond the byte limit")
 	}
 	return data, nil
+}
+
+// classifyOpen names which containment guard refused, so an audit can tell a link that
+// escapes apart from an absent file. os.Root answers both with the same *PathError, and a
+// refusal that only reads "not found" would let an escape look like ordinary absence.
+//
+// The whole path cannot be inspected at once: when an intermediate component is the link,
+// Lstat on the full path fails for the same reason Open did, and the two cases collapse
+// back into one message. So each component is inspected in turn and the first one that is
+// not a plain directory names the guard. Lstat is used deliberately because Stat would
+// follow the very link being reported.
+func classifyOpen(root *os.Root, relative string, openErr error) error {
+	parts := strings.Split(filepath.ToSlash(relative), "/")
+	for i := range parts {
+		prefix := strings.Join(parts[:i+1], "/")
+		info, err := root.Lstat(prefix)
+		if err != nil {
+			if i == len(parts)-1 {
+				return fmt.Errorf("path is not present inside the registered root: %w", openErr)
+			}
+			return fmt.Errorf("path component %q could not be inspected inside the registered root: %w", prefix, openErr)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, linkErr := root.Readlink(prefix)
+			if linkErr != nil {
+				target = "unreadable"
+			}
+			return fmt.Errorf("path component %q is a symbolic link to %q; snapshots must be a regular file inside the registered root", prefix, target)
+		}
+		if !info.Mode().IsRegular() && !info.Mode().IsDir() {
+			return fmt.Errorf("path component %q is a link or reparse point with irregular mode %s; snapshots must be a regular file inside the registered root", prefix, info.Mode())
+		}
+	}
+	return fmt.Errorf("registered root refused the path: %w", openErr)
 }
