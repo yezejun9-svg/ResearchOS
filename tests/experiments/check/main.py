@@ -48,6 +48,13 @@ SUITES = {
                 "why": "arm isolation: per-arm exit, denials for writes/reads/egress outside the workspace"},
 }
 
+# Round-1 blocker P3: SUITE-CLEAN-<suite> only looked at the exit status and at rows that disagreed, so a
+# declared suite silently contributing ZERO rows still produced an overall PASS (measured by the reviewer:
+# PASS at 102 assertions with sandbox rows 0). These are the per-suite row counts the clean tree emits -
+# adapter 43, domain 57, sandbox 21, measured through the bound handler at HEAD 2ce7fcfc with this round's
+# two extra BETWEEN rows. A suite that goes quiet or shrinks is now a refusal, not a pass.
+SUITE_VOLUME = {"adapter": 43, "domain": 57, "sandbox": 21}
+
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -77,7 +84,11 @@ def refuse(reason, observed):
                                    "decision": "refuse",
                                    "note": "this key belongs to W10-01 only; W10-G01/W10-G02/W08-G01 stay on "
                                            "the legacy test.experiments binding, whose handler "
-                                           "ops/ci/experiments.py is outside this card's write_scope"}})
+                                           "ops/ci/experiments.py is outside this card's write_scope"},
+                       # A refused report must not claim a case it did not serve (round-1 P8: the payload
+                       # still said case_id A07 while the observed case was C05).
+                       "case_id": observed[2] or None, "check_id": observed[1] or None,
+                       "task_id": observed[0] or None})
 
 
 def resolve_go(explicit=None):
@@ -176,6 +187,12 @@ def run_suite(go_binary, name):
 
 def main():
     task, check, case = check_binding()
+    # Round-1 minor P8: task and check were compared but case was not, so a direct call carrying
+    # RESEARCHOS_CASE_ID=C05 returned PASS while labelling its own report case_id A07. Case isolation is now
+    # enforced here as well as by the registry selectors, and the report only claims a case it verified.
+    if case not in ("", "A07"):
+        return refuse("this handler answers case A07 only; observed %r / %r / %r" % (task, check, case),
+                      (task, check, case))
     if task != "W10" or check != CARD_ID:
         return refuse("this handler answers task W10 / check %s only; observed %r / %r / %r" %
                       (CARD_ID, task, check, case), (task, check, case))
@@ -253,6 +270,14 @@ def main():
                      "actual": {"rc": suite["rc"], "rows": len(suite["rows"]), "not_pass": [b["assertion_id"] for b in bad],
                                 "go_failure_output": suite.get("failure_output") or ""},
                      "evidence": SUITES[suite["name"]]["why"]})
+        observed_rows = len(suite["rows"])
+        want_rows = SUITE_VOLUME[suite["name"]]
+        rows.append({"assertion_id": "W1001-SUITE-VOLUME-%s" % suite["name"], "check": CHECKS[2],
+                     "status": "PASS" if observed_rows == want_rows else "FAIL",
+                     "suite": "harness",
+                     "expected": want_rows, "actual": observed_rows,
+                     "evidence": "pinned per-suite row count; a quiet or shrunk suite is a refusal, which is "
+                                 "the hole round 1 measured (PASS at 102 assertions with sandbox contributing 0 rows)"})
         for b in bad:
             problems.append({"id": b["assertion_id"], "check": classify(b["assertion_id"]) or CHECKS[2],
                              "detail": "emitted FAIL by suite %s" % suite["name"],
