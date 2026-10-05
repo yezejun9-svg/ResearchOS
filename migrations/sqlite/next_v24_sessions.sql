@@ -1,5 +1,6 @@
 -- W03-01 (rev2, review P1..P10 closed): minimal v2.4-compatible client session mapping.
--- Additive only: creates client_sessions plus its indexes; never alters prior tables.
+-- Additive session mapping. Existing-table additions are installed idempotently
+-- by installClientSessionFence in the caller's same transaction.
 -- Business truth stays in existing Go-owned tables; this is the single-host index.
 -- Applied inside one caller transaction: any failure rolls the whole thing back and
 -- schema_migrations is not bumped.
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS client_sessions (
   title                         TEXT,
   model_config_ref              TEXT,
   core_build_id                 TEXT,
+  transcript_artifact_id        TEXT,
   resume_requires_explicit_user INTEGER NOT NULL DEFAULT 1 CHECK (resume_requires_explicit_user IN (0,1)),
   sealed_at                     TEXT,
   archived_at                   TEXT,
