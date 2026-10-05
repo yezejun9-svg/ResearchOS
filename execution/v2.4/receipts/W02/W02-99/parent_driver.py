@@ -314,6 +314,9 @@ def main():
     selector=sys.argv[1] if len(sys.argv)==2 else ''
     if selector not in SELECTORS:
         print(json.dumps({'status':'NOT_IMPLEMENTED','assertions':0,'assertion_ids':[]}));return 3
+    if selector in ('W02-G01','W02-G03'):
+        from evidence_reuse import run
+        return run(selector)
     g=Gate(selector)
     try:
         if selector=='W02-G01':g01(g)
