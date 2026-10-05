@@ -296,6 +296,10 @@ func BuildSessionSnapshot(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, proje
 	if leaseExpires.Valid {
 		writer = map[string]any{"client_id": writerClient, "epoch": epoch, "expires_at": leaseExpires.String}
 	}
+	permissions, err := snapshotPermissions(ctx, tx, doc, project, sessionID)
+	if err != nil {
+		return nil, err
+	}
 	snap := map[string]any{
 		"session_id":                    sessionID,
 		"project_id":                    project,
@@ -318,7 +322,7 @@ func BuildSessionSnapshot(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, proje
 		"earliest_event_sequence":       earliest,
 		"checkpoint_artifact_ref":       nil,
 		"pending_command_ids":           []any{},
-		"pending_permissions":           []any{},
+		"pending_permissions":           permissions,
 		"resume_requires_explicit_user": resumeExplicit == 1,
 		"messages":                      messages,
 		"transcript_artifact_ref":       nil,

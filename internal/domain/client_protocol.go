@@ -308,7 +308,7 @@ func (e *Envelope) validatePayload() error {
 		if p.ActionDigest == nil || !isSHA256(*p.ActionDigest, false, m["action_digest"]) {
 			return fmt.Errorf("MISSING_FROZEN_SCOPE_DIGEST")
 		}
-		if p.Decision == nil || !map[string]bool{"ALLOW_ONCE": true, "ALLOW_SESSION": true, "DENY": true}[func() string {
+		if p.Decision == nil || !map[string]bool{"ALLOW_ONCE": true, "DENY": true}[func() string {
 			if p.Decision != nil {
 				return *p.Decision
 			}
@@ -1007,6 +1007,8 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		return s.importClientArtifact(ctx, tx, env, principal, sess)
 	case "workspace.write":
 		return s.writeClientWorkspace(ctx, tx, env, principal, sess)
+	case "permission.respond":
+		return s.respondClientPermission(ctx, tx, env, principal, sess)
 	case "session.attach":
 		var p struct {
 			RequestWriteOwner bool `json:"request_write_owner"`

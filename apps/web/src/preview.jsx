@@ -4,7 +4,7 @@ const LIMIT = 5 * 1024 * 1024
 const textKinds = /^(text\/|application\/(json|xml|javascript|x-ndjson))/i
 const htmlCsp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; form-action 'none'; base-uri 'none'"
 
-export function ArtifactPreview({ artifact, expectedRef, api, projectId }) {
+export function ArtifactPreview({ artifact, expectedRef, api, projectId, onVerified }) {
   const [state, setState] = useState({ status: 'idle' })
   const [downloadError, setDownloadError] = useState('')
   const active = useRef(null)
@@ -36,6 +36,7 @@ export function ArtifactPreview({ artifact, expectedRef, api, projectId }) {
       const text = textKinds.test(media) ? await object.text() : null
       if (controller.signal.aborted) return
       setState({ status: 'ready', text, url: URL.createObjectURL(object) })
+      onVerified?.({ content_hash: hash, text })
     } catch (error) { if (!controller.signal.aborted) setState({ status: 'error', message: error.message }) }
   }
   async function download() {

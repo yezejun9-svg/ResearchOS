@@ -201,7 +201,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
   </>
 }
 
-function BoundArtifact({ reference, api, projectId, label = '读取引用产物' }) {
+function BoundArtifact({ reference, api, projectId, label = '读取引用产物', onVerified }) {
   const [artifact, setArtifact] = useState(null), [error, setError] = useState(null)
   const controller = useRef(null)
   useEffect(() => { controller.current?.abort(); setArtifact(null); setError(null); return () => controller.current?.abort() }, [projectId, reference.id, reference.revision, reference.content_hash])
@@ -213,18 +213,23 @@ function BoundArtifact({ reference, api, projectId, label = '读取引用产物'
       if (!active.signal.aborted) { setArtifact(value); setError(null) }
     } catch (cause) { if (!active.signal.aborted) setError(cause) }
   }
-  return <div><button onClick={read}>{label}</button><Failure error={error} retry={read}/>{artifact && <ArtifactPreview artifact={artifact} expectedRef={reference} api={api} projectId={projectId}/>}</div>
+  return <div><button onClick={read}>{label}</button><Failure error={error} retry={read}/>{artifact && <ArtifactPreview artifact={artifact} expectedRef={reference} api={api} projectId={projectId} onVerified={onVerified}/>}</div>
 }
 
 function PermissionDecision({ prompt, api, projectId, disabled, respond }) {
   const scope = prompt.action_scope
+  const [reviewed, setReviewed] = useState(false), [now, setNow] = useState(Date.now())
+  useEffect(() => { setReviewed(false) }, [prompt.action_digest, scope.arguments_artifact_ref.content_hash])
+  useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer) }, [])
+  const expired = !Number.isFinite(Date.parse(scope.expires_at)) || now >= Date.parse(scope.expires_at)
   return <Panel title="工具等待授权"><p>{prompt.request.summary}</p>
     <dl><dt>工具</dt><dd>{scope.tool_name}</dd><dt>工作区</dt><dd className="break-all">{scope.workspace_ref}</dd><dt>允许路径</dt><dd>{scope.allowed_relative_paths.length ? scope.allowed_relative_paths.join('、') : '没有文件路径授权'}</dd><dt>有效期</dt><dd>{new Date(scope.expires_at).toLocaleString()}</dd></dl>
-    <p>授权仅对本次动作生效一次。可先查看冻结参数和输入版本。</p>
-    <BoundArtifact reference={scope.arguments_artifact_ref} api={api} projectId={projectId}/>
+    <p>授权仅对本次动作生效一次。请先预览冻结参数，再决定是否允许。</p>
+    <BoundArtifact reference={scope.arguments_artifact_ref} api={api} projectId={projectId} label="查看本次工具参数" onVerified={({ content_hash, text }) => setReviewed(content_hash === scope.arguments_artifact_ref.content_hash && text != null)}/>
     <details><summary>动作范围与输入版本</summary><pre>{JSON.stringify(scope, null, 2)}</pre></details>
     {!prompt.policy_allows_user_decision && <p role="status">当前策略不允许用户授权此动作，请先处理策略限制。</p>}
-    {prompt.allowed_responses.filter(decision => decision !== 'ALLOW_ONCE' || prompt.policy_allows_user_decision).map(decision => <button key={decision} disabled={disabled || !prompt.policy_allows_user_decision} onClick={() => respond(decision)}>{decision === 'DENY' ? '拒绝' : '允许本次'}</button>)}
+    {expired && <p role="status">本次授权请求已过期，请刷新原任务状态。</p>}
+    {prompt.allowed_responses.filter(decision => decision !== 'ALLOW_ONCE' || prompt.policy_allows_user_decision).map(decision => <button key={decision} disabled={disabled || expired || !prompt.policy_allows_user_decision || (decision === 'ALLOW_ONCE' && !reviewed)} onClick={() => respond(decision)}>{decision === 'DENY' ? '拒绝' : '允许本次'}</button>)}
   </Panel>
 }
 
