@@ -105,6 +105,8 @@ def main():
     try:
         for name, source in sources.items():
             command("build-" + name, ["go", "build", "-o", binaries[name], source], repo, receipt)
+        # The integrated React sources may be newer than an ignored local dist.
+        command("build-web", ["npm.cmd", "run", "build"], repo / "apps" / "web", receipt)
         dist = repo / "apps" / "web" / "dist" / "index.html"
         if not dist.is_file():
             raise RuntimeError("React web dist unavailable; build it in integrated main before the GUI window")
