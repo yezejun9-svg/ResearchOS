@@ -155,6 +155,9 @@ func v2EnvelopeFor(ctx *v2Context, method string, payload map[string]any) (*v2En
 		if claim && ctx.epoch != 0 {
 			return nil, "ATTACKER_CLAIMED_EPOCH"
 		}
+		if claim {
+			env.ExpectedRevision = &ctx.revision
+		}
 		if !claim {
 			env.WriterEpoch = &ctx.epoch
 		}

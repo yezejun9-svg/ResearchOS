@@ -77,8 +77,13 @@ func verbSteps(name string, args []string, ctx *v2Context, cfg cliConfig) ([]v2S
 		ctx.sessionID = session
 		epoch, hasEpoch := flagValue(args, "writer-epoch")
 		if !hasEpoch {
-			return nil, "MISSING_WRITER_EPOCH",
-				"resume reads as the writer it observed: pass --writer-epoch <n> from the session you are continuing"
+			return []v2Step{
+				{"session.get", map[string]any{}, ""},
+				{"session.attach", map[string]any{"after_sequence": intFlag(args, "after-sequence", 0), "request_write_owner": true}, ""},
+				{"session.get", map[string]any{}, ""},
+				{"session.control", map[string]any{"action": "RESUME", "target_id": session, "reason": "resuming saved context from the CLI"}, ""},
+				{"session.events", map[string]any{"after_sequence": intFlag(args, "after-sequence", 0), "limit": 200}, ""},
+			}, "", ""
 		}
 		e, err := strconv.ParseInt(epoch, 10, 64)
 		if err != nil || e < 0 {
@@ -170,11 +175,20 @@ func cliHostCommand(name string, args []string) {
 	worst := exitCompleted
 	worstReason := ""
 	stop := interruptGuard(name)
-	for _, s := range steps {
+	baseCommandID := ctx.commandID
+	for index, s := range steps {
+		if worst != exitCompleted {
+			report = append(report, map[string]any{"method": s.method, "status": "SKIPPED", "reason": "PREVIOUS_OPERATION_FAILED"})
+			continue
+		}
 		if s.skipped != "" {
 			report = append(report, map[string]any{"method": s.method, "status": "SKIPPED", "reason": s.skipped})
 			continue
 		}
+		if s.method == "session.attach" && s.payload["request_write_owner"] == true {
+			ctx.epoch = 0 // The host assigns the new epoch; never claim one on takeover.
+		}
+		ctx.commandID = v2FlowCommandID(baseCommandID, s.method, index)
 		reply, reason, code := v2Call(ctx, s.method, s.payload)
 		row := map[string]any{"method": s.method, "exit_code": code,
 			"status": orDefault(statusOf(reply), orDefault(reason, "NO_REPLY"))}
@@ -192,6 +206,15 @@ func cliHostCommand(name string, args []string) {
 		}
 	}
 	stop()
+	if worst == exitCompleted && ctx.sessionID != "" {
+		cfg.ProjectID, cfg.SessionID = ctx.projectID, ctx.sessionID
+		cfg.Revision, cfg.WriterEpoch = ctx.revision, ctx.epoch
+		cfg.UpdatedBy = ctx.clientID
+		if err := writeConfig(cfg); err != nil {
+			worst, worstReason = exitFailed, "CONFIG_WRITE_FAILED"
+			diag("session context could not be saved: %s", err)
+		}
+	}
 	out := map[string]any{"command": name, "exit_code": worst, "operations": report,
 		"requests_sent": ctx.requestLog, "host_url": d.URL, "client_id": ctx.clientID}
 	if worst == exitCompleted {
@@ -207,13 +230,16 @@ func cliHostCommand(name string, args []string) {
 	os.Exit(worst)
 }
 
-// newV2Context reads the current short local credential without opening a UI.
-// Explicit init is the only verb permitted to renew it through the native bridge.
+// Existing local projects renew their short credential through the same-SID
+// native bridge. Renewal never opens the workspace chooser.
 func newV2Context(name string, args []string, cfg cliConfig, baseURL string) *v2Context {
 	credential := os.Getenv("RESEARCHOS_CLI_CREDENTIAL")
 	if credential == "" {
 		if d, _, err := hostDiscovery(); err == nil && d.URL == baseURL {
 			credential, _ = cliSessionCredential(d)
+			if credential == "" && cfg.ProjectID != "" && cfg.WorkspaceRef != "" {
+				credential, _ = cliInitCredential(d, cliEnv("RESEARCHOS_CLI_CLIENT_ID", defaultClientID()))
+			}
 		}
 	}
 	ctx := &v2Context{

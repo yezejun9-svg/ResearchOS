@@ -1067,8 +1067,28 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 			TargetID *string `json:"target_id"`
 		}
 		json.Unmarshal(env.Payload, &p)
+		if deref(p.Action) == "RESUME" && deref(p.TargetID) == sess.sessionID {
+			// Resuming a session restores its saved context. A cancelled or failed
+			// Run is never restarted; a later explicit send creates the next turn.
+			if sess.runID != "" {
+				run, err := loadClientRun(ctx, tx, sess.project, sess.runID)
+				if err != nil {
+					return nil, err
+				}
+				if !run.terminal() || !run.childrenStopped || !run.queueEmpty {
+					return reject(sess.revision, sess.epoch, "SESSION_BUSY", "previous runtime must settle before session resume"), nil
+				}
+			}
+			snap, err := BuildSessionSnapshot(ctx, tx, s.Doc, sess.project, sess.sessionID)
+			if err != nil {
+				return nil, err
+			}
+			return complete(sess.revision, map[string]any{"action": "RESUME", "target_id": sess.sessionID,
+				"control_request_id": "ctrl-" + deref(env.CommandID), "settled": true,
+				"children_stopped": true, "queue_empty": true, "snapshot": snap}), nil
+		}
 		if p.Action == nil || *p.Action != "CANCEL" {
-			return reject(sess.revision, sess.epoch, "NOT_IMPLEMENTED", "only CANCEL control is implemented on this host build"), nil
+			return reject(sess.revision, sess.epoch, "NOT_IMPLEMENTED", "only CANCEL run and RESUME session controls are implemented on this host build"), nil
 		}
 		if sess.runID == "" || sess.runID != deref(p.TargetID) {
 			return reject(sess.revision, sess.epoch, "NOT_FOUND", "target is not the current session run"), nil
