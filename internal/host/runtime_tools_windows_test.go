@@ -4,6 +4,7 @@ package host
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -45,6 +46,17 @@ func runtimeToolCall(t *testing.T, host *Host, workspace, access, name string, a
 	if result["details"] == nil || len(result["content"].([]any)) != 1 {
 		t.Fatalf("invalid tool reply: %v", result)
 	}
+	if name == "read" {
+		if _, duplicated := result["details"].(map[string]any)["text"]; duplicated {
+			t.Fatal("read text duplicated in details")
+		}
+		var visible domain.Object
+		part := result["content"].([]any)[0].(domain.Object)
+		if err := json.Unmarshal([]byte(part["text"].(string)), &visible); err != nil {
+			t.Fatal(err)
+		}
+		return visible
+	}
 	return result["details"].(map[string]any)
 }
 
@@ -63,7 +75,7 @@ func TestRuntimeToolBoundReadWriteEditCAS(t *testing.T) {
 		t.Fatal(created)
 	}
 	read := runtimeToolCall(t, host, workspace, AccessReadWrite, "read", domain.Object{"path": "allowed.txt", "offset": 0, "limit": 3}, policy)
-	if read["text"] != "éa" || read["next_offset"] != int64(3) || read["truncated"] != true || read["content_hash"] != created["content_hash"] {
+	if read["text"] != "éa" || read["next_offset"] != float64(3) || read["truncated"] != true || read["content_hash"] != created["content_hash"] {
 		t.Fatal(read)
 	}
 	runtimeToolReject(t, host, workspace, AccessReadWrite, "read", domain.Object{"path": "allowed.txt", "offset": 1}, policy)
@@ -145,5 +157,64 @@ func TestRuntimeToolFailureOutcomeAtHostBoundary(t *testing.T) {
 	}
 	if data, err := os.ReadFile(filepath.Join(workspace, "allowed.txt")); err != nil || string(data) != "old" {
 		t.Fatalf("stale CAS modified target: %q %v", data, err)
+	}
+}
+
+func TestRuntimeToolReadPagesEncodedTextWithinBridgeFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name, text string
+	}{
+		{"multibyte", strings.Repeat("中文", 17000)},
+		{"escaped", strings.Repeat("\"\\\n<>&", 16000)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			host, workspace, _ := runtimeToolFixture(t, AccessReadWrite)
+			data := []byte(tc.text)
+			if err := os.WriteFile(filepath.Join(workspace, "allowed.txt"), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			policy := runtimeToolPolicy()
+			policy["max_read_bytes"] = 65536
+			var offset int64
+			var got strings.Builder
+			for page := 0; page < 20; page++ {
+				reply, err := host.ExecuteRuntimeTool(context.Background(), domain.RuntimeToolRequest{WorkspacePath: workspace, Access: AccessReadWrite, Name: "read", Arguments: domain.Object{"path": "allowed.txt", "offset": offset}, Policy: policy})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(domain.Bytes(reply)) > runtimeToolReadReplyLimit {
+					t.Fatalf("payload exceeds read frame budget: %d", len(domain.Bytes(reply)))
+				}
+				frame := domain.Object{"sequence": 123, "key": "task:run:1:tool:1", "state": "CONFIRMED", "payload": reply}
+				if len(domain.Bytes(frame)) > 64<<10 {
+					t.Fatalf("reply exceeds actual bridge frame: %d", len(domain.Bytes(frame)))
+				}
+				metadata := reply["details"].(domain.Object)
+				if _, duplicate := metadata["text"]; duplicate {
+					t.Fatal("read text duplicated in details")
+				}
+				part := reply["content"].([]any)[0].(domain.Object)
+				var visible domain.Object
+				if err := json.Unmarshal([]byte(part["text"].(string)), &visible); err != nil {
+					t.Fatal(err)
+				}
+				next := int64(visible["next_offset"].(float64))
+				if visible["content_hash"] != domain.Digest(data) || visible["text"] == nil || next != metadata["next_offset"] {
+					t.Fatalf("page metadata mismatch: %v", visible)
+				}
+				got.WriteString(visible["text"].(string))
+				if next <= offset || next > int64(len(data)) {
+					t.Fatalf("page did not advance: %d -> %d", offset, next)
+				}
+				offset = next
+				if visible["truncated"] == false {
+					if got.String() != tc.text || offset != int64(len(data)) {
+						t.Fatalf("paginated bytes differ: got %d, want %d", got.Len(), len(data))
+					}
+					return
+				}
+			}
+			t.Fatal("read did not finish pagination")
+		})
 	}
 }
