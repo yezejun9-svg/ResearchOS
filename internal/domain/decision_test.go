@@ -47,6 +47,8 @@ func w11Client(t *testing.T, scenario string) decision.Client {
 			return
 		case "model_revision_changed":
 			raw = strings.Replace(raw, "jev-1.13.0", "jev-9", 1)
+		case "recommend_reject":
+			raw = strings.Replace(raw, `"choice":"ACCEPT","confidence":1,"probabilities":{"ACCEPT":1,"REJECT":0}`, `"choice":"REJECT","confidence":1,"probabilities":{"ACCEPT":0,"REJECT":1}`, 1)
 		case "chinese_low_confidence":
 			raw = strings.Replace(raw, `"confidence":1,"probabilities":{"ACCEPT":1,"REJECT":0}`, `"confidence":0.55,"probabilities":{"ACCEPT":0.55,"REJECT":0.45}`, 1)
 		}
