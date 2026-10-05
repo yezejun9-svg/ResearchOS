@@ -184,6 +184,11 @@ func main() {
 		if r := recover(); r != nil {
 			failures = append(failures, map[string]string{"id": "PANIC", "detail": fmt.Sprint(r)})
 		}
+		if os.Getenv("RESEARCHOS_CHECK_ID") == "W12-02" {
+			// Reconciled in the report path, not at the end of the phase, because the phase returns early
+			// whenever a precondition cannot be built and those are exactly the runs worth flagging.
+			w1202RosterOK()
+		}
 		if len(ids) == 0 && len(failures) == 0 {
 			failures = append(failures, map[string]string{"id": "NO-ASSERTIONS-RECORDED",
 				"detail": "a run that recorded nothing is never a pass"})
