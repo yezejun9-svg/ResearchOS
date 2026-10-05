@@ -280,7 +280,7 @@ func (s *ClientService) sendClientMessage(ctx context.Context, tx *sql.Tx, env *
 	if err != nil {
 		return nil, err
 	}
-	task, err := s.Domain.createTask(tx, sess.project, Object{"goal_id": goal["id"], "title": "Client message", "task_type": "mu_turn", "stage": "delivery", "dependency_task_ids": Empty(), "requirement_refs": []any{Ref(req, "Requirement")}, "input_refs": refs, "acceptance_contract": contract, "origin_problem_id": problem, "candidate_id": sess.sessionID, "stop_policy": Object{"wall_time_seconds": 300, "max_attempts": 1, "max_parallel_runs": 1, "stop_conditions": []any{"turn complete", "model or tool effect unknown", "lease or authority lost", "Owner cancellation"}}})
+	task, err := s.Domain.createTask(tx, sess.project, Object{"goal_id": goal["id"], "title": "Client message", "task_type": "mu_turn", "stage": "delivery", "dependency_task_ids": Empty(), "requirement_refs": []any{Ref(req, "Requirement")}, "input_refs": refs, "acceptance_contract": contract, "origin_problem_id": problem, "candidate_id": sess.sessionID, "stop_policy": Object{"wall_time_seconds": 900, "max_attempts": 1, "max_parallel_runs": 1, "stop_conditions": []any{"turn complete", "model or tool effect unknown", "lease or authority lost", "Owner cancellation"}}})
 	if err != nil {
 		return nil, err
 	}

@@ -21,7 +21,11 @@ func validateRuntimeDispatchProfile(profile Object) error {
 		return Fail(422, "GATE_FAILED", "unsupported task permission profile")
 	}
 	seconds, e := Num(profile, "timeout_seconds")
-	if e != nil || seconds <= 0 || seconds > 300 {
+	maxSeconds := int64(300)
+	if profile["backend"] == runtimeMuBackend {
+		maxSeconds = 900 // Finite coding turn, including host-staged native checks.
+	}
+	if e != nil || seconds <= 0 || seconds > maxSeconds {
 		return Fail(422, "GATE_FAILED", "bounded native timeout required")
 	}
 	seen := map[string]bool{}
