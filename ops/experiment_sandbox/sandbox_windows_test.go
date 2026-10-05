@@ -136,7 +136,7 @@ func TestNativeSandbox(t *testing.T) {
 		if mode == "timeout" {
 			timeout = 100 * time.Millisecond
 		}
-		r, e := Run(context.Background(), Command{child, []string{"-test.run=^TestSandboxChild$", "--", "--probe", data, canary, dest, listener.Addr().String(), mode}, input, output, timeout})
+		r, e := Run(context.Background(), Command{Executable: child, Args: []string{"-test.run=^TestSandboxChild$", "--", "--probe", data, canary, dest, listener.Addr().String(), mode}, InputDirectory: input, OutputDirectory: output, Timeout: timeout})
 		if e != nil {
 			t.Fatalf("AppContainer %s: %v", mode, e)
 		}
@@ -194,5 +194,35 @@ func TestSandboxRootOverlap(t *testing.T) {
 		}
 		r, e := Run(context.Background(), Command{Executable: path, InputDirectory: input, OutputDirectory: output, Timeout: time.Second})
 		assertion(t, "SANDBOX-REJECT-"+mode, true, e != nil && r.PID == 0 && r.SID == "")
+	}
+}
+
+func TestGoEnvironmentBoundary(t *testing.T) {
+	input, output := filepath.Join(t.TempDir(), "input"), filepath.Join(t.TempDir(), "output")
+	good := map[string]string{"GOROOT": filepath.Join(input, "go"), "GOCACHE": filepath.Join(output, "cache"), "GOPROXY": "off", "GOTOOLCHAIN": "local", "CGO_ENABLED": "0"}
+	if _, err := goEnvironment(good, input, output, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range []map[string]string{
+		{"PATH": input},
+		{"GOPROXY": "https://proxy.golang.org"},
+		{"GOTOOLCHAIN": "auto"},
+		{"GOROOT": filepath.Dir(input)},
+		{"GOCACHE": filepath.Join(output, "..", "escape")},
+		{"GOTMPDIR": input},
+		{"GOENV": "C:\\host\\goenv"},
+	} {
+		if _, err := goEnvironment(candidate, input, output, nil); err == nil {
+			t.Fatalf("accepted unsafe Go environment: %v", candidate)
+		}
+	}
+}
+
+func TestExplicitSandboxLimitRejected(t *testing.T) {
+	for _, command := range []Command{{Timeout: time.Second, ProcessLimit: 33}, {Timeout: time.Second, MemoryMiB: 1025}} {
+		receipt, err := Run(context.Background(), command)
+		if err == nil || receipt.PID != 0 || receipt.SID != "" {
+			t.Fatalf("limit was not rejected before profile creation: %+v, %v", receipt, err)
+		}
 	}
 }

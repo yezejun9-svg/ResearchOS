@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -24,6 +25,10 @@ type Command struct {
 	Args                            []string
 	InputDirectory, OutputDirectory string
 	Timeout                         time.Duration
+	// Zero values preserve the original single-process, 256 MiB boundary.
+	ProcessLimit, MemoryMiB uint32
+	// Env accepts only the offline Go keys validated by goEnvironment.
+	Env map[string]string
 }
 type Receipt struct {
 	Executable      string   `json:"executable"`
@@ -40,6 +45,7 @@ type Receipt struct {
 	Capabilities    []string `json:"capabilities"`
 	ExitCode        int      `json:"exit_code"`
 	Stopped         bool     `json:"children_stopped"`
+	JobProcesses    uint32   `json:"job_total_processes"`
 	TimedOut        bool     `json:"timed_out"`
 	Started         string   `json:"started_at"`
 	Finished        string   `json:"finished_at"`
@@ -86,6 +92,19 @@ func Run(ctx context.Context, c Command) (Receipt, error) {
 func runSandbox(ctx context.Context, c Command, options StartOptions, process *Process) (r Receipt, err error) {
 	if c.Timeout <= 0 || c.Timeout > 5*time.Minute {
 		return r, errors.New("bounded timeout 0..5m required")
+	}
+	processLimit, memoryMiB := c.ProcessLimit, c.MemoryMiB
+	if processLimit == 0 {
+		processLimit = 1
+	}
+	if memoryMiB == 0 {
+		memoryMiB = 256
+	}
+	if processLimit > 32 || memoryMiB > 1024 {
+		return r, errors.New("process limit 1..32 and memory limit 1..1024 MiB required")
+	}
+	if _, e := goEnvironment(c.Env, c.InputDirectory, c.OutputDirectory, nil); e != nil {
+		return r, e
 	}
 	for _, p := range []string{c.Executable, c.InputDirectory, c.OutputDirectory} {
 		if !filepath.IsAbs(p) {
@@ -183,8 +202,8 @@ func runSandbox(ctx context.Context, c Command, options StartOptions, process *P
 	defer windows.CloseHandle(job)
 	limit := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 	limit.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_PROCESS_MEMORY
-	limit.BasicLimitInformation.ActiveProcessLimit = 1
-	limit.ProcessMemoryLimit = 256 * 1024 * 1024
+	limit.BasicLimitInformation.ActiveProcessLimit = processLimit
+	limit.ProcessMemoryLimit = uintptr(memoryMiB) * 1024 * 1024
 	if _, e = windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limit)), uint32(unsafe.Sizeof(limit))); e != nil {
 		return r, e
 	}
@@ -253,7 +272,20 @@ func runSandbox(ctx context.Context, c Command, options StartOptions, process *P
 		args = append(args, syscall.EscapeArg(a))
 	}
 	line := utf(strings.Join(args, " "))
-	env := utf16.Encode([]rune("SystemRoot=" + os.Getenv("SystemRoot") + "\x00TEMP=" + c.OutputDirectory + "\x00TMP=" + c.OutputDirectory + "\x00USERPROFILE=" + c.OutputDirectory + "\x00LOCALAPPDATA=" + c.OutputDirectory + "\x00APPDATA=" + c.OutputDirectory + "\x00\x00"))
+	goEnv, e := goEnvironment(c.Env, originalInput, originalOutput, replace)
+	if e != nil {
+		return r, e
+	}
+	envValues := []string{"SystemRoot=" + os.Getenv("SystemRoot"), "TEMP=" + c.OutputDirectory, "TMP=" + c.OutputDirectory, "USERPROFILE=" + c.OutputDirectory, "LOCALAPPDATA=" + c.OutputDirectory, "APPDATA=" + c.OutputDirectory}
+	keys := make([]string, 0, len(goEnv))
+	for k := range goEnv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		envValues = append(envValues, k+"="+goEnv[k])
+	}
+	env := utf16.Encode([]rune(strings.Join(envValues, "\x00") + "\x00\x00"))
 	var pi windows.ProcessInformation
 	r.Started = time.Now().UTC().Format(time.RFC3339Nano)
 	if e = windows.CreateProcess(utf(c.Executable), line, nil, nil, true, windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_NO_WINDOW|windows.CREATE_UNICODE_ENVIRONMENT|windows.CREATE_SUSPENDED, &env[0], utf(c.OutputDirectory), &si.StartupInfo, &pi); e != nil {
@@ -330,10 +362,59 @@ func runSandbox(ctx context.Context, c Command, options StartOptions, process *P
 		}
 	}
 	r.Stopped = accounting.ActiveProcesses == 0
+	r.JobProcesses = accounting.TotalProcesses
 	outResult, errResult := <-outDone, <-errDone
 	r.Stdout, r.Stderr = outResult.bytes, errResult.bytes
 	r.StreamsDrained = outResult.err == nil && errResult.err == nil
 	return r, errors.Join(outResult.err, errResult.err)
+}
+
+// goEnvironment permits only offline, deterministic Go configuration. Writable
+// paths stay in the output root; GOROOT is read-only staged input. No PATH or
+// host environment is inherited by the AppContainer.
+func goEnvironment(values map[string]string, input, output string, remap func(string) string) (map[string]string, error) {
+	result := make(map[string]string, len(values))
+	within := func(root, path string) bool {
+		if !filepath.IsAbs(path) {
+			return false
+		}
+		rel, err := filepath.Rel(root, path)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+	}
+	for key, value := range values {
+		if key != strings.ToUpper(key) || strings.ContainsAny(key+value, "=\x00") || value == "" {
+			return nil, fmt.Errorf("invalid Go environment %q", key)
+		}
+		switch key {
+		case "GOROOT":
+			if !within(input, value) {
+				return nil, fmt.Errorf("GOROOT must be in staged input")
+			}
+		case "GOPATH", "GOCACHE", "GOTMPDIR":
+			if !within(output, value) {
+				return nil, fmt.Errorf("%s must be in staged output", key)
+			}
+		case "GOTOOLCHAIN":
+			if value != "local" {
+				return nil, fmt.Errorf("GOTOOLCHAIN must be local")
+			}
+		case "GOPROXY", "GOSUMDB", "GOENV", "GOWORK":
+			if value != "off" {
+				return nil, fmt.Errorf("%s must be off", key)
+			}
+		case "CGO_ENABLED":
+			if value != "0" {
+				return nil, fmt.Errorf("CGO_ENABLED must be 0")
+			}
+		default:
+			return nil, fmt.Errorf("Go environment key %q is not allowed", key)
+		}
+		if remap != nil && (key == "GOROOT" || key == "GOPATH" || key == "GOCACHE" || key == "GOTMPDIR") {
+			value = remap(value)
+		}
+		result[key] = value
+	}
+	return result, nil
 }
 
 func copyTree(ctx context.Context, source, target string) error {
