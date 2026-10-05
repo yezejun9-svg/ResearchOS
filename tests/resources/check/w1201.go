@@ -58,7 +58,10 @@ func defaultsPhase(ctx context.Context, h *harness) {
 
 // orchestrationGraph builds the smallest real object graph that can carry a cost: requirement,
 // goal, fixture runtime, task, frozen context bundle, submission and one admitted run.
-func orchestrationGraph(ctx context.Context, h *harness) (*runGraph, error) {
+// admitLabel is the id the run-admission witness carries. W12-02 builds a second graph to get an
+// independent branch, and re-emitting the accepted W12-01 id twice would be rejected by the dispatcher as a
+// duplicate assertion id, so a caller that is not this card names its own witness instead.
+func orchestrationGraph(ctx context.Context, h *harness, admitLabel string) (*runGraph, error) {
 	code, req, body := h.api(ctx, "POST", h.base+"/requirements", domain.ID(), h.stateTag(ctx), domain.Object{
 		"requirement_key": "REQ-W1201", "text": "spend within the bound that was agreed",
 		"basis": "USER_STATED", "source_refs": domain.Empty(), "rationale": "cost qualification fixture",
@@ -151,7 +154,7 @@ func orchestrationGraph(ctx context.Context, h *harness) (*runGraph, error) {
 	if e := json.Unmarshal([]byte(raw), &run); e != nil {
 		return nil, fmt.Errorf("run decode %w", e)
 	}
-	ok("W1201-RUN-ADMITTED", run["id"] != nil, run)
+	ok(admitLabel, run["id"] != nil, run)
 
 	_, policy, body := h.api(ctx, "GET", h.base+"/goals/"+domain.Str(goal, "id")+"/budget-policy", "", "", nil)
 	if policy["id"] == nil {

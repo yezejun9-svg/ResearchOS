@@ -219,7 +219,7 @@ func main() {
 	defer h.db.Close()
 
 	defaultsPhase(ctx, h)
-	graph, e := orchestrationGraph(ctx, h)
+	graph, e := orchestrationGraph(ctx, h, "W1201-RUN-ADMITTED")
 	if e != nil {
 		ok("W1201-RUN-ADMITTED", false, e)
 		skip("W1201-LEDGER-COLUMNS-SEPARATED", "no run could be admitted: "+e.Error())

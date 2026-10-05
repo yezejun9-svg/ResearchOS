@@ -29,12 +29,21 @@ var w1202GuardRows = map[string]bool{
 	"W1202-ROSTER-COMPLETE-AND-EXACT": true,
 }
 
-func w1202DeclaredRows() (asserted map[string]bool, disclosed map[string]bool) {
-	asserted, disclosed = map[string]bool{}, map[string]bool{}
+// w1202AnyLiteral catches every W1202- id written anywhere in the source, including ids handed to a helper
+// as an argument (orchestrationGraph emits the caller's own admission label). Completeness is still held only
+// by the ok() set; this widens what counts as declared so an emitted id cannot be "undeclared" merely because
+// it sits in a call argument rather than in an ok() call.
+var w1202AnyLiteral = regexp.MustCompile(`"(W1202-[A-Z0-9_-]+)"`)
+
+func w1202DeclaredRows() (asserted map[string]bool, disclosed map[string]bool, declared map[string]bool) {
+	asserted, disclosed, declared = map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, name := range []string{"w1202.go", "w1202_roster.go"} {
 		src, e := os.ReadFile(filepath.Join(repoRoot(), "tests", "resources", "check", name))
 		if e != nil {
-			return nil, nil
+			return nil, nil, nil
+		}
+		for _, m := range w1202AnyLiteral.FindAllStringSubmatch(string(src), -1) {
+			declared[m[1]] = true
 		}
 		for _, m := range w1202RosterPattern.FindAllStringSubmatch(string(src), -1) {
 			if m[1] == "skip" {
@@ -44,11 +53,11 @@ func w1202DeclaredRows() (asserted map[string]bool, disclosed map[string]bool) {
 			}
 		}
 	}
-	return asserted, disclosed
+	return asserted, disclosed, declared
 }
 
 func w1202RosterOK() {
-	asserted, disclosed := w1202DeclaredRows()
+	asserted, disclosed, declared := w1202DeclaredRows()
 	if len(asserted) < 20 {
 		ok("W1202-GUARD-SOURCE-UNREADABLE", true,
 			itoa(len(asserted))+" assertion ids parsed from source; refusing to reconcile")
@@ -58,6 +67,15 @@ func w1202RosterOK() {
 	for _, id := range ids {
 		emitted[id] = true
 	}
+	// The dispatcher refuses a report with a repeated id, so the guard checks that too: a second call into a
+	// helper that emits its own card's witness is exactly how a duplicate sneaks in.
+	seen, dupes := map[string]bool{}, []string{}
+	for _, id := range ids {
+		if seen[id] {
+			dupes = append(dupes, id)
+		}
+		seen[id] = true
+	}
 	missing, extra := []string{}, []string{}
 	for id := range asserted {
 		if w1202GuardRows[id] || emitted[id] {
@@ -66,16 +84,17 @@ func w1202RosterOK() {
 		missing = append(missing, id)
 	}
 	for _, id := range ids {
-		if !strings.HasPrefix(id, "W1202-") || w1202GuardRows[id] || asserted[id] || disclosed[id] {
+		if !strings.HasPrefix(id, "W1202-") || w1202GuardRows[id] || declared[id] {
 			continue
 		}
 		extra = append(extra, id)
 	}
-	ok("W1202-ROSTER-COMPLETE-AND-EXACT", len(missing) == 0 && len(extra) == 0,
+	ok("W1202-ROSTER-COMPLETE-AND-EXACT", len(missing) == 0 && len(extra) == 0 && len(dupes) == 0,
 		"declared but never emitted: "+strings.Join(missing, ","),
 		"emitted but undeclared: "+strings.Join(extra, ","),
+		"emitted more than once: "+strings.Join(dupes, ","),
 		itoa(len(asserted))+" asserted in source, "+itoa(len(ids))+" emitted, "+
-			itoa(len(disclosed))+" disclosed-only")
+			itoa(len(disclosed))+" disclosed-only, "+itoa(len(declared))+" declared anywhere")
 }
 
 func itoa(n int) string {
