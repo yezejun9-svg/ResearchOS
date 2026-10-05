@@ -19,7 +19,7 @@ type ClientSessionRuntime interface {
 	AdmitTurn(ctx context.Context, tx *sql.Tx, project, modelConfigRef string, task Object) error
 }
 
-func clientPrincipal(ctx context.Context, tx *sql.Tx, id, project string, owner bool) (Principal, error) {
+func clientAuthenticatedPrincipal(ctx context.Context, tx *sql.Tx, id string) (Principal, error) {
 	p := Principal{ID: id}
 	var roles string
 	if err := tx.QueryRowContext(ctx, "SELECT roles,can_create_project FROM auth_principals WHERE id=? AND revoked=0", id).Scan(&roles, &p.CanCreateProject); err != nil {
@@ -46,6 +46,14 @@ func clientPrincipal(ctx context.Context, tx *sql.Tx, id, project string, owner 
 		return p, err
 	}
 	if err = constrainRemotePrincipal(tx, &p); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+
+func clientPrincipal(ctx context.Context, tx *sql.Tx, id, project string, owner bool) (Principal, error) {
+	p, err := clientAuthenticatedPrincipal(ctx, tx, id)
+	if err != nil {
 		return p, err
 	}
 	if !p.Allowed(project, "", "", false) || owner && !p.HasRole("OWNER") {
@@ -226,7 +234,7 @@ func (s *ClientService) sendClientMessage(ctx context.Context, tx *sql.Tx, env *
 		if err != nil {
 			return nil, err
 		}
-		if task["status"] != "ACCEPTED" && task["status"] != "CANCELLED" && task["status"] != "FAILED" {
+		if !clientTurnSettled(tx, sess.project, sess.sessionID, task) {
 			return NewTypedRejection(env, "SESSION_BUSY", "the previous turn requires settlement or explicit cancellation"), nil
 		}
 	}
@@ -329,4 +337,37 @@ func (s *ClientService) sendClientMessage(ctx context.Context, tx *sql.Tx, env *
 		return nil, err
 	}
 	return &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method, Status: strptr("COMPLETED"), SessionID: env.SessionID, Revision: revPtr(sess.revision), Result: Object{"message_id": messageID, "queue_position": 0, "run_id": nil, "snapshot": snap}}, nil
+}
+
+// A finite response can finish before its Task receives independent acceptance.
+// Keep that acceptance pending while requiring actual process/effect settlement
+// and durable terminal projection before replacing the session's current Task.
+func clientTurnSettled(tx *sql.Tx, project, sessionID string, task Object) bool {
+	runID := Str(task, "active_run_id")
+	if runID == "" {
+		return task["status"] == "ACCEPTED" || task["status"] == "CANCELLED" || task["status"] == "FAILED"
+	}
+	run, err := load(tx, project, "Run", runID)
+	if err != nil || !runTerminal(run) || run["children_stopped"] != true || run["queue_empty"] != true || effectsReconciled(tx, project, runID) != nil {
+		return false
+	}
+	if run["status"] == "CANCELLED" {
+		if Str(run, "cancel_confirmed_at") == "" {
+			return false
+		}
+	} else if Str(run, "runtime_settled_at") == "" {
+		return false
+	}
+	// Report and client projection use separate commits. Until projection is
+	// recovered, retaining this binding prevents a following turn hiding results.
+	var projected int
+	runRevision, err := Num(run, "revision")
+	if err != nil {
+		return false
+	}
+	err = tx.QueryRow(`SELECT count(*) FROM outbox WHERE project=? AND json_extract(body,'$.session_id')=?
+		AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.kind')='RUN_STATE'
+		AND json_extract(body,'$.payload.revision')=? AND json_extract(body,'$.payload.status')=?`,
+		project, sessionID, runID, runRevision, run["status"]).Scan(&projected)
+	return err == nil && projected > 0
 }

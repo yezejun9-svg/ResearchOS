@@ -232,8 +232,16 @@ func (c *RuntimeCoordinator) recoverTerminal(ctx context.Context, project, runID
 	if e != nil {
 		return e
 	}
-	if Hash(run["lease_epoch"]) != Hash(epoch) || runTerminal(run) {
+	if Hash(run["lease_epoch"]) != Hash(epoch) {
 		return nil
+	}
+	if runTerminal(run) {
+		// The report may have committed before a crash interrupted client projection.
+		// Replaying the canonical terminal Run is idempotent and grants no new work.
+		if e = c.projectSessionRun(tx, project, run, Arr(run, "result_artifact_ids")); e != nil {
+			return e
+		}
+		return tx.Commit()
 	}
 	task, e := load(tx, project, "Task", Str(run, "task_id"))
 	if e != nil {
@@ -262,6 +270,13 @@ func (c *RuntimeCoordinator) recoverTerminal(ctx context.Context, project, runID
 		return nil
 	}
 	if _, _, _, e = c.service.runtimeOperationMode(tx, executor, project, runID, body, op, ID(), true); e != nil {
+		return e
+	}
+	latest, e := load(tx, project, "Run", runID)
+	if e != nil {
+		return e
+	}
+	if e = c.projectSessionRun(tx, project, latest, Arr(latest, "result_artifact_ids")); e != nil {
 		return e
 	}
 	return tx.Commit()
