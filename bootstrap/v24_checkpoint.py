@@ -22,6 +22,7 @@ import argparse
 import copy
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -94,14 +95,40 @@ def accepted_and_status(state: dict, plan: dict) -> tuple[set[str], dict[str, st
     return accepted, statuses, plans
 
 
-def gates(statuses: dict[str, str], plans: dict[str, dict]) -> dict:
+def gates(statuses: dict[str, str], plans: dict[str, dict], formal_index: dict | None = None) -> dict:
     parents = sorted(step_id for step_id, row in plans.items()
                      if row.get("phase") == "PARENT_FINAL_GATE" and statuses.get(step_id) == "ACCEPTED")
     if sum(row.get("phase") == "PARENT_FINAL_GATE" for row in plans.values()) != 22:
         raise CheckpointError("frozen 22-parent plan mismatch")
-    return {"required_parent_tasks": 22, "accepted_parent_step_ids": parents,
-            "required_formal_cases": 42, "formal_cases_accepted": "NOT_DERIVABLE_FROM_STEP_STATE",
-            "overall": "OPEN_PENDING_INDEPENDENT_FORMAL_CASE_EVIDENCE"}
+    result = {"required_parent_tasks": 22, "accepted_parent_step_ids": parents,
+              "required_formal_cases": 42, "formal_cases_accepted": "NOT_DERIVABLE_FROM_STEP_STATE",
+              "formal_evidence_integrity": "NOT_DERIVED", "accepted_case_ids": [],
+              "overall": "OPEN_PENDING_INDEPENDENT_FORMAL_CASE_EVIDENCE"}
+    if formal_index is not None:
+        result.update(formal_cases_accepted=formal_index["formal_cases_accepted"],
+                      accepted_case_ids=formal_index["accepted_case_ids"],
+                      formal_evidence_integrity=formal_index["integrity"],
+                      formal_evidence_reasons=formal_index["reasons"],
+                      case_states=formal_index["cases"])
+        if len(parents) == 22 and formal_index["integrity"] == "PASS" and formal_index["formal_cases_accepted"] == 42:
+            result["overall"] = "COMPLETE_INDEPENDENT_FORMAL_EVIDENCE"
+    return result
+
+
+def formal_reader(root: Path):
+    """Load only repository source; evidence never supplies an executable path."""
+    source = root / "execution/v2.4/formal_case_index.py"
+    if not source.is_file():
+        return None  # Standalone synthetic checkpoint callers have no evidence reader.
+    resolved = source.resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        raise CheckpointError("formal reader source outside repository")
+    spec = importlib.util.spec_from_file_location("researchos_formal_case_index", resolved)
+    module = importlib.util.module_from_spec(spec)
+    raw = resolved.read_bytes()
+    exec(compile(raw, str(resolved), "exec"), module.__dict__)
+    module.loaded_source_sha256 = sha(raw)
+    return module
 
 
 def ready_flows(statuses: dict[str, str], plans: dict[str, dict], delivery: dict) -> list[dict]:
@@ -285,7 +312,7 @@ def validate_round(event: dict, event_path: Path, root: Path) -> dict:
 
 def update_value(current: dict, accepted: set[str], statuses: dict[str, str], plans: dict[str, dict],
                  delivery: dict, *, baseline: bool, round_record: dict | None,
-                 force: bool, reason: str | None, now: str) -> dict:
+                 force: bool, reason: str | None, now: str, formal_index: dict | None = None) -> dict:
     old = current.get("value_checkpoint")
     if not isinstance(old, dict):
         raise CheckpointError("value_checkpoint must be an object")
@@ -297,7 +324,7 @@ def update_value(current: dict, accepted: set[str], statuses: dict[str, str], pl
         raise CheckpointError("frozen U09 thresholds changed")
     priority = flow_priority(statuses, plans, delivery)
     candidates = priority["candidates"]
-    gate = gates(statuses, plans)
+    gate = gates(statuses, plans, formal_index)
     if baseline:
         if old.get("status") != "NOT_RUN" or round_record is not None or force or reason:
             raise CheckpointError("baseline only initializes an unobserved checkpoint")
@@ -414,10 +441,13 @@ def update_file(checkpoint: Path, state_path: Path, plan_path: Path, delivery_pa
             event, _ = read(event_path)
             event_record = validate_round(event, event_path, root)
         now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        reader = formal_reader(root)
+        formal_index = reader.derive_formal_cases(root, state_path, plan_path) if reader is not None else None
+        reader_source_hash = reader.loaded_source_sha256 if reader is not None else None
         updated = copy.deepcopy(current)
         updated["value_checkpoint"] = update_value(current, accepted, statuses, plans, delivery,
                                                      baseline=baseline, round_record=event_record,
-                                                     force=force, reason=reason, now=now)
+                                                     force=force, reason=reason, now=now, formal_index=formal_index)
         updated["expected_previous_revision"] = expected_revision
         updated["revision"] = expected_revision + 1
         updated["updated_at"] = now
@@ -429,6 +459,12 @@ def update_file(checkpoint: Path, state_path: Path, plan_path: Path, delivery_pa
         if (checkpoint.read_bytes() != original or state_path.read_bytes() != state_raw
                 or plan_path.read_bytes() != plan_raw or delivery_path.read_bytes() != delivery_raw):
             raise CheckpointError("CAS source changed before replace")
+        if reader is not None:
+            if sha((root / "execution/v2.4/formal_case_index.py").read_bytes()) != reader_source_hash:
+                raise CheckpointError("formal reader changed before replace")
+            observed = reader.recheck_inputs(formal_index["dependency_snapshot"])
+            if observed["status"] != "PASS":
+                raise CheckpointError("formal evidence changed before replace: " + observed["reason"])
         with tempfile.NamedTemporaryFile(mode="wb", dir=checkpoint.parent,
                                          prefix=checkpoint.name + ".value.", suffix=".tmp",
                                          delete=False) as stream:

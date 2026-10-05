@@ -1,150 +1,78 @@
-"""Build the 22-parent gate ledger from the plan, the step state, the registry and the checkpoint.
+"""Write a derived parent report; authoritative inputs remain read-only.
 
-The objective is not "accept cards" but "all 22 parent tasks and all 42 formal cases validly accepted", so this
-computes, per parent, exactly how far that is and what stands in the way - without executing anything, which makes
-it safe to run while an independent reviewer holds the tree.
-
-Inputs (all read-only):
-  - spec contracts/execution.plan.json      -> the DAG: parents, their cards, dependencies, formal cases
-  - execution/v2.4/step_state.json          -> which cards are ACCEPTED and by whom
-  - execution/v2.4/commands.json            -> which formal case a selector can actually reach
-  - execution/v2.4/checkpoint.json          -> blocked resources and outstanding obligations
-
-A parent is shown as it is, not as hoped: a parent with one unaccepted card is NOT gateable, and a formal case is
-counted only when a v2.4 selector names it. Reachable is not accepted.
+Command reachability, all-card status and formal evidence validity are separate.
+The default output remains execution/v2.4/parent_gate_ledger.json.
 """
-import collections, io, json, os, re
+from pathlib import Path
+import collections
+import hashlib
+import importlib.util
+import json
 
-NL = chr(10)
+REPO = Path(__file__).resolve().parents[2]
+SPEC = Path('D:/作品集/ResearchOS/ResearchOS_Implementation_Package_v2.4')
 
+def build(repo=REPO, spec=SPEC):
+    repo, spec = Path(repo).resolve(), Path(spec).resolve()
+    source = repo/'execution/v2.4/formal_case_index.py'
+    if not source.resolve().is_relative_to(repo): raise ValueError('formal reader outside repository')
+    module_spec = importlib.util.spec_from_file_location('researchos_formal_case_index', source)
+    formal = importlib.util.module_from_spec(module_spec)
+    reader_raw = source.read_bytes()
+    exec(compile(reader_raw,str(source),'exec'),formal.__dict__)
+    folder = repo/'execution/v2.4'; plan_path = spec/'contracts/execution.plan.json'
+    result = formal.derive_formal_cases(repo, folder/'step_state.json', plan_path)
+    def load(path): return formal.strict_json(path.read_bytes())
+    plan, state, registry, checkpoint = [load(path) for path in (plan_path,folder/'step_state.json',folder/'commands.json',folder/'checkpoint.json')]
+    status = {row['id']:row['status'] for row in state['steps']}
+    bindings = load(spec/'contracts/tasks.json')['verification_command_selection']['formal_case_bindings']
+    owners = {row['task_id']:row for row in result['owners']}; reachable = set()
+    for case in result['cases']:
+        selected = [b for b in bindings if b['case_id']==case['case_id']]
+        admitted = []
+        for binding in selected:
+            entry = registry.get('commands',{}).get(binding['key'],{}); selectors = entry.get('selectors',{})
+            admitted.append(entry.get('state')=='BOUND' and binding['task_id'] in selectors.get('task_id',[]) and binding['case_id'] in selectors.get('case_id',[]))
+        if admitted and all(admitted): reachable.add(case['case_id'])
+    parents = collections.OrderedDict()
+    for task_id in sorted({step['parent_task'] for step in plan['steps']}):
+        cards = sorted(step['id'] for step in plan['steps'] if step['parent_task']==task_id)
+        accepted = [card for card in cards if status.get(card)=='ACCEPTED']
+        owner = owners.get(task_id,{'owned_case_ids':[],'accepted_case_ids':[],'integrity':'INVALID'})
+        cases = owner['owned_case_ids']
+        parents[task_id] = {'cards_total':len(cards),'cards_accepted':len(accepted),
+            'cards_reported_not_accepted':[card for card in cards if card in status and status[card]!='ACCEPTED'],
+            'cards_untracked':[card for card in cards if card not in status], 'all_cards_accepted':bool(cards) and len(accepted)==len(cards),
+            'parent_final_status':status.get(task_id+'-99','NOT_STARTED'),'formal_cases':cases,
+            'formal_cases_reachable':[case for case in cases if case in reachable], 'formal_cases_unreachable':[case for case in cases if case not in reachable],
+            'formal_cases_accepted':owner['accepted_case_ids'],'formal_evidence_integrity':owner['integrity'],'formal_evidence_reasons':owner.get('reasons',[])}
+    blocked = sorted((row.get('resource') or row.get('id') or '?') if isinstance(row,dict) else row for row in checkpoint.get('blocked_resources',[]))
+    case_ids = [case['case_id'] for case in result['cases']]
+    summary = {'generated_by':'execution/v2.4/parent_gate_ledger.py (authority inputs read-only; derived output written)',
+        'scope':'DERIVED_REPORT_NOT_ACCEPTANCE_AUTHORITY','registry_revision':registry.get('revision'),
+        'cards_accepted':sum(value=='ACCEPTED' for value in status.values()),'cards_total_in_plan':sum(row['cards_total'] for row in parents.values()),
+        'parents_total':len(parents),'parents_with_every_card_accepted':[task for task,row in parents.items() if row['all_cards_accepted']],
+        'accepted_parent_final_ids':[task+'-99' for task,row in parents.items() if row['parent_final_status']=='ACCEPTED'],
+        'formal_cases_total':result['required_formal_cases'],'formal_cases_reachable_by_a_selector':sorted(reachable),
+        'formal_cases_unreachable':[case for case in case_ids if case not in reachable],
+        'formal_cases_accepted':result['accepted_case_ids'],'formal_case_accepted_count':result['formal_cases_accepted'],
+        'formal_evidence_integrity':result['integrity'],'formal_evidence_reasons':result['reasons'],'formal_case_states':result['cases'],
+        'formal_dependency_snapshot':result['dependency_snapshot'],'blocked_resources':blocked,
+        'reading':'Reachability is diagnostic. Formal cases require exact final ownership, independent full evidence and current applicable inputs registered on canonical accepted owner-99 rows.',
+        'parents':parents}
+    checked = formal.recheck_inputs(result['dependency_snapshot'])
+    if checked['status']!='PASS': raise ValueError('formal evidence changed before report: '+checked['reason'])
+    if hashlib.sha256(source.read_bytes()).digest()!=hashlib.sha256(reader_raw).digest(): raise ValueError('formal reader changed before report')
+    return summary
 
-def _find_repo(start):
-    d = start
-    for _ in range(10):
-        if os.path.isdir(os.path.join(d, "execution", "v2.4")) and os.path.isdir(os.path.join(d, "internal", "domain")):
-            return d
-        d = os.path.dirname(d)
-    raise SystemExit("repository root not found from %s" % start)
+def main():
+    summary = build()
+    (REPO/'execution/v2.4/parent_gate_ledger.json').write_text(json.dumps(summary,ensure_ascii=False,indent=1)+'\n',encoding='utf8')
+    keys = ('registry_revision','cards_accepted','cards_total_in_plan','parents_total','parents_with_every_card_accepted','formal_cases_total','formal_case_accepted_count','formal_evidence_integrity')
+    print(json.dumps({key:summary[key] for key in keys},indent=1,ensure_ascii=False))
+    print('reachable cases:',len(summary['formal_cases_reachable_by_a_selector']),'| unreachable:',len(summary['formal_cases_unreachable']))
+    print('blocked resources:',summary['blocked_resources'])
+    for task,row in sorted(summary['parents'].items(),key=lambda item:item[1]['cards_accepted']-item[1]['cards_total'])[:6]:
+        print('%s cards %d/%d | reported-not-accepted %s | cases %d, unreachable %d' % (task,row['cards_accepted'],row['cards_total'],row['cards_reported_not_accepted'],len(row['formal_cases']),len(row['formal_cases_unreachable'])))
 
-
-REPO = _find_repo(os.path.dirname(os.path.abspath(__file__)))
-os.chdir(REPO)
-SPEC = r"D:/作品集/ResearchOS/ResearchOS_Implementation_Package_v2.4"
-V24 = "execution/v2.4"
-
-
-def load(p):
-    return json.load(io.open(p, encoding="utf-8-sig"))
-
-
-plan = load(os.path.join(SPEC, "contracts", "execution.plan.json"))
-st = load(os.path.join(V24, "step_state.json"))
-reg = load(os.path.join(V24, "commands.json"))
-cp = load(os.path.join(V24, "checkpoint.json"))
-
-recs = st["steps"] if isinstance(st["steps"], list) else list(st["steps"].values())
-status = {r.get("id"): r.get("status") for r in recs if isinstance(r, dict) and r.get("id")}
-
-steps = plan.get("steps") or []
-parents = collections.OrderedDict()
-cards_of = collections.defaultdict(list)
-for s in steps:
-    sid = s.get("step_id") or s.get("id") or ""
-    if not sid:
-        continue
-    parent = s.get("parent_task") or sid.split("-")[0]
-    parents.setdefault(parent, {"kind": "parent", "cards": []})
-    parents[parent]["cards"].append(sid)
-    cards_of[sid] = s
-
-# formal cases, and which v2.4 command key can reach them
-case_owner, case_list = {}, []
-
-
-def walk(o, path=None):
-    if isinstance(o, dict):
-        cid = o.get("case_id")
-        if isinstance(cid, str) and cid.strip():
-            if cid not in case_owner:
-                case_owner[cid] = o.get("task_id") or o.get("owner_card") or ""
-                case_list.append(cid)
-        for v in o.values():
-            walk(v)
-    elif isinstance(o, list):
-        for v in o:
-            walk(v)
-
-
-walk(plan)
-
-
-def texts(sel):
-    if isinstance(sel, str):
-        return [sel]
-    if isinstance(sel, dict):
-        return [json.dumps(sel, ensure_ascii=False)]
-    if isinstance(sel, list):
-        return [t for x in sel for t in texts(x)]
-    return []
-
-
-reachable = collections.defaultdict(set)
-for name, entry in (reg.get("commands") or {}).items():
-    for t in texts(entry.get("selectors")):
-        for cid in set(re.findall(r"\b(?:C|A)\d{2}\b", t)):
-            reachable[cid].add(name)
-
-blocked_resources = {}
-for b in (cp.get("blocked_resources") or []):
-    if isinstance(b, dict):
-        blocked_resources[b.get("resource") or b.get("id") or "?"] = b
-    elif isinstance(b, str):
-        blocked_resources[b] = {"note": "recorded as a bare name"}
-
-ledger = collections.OrderedDict()
-for parent, info in parents.items():
-    cards = sorted(set(info["cards"]))
-    acc = [c for c in cards if status.get(c) == "ACCEPTED"]
-    rep = [c for c in cards if c in status and status[c] != "ACCEPTED"]
-    untracked = [c for c in cards if c not in status]
-    cases = [c for c in case_list if case_owner.get(c) == parent]
-    ledger[parent] = {
-        "cards_total": len(cards), "cards_accepted": len(acc),
-        "cards_reported_not_accepted": rep, "cards_untracked": untracked,
-        "all_cards_accepted": bool(cards) and len(acc) == len(cards),
-        "formal_cases": cases,
-        "formal_cases_reachable": [c for c in cases if reachable.get(c)],
-        "formal_cases_unreachable": [c for c in cases if not reachable.get(c)],
-        "formal_cases_accepted": [],
-    }
-
-accepted_parents = [p for p, v in ledger.items() if v["all_cards_accepted"]]
-summary = {
-    "generated_by": "execution/v2.4/parent_gate_ledger.py (read-only; nothing executed)",
-    "registry_revision": reg.get("revision"),
-    "cards_accepted": sum(1 for s in status.values() if s == "ACCEPTED"),
-    "cards_total_in_plan": sum(v["cards_total"] for v in ledger.values()),
-    "parents_total": len(ledger),
-    "parents_with_every_card_accepted": accepted_parents,
-    "formal_cases_total": len(case_list),
-    "formal_cases_reachable_by_a_selector": [c for c in case_list if reachable.get(c)],
-    "formal_cases_unreachable": [c for c in case_list if not reachable.get(c)],
-    "blocked_resources": sorted(blocked_resources),
-    "reading": "no parent is gateable until every one of its cards is ACCEPTED, and a formal case counts only when "
-               "it is both reachable by a registered selector and accepted by its owning card; both columns are "
-               "reported separately so a green-looking parent count cannot hide an unreachable case",
-    "parents": ledger,
-}
-io.open(os.path.join(V24, "parent_gate_ledger.json"), "w", encoding="utf-8", newline=NL).write(
-    json.dumps(summary, indent=1, ensure_ascii=False))
-print(json.dumps({k: summary[k] for k in ("registry_revision", "cards_accepted", "cards_total_in_plan",
-                                          "parents_total", "parents_with_every_card_accepted",
-                                          "formal_cases_total")}, indent=1, ensure_ascii=False))
-print("reachable cases:", len(summary["formal_cases_reachable_by_a_selector"]),
-      "| unreachable:", len(summary["formal_cases_unreachable"]))
-print("blocked resources:", summary["blocked_resources"])
-worst = sorted(ledger.items(), key=lambda kv: kv[1]["cards_accepted"] - kv[1]["cards_total"])[:6]
-for p, v in worst:
-    print("%s cards %d/%d | reported-not-accepted %s | cases %d, unreachable %d"
-          % (p, v["cards_accepted"], v["cards_total"], v["cards_reported_not_accepted"],
-             len(v["formal_cases"]), len(v["formal_cases_unreachable"])))
+if __name__=='__main__': main()
