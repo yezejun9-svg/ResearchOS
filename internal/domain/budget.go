@@ -57,7 +57,7 @@ func (s *Service) resourceOperation(tx *sql.Tx, p Principal, project, id string,
 		return o, "NoProgressRecord", 200, e
 	}
 	if op == "createResourceRequest" {
-		o, e := s.createResourceRequest(tx, project, b)
+		o, e := s.createResourceRequest(tx, p, project, b)
 		return o, "ResourceRequest", 201, e
 	}
 	if op == "resolveResourceRequest" {

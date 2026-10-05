@@ -143,7 +143,7 @@ func (s *Service) createResearchCycle(tx *sql.Tx, p Principal, project string, b
 			"summary": "Required research source is not configured", "blocked_task_ids": Empty(), "continuable_task_ids": Empty(),
 			"completed_artifact_refs": Empty(), "requested_capability": "Configure source " + Str(c, "source_id"),
 			"estimated_cost": nil, "cost_known": false, "resume_checkpoint_ref": nil}
-		resource, requestErr := s.createResourceRequest(tx, project, request)
+		resource, requestErr := s.createResourceRequest(tx, p, project, request)
 		if requestErr != nil {
 			return nil, requestErr
 		}
