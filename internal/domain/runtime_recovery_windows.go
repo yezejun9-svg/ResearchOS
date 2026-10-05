@@ -293,7 +293,7 @@ func (c *RuntimeCoordinator) recoverEffects(ctx context.Context, project, run, d
 			return errors.New("host effect receipt reparse rejected")
 		}
 		info, e := os.Stat(path)
-		if e != nil || !info.Mode().IsRegular() || info.Size() > 128*1024 {
+		if e != nil || !info.Mode().IsRegular() || info.Size() > runtimeFactMaxBytes {
 			return errors.New("host effect receipt exceeds bound")
 		}
 		raw, e := os.ReadFile(path)

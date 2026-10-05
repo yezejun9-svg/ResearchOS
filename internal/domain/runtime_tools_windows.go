@@ -5,9 +5,11 @@ package domain
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 
+	"github.com/santhosh-tekuri/jsonschema/v6"
 	rt "researchos.local/research-os/adapters/runtime"
 )
 
@@ -34,8 +36,19 @@ func validateRuntimeToolArguments(config, payload Object) error {
 	if schema == nil {
 		return Fail(403, "FORBIDDEN", "tool absent from frozen model schema")
 	}
-	doc, e := LoadSchema(Bytes(Object{"$id": "https://researchos.local/runtime-tool.json", "$defs": Object{"Arguments": schema}}))
-	if e != nil || doc.ValidateDefInput("Arguments", args) != nil {
+	compiler := jsonschema.NewCompiler()
+	compiler.UseLoader(localOnly{})
+	compiler.AssertFormat()
+	compiler.DefaultDraft(jsonschema.Draft2020)
+	const location = "https://researchos.local/runtime-tool.json"
+	if e := compiler.AddResource(location, schema); e != nil {
+		return Fail(403, "FORBIDDEN", "invalid frozen tool schema")
+	}
+	doc, e := compiler.Compile(location)
+	if e != nil {
+		return Fail(403, "FORBIDDEN", "frozen tool schema cannot be compiled locally")
+	}
+	if doc.Validate(args) != nil {
 		return Fail(400, "INVALID_REQUEST", "arguments do not match the frozen tool schema")
 	}
 	return nil
@@ -95,9 +108,12 @@ func (c *RuntimeCoordinator) brokerTool(ctx context.Context, route RuntimeCoordi
 		}
 		return nil, Fail(409, "STATE_CONFLICT", "tool outcome UNKNOWN; automatic retry prohibited")
 	}
+	notApplied := func(reason string) (Object, error) {
+		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "HOST_TOOL_NOT_APPLIED", reason)
+	}
 	tx, run, current, e := c.dispatchGate(ctx, route, runID, lease, epoch)
 	if e != nil {
-		return unknown("tool authority ended before host dispatch")
+		return notApplied("tool authority ended before host dispatch")
 	}
 	task, e := load(tx, route.ProjectID, "Task", Str(run, "task_id"))
 	var request RuntimeToolRequest
@@ -106,10 +122,14 @@ func (c *RuntimeCoordinator) brokerTool(ctx context.Context, route RuntimeCoordi
 	}
 	tx.Rollback()
 	if e != nil {
-		return unknown("tool binding ended before host dispatch")
+		return notApplied("tool binding ended before host dispatch")
 	}
 	result, e := c.config.RunTool(ctx, request)
 	if e != nil {
+		var witnessed *RuntimeToolFailure
+		if errors.As(e, &witnessed) && witnessed.Outcome == "NOT_APPLIED" {
+			return notApplied("host refused the tool before any side effect")
+		}
 		return unknown("host tool did not return a complete result")
 	}
 	evidence := result["host_evidence"]
@@ -131,6 +151,7 @@ func (c *RuntimeCoordinator) brokerTool(ctx context.Context, route RuntimeCoordi
 	fact := Object{"version": 1, "project_id": route.ProjectID, "run_id": runID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "effect_key": frame.Key, "request_hash": intent["request_hash"], "reservation_id": intent["reservation_id"], "provider_response_hash": Digest(raw), "receipt": receipt}
 	if evidence != nil {
 		fact["host_tool_evidence"] = evidence
+		fact["host_tool_evidence_hash"] = Hash(evidence)
 	}
 	if e = writeRuntimeFact(filepath.Join(bridge.Directory(), "effect-"+strings.TrimPrefix(Digest([]byte(frame.Key)), "sha256:")+".json"), Bytes(fact)); e != nil {
 		return unknown("tool result persistence failed")

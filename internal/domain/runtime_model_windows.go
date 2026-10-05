@@ -59,21 +59,7 @@ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoord
 	notDispatched := func() (Object, error) {
 		// Credential resolution failed before HTTP request construction. This is a
 		// known absent provider operation, unlike a transport failure after send.
-		result := Object{"code": "CREDENTIAL_MISSING", "dispatched": false}
-		raw := Bytes(result)
-		currency := Str(provider.UpperBound, "currency")
-		if currency == "" {
-			currency = "USD"
-		}
-		receipt := Object{"key": frame.Key, "epoch": epoch, "run_id": runID, "receipt_id": Digest(raw), "state": "NOT_APPLIED", "actual_cost": Object{"amount": "0", "currency": currency}, "payload": result}
-		fact := Object{"version": 1, "project_id": route.ProjectID, "run_id": runID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "effect_key": frame.Key, "request_hash": intent["request_hash"], "reservation_id": intent["reservation_id"], "provider_response_hash": Digest(raw), "receipt": receipt}
-		if e = writeRuntimeFact(filepath.Join(bridge.Directory(), "effect-"+strings.TrimPrefix(Digest([]byte(frame.Key)), "sha256:")+".json"), Bytes(fact)); e != nil {
-			return nil, e
-		}
-		if e = c.ingestEffectFact(context.Background(), fact); e != nil {
-			return nil, e
-		}
-		return nil, Fail(403, "CREDENTIAL_MISSING", "protected model credential unavailable; no provider request was sent")
+		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "CREDENTIAL_MISSING", "protected model credential unavailable; no provider request was sent")
 	}
 	if provider.CredentialRef != "" {
 		if c.config.ModelCredential == nil {
@@ -90,7 +76,7 @@ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoord
 	}
 	req, e := http.NewRequestWithContext(ctx, http.MethodPost, provider.Endpoint, bytes.NewReader(Bytes(body)))
 	if e != nil {
-		return unknown("model request construction failed")
+		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "INVALID_REQUEST", "model request construction failed before dispatch")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
@@ -104,8 +90,8 @@ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoord
 		return unknown("model transport ended without complete response")
 	}
 	defer response.Body.Close()
-	raw, e := io.ReadAll(io.LimitReader(response.Body, 48*1024+1))
-	if e != nil || len(raw) > 48*1024 || response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") || !completeRuntimeModelSSE(raw) {
+	raw, e := io.ReadAll(io.LimitReader(response.Body, runtimeModelMaxSSEBytes+1))
+	if e != nil || len(raw) > runtimeModelMaxSSEBytes || response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") || !completeRuntimeModelSSE(raw) {
 		return unknown("model returned no complete bounded SSE response")
 	}
 	for _, secret := range []string{provider.BearerToken, c.config.SchedulerToken, route.ExecutorToken} {
@@ -114,13 +100,13 @@ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoord
 		}
 	}
 	result := Object{"status": response.StatusCode, "content_type": "text/event-stream", "body": string(raw)}
-	reply := Object{"sequence": frame.Sequence, "key": frame.Key, "state": "CONFIRMED", "payload": result}
-	if len(Bytes(reply)) > 64*1024 {
-		return unknown("encoded model response exceeds bridge frame limit")
-	}
 	// A received response proves the operation completed, not what it cost.
 	// Retain the original upper-bound reservation until a real billing fact arrives.
 	receipt := Object{"key": frame.Key, "epoch": epoch, "run_id": runID, "receipt_id": Digest(raw), "state": "CONFIRMED", "model_transport": true, "actual_cost": nil, "payload": result}
+	reply, e := runtimeEffectWireReply(frame, receipt)
+	if e != nil {
+		return unknown("encoded model response exceeds bridge frame limit")
+	}
 	fact := Object{"version": 1, "project_id": route.ProjectID, "run_id": runID, "epoch": epoch, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "effect_key": frame.Key, "request_hash": intent["request_hash"], "reservation_id": intent["reservation_id"], "provider_response_hash": Digest(raw), "receipt": receipt}
 	if e = writeRuntimeFact(filepath.Join(bridge.Directory(), "effect-"+strings.TrimPrefix(Digest([]byte(frame.Key)), "sha256:")+".json"), Bytes(fact)); e != nil {
 		return unknown("model response persistence failed")
