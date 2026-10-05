@@ -48,6 +48,31 @@ async function main() {
   const firstText = await articles.first().locator('.message-text').textContent();
   const lastText = await articles.last().locator('.message-text').textContent();
   check('FIRST_VISIBLE_IS_SEED_2', firstText === 'u002');
+  fs.writeFileSync(path.join(out, 'ui-last-text.utf8.txt'), lastText, 'utf8');
+  const wireAtLastText = await page.evaluate(async () => {
+    const context = await window.researchos.desktop.context();
+    const reply = await window.researchos.v2['session.get']({});
+    const snapshot = reply?.result || null;
+    const last = snapshot?.messages?.at(-1);
+    return { context, ok: reply?.ok, status: reply?.protocol_status,
+      snapshot: snapshot && { project_id: snapshot.project_id, session_id: snapshot.session_id,
+        goal_id: snapshot.goal_id, revision: snapshot.revision, event_sequence: snapshot.event_sequence,
+        visible_count: snapshot.messages?.length, first_visible_message_id: snapshot.messages?.[0]?.message_id,
+        last_visible_message_id: last?.message_id, last_complete: last?.complete,
+        last_parts: last?.parts?.length, transcript_artifact_ref: snapshot.transcript_artifact_ref },
+      last_text: (last?.parts || []).map(part => part.text).join('') };
+  });
+  const nativeLastText = wireAtLastText.last_text;
+  fs.writeFileSync(path.join(out, 'native-last-text.utf8.txt'), nativeLastText, 'utf8');
+  report.last_text_diagnostic = {
+    expected: { message_id: input.last_message_id, utf8_bytes: input.last_text_bytes, sha256: input.last_text_hash },
+    ui: { utf8_bytes: Buffer.byteLength(lastText, 'utf8'), sha256: hash(Buffer.from(lastText, 'utf8')),
+      starts_with: lastText.slice(0, 32), ends_with: lastText.slice(-32) },
+    native: { utf8_bytes: Buffer.byteLength(nativeLastText, 'utf8'), sha256: hash(Buffer.from(nativeLastText, 'utf8')),
+      starts_with: nativeLastText.slice(0, 32), ends_with: nativeLastText.slice(-32) },
+    native_snapshot: wireAtLastText.snapshot, native_context: wireAtLastText.context,
+  };
+  fs.writeFileSync(path.join(out, 'last-text-diagnostic.json'), JSON.stringify(report.last_text_diagnostic, null, 2) + '\n');
   check('LAST_VISIBLE_EXACT_TEXT_HASH', hash(Buffer.from(lastText, 'utf8')) === input.last_text_hash &&
     Buffer.byteLength(lastText, 'utf8') === input.last_text_bytes);
   const wire = await page.evaluate(async () => {

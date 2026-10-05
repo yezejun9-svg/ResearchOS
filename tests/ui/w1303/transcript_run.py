@@ -130,6 +130,18 @@ def main() -> int:
         before_raw = command([cli, 'status', '--project', fixture['project_id'], '--session', fixture['session_id'], '--output', 'jsonl'], 'cli-before')
         _, before = snapshot_from_cli(before_raw)
         ref = fixture['transcript_artifact_ref']
+        before_last = (before.get('messages') or [])[-1]
+        before_last_text = ''.join(part.get('text') or '' for part in before_last.get('parts') or [])
+        (out / 'cli-last-text.utf8.txt').write_text(before_last_text, encoding='utf-8')
+        before_last_bytes = before_last_text.encode('utf-8')
+        save(out / 'cli-last-text-summary.json', {
+            'message_id': before_last.get('message_id'), 'complete': before_last.get('complete'),
+            'utf8_bytes': len(before_last_bytes), 'sha256': 'sha256:' + hashlib.sha256(before_last_bytes).hexdigest(),
+            'snapshot_revision': before.get('revision'), 'snapshot_event_sequence': before.get('event_sequence'),
+        })
+        check('CLI_LAST_TEXT_EXACT', before_last.get('message_id') == fixture['last_message_id'] and
+              len(before_last_bytes) == fixture['last_text_bytes'] and
+              'sha256:' + hashlib.sha256(before_last_bytes).hexdigest() == fixture['last_text_hash'])
         check('CLI_SCOPE_AND_REF', before.get('project_id') == fixture['project_id'] and before.get('session_id') == fixture['session_id'] and
               before.get('goal_id') == fixture['goal_id'] and before.get('transcript_artifact_ref') == ref)
         check('CLI_VISIBLE_200', len(before.get('messages') or []) == 200 and before.get('has_earlier_messages') is True)
