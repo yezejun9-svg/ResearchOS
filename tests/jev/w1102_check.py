@@ -13,6 +13,8 @@ import sys
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
+GO_SHA256 = 'sha256:d3ccdb604eafa6031133aefe1a3db24f0bb7362b857bc2125ac4e4c178b4b490'
+PYTHON_SHA256 = 'sha256:cce21c0e8710e304273e98ac4b2b0f5aceb639acbcd2343cbaa5c4e81619c45b'
 EXPECTED = {
     'REPORT-NEVER-GRANTS', 'UNKNOWN-COST-NULL', 'LATENCY', 'SMOKE12',
     'MODEL-VOTE', 'DEVELOPMENT-AS-HOLDOUT', 'FAMILY-OVERLAP', 'HOLDOUT-TUNING',
@@ -48,6 +50,13 @@ def main():
     if not go.is_file():
         print('pinned Go unavailable', file=sys.stderr)
         return 1
+    toolchain = {
+        'go': {'path': str(go), 'sha256': digest(go)},
+        'python': {'path': sys.executable, 'sha256': digest(Path(sys.executable))},
+    }
+    if toolchain['go']['sha256'] != GO_SHA256 or toolchain['python']['sha256'] != PYTHON_SHA256:
+        print('pinned toolchain binary hash mismatch', file=sys.stderr)
+        return 1
     out = ROOT / 'execution/v2.4/receipts/W11/W11-02/dispatched' / str(uuid.uuid4())
     out.mkdir(parents=True, exist_ok=False)
     sources = [*ROOT.glob('adapters/decision/*.go'),
@@ -82,7 +91,7 @@ def main():
         started_at=dt.datetime.now(dt.timezone.utc).isoformat(), source_hashes=hashes,
         source_revision=subprocess.check_output(['git','rev-parse','HEAD'], cwd=ROOT, text=True).strip(),
         source_dirty_status=subprocess.check_output(['git','status','--porcelain'], cwd=ROOT, text=True).splitlines(),
-        expected_assertion_ids=sorted(EXPECTED), new_provider_calls=0,
+        expected_assertion_ids=sorted(EXPECTED), toolchain=toolchain, new_provider_calls=0,
         independent_acceptance='PENDING_INDEPENDENT_REVIEW'))
     code, version = run('go-version', [str(go), 'version'], 15)
     if code or version.decode().strip() != 'go version go1.27.1 windows/amd64':
@@ -119,10 +128,14 @@ def main():
         except (ValueError, KeyError, TypeError):
             probe_ok = False
     drift = [p for p, sha in hashes.items() if digest(ROOT/p) != sha]
-    good = fixture_ok and probe_ok and not drift
+    toolchain_drift = [name for name, entry in toolchain.items()
+                       if digest(Path(entry['path'])) != entry['sha256']]
+    actual_ids = sorted(ids, key=str)
+    good = fixture_ok and probe_ok and not drift and not toolchain_drift
     save(out/'commands.json', commands)
     save(out/'report.json', dict(task_id='W11', check_id='W11-02', status='BLOCKED' if good else 'FAIL',
         fixture_status='PASS' if fixture_ok else 'FAIL', assertions=rows, assertion_count=len(rows),
+        assertion_ids=actual_ids, toolchain=toolchain, toolchain_drift=toolchain_drift,
         expected_assertion_count=len(EXPECTED), malformed=malformed, source_drift=drift,
         resource_probe=probe, resource_probe_valid=probe_ok,
         measurement_modes=['FIXTURE','RECORDED_LIVE_WINDOWS_READINESS_NOT_NEW_MEASUREMENT'],
@@ -131,7 +144,7 @@ def main():
         independent_acceptance='PENDING_INDEPENDENT_REVIEW', ended_at=dt.datetime.now(dt.timezone.utc).isoformat()))
     save(out/'evidence-index.json', {'files': [{'path':p.name,'sha256':digest(p)} for p in sorted(out.iterdir()) if p.is_file()]})
     print(json.dumps(dict(status='BLOCKED' if good else 'FAIL', fixture_status='PASS' if fixture_ok else 'FAIL',
-        assertion_count=len(rows), receipt=str(out/'report.json')), ensure_ascii=False))
+        assertion_count=len(rows), assertion_ids=actual_ids, receipt=str(out/'report.json')), ensure_ascii=False))
     return 2 if good else 1
 
 
