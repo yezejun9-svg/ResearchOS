@@ -59,7 +59,9 @@ def source_review(filename):
     return {"status": record["status"] if not changed else "SOURCE_CHANGED_PENDING_REVIEW",
             "historical_status": record["status"], "source_drift": changed,
             "evidence": {"path": path.relative_to(ROOT).as_posix(), "sha256": digest(path)},
-            "scope": record.get("scope", "Only the specific independent review; no whole card acceptance.")}
+            "scope": record.get("scope", "Only the specific independent review; no whole card acceptance."),
+            "prior_runtime_evidence": record.get("prior_runtime_evidence", record.get("prior_runtime_scope")),
+            "new_runtime_executions": record.get("new_runtime_executions")}
 
 
 def observed_checks(parent, child_name):
@@ -164,7 +166,7 @@ def main():
               "status": status, "source_hashes": before, "source_drift": drift,
               "stages": stages, "assertion_rows": rows, "assertion_ids": [r["assertion_id"] for r in rows],
               "blockers": blockers,
-              "independent_permission_review": source_review("independent_permission_review_round3_codex.json"),
+              "independent_permission_review": source_review("independent_permission_review_round4_codex.json"),
               "independent_transcript_review": source_review("independent_transcript_review_round1_codex.json"),
               "card_accepted": False, "formal_cases_accepted": [], "provider_calls": 0,
               "scope": "Actual Windows Electron observations with explicit FIXTURE inputs; unresolved card gates remain blocked.",
