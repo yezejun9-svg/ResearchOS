@@ -26,13 +26,29 @@ const runtimeToolReplyLimit = 56 << 10
 func toolDenied(message string) error  { return domain.Fail(403, "FORBIDDEN", message) }
 func toolInvalid(message string) error { return domain.Fail(400, "INVALID_REQUEST", message) }
 
+func runtimeToolEarlyOutcome(h *Host, name, key string, cause error) error {
+	if name != "write" && name != "edit" {
+		return &domain.RuntimeToolFailure{Err: cause, Outcome: "NOT_APPLIED"}
+	}
+	if key == "" {
+		return cause // No durable identity can prove an older physical effect absent.
+	}
+	if h != nil && h.dir != "" {
+		prior, _, exists, lookupErr := priorWorkspaceWriteIntent(h.dir, key)
+		if lookupErr != nil || exists && prior.State != "CONFLICT" {
+			return writeError("WRITE_RECOVERY_REQUIRED", "UNKNOWN", cause)
+		}
+	}
+	return &domain.RuntimeToolFailure{Err: cause, Outcome: "NOT_APPLIED"}
+}
+
 func (h *Host) ExecuteRuntimeTool(ctx context.Context, request domain.RuntimeToolRequest) (result domain.Object, err error) {
 	// Validation and reads cannot mutate the workspace. Each mutating tool
 	// takes responsibility for classifying errors after this boundary.
 	beforeMutation := true
 	defer func() {
 		if err != nil && beforeMutation {
-			err = &domain.RuntimeToolFailure{Err: err, Outcome: "NOT_APPLIED"}
+			err = runtimeToolEarlyOutcome(h, request.Name, request.IntentKey, err)
 		}
 	}()
 	if err := ctx.Err(); err != nil {
@@ -365,7 +381,7 @@ func runtimeToolWrite(ctx context.Context, h *Host, root *os.Root, binding *Root
 	beforeMutation := true
 	defer func() {
 		if err != nil && beforeMutation {
-			err = &domain.RuntimeToolFailure{Err: err, Outcome: "NOT_APPLIED"}
+			err = runtimeToolEarlyOutcome(h, name, request.IntentKey, err)
 		}
 	}()
 	allowed := map[string]bool{"path": true, "expected_hash": true}

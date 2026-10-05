@@ -115,8 +115,8 @@ func TestRuntimeToolWriteRequiresEffectIdentityAndRevalidation(t *testing.T) {
 	request.IntentKey = ""
 	_, err := h.ExecuteRuntimeTool(context.Background(), request)
 	var failure *domain.RuntimeToolFailure
-	if !errors.As(err, &failure) || failure.Outcome != "NOT_APPLIED" {
-		t.Fatalf("missing effect key must refuse before mutation: %v", err)
+	if err == nil || errors.As(err, &failure) && failure.Outcome == "NOT_APPLIED" {
+		t.Fatalf("missing effect key cannot claim an unknown history was NOT_APPLIED: %v", err)
 	}
 	request.IntentKey = "runtime-tool/identity-required"
 	request.Revalidate = nil
@@ -176,5 +176,35 @@ func TestRuntimeToolRevokedAfterIntentIsUnknown(t *testing.T) {
 	}
 	if actual, err := os.ReadFile(target); err != nil || string(actual) != "before" {
 		t.Fatalf("revoked target changed: %q %v", actual, err)
+	}
+}
+
+func TestRuntimeToolPendingReplayRevocationNeverBecomesNotApplied(t *testing.T) {
+	h, workspace, _ := runtimeToolFixture(t, AccessReadWrite)
+	target := filepath.Join(workspace, "allowed.txt")
+	if err := os.WriteFile(target, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := runtimeToolTestRequest(workspace, AccessReadWrite, "write", domain.Object{
+		"path": "allowed.txt", "content": "after", "expected_hash": domain.Digest([]byte("before"))}, runtimeToolPolicy())
+	request.IntentKey = "runtime-tool/pending-replay-revoked"
+	workspaceWriteBeforePublish = func(string) error { return errors.New("stop after durable PENDING") }
+	_, first := h.ExecuteRuntimeTool(context.Background(), request)
+	workspaceWriteBeforePublish = nil
+	var physical *WorkspaceWriteError
+	if !errors.As(first, &physical) || physical.Outcome != "UNKNOWN" {
+		t.Fatalf("first pending write was not unknown: %v", first)
+	}
+	request.Revalidate = func(context.Context) error { return errors.New("lease now revoked") }
+	_, second := h.ExecuteRuntimeTool(context.Background(), request)
+	var witnessed *domain.RuntimeToolFailure
+	if errors.As(second, &witnessed) && witnessed.Outcome == "NOT_APPLIED" {
+		t.Fatalf("durable pending intent was downgraded to NOT_APPLIED: %v", second)
+	}
+	if !errors.As(second, &physical) || physical.Outcome != "UNKNOWN" {
+		t.Fatalf("pending replay must remain unknown: %v", second)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "before" {
+		t.Fatalf("replayed write touched target: %q %v", data, err)
 	}
 }

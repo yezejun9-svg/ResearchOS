@@ -293,6 +293,38 @@ func writeIntentResult(v workspaceWriteIntent, p string) WorkspaceWriteResult {
 		PreimagePath: v.PreimagePath, BackupPath: v.BackupPath, IntentPath: p, State: v.State, Applied: v.State == "APPLIED"}
 }
 
+// This read-only lookup runs before authorization so an already durable
+// physical outcome cannot be reclassified as NOT_APPLIED when the lease or
+// root is revoked. It grants no right to publish or replay the write.
+func priorWorkspaceWriteIntent(journalRoot, key string) (workspaceWriteIntent, string, bool, error) {
+	var intent workspaceWriteIntent
+	if key == "" || len(key) > 1024 || journalRoot == "" {
+		return intent, "", false, nil
+	}
+	journal, err := filepath.Abs(journalRoot)
+	if err != nil || !localWindowsPath(journal) {
+		return intent, "", false, errors.New("trusted local journal unavailable")
+	}
+	keyHash := strings.TrimPrefix(writeHash([]byte(key)), "sha256:")
+	p := filepath.Join(journal, "workspace-writes", "intents", "intent-"+keyHash+".json")
+	if reparse, e := chainHasReparsePoint(p); e != nil || reparse {
+		return intent, p, true, errors.New("intent journal path is unavailable or reparse")
+	}
+	f, err := os.Open(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return intent, p, false, nil
+	}
+	if err != nil {
+		return intent, p, true, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, 64<<10))
+	if err != nil || len(raw) >= 64<<10 || json.Unmarshal(raw, &intent) != nil || intent.Version != 1 || intent.KeyHash != keyHash {
+		return intent, p, true, errors.New("durable intent cannot be trusted")
+	}
+	return intent, p, true, nil
+}
+
 func intentBodyHash(rootIdentity, rel, expected, after string, create bool, scopeHash string) string {
 	raw, _ := json.Marshal([]any{rootIdentity, strings.ToLower(rel), expected, after, create, scopeHash})
 	return writeHash(raw)
@@ -301,8 +333,24 @@ func intentBodyHash(rootIdentity, rel, expected, after string, create bool, scop
 // WriteWorkspaceFile has no business permission of its own. The caller binds
 // the project/session/task before invoking it and supplies Revalidate for the
 // current root pin and authority while this physical path is locked.
-func WriteWorkspaceFile(ctx context.Context, in WorkspaceWriteInput) (WorkspaceWriteResult, error) {
-	var out WorkspaceWriteResult
+func WriteWorkspaceFile(ctx context.Context, in WorkspaceWriteInput) (out WorkspaceWriteResult, err error) {
+	prior, priorPath, priorExists, priorErr := priorWorkspaceWriteIntent(in.JournalRoot, in.IntentKey)
+	if priorErr != nil {
+		return out, writeError("WRITE_RECOVERY_REQUIRED", "UNKNOWN", priorErr)
+	}
+	defer func() {
+		if err == nil || !priorExists || prior.State == "CONFLICT" {
+			return
+		}
+		var classified *WorkspaceWriteError
+		if errors.As(err, &classified) && classified.Outcome == "NOT_APPLIED" {
+			if prior.State == "APPLIED" && (classified.Code == "COMMAND_ID_CONFLICT" || classified.Code == "INTENT_KEY_CONFLICT") {
+				return // Different requested body was not applied; old proof remains.
+			}
+			out = writeIntentResult(prior, priorPath)
+			err = writeError(classified.Code, "UNKNOWN", classified)
+		}
+	}()
 	rootPath, err := validateWorkspaceWrite(in)
 	if err != nil {
 		return out, err
