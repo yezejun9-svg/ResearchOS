@@ -34,6 +34,9 @@ async function main() {
   page.on('pageerror', error => report.renderer_errors.push(String(error)));
   page.on('console', message => { if (message.type() === 'error') report.renderer_errors.push(message.text()); });
   page.on('requestfailed', request => report.request_failures.push({ url: request.url(), failure: request.failure()?.errorText }));
+  // The first window is still completing its default ros-app navigation when
+  // Playwright receives it. Wait for that load before choosing this project.
+  await page.locator('#main h1').waitFor({ timeout: 30000 });
   await page.goto('ros-app://desktop/p/' + encodeURIComponent(input.project_id), { waitUntil: 'domcontentloaded' });
   await page.locator('.session-picker li button').first().waitFor();
   const sessionButtons = await page.locator('.session-picker li button').count();
