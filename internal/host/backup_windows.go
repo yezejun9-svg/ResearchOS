@@ -25,9 +25,6 @@ func (h *Host) SnapshotWorkspace(ctx context.Context, binding domain.WorkspaceBi
 	if limits.MaxFiles < 0 || limits.MaxDirs < 0 || limits.MaxBytes < 0 || limits.MaxFileBytes < 1 || limits.MaxFileBytes > domain.BackupWorkspaceMaxFileBytes {
 		return out, fmt.Errorf("BACKUP_WORKSPACE_LIMIT_INVALID")
 	}
-	if backupPathsOverlap(binding.RealPath, filepath.Dir(h.dir)) || backupPathsOverlap(binding.RealPath, destination) {
-		return out, fmt.Errorf("BACKUP_WORKSPACE_RECURSION: workspace intersects data root or backup output")
-	}
 	var pinned *RootBinding
 	for _, root := range h.roots.List() {
 		if root.Revoked || !strings.EqualFold(filepath.Clean(root.RealPath), filepath.Clean(binding.RealPath)) {
@@ -43,6 +40,14 @@ func (h *Host) SnapshotWorkspace(ctx context.Context, binding domain.WorkspaceBi
 	}
 	if pinned == nil {
 		return out, fmt.Errorf("BACKUP_WORKSPACE_ROOT_NOT_PINNED")
+	}
+	// A restored workspace lives under its new data root by design. Allow only
+	// that exact, currently pinned ref and path; every other data-root overlap
+	// remains recursive/unsafe, as does any backup output inside the workspace.
+	dataRoot := filepath.Dir(h.dir)
+	if backupPathsOverlap(binding.RealPath, destination) ||
+		(backupPathsOverlap(binding.RealPath, dataRoot) && !backupRestoredWorkspacePath(dataRoot, binding.AuthorizedRef, pinned)) {
+		return out, fmt.Errorf("BACKUP_WORKSPACE_RECURSION: workspace intersects data root or backup output")
 	}
 	vol, id, _, err := fileIdentity(pinned.RealPath)
 	if err != nil || vol != pinned.VolumeID || id != pinned.FileID {
@@ -134,6 +139,18 @@ func (h *Host) SnapshotWorkspace(ctx context.Context, binding domain.WorkspaceBi
 		return domain.BackupWorkspaceSnapshot{}, err
 	}
 	return out, nil
+}
+
+func backupRestoredWorkspacePath(dataRoot, authorizedRef string, pinned *RootBinding) bool {
+	if pinned == nil || pinned.Ref == "" || pinned.Ref != authorizedRef {
+		return false
+	}
+	actual, err := filepath.Abs(pinned.RealPath)
+	if err != nil {
+		return false
+	}
+	expected, err := filepath.Abs(domain.BackupWorkspaceDestination(dataRoot, pinned.Ref))
+	return err == nil && strings.EqualFold(filepath.Clean(actual), filepath.Clean(expected))
 }
 
 func backupPathsOverlap(left, right string) bool {
