@@ -62,8 +62,8 @@ def emit(status, rows, failures, extra=None):
                "assertion_ids": ids,
                "assertions": len(ids),
                "assertions_total": len(rows), "assertions_failed": len(failures),
-               "checks": {c: {"rows": sum(1 for r in rows if r["check"] == c),
-                              "failed": sum(1 for r in failures if r["check"] == c)} for c in CHECKS},
+               "checks": {c: {"rows": sum(1 for r in rows if r.get("check") == c),
+                              "failed": sum(1 for r in failures if r.get("check") == c)} for c in CHECKS},
                "failures": failures, "rows": rows}
     if extra:
         payload.update(extra)
