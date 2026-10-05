@@ -7,6 +7,10 @@ const { createHash } = require('node:crypto');
 const playwright = require(process.env.RESEARCHOS_PLAYWRIGHT_MODULE || 'C:/Users/yqyyds/AppData/Local/Python/pythoncore-3.14-64/Lib/site-packages/playwright/driver/package');
 const root = path.resolve(__dirname, '../../..');
 const input = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (process.env.RESEARCHOS_UI_SCREENS) {
+  const requested = process.env.RESEARCHOS_UI_SCREENS.split(',');
+  input.routes = Object.fromEntries(Object.entries(input.routes).filter(([screen]) => requested.includes(screen)));
+}
 const out = path.resolve(process.argv[3]);
 const report = { schema: 'researchos.electron-visual.v1', status: 'EXECUTING', checks: [], failures: [], matrix: [], states: [], accessibility: [], screenshots: [], limitations: [
   'Development fixture data served by the real local API; simulated runtime observations are marked FIXTURE.',
@@ -72,12 +76,12 @@ async function proxyStart() {
     const forward = () => {
       if (res.destroyed) return;
       const target = http.request({ hostname: upstream.hostname, port: upstream.port, path: req.url, method: req.method, headers: { ...req.headers, host: upstream.host }, agent: false }, response => {
-        entry.status = response.statusCode;
-        if (mode === 'empty' && response.statusCode === 200 && req.method === 'GET' && !/\/events\/(stream|poll)$/.test(route) && !route.endsWith('/events')) {
+        entry.status = response.statusCode; entry.response_mode = mode;
+        if (mode === 'empty' && response.statusCode === 200 && ((req.method === 'GET' && !/\/events\/(stream|poll)$/.test(route) && !route.endsWith('/events')) || operation === 'session.list')) {
           const pieces = []; response.on('data', piece => pieces.push(piece));
           response.on('end', () => {
             let bytes = Buffer.concat(pieces);
-            try { const value = JSON.parse(bytes.toString()); if (Array.isArray(value)) bytes = Buffer.from('[]'); else if (Array.isArray(value.items)) bytes = Buffer.from(JSON.stringify({ ...value, items: [], ...('next_cursor' in value ? { next_cursor: null } : {}) })); } catch {}
+            try { const value = JSON.parse(bytes.toString()); if (Array.isArray(value)) bytes = Buffer.from('[]'); else if (Array.isArray(value.items)) bytes = Buffer.from(JSON.stringify({ ...value, items: [], ...('next_cursor' in value ? { next_cursor: null } : {}) })); else if (operation === 'session.list' && Array.isArray(value.result?.items)) bytes = Buffer.from(JSON.stringify({ ...value, result: { items: [], next_cursor: null } })); } catch {}
             const headers = { ...response.headers }; delete headers['content-length'];
             res.writeHead(response.statusCode, headers); res.end(bytes);
           });
@@ -121,9 +125,20 @@ async function main() {
   check('NATIVE_REACT_ENTRY', report.origin === 'ros-app://desktop' && await page.locator('#access-token').count() === 0);
   check('CREDENTIAL_NOT_IN_RENDERER', await page.evaluate(() => !window.researchos?.credential && !Object.keys(localStorage).some(key => /token|credential/i.test(key))));
   report.browser_origin = await page.evaluate(() => location.origin);
-  await page.locator('#main a[href="' + input.routes.S01 + '"]').click();
-  await settle(page);
-  check('ACTUAL_PROJECT_LINK_OPENS_WORKBENCH', new URL(page.url()).pathname === input.routes.S01 && await page.getByRole('heading', { name: '项目会话', exact: true }).count() === 1);
+  if (input.routes.S01) {
+    await page.locator('#main a[href="' + input.routes.S01 + '"]').click();
+    await settle(page);
+    check('ACTUAL_PROJECT_LINK_OPENS_WORKBENCH', new URL(page.url()).pathname === input.routes.S01 && await page.getByRole('heading', { name: '项目会话', exact: true }).count() === 1);
+    if (input.sessions) {
+      await page.getByRole('button', { name: '加载更多会话', exact: true }).click();
+      await page.waitForFunction(count => document.querySelectorAll('.session-picker li').length === count, input.sessions.session_count);
+      check('SESSION_LIST_SECOND_PAGE', await page.locator('.session-picker li').count() === input.sessions.session_count);
+      await page.getByRole('button', { name: /FIXTURE · 消息与工具回执/ }).click();
+      await page.getByText('FIXTURE：请检查已封存的本地研究结果。此消息未调用模型。', { exact: true }).waitFor();
+      await page.getByRole('heading', { name: '工具与结果', exact: true }).waitFor();
+      check('PERSISTED_SESSION_MESSAGES_AND_TOOLS', await page.locator('.conversation-message').count() === 2 && await page.locator('.session-center .event-list li').count() === 2);
+    }
+  }
 
   const viewports = [[1440, 1000], [1024, 768], [768, 1024], [390, 844], [320, 780]];
   for (const [screen, route] of Object.entries(input.routes)) {
@@ -161,11 +176,11 @@ async function main() {
   await setViewport(1024, 768);
   for (const [screen, route] of Object.entries(input.routes)) {
     stateScreen = screen;
-    mode = 'empty';
-    const emptyRoute = ['S02', 'S03', 'S04', 'S06'].includes(screen) ? route.substring(0, route.lastIndexOf('/')) : route;
+    mode = screen === 'S00' ? 'empty' : 'ready';
+    const emptyRoute = (['S02', 'S03', 'S04', 'S06'].includes(screen) ? route.substring(0, route.lastIndexOf('/')) : route).replace(input.project_id, input.empty_project_id);
     await navigate(page, emptyRoute);
     const emptyValue = await metrics(page);
-    report.states.push({ screen, state: 'empty', route: emptyRoute, source: 'CONTRACT_LIST_EMPTY_FIXTURE', text: emptyValue.mainText });
+    report.states.push({ screen, state: 'empty', route: emptyRoute, source: screen === 'S00' ? 'CONTRACT_LIST_EMPTY_FIXTURE' : 'REAL_LOCAL_API_EMPTY_PROJECT', text: emptyValue.mainText });
     check(screen + '-EMPTY_SUCCESS', await page.locator('#main .empty-state').count() > 0 && await page.locator('#main .state-notice').count() === 0);
     mode = 'ready';
     for (const state of ['loading', 'error', 'forbidden', 'stale', 'offline', 'partial']) {
@@ -190,11 +205,11 @@ async function main() {
       if (state !== 'loading') {
         const retry = page.locator('#main .state-notice button').filter({ hasText: '重新读取' });
         check(`${screen}-${state}-RETRY_AVAILABLE`, await retry.count() > 0);
-        if (await retry.count()) await retry.first().click();
+        for (const button of await retry.elementHandles()) if (await button.isVisible()) await button.click();
       }
       await settle(page);
       report.states.push({ screen, state: 'RECOVERED_FROM_' + state, source: 'REAL_LOCAL_API', title: (await metrics(page)).title });
-      check(`${screen}-${state}-RECOVERY`, await page.locator('#main .loading-state').count() === 0 && await page.locator('#main .state-notice').count() === 0 && proxyLog.slice(before).some(row => row.mode === 'ready' && row.status === 200));
+      check(`${screen}-${state}-RECOVERY`, await page.locator('#main .loading-state').count() === 0 && await page.locator('#main .state-notice').count() === 0 && proxyLog.slice(before).some(row => row.response_mode === 'ready' && row.status === 200));
     }
   }
   report.proxy_requests = proxyLog;
