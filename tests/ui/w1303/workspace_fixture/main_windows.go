@@ -8,7 +8,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -34,21 +33,6 @@ import (
 // existing writer attribution remains valid without a fabricated epoch.
 const clientID = "desktop-shell"
 
-// A fixed local model reference permits a readable Session. It never admits a
-// provider turn or grants workspace.write authority.
-type localRuntime struct{}
-
-func (localRuntime) ValidateBinding(_ context.Context, _ *sql.Tx, _, _, _, model string) error {
-	if model != "model-local-fixture" {
-		return domain.Fail(422, "MODEL_UNAVAILABLE", "fixture model binding unavailable")
-	}
-	return nil
-}
-
-func (localRuntime) AdmitTurn(context.Context, *sql.Tx, string, string, domain.Object) error {
-	return domain.Fail(503, "RESOURCE_UNAVAILABLE", "fixture has no provider")
-}
-
 func runGit(root string, args ...string) error {
 	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1")
@@ -64,7 +48,7 @@ func createRoot(dir string) (string, []byte, error) {
 		return "", nil, err
 	}
 	source := []byte("before\n")
-	big := []byte(strings.Repeat("baseline fixture line\n", 160))
+	big := []byte(strings.Repeat("baseline fixture line\n", 30000))
 	for name, body := range map[string][]byte{
 		"source.txt": source, "large-diff.txt": big,
 		filepath.Join("nested", "note.txt"): []byte("nested fixture\n"),
@@ -87,7 +71,7 @@ func createRoot(dir string) (string, []byte, error) {
 	if err := os.WriteFile(filepath.Join(root, "source.txt"), source, 0o600); err != nil {
 		return "", nil, err
 	}
-	if err := os.WriteFile(filepath.Join(root, "large-diff.txt"), []byte(strings.Repeat("changed fixture line\n", 160)), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "large-diff.txt"), []byte(strings.Repeat("changed fixture line\n", 30000)), 0o600); err != nil {
 		return "", nil, err
 	}
 	return root, source, nil
@@ -239,8 +223,10 @@ func run() error {
 	}
 	defer listener.Close()
 	base := "http://" + listener.Addr().String()
-	srv := &http.Server{Handler: api.HandlerWithLocalHost(db, *webFlag, svc, localRuntime{},
-		h.InstanceID(), localworkspace.NewAuthority(h), localworkspace.NewScanner(), h),
+	authority, scanner := localworkspace.NewAuthority(h), localworkspace.NewScanner()
+	handler := &switchableHandler{h: api.HandlerWithLocalHost(db, *webFlag, svc, nil,
+		h.InstanceID(), authority, scanner, h)}
+	srv := &http.Server{Handler: handler,
 		ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -273,8 +259,15 @@ func run() error {
 		return err
 	}
 	project := proj["project_id"].(string)
+	coordinator, err := fixtureModelProfile(ctx, svc, h, client, base, token, project, dataDir)
+	if err != nil {
+		return err
+	}
+	defer coordinator.Close()
+	handler.swap(api.HandlerWithLocalHost(db, *webFlag, svc, coordinator,
+		h.InstanceID(), authority, scanner, h))
 	snap, err := command(ctx, client, base, token, "session.create", "create-session", &project, nil, nil, nil,
-		domain.Object{"workspace_ref": ref, "model_config_ref": "model-local-fixture", "title": "W13 local files FIXTURE"})
+		domain.Object{"workspace_ref": ref, "model_config_ref": fixtureModelRef, "title": "W13 local files FIXTURE"})
 	if err != nil {
 		return err
 	}
@@ -310,6 +303,115 @@ func run() error {
 	if imported["artifact_ref"] == nil {
 		return errors.New("typed artifact.import omitted sealed artifact")
 	}
+	current, err := command(ctx, client, base, token, "session.get", "before-blocked-send", &project, &session, nil, nil, domain.Object{})
+	if err != nil {
+		return err
+	}
+	revision, err := domain.Num(current, "revision")
+	if err != nil {
+		return err
+	}
+	writer, ok := current["writer"].(map[string]any)
+	if !ok {
+		return errors.New("fixture session has no real writer lease")
+	}
+	epoch, err := domain.Num(writer, "epoch")
+	if err != nil {
+		return err
+	}
+	if _, err := command(ctx, client, base, token, "session.send", "persist-blocked-turn", &project, &session, revision, epoch,
+		domain.Object{"text": "Save a bounded local draft. The fixture must not call a provider.", "attachment_artifact_ids": domain.Empty(), "delivery": "NORMAL"}); err != nil {
+		return err
+	}
+	var taskID string
+	if err := db.QueryRowContext(ctx, "SELECT task_id FROM client_sessions WHERE project_id=? AND id=?", project, session).Scan(&taskID); err != nil || taskID == "" {
+		return fmt.Errorf("fixture session did not persist its Task: %w", err)
+	}
+	taskReq, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/projects/"+project+"/tasks/"+taskID, nil)
+	if err != nil {
+		return err
+	}
+	taskReq.Header.Set("Authorization", "Bearer "+token)
+	taskResp, err := client.Do(taskReq)
+	if err != nil {
+		return err
+	}
+	var task domain.Object
+	decodeErr := json.NewDecoder(io.LimitReader(taskResp.Body, 1<<20)).Decode(&task)
+	taskResp.Body.Close()
+	if taskResp.StatusCode != 200 || decodeErr != nil || task["status"] != "BLOCKED" || task["task_type"] != "mu_turn" {
+		return fmt.Errorf("fixture Task is not a persisted BLOCKED mu_turn: HTTP %d task=%v decode=%v", taskResp.StatusCode, task, decodeErr)
+	}
+	var boundProfileRaw string
+	if err := db.QueryRowContext(ctx, "SELECT profile_ref FROM runtime_bindings WHERE project=?", project).Scan(&boundProfileRaw); err != nil {
+		return err
+	}
+	var boundProfile domain.Object
+	if err := json.Unmarshal([]byte(boundProfileRaw), &boundProfile); err != nil {
+		return err
+	}
+	profileFrozen := false
+	for _, input := range domain.Arr(task, "input_refs") {
+		if domain.Hash(input) == domain.Hash(boundProfile) {
+			profileFrozen = true
+		}
+	}
+	if !profileFrozen {
+		return errors.New("BLOCKED Task omitted its real frozen runtime profile input")
+	}
+	var providerCalls, runs int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM resource_effects WHERE project=?", project).Scan(&providerCalls); err != nil {
+		return err
+	}
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM domain_objects WHERE project=? AND kind='Run'", project).Scan(&runs); err != nil {
+		return err
+	}
+	if providerCalls != 0 || runs != 0 {
+		return fmt.Errorf("fixture unexpectedly executed: provider effects=%d runs=%d", providerCalls, runs)
+	}
+	current, err = command(ctx, client, base, token, "session.get", "before-write-probe", &project, &session, nil, nil, domain.Object{})
+	if err != nil {
+		return err
+	}
+	revision, err = domain.Num(current, "revision")
+	if err != nil {
+		return err
+	}
+	// Publishing the same bytes exercises the real filesystem CAS and seals a
+	// draft while preserving the exact source baseline for the Electron test.
+	written, err := command(ctx, client, base, token, "workspace.write", "probe-write-same-bytes", &project, &session, revision, epoch,
+		domain.Object{"workspace_ref": ref, "relative_path": "source.txt", "task_id": taskID,
+			"expected_content_hash": domain.Digest(source), "text": string(source), "create_if_missing": false})
+	if err != nil {
+		return err
+	}
+	physical, err := os.ReadFile(filepath.Join(root, "source.txt"))
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(physical, source) || written["before_hash"] != domain.Digest(source) || written["after_hash"] != domain.Digest(source) || written["draft_artifact_ref"] == nil {
+		return errors.New("typed workspace.write did not prove physical bytes and sealed draft")
+	}
+	draftRef, ok := written["draft_artifact_ref"].(map[string]any)
+	if !ok || domain.Str(draftRef, "entity_type") != "Artifact" {
+		return errors.New("typed workspace.write returned an invalid Artifact ref")
+	}
+	draftAPI := fixtureAPI{client: client, base: base, token: token, project: project}
+	draft, err := draftAPI.call(ctx, http.MethodGet, draftAPI.path("/artifacts/"+domain.Str(draftRef, "id")), "", nil, 200)
+	if err != nil {
+		return err
+	}
+	if draft["sealed_at"] == nil || draft["content_hash"] != domain.Digest(source) || draft["id"] != draftRef["id"] {
+		return errors.New("workspace.write draft Artifact is not persistently sealed with published bytes")
+	}
+	current, ok = written["snapshot"].(map[string]any)
+	if !ok {
+		return errors.New("typed workspace.write omitted updated snapshot")
+	}
+	revision, err = domain.Num(current, "revision")
+	if err != nil {
+		return err
+	}
 	discovery := filepath.Join(dataDir, "discovery.json")
 	if err := writeDiscovery(discovery, listener.Addr().String(), dataDir, h.InstanceID()); err != nil {
 		return err
@@ -320,20 +422,23 @@ func run() error {
 		"credential_file": h.SessionFile(), "host_instance_id": h.InstanceID(),
 		"native_pipe": host.PipeName(h.InstanceID()), "project_id": project,
 		"session_id": session, "workspace_ref": ref, "workspace_root": root,
-		"source_path": filepath.Join(root, "source.txt"), "source_file": filepath.Join(root, "source.txt"),
-		"source_content_hash": domain.Digest(source), "task_id": nil,
-		"model_config_ref": "model-local-fixture",
-		"session_revision": 2, "writer_epoch": 1,
+		"source_path": "source.txt", "source_file": filepath.Join(root, "source.txt"),
+		"binary_path": "binary.dat", "directory_path": "nested",
+		"source_content_hash": domain.Digest(source), "task_id": taskID,
+		"model_config_ref": fixtureModelRef,
+		"session_revision": revision, "writer_epoch": epoch,
 		"seed_origin": "temporary Git files created by tests/ui/w1303/workspace_fixture; no external source or provider",
 		"provenance": []string{
 			"Fresh .local Git root and SQLite created by workspace_fixture; no existing project or provider used",
 			"Folder selection callback is FIXTURE; Host selection record and workspace.register use production code",
 			"Session writer client_id is desktop-shell, matching Electron main; no epoch was forged or transferred",
-			"Fixed model binding cannot admit provider turns or authorize workspace.write",
+			"Real frozen Mu profile and runtime binding permit only exact source.txt draft writes; qualification is absent",
 		},
 		"typed_probes": map[string]any{"tree_entries": len(tree["entries"].([]any)),
 			"read_hash": read["content_hash"], "diff_full_artifact_ref": diff["full_diff_artifact_ref"],
-			"import_artifact_ref": imported["artifact_ref"]},
+			"import_artifact_ref":      imported["artifact_ref"],
+			"write_draft_artifact_ref": written["draft_artifact_ref"], "write_after_hash": written["after_hash"],
+			"provider_effect_count": providerCalls, "run_count": runs},
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 		return err
