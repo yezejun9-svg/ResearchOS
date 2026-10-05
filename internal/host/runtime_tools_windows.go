@@ -36,12 +36,64 @@ func (h *Host) ExecuteRuntimeTool(ctx context.Context, request domain.RuntimeToo
 	if h == nil || h.roots == nil {
 		return nil, toolDenied("workspace host unavailable")
 	}
-	if request.Name != "read" && request.Name != "write" && request.Name != "edit" {
+	if request.Name != "read" && request.Name != "write" && request.Name != "edit" && request.Name != "run_check" {
 		return nil, toolDenied("tool is not permitted")
 	}
 	args := request.Arguments
 	if args == nil {
 		return nil, toolInvalid("tool arguments required")
+	}
+	if request.Name == "run_check" {
+		if request.Access != AccessReadOnly && request.Access != AccessReadWrite {
+			return nil, toolDenied("session workspace access does not permit check")
+		}
+		if len(args) != 1 {
+			return nil, toolInvalid("run_check accepts only check_id")
+		}
+		checkID, ok := args["check_id"].(string)
+		if !ok {
+			return nil, toolInvalid("check_id must be text")
+		}
+		check, err := parseFrozenRuntimeCheck(request.Policy, checkID)
+		if err != nil {
+			return nil, err
+		}
+		if _, present := request.Policy["read_paths"]; present {
+			readPaths, err := runtimeToolPaths(request.Policy, "read_paths")
+			if err != nil {
+				return nil, err
+			}
+			for _, source := range check.sources {
+				if !readPaths[source.path] {
+					return nil, toolDenied("check source is outside frozen read permission")
+				}
+			}
+		}
+		var binding *RootBinding
+		for _, candidate := range h.roots.List() {
+			if candidate.RealPath != request.WorkspacePath {
+				continue
+			}
+			if candidate.Revoked {
+				return nil, ErrRootRevoked
+			}
+			if binding != nil {
+				return nil, toolDenied("workspace path has ambiguous root bindings")
+			}
+			binding = candidate
+		}
+		if binding == nil {
+			return nil, ErrRootUnknown
+		}
+		if binding.Access != request.Access {
+			return nil, toolDenied("workspace access differs from current root binding")
+		}
+		for _, source := range check.sources {
+			if _, err := h.ResolveWorkspace(binding.Ref, source.path, AccessReadOnly); err != nil {
+				return nil, err
+			}
+		}
+		return h.executeRuntimeCheck(ctx, request)
 	}
 	rel := domain.Str(args, "path")
 	if err := CheckRelativePath(rel); err != nil {
