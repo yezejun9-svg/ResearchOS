@@ -21,7 +21,7 @@ func (s *setup) qualify(ctx context.Context) error {
 		return errors.New("LIVE plan, exact workspace and credential must be prepared before qualification")
 	}
 	if s.state.Qualified {
-		return nil
+		return s.authorizeCodingPurpose(ctx)
 	}
 	api, err := s.startAPI(ctx, nil)
 	if err != nil {
@@ -119,15 +119,64 @@ func (s *setup) qualify(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	qualified, err := api.postWithSubject(ctx, verifierToken, api.path("/runtimes/"+s.state.RuntimeID+"/qualify"), registration, domain.Object{"qualification_ids": []any{s.state.AcceptanceID}, "supports_resume": false, "resume_evidence_ref": nil, "receipt_artifact_ref": domain.Ref(logArtifact, "Artifact")}, 200)
-	if err != nil {
-		return err
+	qualified := registration
+	if registration["status"] == "AVAILABLE" {
+		ids := domain.Arr(registration, "qualification_ids")
+		if len(ids) != 1 || ids[0] != s.state.AcceptanceID {
+			return errors.New("available runtime has a different qualification receipt")
+		}
+	} else {
+		qualified, err = api.postWithSubject(ctx, verifierToken, api.path("/runtimes/"+s.state.RuntimeID+"/qualify"), registration, domain.Object{"qualification_ids": []any{s.state.AcceptanceID}, "supports_resume": false, "resume_evidence_ref": nil, "receipt_artifact_ref": domain.Ref(logArtifact, "Artifact")}, 200)
+		if err != nil {
+			return err
+		}
 	}
 	if qualified["status"] != "AVAILABLE" {
 		return errors.New("runtime remained unavailable after qualification")
 	}
+	if err := s.authorizeCodingPurpose(ctx); err != nil {
+		return err
+	}
 	s.state.Qualified = true
 	return s.saveState()
+}
+
+// Purpose grants are separate from runtime qualification and bind only the
+// ordinary mu_turn task type. Refreshing them never redispatches a Run.
+func (s *setup) authorizeCodingPurpose(ctx context.Context) error {
+	if err := s.refreshCoordinatorConfig(ctx); err != nil {
+		return err
+	}
+	var receiptRaw, planRaw string
+	if err := s.db.QueryRowContext(ctx, "SELECT body FROM domain_objects WHERE project=? AND kind='AcceptanceReceipt' AND id=?", s.state.ProjectID, s.state.AcceptanceID).Scan(&receiptRaw); err != nil {
+		return err
+	}
+	if err := s.db.QueryRowContext(ctx, "SELECT plan FROM runtime_qualification_plans WHERE project=? AND task=? AND runtime=?", s.state.ProjectID, s.state.TaskID, s.state.RuntimeID).Scan(&planRaw); err != nil {
+		return err
+	}
+	var receipt, plan domain.Object
+	if err := json.Unmarshal([]byte(receiptRaw), &receipt); err != nil {
+		return err
+	}
+	if err := json.Unmarshal([]byte(planRaw), &plan); err != nil {
+		return err
+	}
+	created, err := time.Parse(time.RFC3339Nano, domain.Str(receipt, "created_at"))
+	if err != nil {
+		return err
+	}
+	valid, err := domain.Num(plan, "max_validity_seconds")
+	if err != nil || valid <= 0 {
+		return errors.New("invalid frozen qualification lifetime")
+	}
+	expires := created.Add(time.Duration(valid) * time.Second).Add(-time.Second)
+	if oneHour := time.Now().Add(time.Hour); oneHour.Before(expires) {
+		expires = oneHour
+	}
+	if !expires.After(time.Now()) {
+		return errors.New("qualification expired before coding purpose authorization")
+	}
+	return s.svc.AuthorizeRuntimePurpose(ctx, s.ownerToken, s.state.ProjectID, s.state.RuntimeID, "mu_turn", expires)
 }
 
 func (s *setup) dispatchQualification(ctx context.Context, api *localAPI) error {
