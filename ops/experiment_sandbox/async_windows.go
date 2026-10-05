@@ -37,6 +37,10 @@ type StartOptions struct {
 	// the final receipt never treats a lost or truncated stream as drained.
 	OnStream    func(StreamChunk) error
 	Interactive bool
+	// AllowCodingTurnTimeout is reserved for the trusted Mu coding bridge.
+	// It raises only the per-process upper bound from 5 to 15 minutes;
+	// Run and ordinary Start calls retain the 5-minute default.
+	AllowCodingTurnTimeout bool
 }
 
 type Process struct {

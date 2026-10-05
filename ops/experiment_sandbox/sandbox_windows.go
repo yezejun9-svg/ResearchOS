@@ -90,8 +90,12 @@ func Run(ctx context.Context, c Command) (Receipt, error) {
 }
 
 func runSandbox(ctx context.Context, c Command, options StartOptions, process *Process) (r Receipt, err error) {
-	if c.Timeout <= 0 || c.Timeout > 5*time.Minute {
-		return r, errors.New("bounded timeout 0..5m required")
+	maxTimeout := 5 * time.Minute
+	if options.AllowCodingTurnTimeout {
+		maxTimeout = 15 * time.Minute
+	}
+	if c.Timeout <= 0 || c.Timeout > maxTimeout {
+		return r, fmt.Errorf("bounded timeout 0..%s required", maxTimeout)
 	}
 	processLimit, memoryMiB := c.ProcessLimit, c.MemoryMiB
 	if processLimit == 0 {

@@ -142,6 +142,42 @@ func runtimeSandboxCommand(t *testing.T, mode string) Command {
 	return Command{Executable: child, Args: []string{"-test.run=^TestRuntimeSandboxChild$", "--", "--runtime-probe", mode}, InputDirectory: input, OutputDirectory: output, Timeout: 5 * time.Second}
 }
 
+func TestCodingTurnTimeoutBoundary(t *testing.T) {
+	command := runtimeSandboxCommand(t, "exit")
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	for _, candidate := range []struct {
+		name    string
+		timeout time.Duration
+		options StartOptions
+	}{
+		{"ordinary_start_301_rejected", 301 * time.Second, StartOptions{}},
+		{"coding_901_rejected", 901 * time.Second, StartOptions{AllowCodingTurnTimeout: true}},
+		{"coding_zero_rejected", 0, StartOptions{AllowCodingTurnTimeout: true}},
+	} {
+		t.Run(candidate.name, func(t *testing.T) {
+			command.Timeout = candidate.timeout
+			process, err := Start(ctx, command, candidate.options)
+			if err == nil || process != nil {
+				t.Fatalf("timeout %s unexpectedly started: process=%v err=%v", candidate.timeout, process, err)
+			}
+		})
+	}
+	command.Timeout = 301 * time.Second
+	if receipt, err := Run(ctx, command); err == nil || receipt.PID != 0 {
+		t.Fatalf("ordinary Run bypassed default bound: %+v %v", receipt, err)
+	}
+	command.Timeout = 900 * time.Second
+	process, err := Start(ctx, command, StartOptions{AllowCodingTurnTimeout: true})
+	if err != nil {
+		t.Fatalf("trusted coding turn 900s rejected before quick child: %v", err)
+	}
+	receipt, err := process.Wait(ctx)
+	if err != nil || receipt.PID == 0 || receipt.ExitCode != 0 || receipt.TimedOut || !receipt.CleanupComplete {
+		t.Fatalf("quick child under 900s option failed: receipt=%+v err=%v", receipt, err)
+	}
+}
+
 func TestRuntimeSandboxAsync(t *testing.T) {
 	t.Setenv("RESEARCHOS_TEST_SECRET", "host-only-sentinel")
 	command := runtimeSandboxCommand(t, "interactive")
