@@ -69,10 +69,13 @@ It reads only the standard `RESEARCHOS_TASK_ID`, `RESEARCHOS_CHECK_ID`, and
 `RESEARCHOS_CASE_ID` selector variables:
 
 - `W01`, exactly `W01-G01` through `W01-G04`, empty case: current strict handler.
-- `W01`, `W02` or `W06`, empty check, empty case or `A02`: forward the same Python
+- Omitted task, `W01`, `W02` or `W06`, empty check, empty case or `A02`: forward the same Python
   interpreter with `-X utf8` to unchanged `ops/ci/core_evidence.py`, preserving
-  environment, standard streams and exit code. All six legacy tuples are simulated
-  separately in tests; no legacy provider/fixture command was run for this work.
+  environment, standard streams and exit code. All eight legacy tuples are simulated
+  separately in tests. The two omitted-task defaults were added after root found
+  that the original selector validator only validates nonempty values. The original
+  ten-test raw validation stays unchanged; the compatibility addendum records the
+  expanded twelve-test run. No legacy provider/fixture command was run for this work.
 - Any other tuple: NOT_IMPLEMENTED, exit 2, no child process. Future W02 gates
   remain unimplemented until their owner supplies a real handler.
 
