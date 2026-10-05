@@ -20,6 +20,8 @@ type Service struct {
 	DB        *sql.DB
 	Contracts *Contracts
 	Protected protectedstore.Provider
+	// Fixed by a trusted constructor, never by a request or environment selector.
+	projectBindingRoute string
 }
 type Fault struct {
 	Status        int
@@ -31,6 +33,19 @@ func (f *Fault) Error() string { return f.Code + ": " + f.Message }
 func Fail(status int, code, msg string) error {
 	return &Fault{Status: status, Code: code, Message: msg}
 }
+
+// NewCurrentMu is the installed current host's fixed construction policy. New
+// remains the legacy constructor so existing stored projects and fixtures keep
+// their historical binding semantics. Children inherit their stored parent.
+func NewCurrentMu(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
+	s, err := New(db, contractsDir, migrationFile)
+	if err != nil {
+		return nil, err
+	}
+	s.projectBindingRoute = "MU_FORK"
+	return s, nil
+}
+
 func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
 	c, e := LoadContracts(contractsDir)
 	if e != nil {
@@ -94,7 +109,7 @@ func New(db *sql.DB, contractsDir, migrationFile string) (*Service, error) {
 	if e = tx.Commit(); e != nil {
 		return nil, e
 	}
-	return &Service{DB: db, Contracts: c}, nil
+	return &Service{DB: db, Contracts: c, projectBindingRoute: "THIN_CORE"}, nil
 }
 func ID() string {
 	var b [16]byte

@@ -2,17 +2,23 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
+	"researchos.local/research-os/adapters/evaluation"
 	"researchos.local/research-os/internal/api"
 	"researchos.local/research-os/internal/domain"
+	"researchos.local/research-os/internal/store"
 )
 
 type O = map[string]any
@@ -199,6 +205,7 @@ func schemaProbes(spec string) {
 	old := read("spec/v2.0/contracts/domain.schema.json")
 	embedded := read("internal/api/contracts/domain.schema.json")
 	overlay := read("internal/domain/contracts/evaluation-v24.schema.json")
+	persistence := read("internal/domain/contracts/persistence-v24.schema.json")
 	current, e := domain.LoadContracts(spec)
 	add("projection", "CURRENT-SCHEMA-COMPILE", e == nil, fmt.Sprint(e))
 	if e != nil {
@@ -229,6 +236,9 @@ func schemaProbes(spec string) {
 	runtimeDefs := obj(old["$defs"])
 	for name, v := range defs {
 		actual := runtimeDefs[name]
+		if current, ok := obj(persistence["$defs"])[name]; ok {
+			actual = current
+		}
 		if name == "EvaluationReport" {
 			actual = obj(overlay["$defs"])[name]
 		}
@@ -237,7 +247,11 @@ func schemaProbes(spec string) {
 		}
 	}
 	sort.Strings(changed)
-	add("projection", "RUNTIME-DEFINITION-PROJECTION", len(changed) == 0, O{"missing_or_different_definitions": changed, "evaluation_report_overlay": "internal/domain/contracts/evaluation-v24.schema.json"})
+	available := true
+	for _, name := range []string{"ProjectBinding", "ProjectState", "Goal", "Task", "EvaluationSummary"} {
+		available = available && runtime.Schemas[name+"V24"] != nil
+	}
+	add("projection", "RUNTIME-DEFINITION-PROJECTION", len(changed) == 0 && available, O{"missing_or_different_definitions": changed, "all_current_roots_compiled": available, "evaluation_report_overlay": "internal/domain/contracts/evaluation-v24.schema.json", "persistence_overlay": "internal/domain/contracts/persistence-v24.schema.json"})
 	add("projection", "API-EMBEDDED-SCHEMA-EXACT", same(frozen, embedded), O{"current_hash": domain.Hash(frozen), "embedded_hash": domain.Hash(embedded)})
 	_, e = api.ClientProtocolDocument()
 	add("projection", "API-SCHEMA-LOAD", e == nil, fmt.Sprint(e))
@@ -283,6 +297,66 @@ func schemaProbes(spec string) {
 	e = runtime.Validate("EvaluationSummary", summary)
 	fe = current.Validate("EvaluationSummary", summary)
 	add("aggregate", "CURRENT-EVALUATION-SUMMARY", e == nil && fe == nil, O{"runtime_error": fmt.Sprint(e), "current_error": fmt.Sprint(fe), "input": summary})
+	manifest := evaluation.Manifest{ProjectID: "p", ExperimentID: "e", RunID: "r", Engine: O{"name": "NATIVE", "version": "1", "config_hash": h}, DatasetHash: h, CandidateHash: h, BaselineHash: h, RubricHash: h, Expected: []string{"fixture"}}
+	hard, exit := true, 0
+	raw := evaluation.Bytes([]evaluation.Result{{CaseID: "fixture", Verdict: "PASS", Hard: &hard, Reason: "development only"}})
+	report, e := evaluation.Normalize(manifest, manifest, raw, evaluation.Digest(raw), &exit, 1)
+	if e != nil {
+		panic(e)
+	}
+	report["schema_version"] = "2.4.0"
+	produced := evaluation.Summary(report, summary["report_artifact_ref"])
+	add("aggregate", "CURRENT-SUMMARY-PRODUCER", runtime.Validate("EvaluationReport", report) == nil && runtime.Validate("EvaluationSummary", produced) == nil && current.Validate("EvaluationSummary", produced) == nil && produced["schema_version"] == "2.4.0", O{"report_version": report["schema_version"], "summary_version": produced["schema_version"], "summary": produced})
+	currentProjectProducer(current)
+}
+
+func currentProjectProducer(current *domain.Contracts) {
+	dir, e := os.MkdirTemp("", "researchos-w03-current-")
+	if e != nil {
+		panic(e)
+	}
+	defer os.RemoveAll(dir)
+	db, e := store.Open(filepath.Join(dir, "current.sqlite"))
+	if e != nil {
+		panic(e)
+	}
+	defer db.Close()
+	if e = store.Bootstrap(context.Background(), db, "migrations/sqlite/0001_bootstrap.sql"); e != nil {
+		panic(e)
+	}
+	s, e := domain.NewCurrentMu(db, "spec/v2.0/contracts", "migrations/sqlite/0002_domain.sql")
+	if e != nil {
+		panic(e)
+	}
+	p := domain.Principal{ID: "w03-current-probe", Roles: []string{"OWNER"}, CanCreateProject: true}
+	if e = s.ProvisionPrincipal(context.Background(), p); e != nil {
+		panic(e)
+	}
+	token, e := s.IssueCredential(context.Background(), p.ID, time.Minute)
+	if e != nil {
+		panic(e)
+	}
+	body := O{"name": "current W03 probe", "intent": "isolated current producer", "facts": []any{}, "accepted_scope": []any{"development"}, "constraints": []any{}, "source_configs": []any{}, "source_document_refs": []any{}, "read_snapshot_ids": []any{}}
+	r := httptest.NewRequest("POST", "/v1/projects", bytes.NewReader(domain.Bytes(body)))
+	r.Header.Set("Authorization", "Bearer "+token)
+	r.Header.Set("Idempotency-Key", domain.ID())
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	project, e := domain.Decode(w.Body.Bytes())
+	if e != nil {
+		panic(e)
+	}
+	var stored string
+	e = db.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='ProjectState'", project["id"]).Scan(&stored)
+	if e != nil {
+		panic(e)
+	}
+	state, e := domain.Decode([]byte(stored))
+	if e != nil {
+		panic(e)
+	}
+	validation := current.Validate("ProjectState", state)
+	add("aggregate", "CURRENT-PROJECT-PERSISTED", w.Code == 201 && validation == nil && obj(state["binding"])["route"] == "MU_FORK", O{"http_status": w.Code, "persisted_state": state, "current_validation_error": fmt.Sprint(validation)})
 }
 func scalarProbes(spec string) {
 	runtime, e := domain.LoadContracts("spec/v2.0/contracts")

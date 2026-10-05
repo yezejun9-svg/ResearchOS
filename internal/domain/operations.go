@@ -6,8 +6,19 @@ import (
 	"time"
 )
 
-func binding() Object {
-	return Object{"route": "THIN_CORE", "upstream_project_id": nil, "upstream_goal_id": nil, "upstream_task_id": nil}
+func (s *Service) newProjectBinding() Object {
+	route := s.projectBindingRoute
+	if route == "" {
+		route = "THIN_CORE"
+	}
+	return Object{"route": route, "upstream_project_id": nil, "upstream_goal_id": nil, "upstream_task_id": nil}
+}
+
+func (s *Service) inheritedProjectBinding(parent Object) (Object, error) {
+	if err := s.Contracts.Validate("ProjectBinding", parent["binding"]); err != nil {
+		return nil, Fail(422, "GATE_FAILED", "stored parent binding is invalid")
+	}
+	return Decode(Bytes(parent["binding"]))
 }
 func (s *Service) policy(tx *sql.Tx, kind, project, scope, id, parent string) (Object, error) {
 	o := Base(project)
@@ -69,7 +80,7 @@ func (s *Service) createProject(tx *sql.Tx, p Principal, b Object) (Object, erro
 	if e := s.put(tx, "ProjectProfile", profile); e != nil {
 		return nil, e
 	}
-	state := Merge(Base(project), Object{"profile_revision": 1, "current_requirement_refs": Empty(), "current_decision_refs": Empty(), "active_goal_ids": Empty(), "active_cycle_id": nil, "blocking_conflict_ids": Empty(), "pending_change_ids": Empty(), "latest_release_id": nil, "event_sequence": 0, "policy_revision": 1, "binding": binding()})
+	state := Merge(Base(project), Object{"profile_revision": 1, "current_requirement_refs": Empty(), "current_decision_refs": Empty(), "active_goal_ids": Empty(), "active_cycle_id": nil, "blocking_conflict_ids": Empty(), "pending_change_ids": Empty(), "latest_release_id": nil, "event_sequence": 0, "policy_revision": 1, "binding": s.newProjectBinding()})
 	if e := s.put(tx, "ProjectState", state); e != nil {
 		return nil, e
 	}
@@ -153,16 +164,28 @@ func (s *Service) createGoal(tx *sql.Tx, project string, b Object) (Object, erro
 	if e != nil {
 		return nil, e
 	}
+	state, e := singleton(tx, project, "ProjectState")
+	if e != nil {
+		return nil, e
+	}
+	binding, e := s.inheritedProjectBinding(state)
+	if e != nil {
+		return nil, e
+	}
 	o := Merge(Base(project), b)
 	budget, e := s.policy(tx, "BudgetPolicy", project, "GOAL", Str(o, "id"), Str(profile, "budget_policy_id"))
 	if e != nil {
 		return nil, e
 	}
-	Merge(o, Object{"status": "DRAFT", "task_ids": Empty(), "budget_policy_id": budget["id"], "outcome": nil, "acceptance_id": nil, "binding": binding()})
+	Merge(o, Object{"status": "DRAFT", "task_ids": Empty(), "budget_policy_id": budget["id"], "outcome": nil, "acceptance_id": nil, "binding": binding})
 	return o, s.put(tx, "Goal", o)
 }
 func (s *Service) createTask(tx *sql.Tx, project string, b Object) (Object, error) {
 	goal, e := load(tx, project, "Goal", Str(b, "goal_id"))
+	if e != nil {
+		return nil, e
+	}
+	binding, e := s.inheritedProjectBinding(goal)
 	if e != nil {
 		return nil, e
 	}
@@ -205,7 +228,7 @@ func (s *Service) createTask(tx *sql.Tx, project string, b Object) (Object, erro
 			o[k] = v
 		}
 	}
-	Merge(o, Object{"status": "DRAFT", "context_bundle_id": nil, "assigned_principal_id": nil, "active_run_id": nil, "output_artifact_ids": Empty(), "acceptance_id": nil, "blocking_conflict_ids": Empty(), "no_progress_record_id": n["id"], "binding": binding()})
+	Merge(o, Object{"status": "DRAFT", "context_bundle_id": nil, "assigned_principal_id": nil, "active_run_id": nil, "output_artifact_ids": Empty(), "acceptance_id": nil, "blocking_conflict_ids": Empty(), "no_progress_record_id": n["id"], "binding": binding})
 	if e = s.put(tx, "Task", o); e != nil {
 		return nil, e
 	}
@@ -329,7 +352,7 @@ func (s *Service) seal(tx *sql.Tx, p Principal, project string, b Object) (Objec
 		return nil, Fail(422, "CONTENT_HASH_MISMATCH", "content hash or size mismatch")
 	}
 	if b["kind"] == "TEST_RESULT" {
-		if report, e := Decode(content); e == nil && report["schema_version"] == "2.0.0" {
+		if report, e := Decode(content); e == nil && (report["schema_version"] == "2.0.0" || report["schema_version"] == "2.4.0") {
 			name := "EvaluationReport"
 			if report["report_artifact_ref"] != nil {
 				name = "EvaluationSummary"

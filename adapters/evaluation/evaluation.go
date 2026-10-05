@@ -192,7 +192,10 @@ func Validate(m Manifest, report Object, rawExport []byte, rawHash string) error
 
 // Summary emits allowlisted structured development fields only; never arbitrary reasons or case contents.
 func Summary(report Object, artifactRef any) Object {
-	s := Object{"schema_version": "2.0.0", "report_artifact_ref": artifactRef, "limitations": []string{"DEVELOPMENT_ONLY; no Jev or holdout qualification"}}
+	// The caller validates the report before publishing either artifact. Preserve
+	// its version, including invalid/missing values so they cannot be downgraded
+	// into a valid legacy summary by this allowlist projection.
+	s := Object{"schema_version": report["schema_version"], "report_artifact_ref": artifactRef, "limitations": []string{"DEVELOPMENT_ONLY; no Jev or holdout qualification"}}
 	for _, k := range []string{"project_id", "experiment_id", "run_id", "dataset_split", "counts", "dataset_hash", "candidate_hash", "baseline_hash", "rubric_hash", "integrity_status", "duration_ms", "cost", "created_at"} {
 		s[k] = report[k]
 	}
