@@ -276,6 +276,12 @@ func metricStatus(m, r Object) (string, error) {
 			return "", Fail(422, "GATE_FAILED", "invalid upper target")
 		}
 		pass = cmp >= 0 && v.Cmp(upper) <= 0
+	default:
+		// MetricSpec.operator is a closed enum, so reaching here means the stored metric did not come
+		// through the validated create path. Falling out of the switch previously left pass=false and
+		// reported FAIL, which records a measurement that could not be evaluated as a measured
+		// shortfall - and an experiment outcome must not be implied by a gate that never ran.
+		return "INCONCLUSIVE", nil
 	}
 	if pass {
 		return "PASS", nil
