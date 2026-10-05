@@ -279,6 +279,9 @@ func (c *RuntimeCoordinator) projectSessionRun(tx *sql.Tx, project string, run O
 		if e = part("END", ""); e != nil {
 			return e
 		}
+		if e = c.service.sealSessionTranscript(context.Background(), tx, c.config.ClientSchema, project, sid, Str(run, "executor_principal_id")); e != nil {
+			return e
+		}
 	}
 	return nil
 }

@@ -34,7 +34,7 @@ func nextSessionTurn(t *testing.T, f *fixture, doc *SchemaDoc, sid, want string)
 		if err != nil {
 			return err
 		}
-		svc := ClientService{Doc: doc, Domain: f.s, SessionRuntime: nextTurnFixturePort{}}
+		svc := ClientService{Doc: doc, Domain: f.s, SessionRuntime: nextTurnFixturePort{}, Host: ClientHostInfo{CoreBuildID: "fixture-build"}}
 		env := &Envelope{ProtocolVersion: strptr(ProtocolV2), CommandID: strptr(ID()), Method: strptr("session.send"), ProjectID: &f.project, SessionID: &sid, Payload: Bytes(Object{"text": "下一条独立消息", "attachment_artifact_ids": Empty(), "delivery": "NORMAL"})}
 		reply, err := svc.sendClientMessage(context.Background(), tx, env, f.owner, sess)
 		if err != nil {

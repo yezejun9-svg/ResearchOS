@@ -338,6 +338,9 @@ func (s *ClientService) sendClientMessage(ctx context.Context, tx *sql.Tx, env *
 		sess.revision++
 		sess.watermark++
 	}
+	if err = s.Domain.sealSessionTranscript(ctx, tx, s.Doc, sess.project, sess.sessionID, principal); err != nil {
+		return nil, err
+	}
 	if blocked != nil || task["status"] == "BLOCKED" {
 		errorPayload := Object{"code": "RESOURCE_BLOCKED", "message": "Message saved; its Task is BLOCKED until the selected runtime has current qualification and permission", "retryable": false, "recovery": "RESOLVE_RESOURCE", "current_revision": sess.revision, "current_writer_epoch": sess.epoch, "resource_request_id": nil, "retry_after_ms": nil, "correlation_id": deref(env.CommandID)}
 		if err = s.journal(ctx, tx, env, sess, "ERROR", errorPayload); err != nil {
