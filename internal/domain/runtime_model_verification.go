@@ -62,6 +62,9 @@ func (s *Service) muTurnSnapshot(tx *sql.Tx, project string, task, run, contract
 		if Digest(raw) != a["content_hash"] || !utf8.Valid(raw) {
 			return nil, Fail(422, "GATE_FAILED", "Mu input artifact seal or UTF-8 mismatch")
 		}
+		if Hash(ref) == Hash(admission["profile_ref"]) {
+			continue // Host control input stays hash-bound, never user prompt text.
+		}
 		request["artifact_inputs"] = append(Arr(request, "artifact_inputs"), Object{"id": a["id"], "content_hash": a["content_hash"], "media_type": a["media_type"], "path": "artifacts/" + Str(a, "id")})
 		attachments = append(attachments, Object{"id": a["id"], "content_hash": a["content_hash"], "media_type": a["media_type"], "text": string(raw)})
 	}
