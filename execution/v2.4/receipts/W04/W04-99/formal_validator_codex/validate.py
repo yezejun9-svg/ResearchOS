@@ -528,9 +528,14 @@ def registered_dispatch(reader, row, binding, registry, registry_hash, execution
     tool = locked.get("tools", {}).get(entry.get("executable_tool"), {})
     require(Path(argv[0]).resolve() == Path(tool.get("path", "")).resolve(), "DISPATCH_EXECUTABLE", selector_id)
     reader.local_tool(tool["path"], tool["sha256"])
-    dispatcher = reader.path("execution/command_dispatcher/dispatch.py")
-    require(sha256(dispatcher) == receipt["dispatcher_sha256"] and pinned.get(dispatcher) == receipt["dispatcher_sha256"],
-            "DISPATCHER_CHANGED", selector_id)
+    # Registration is a later construction invocation. Its real native receipt
+    # pins the dispatcher independently of the earlier product execution vector.
+    # Reader.ref also retains these current bytes for finish/CAS checks.
+    try:
+        reader.ref({"path": "execution/command_dispatcher/dispatch.py",
+                    "sha256": receipt["dispatcher_sha256"]})
+    except InvalidEvidence as exc:
+        raise InvalidEvidence("DISPATCHER_CHANGED", selector_id) from exc
     seen = set()
     for reference in sequence(receipt["input_versions"], "dispatch input versions"):
         path = reader.ref(reference)

@@ -193,6 +193,13 @@ are checked. The registered child stdout adds `execution_index_ref:Ref` to the
 already fixed executor index, connecting reuse to that proof. Direct candidate
 stdout does not add this ref, preventing a circular index hash.
 
+The native registration receipt pins the fixed construction dispatcher source
+separately. It need not appear in the earlier Go product execution vector.
+The checker reads that source through `Reader.ref`, so its exact native hash,
+current bytes and later finish/CAS rechecks still apply. Registered child input
+versions remain required in the original product vector; no archived vector or
+original invocation is rewritten to add the later construction dispatcher.
+
 Root pins the actual execution snapshot, including a truthful dirty boolean.
 Every case's commit/dirty values must match this snapshot, and every applicable
 file is rehashed. Root defines complete source_coverage roots/patterns and exact
