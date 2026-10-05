@@ -85,6 +85,14 @@ def main():
     repo = args.repo.resolve()
     if os.name != "nt":
         raise RuntimeError("Windows native Host/Electron scenario only")
+    locked_file = repo / "execution" / "toolchains" / "locked.json"
+    locked = json.loads(locked_file.read_text(encoding="utf-8"))["tools"]
+    tools = {name: Path(locked[name]["path"]).resolve() for name in ("go", "node", "python")}
+    for name, executable in tools.items():
+        if not executable.is_file() or sha256(executable).lower() != locked[name]["sha256"].lower():
+            raise RuntimeError(f"locked {name} path or SHA-256 mismatch: {executable}")
+    if Path(sys.executable).resolve() != tools["python"]:
+        raise RuntimeError("launch gui_restore_run.py with locked Python interpreter")
     root = (repo / ".local" / "w1802-gui" / ("run-" + uuid.uuid4().hex[:12])).resolve()
     root.mkdir(parents=True, exist_ok=False)
     receipt_base = (args.receipt_base or repo / "execution" / "v2.4" / "receipts" / "W18").resolve()
@@ -102,11 +110,16 @@ def main():
     stage = "build"
     control = electron = None
     save(receipt / "provenance.json", {"mode": "FIXTURE", "scenario": "W18-02 restored new data root, same session/goal/next task", "source_repo": str(repo), "fixture_dir": str(root), "provider_calls_by_harness": 0})
+    save(receipt / "locked-tools.json", {"source": str(locked_file), "source_sha256": sha256(locked_file),
+                                         "verified": {name: {"path": str(exe), "sha256": sha256(exe)} for name, exe in tools.items()}})
     try:
         for name, source in sources.items():
-            command("build-" + name, ["go", "build", "-o", binaries[name], source], repo, receipt)
+            command("build-" + name, [tools["go"], "build", "-o", binaries[name], source], repo, receipt)
         # The integrated React sources may be newer than an ignored local dist.
-        command("build-web", ["npm.cmd", "run", "build"], repo / "apps" / "web", receipt)
+        vite = repo / "apps" / "web" / "node_modules" / "vite" / "bin" / "vite.js"
+        if not vite.is_file():
+            raise RuntimeError("installed Vite entry unavailable")
+        command("build-web", [tools["node"], vite, "build"], repo / "apps" / "web", receipt)
         dist = repo / "apps" / "web" / "dist" / "index.html"
         if not dist.is_file():
             raise RuntimeError("React web dist unavailable; build it in integrated main before the GUI window")
@@ -117,13 +130,15 @@ def main():
             repo / "tests" / "backup" / "gui_fixture" / "main_windows.go",
             repo / "tests" / "backup" / "gui_restore.cjs",
             repo / "tests" / "backup" / "gui_restore_run.py",
+            locked_file, vite,
             repo / "ops" / "backup" / "main.go",
             repo / "apps" / "control" / "main.go",
             repo / "apps" / "cli" / "main.go",
             repo / "apps" / "desktop" / "main" / "main.js",
             repo / "apps" / "web" / "src" / "workbench.jsx", dist,
         ]})
-        save(receipt / "tool-hashes.json", {name: sha256(binary) for name, binary in binaries.items()} | {"electron.exe": sha256(electron_exe)})
+        save(receipt / "tool-hashes.json", {name: sha256(binary) for name, binary in binaries.items()} |
+             {"electron.exe": sha256(electron_exe), "vite.js": sha256(vite)})
         stage = "fixture_and_restore"
         fixture_dir = root / "fixture"
         fixture = command("fixture", [binaries["gui_fixture"], "--repo", repo, "--dir", fixture_dir,
@@ -161,12 +176,13 @@ def main():
         cli_checks = {"session_id_exact": session_result.get("session_id") == meta["session_id"],
                       "project_id_exact": session_result.get("project_id") == meta["project_id"],
                       "goal_id_exact": session_result.get("goal_id") == meta["goal_id"],
-                      "task_id_exact": session_result.get("task_id") == meta["task_id"],
                       "restored_event_cursor": session_result.get("event_sequence") == meta["event_cursor"],
                       "host_url_matches_restored_discovery": cli_rows[0].get("host_url") == discovery["url"] if len(cli_rows) == 1 else False,
                       "status_completed": len(cli_rows) == 1 and cli_rows[0].get("status") == "COMPLETED" and
                       all(row.get("status") == "COMPLETED" for row in operations)}
         save(receipt / "cli-checks.json", cli_checks)
+        save(receipt / "cli-next-task-visibility.json", {"status": "GAP", "reason": "Frozen SessionSnapshot exposes goal_id and event cursor but not task_id; CLI status has no read-only Task operation.",
+                                                        "task_provenance": "restored Host typed Task plus authenticated Electron ros-app Task route"})
         if not all(cli_checks.values()):
             raise RuntimeError("CLI_ASSERTION_FAILED:" + json.dumps(cli_checks))
         stage = "electron"
@@ -180,7 +196,7 @@ def main():
                                      f"--remote-debugging-port={cdp_port}"], cwd=repo, env=env,
                                     stdout=out, stderr=err, creationflags=subprocess.CREATE_NO_WINDOW)
         try:
-            command("gui-cdp", ["node", repo / "tests" / "backup" / "gui_restore.cjs", str(cdp_port), meta_path, receipt],
+            command("gui-cdp", [tools["node"], repo / "tests" / "backup" / "gui_restore.cjs", str(cdp_port), meta_path, receipt],
                     repo, receipt, env, timeout=120)
         finally:
             out.close(); err.close()

@@ -101,12 +101,21 @@ async function main() {
       const value = reply?.result || {};
       return { context, ok: reply?.ok, status: reply?.protocol_status,
         project_id: value.project_id, session_id: value.session_id, goal_id: value.goal_id,
-        task_id: value.task_id, event_sequence: value.event_sequence, title: value.title };
+        event_sequence: value.event_sequence, title: value.title };
     })()`);
     save('native-session.json', native);
     await send('Page.navigate', { url: `ros-app://desktop/p/${pid}/tasks/${tid}` });
     await waitFor(`document.querySelector('h1')?.textContent.trim() === ${JSON.stringify(meta.task_title)}`, 'restored task detail');
     const task = await capture('03-task');
+    // Same authenticated desktop app route used by the Task component, not a
+    // direct host request or a synthetic renderer object.
+    const taskRecord = await evaluate(`(async () => {
+      const response = await fetch('/v1/projects/${pid}/tasks/${tid}', { headers: { Accept:'application/json' }, cache:'no-store' });
+      if (!response.ok) return { http_status:response.status };
+      const value = await response.json();
+      return { http_status:response.status, id:value.id, goal_id:value.goal_id, title:value.title, status:value.status };
+    })()`);
+    save('native-task.json', taskRecord);
     await send('Page.navigate', { url: `ros-app://desktop/p/${pid}` });
     await waitFor(`document.querySelector('.goal-section')?.textContent.includes(${JSON.stringify(meta.goal_title)})`, 'restored goal dashboard');
     const goal = await capture('04-goal');
@@ -116,11 +125,12 @@ async function main() {
       restored_transcript: session.body.includes('backup'),
       task_detail_title: task.headings.includes(meta.task_title),
       task_url_id: task.url.endsWith(`/tasks/${tid}`),
+      task_record_identity: taskRecord.http_status === 200 && taskRecord.id === meta.task_id &&
+        taskRecord.goal_id === meta.goal_id && taskRecord.title === meta.task_title,
       goal_dashboard_title: goal.body.includes(meta.goal_title),
       native_session_identity: native.ok === true && native.status === 'COMPLETED' &&
         native.context?.session_id === meta.session_id && native.context?.project_id === meta.project_id &&
-        native.session_id === meta.session_id && native.project_id === meta.project_id &&
-        native.goal_id === meta.goal_id && native.task_id === meta.task_id,
+        native.session_id === meta.session_id && native.project_id === meta.project_id && native.goal_id === meta.goal_id,
       restored_event_cursor: native.event_sequence === meta.event_cursor,
       renderer_errors_zero: rendererErrors.length === 0,
       native_bridge_present: [before, session, task, goal].every(item => item.root && item.bridge),
