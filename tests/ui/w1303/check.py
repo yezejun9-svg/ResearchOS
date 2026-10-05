@@ -21,6 +21,23 @@ STAGES = [
     ("transcript", "transcript_run.py", "electron-transcript.json", 360),
 ]
 
+# Other observation drivers are not executed by a stage; shared fixture/production inputs remain pinned.
+STAGE_DRIVER_FILES = {
+    "matrix": {"run.py", "matrix.cjs"},
+    "preview": {"preview_run.py", "preview.cjs"},
+    "workspace": {"workspace_run.py", "workspace.cjs"},
+    "permission": {"permission_run.py", "permission.cjs"},
+    "accessibility": {"accessibility_run.py", "accessibility.cjs"},
+    "transcript": {"transcript_run.py", "transcript.cjs"},
+}
+
+
+def stage_inputs(stage, fingerprint):
+    unused = {"tests/ui/w1303/check.py"}
+    unused.update("tests/ui/w1303/" + name for other, names in STAGE_DRIVER_FILES.items()
+                  if other != stage for name in names)
+    return {name: value for name, value in fingerprint.items() if name not in unused}
+
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -84,17 +101,23 @@ def observed_checks(parent, child_name):
 
 
 def prior_stage(stage, fingerprint):
-    # Reuse only immutable observations with the same complete recorded inputs.
-    # They stay linked to their original command/run and are never counted anew.
+    # Pin all production, shared fixture, build/toolchain and this stage's driver inputs.
+    # A change confined to a different driver or this orchestration wrapper does not
+    # change an existing observation. Preserve the original complete fingerprint and raw refs.
     for report_path in sorted(RECEIPTS.glob("registered-*/report.json"), reverse=True):
         try:
             report = json.loads(report_path.read_text(encoding="utf-8-sig"))
-            if report.get("source_hashes") != fingerprint:
+            old_inputs = report.get("source_hashes", {})
+            if not old_inputs or stage_inputs(stage, old_inputs) != stage_inputs(stage, fingerprint):
                 continue
             for row in report.get("stages", []):
                 if row["stage"] == stage and row["status"] == "PASS" and row.get("checks"):
                     if all(digest(ROOT / ref["path"]) == ref["sha256"] for ref in row["evidence"]):
-                        return dict(row, reused=True)
+                        return dict(row, reused=True, reuse_source_report={
+                            "path": report_path.relative_to(ROOT).as_posix(), "sha256": digest(report_path)},
+                            ignored_source_changes=[name for name in sorted(set(old_inputs) | set(fingerprint))
+                                                    if old_inputs.get(name) != fingerprint.get(name)],
+                            reuse_rule="All production/shared fixture/build inputs and current stage drivers match; unrelated observation drivers and orchestration wrapper excluded.")
         except (OSError, ValueError, KeyError):
             continue
     return None

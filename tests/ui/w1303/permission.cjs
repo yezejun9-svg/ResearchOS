@@ -53,7 +53,8 @@ async function main(){
   const actual=fs.readFileSync(source),expected=Buffer.from(input.expected_written_text);
   check('ALLOW_WRITES_EXACT_BYTES',actual.equals(expected),{actual_bytes:actual.toString('base64'),expected_bytes:expected.toString('base64')});
  }else{
-  await waitRun(['CANCELLED','FAILED','CANCEL_REQUESTED']);
+  // Verify replay refusal only after the original Run has settled its cancellation.
+  await waitRun(['CANCELLED','FAILED']);
   check('DENY_PRESERVES_PHYSICAL_BYTES',fs.readFileSync(source).equals(initial));
  }
  const observed=await page.evaluate(async({project,run,task})=>{
