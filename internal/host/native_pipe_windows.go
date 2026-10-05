@@ -136,7 +136,9 @@ func (h *Host) serveNativeConnection(ph windows.Handle) {
 	if err != nil {
 		return
 	}
-	reply, err := h.HandleNative(raw, true, nil)
+	// The path in a frame is only an initial suggestion. The Shell dialog runs
+	// in this trusted, same-user host process and requires an explicit choice.
+	reply, err := h.HandleNative(raw, true, chooseNativeFolderWindows)
 	if err != nil {
 		reply = errorFrame(err)
 	}
