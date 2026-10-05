@@ -27,6 +27,12 @@ function readDiscovery(fsImpl, file) {
   try {
     const d = JSON.parse(fsImpl.readFileSync(file, 'utf8'));
     if (!d || typeof d.url !== 'string' || !d.url) return { ok: false, reason: 'DISCOVERY_MALFORMED', detail: String(d && d.url) };
+    let url;
+    try { url = new URL(d.url); } catch { return { ok: false, reason: 'DISCOVERY_MALFORMED' }; }
+    if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) ||
+        !url.port || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+      return { ok: false, reason: 'NONLOCAL_HOST' };
+    }
     return { ok: true, discovery: d };
   } catch (e) {
     return { ok: false, reason: 'DISCOVERY_ABSENT', detail: String(e.code || e.message || e) };
