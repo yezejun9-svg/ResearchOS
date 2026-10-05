@@ -303,11 +303,17 @@ def serve(out):
     case = os.environ.get("RESEARCHOS_CASE_ID", "")
     ok("W0902-ROUTING-BINDING-SERVED", route(task, check, case) == "serve",
        "task_id=%r check_id=%r case_id=%r" % (task, check, case))
+    dirs_before = len(os.listdir(RECEIPT_ROOT)) if RECEIPT_ROOT.is_dir() else 0
     probe = probe_foreign_binding()
+    dirs_after = len(os.listdir(RECEIPT_ROOT)) if RECEIPT_ROOT.is_dir() else 0
     ok("W0902-ROUTING-FOREIGN-BINDING-REFUSED",
        probe.get("ran") is True and probe.get("exit_code") not in (0, None) and probe.get("status") == "FAIL"
        and probe.get("assertions") == 0 and probe.get("assertion_ids") == [] and probe.get("stdout_lines") == 1,
        json.dumps(probe, ensure_ascii=False)[:450])
+    # W09-01 disclosed that its own handler created a receipt directory before it knew whether the
+    # run would write anything, leaving 694 empty directories behind. Refusals must cost nothing.
+    ok("W0902-REFUSED-BINDINGS-LEAVE-NO-DIRECTORY-BEHIND", dirs_after == dirs_before,
+       "directory count moved from %d to %d across a refused binding" % (dirs_before, dirs_after))
     note("foreign-binding-self-probe", {k: probe.get(k) for k in ("exit_code", "status", "assertions", "stdout_lines")},
          "re-ran this program with RESEARCHOS_CHECK_ID=%s and W0902_PROBE_DEPTH=1; the refusal is exactly one report "
          "line whose roster is empty, and the marked child never probes again" % FOREIGN_PROBE_CHECK)
@@ -443,6 +449,7 @@ HARNESS_IDS = [
     "W0902-GO-TEST-EVIDENCE-WRITTEN-UNDER-CARD-DIRECTORY",
     "W0902-GO-TEST-SUITE-EXIT-ZERO",
     "W0902-HARNESS-ROSTER-EXACT",
+    "W0902-REFUSED-BINDINGS-LEAVE-NO-DIRECTORY-BEHIND",
     "W0902-ROUTING-BINDING-SERVED",
     "W0902-ROUTING-FOREIGN-BINDING-REFUSED",
     "W0902-ROUTING-TRUTH-TABLE",
