@@ -32,10 +32,31 @@ class EvidenceNegatives(unittest.TestCase):
                 self.assertEqual(calls, [([sys.executable, "-X", "utf8", str(ROOT / "ops/ci/core_evidence.py")],
                                          {"cwd": ROOT, "env": env})])
 
+    def test_selector_bridge_omitted_task_and_case_forward_legacy(self):
+        env = {"KEEP_MARKER": "unchanged"}
+        calls = []
+        def fake(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return 37
+        self.assertEqual(dispatch(env, fake), 37)
+        self.assertEqual(calls, [([sys.executable, "-X", "utf8", str(ROOT / "ops/ci/core_evidence.py")],
+                                 {"cwd": ROOT, "env": env})])
+
+    def test_selector_bridge_omitted_task_with_a02_forward_legacy(self):
+        env = {"RESEARCHOS_CASE_ID": "A02", "KEEP_MARKER": "unchanged"}
+        calls = []
+        def fake(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return 37
+        self.assertEqual(dispatch(env, fake), 37)
+        self.assertEqual(calls, [([sys.executable, "-X", "utf8", str(ROOT / "ops/ci/core_evidence.py")],
+                                 {"cwd": ROOT, "env": env})])
+
     def test_selector_bridge_refuses_mixed_unknown_before_child(self):
         for task, check, case in (("W02", "W01-G01", ""), ("W01", "W01-G01", "A02"),
                                  ("W06", "W01-G02", ""), ("W01", "W01-G05", ""),
-                                 ("W02", "W02-G01", ""), ("W01", "", "C04"), ("", "", "")):
+                                 ("W02", "W02-G01", ""), ("W01", "", "C04"), ("UNKNOWN", "", ""),
+                                 ("", "W01-G01", "")):
             calls = []
             env = dict(zip(("RESEARCHOS_TASK_ID", "RESEARCHOS_CHECK_ID", "RESEARCHOS_CASE_ID"), (task, check, case)))
             with redirect_stdout(io.StringIO()) as output:

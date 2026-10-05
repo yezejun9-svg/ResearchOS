@@ -12,7 +12,7 @@ PARENT_CHECKS = tuple("W01-G0" + str(n) for n in range(1, 5))
 def select(task, check, case, python=sys.executable, root=ROOT):
     if task == "W01" and check in PARENT_CHECKS and case == "":
         return [python, "-B", "-X", "utf8", str(root / "qualification/v2.4/qualify.py"), "--check-id", check]
-    if task in {"W01", "W02", "W06"} and check == "" and case in {"", "A02"}:
+    if task in {"", "W01", "W02", "W06"} and check == "" and case in {"", "A02"}:
         # Exact legacy interpreter flags, environment and streams. No new claims
         # or interception of the old archived-evidence / W06 fixture report.
         return [python, "-X", "utf8", str(root / "ops/ci/core_evidence.py")]
