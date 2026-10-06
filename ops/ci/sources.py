@@ -37,6 +37,7 @@ EXPECTED = {
     "TestW07XVisibleEmptySealsObservationWithoutCoverage",
     "TestW07OfflineXPrimaryClaimSealsProductLineage",
     "TestW07HealthForgedReportCannotCompleteWindow",
+    "TestW07HealthPublicIngressCannotForgeCapturedSource",
     "TestW07HealthH07ProductionFaultMatrix",
     "TestW07HealthDetailPrecedesSuccessfulEnvelope",
     "TestW07HealthEmptyProofAndIndexReadLevel",
