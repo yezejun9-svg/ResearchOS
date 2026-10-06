@@ -125,21 +125,292 @@ func providerTransport(tx *sql.Tx, project string, run, dispatch Object) (Object
 	return Object{"version": "researchos.provider-transport.v1", "provider_policy": runtimeProviderPolicy, "endpoint": config["endpoint"], "user_agent": "ResearchOS/2.4", "session_header": "x-opencode-session", "session_value": value, "affinity_scope": scope, "authority": authority}, nil
 }
 
-// Inventory is indexed by original dispatch admission, including effects with
-// zero observations or a removed/changed request policy marker.
+// Resolve the effect's historical Run identity, not the current Run after a
+// lease takeover or runtime replacement. Status-only revisions may repeat it.
+func providerOriginalRun(tx *sql.Tx, project, runID string, effect Object) (Object, error) {
+	epoch, err := Num(effect, "epoch")
+	if err != nil || epoch < 1 {
+		return nil, historyInvalid("provider original Run epoch invalid")
+	}
+	rows, err := tx.Query(`SELECT body FROM domain_versions WHERE project=? AND kind='Run' AND id=? AND json_extract(body,'$.lease_epoch')=? ORDER BY revision`, project, runID, epoch)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var original Object
+	for rows.Next() {
+		var raw string
+		if err = rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		run, e := Decode([]byte(raw))
+		if e != nil || run["project_id"] != project || run["id"] != runID || run["task_id"] != effect["task_id"] || Str(run, "runtime_id") == "" || Hash(run["lease_epoch"]) != Hash(effect["epoch"]) {
+			return nil, historyInvalid("provider original Run identity")
+		}
+		if original != nil {
+			for _, key := range []string{"task_id", "runtime_id", "created_at", "executor_principal_id"} {
+				if Hash(original[key]) != Hash(run[key]) {
+					return nil, historyInvalid("provider ambiguous original Run epoch")
+				}
+			}
+		} else {
+			original = run
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if original == nil {
+		return nil, historyInvalid("provider original Run epoch unavailable")
+	}
+	return original, nil
+}
+
+// A binding is independently keyed by the original Run's runtime. Its absence
+// is not proof of legacy: callers still require positive original admission.
+// These tables prevent UPDATE, not DELETE; every required link is checked.
+func providerOriginalProfile(tx *sql.Tx, project string, run Object) (Object, Object, string, error) {
+	var raw, digest, technical string
+	err := tx.QueryRow(`SELECT profile_ref,profile_hash,technical_hash FROM runtime_bindings WHERE project=? AND runtime=?`, project, run["runtime_id"]).Scan(&raw, &digest, &technical)
+	if err == sql.ErrNoRows {
+		return nil, nil, "", nil
+	}
+	if err != nil {
+		return nil, nil, "", err
+	}
+	ref, err := Decode([]byte(raw))
+	if err != nil || ref["entity_type"] != "Artifact" || Hash(ref) != digest {
+		return nil, nil, "", historyInvalid("provider frozen binding reference")
+	}
+	artifact, err := version(tx, project, ref)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	profile, err := runtimeProfileBody(tx, project, artifact)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if profile["runtime_id"] != run["runtime_id"] || profile["technical_hash"] != technical || artifact["project_id"] != project || artifact["id"] != ref["id"] || Hash(artifact["revision"]) != Hash(ref["revision"]) {
+		return nil, nil, "", historyInvalid("provider frozen binding identity")
+	}
+	return ref, profile, technical, nil
+}
+
+// Follow the original persisted relationship revision, never today's head.
+func providerHistoricalRelation(tx *sql.Tx, project, kind string, owner Object, field, targetKind, targetID string) (Object, error) {
+	revision, err := Num(owner, "revision")
+	if err != nil {
+		return nil, historyInvalid("provider historical relation owner")
+	}
+	rows, err := tx.Query(`SELECT r.target_project,r.target_kind,r.target_id,r.target_revision,v.body FROM domain_refs r JOIN domain_versions v ON v.project=r.target_project AND v.kind=r.target_kind AND v.id=r.target_id AND v.revision=r.target_revision WHERE r.project=? AND r.kind=? AND r.id=? AND r.revision=? AND r.field=?`, project, kind, owner["id"], revision, field)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result Object
+	for rows.Next() {
+		var p, k, id, raw string
+		var rev int64
+		if err = rows.Scan(&p, &k, &id, &rev, &raw); err != nil {
+			return nil, err
+		}
+		v, e := Decode([]byte(raw))
+		allowedProject := p == project || (p == "" && targetKind == "BudgetPolicy")
+		if e != nil || result != nil || !allowedProject || k != targetKind || id != targetID || Str(v, "project_id") != p || v["id"] != id || Hash(v["revision"]) != Hash(rev) {
+			return nil, historyInvalid("provider historical relation identity")
+		}
+		result = v
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, historyInvalid("provider historical relation missing")
+	}
+	return result, nil
+}
+
+func providerOriginalReservation(tx *sql.Tx, project string, run Object, id string) (Object, error) {
+	var raw, digest, historicalRaw, historicalDigest string
+	var revision, immutable int64
+	err := tx.QueryRow(`SELECT o.body,o.revision,o.content_hash,o.immutable,v.body,v.content_hash FROM domain_objects o JOIN domain_versions v ON v.project=o.project AND v.kind=o.kind AND v.id=o.id AND v.revision=o.revision WHERE o.project=? AND o.kind='BudgetLedgerEntry' AND o.id=?`, project, id).Scan(&raw, &revision, &digest, &immutable, &historicalRaw, &historicalDigest)
+	if err != nil {
+		return nil, historyInvalid("provider original reservation unavailable")
+	}
+	ledger, err := Decode([]byte(raw))
+	historical, he := Decode([]byte(historicalRaw))
+	if err != nil || he != nil || immutable != 1 || revision != 1 || ledger["project_id"] != project || ledger["id"] != id || Hash(ledger["revision"]) != Hash(revision) || ledger["receipt_hash"] != digest || Receipt(ledger) != digest || historicalDigest != digest || Hash(historical) != Hash(ledger) {
+		return nil, historyInvalid("provider original reservation immutable identity")
+	}
+	boundRun, err := providerHistoricalRelation(tx, project, "BudgetLedgerEntry", ledger, "/run_id", "Run", Str(run, "id"))
+	if err != nil {
+		return nil, err
+	}
+	for _, field := range []string{"id", "task_id", "runtime_id", "lease_epoch", "created_at", "executor_principal_id"} {
+		if Hash(boundRun[field]) != Hash(run[field]) {
+			return nil, historyInvalid("provider reservation original Run")
+		}
+	}
+	task, err := providerHistoricalRelation(tx, project, "Run", boundRun, "/task_id", "Task", Str(run, "task_id"))
+	if err != nil {
+		return nil, err
+	}
+	goal, err := providerHistoricalRelation(tx, project, "Task", task, "/goal_id", "Goal", Str(task, "goal_id"))
+	if err != nil {
+		return nil, err
+	}
+	if ledger["policy_id"] != goal["budget_policy_id"] || ledger["run_id"] != run["id"] {
+		return nil, historyInvalid("provider reservation original budget policy")
+	}
+	if _, err = providerHistoricalRelation(tx, project, "Goal", goal, "/budget_policy_id", "BudgetPolicy", Str(ledger, "policy_id")); err != nil {
+		return nil, err
+	}
+	if _, err = providerHistoricalRelation(tx, project, "BudgetLedgerEntry", ledger, "/policy_id", "BudgetPolicy", Str(ledger, "policy_id")); err != nil {
+		return nil, err
+	}
+	return ledger, nil
+}
+
+// Every original MODEL reservation must still have its own PREPARED chain.
+// This also finds erased/aliased effects when no request marker survives.
+func providerReconcileReservations(tx *sql.Tx, project, runID string, prepared map[string][]Object) error {
+	rows, err := tx.Query(`SELECT project,id,body FROM domain_objects WHERE kind='BudgetLedgerEntry' AND (?='' OR project=?) AND (?='' OR json_extract(body,'$.run_id')=?) AND json_extract(body,'$.operation')='RESERVE' AND instr(json_extract(body,'$.provider_request_id'),':model:')>0 AND substr(json_extract(body,'$.provider_event_id'),1,8)='prepare/'`, project, project, runID, runID)
+	if err != nil {
+		return err
+	}
+	items := []Object{}
+	for rows.Next() {
+		var p, id, raw string
+		if err = rows.Scan(&p, &id, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		v, e := Decode([]byte(raw))
+		if e != nil || v["project_id"] != p || v["id"] != id {
+			rows.Close()
+			return historyInvalid("provider original MODEL reservation identity")
+		}
+		items = append(items, v)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, ledger := range items {
+		p, r, key := Str(ledger, "project_id"), Str(ledger, "run_id"), Str(ledger, "provider_request_id")
+		parts := strings.Split(key, ":")
+		var epoch, ordinal int64
+		if len(parts) != 5 || parts[1] != r || parts[3] != "model" {
+			return historyInvalid("provider original MODEL reservation key")
+		}
+		if _, err = fmt.Sscan(parts[2], &epoch); err != nil || epoch < 1 || parts[2] != fmt.Sprint(epoch) {
+			return historyInvalid("provider original MODEL reservation epoch")
+		}
+		if _, err = fmt.Sscan(parts[4], &ordinal); err != nil || ordinal < 1 || parts[4] != fmt.Sprint(ordinal) {
+			return historyInvalid("provider original MODEL reservation ordinal")
+		}
+		run, e := providerOriginalRun(tx, p, r, Object{"task_id": parts[0], "epoch": epoch})
+		if e != nil {
+			return e
+		}
+		_, profile, _, e := providerOriginalProfile(tx, p, run)
+		if e != nil {
+			return e
+		}
+		config, _ := profile["model_config"].(map[string]any)
+		policy, e := providerPolicy(config)
+		if e != nil {
+			return e
+		}
+		if !policy {
+			// Individual effects still need positive nonpolicy admission.
+			// Missing bindings cannot justify an erased original MODEL hold.
+			if profile == nil {
+				return historyInvalid("provider original MODEL reservation provenance")
+			}
+			continue
+		}
+		if _, e = providerOriginalReservation(tx, p, run, Str(ledger, "id")); e != nil {
+			return e
+		}
+		facts := prepared[p+"/"+r+"/"+key]
+		if len(facts) != 1 || facts[0]["state"] != "PREPARED" || facts[0]["reservation_id"] != ledger["id"] {
+			return historyInvalid("provider unmatched original MODEL reservation")
+		}
+	}
+	return nil
+}
+
+func providerTypedEffectProof(tx *sql.Tx, project string, run, profile, effect Object) (string, error) {
+	ledger, err := providerOriginalReservation(tx, project, run, Str(effect, "reservation_id"))
+	if err != nil {
+		return "", err
+	}
+	key := Str(effect, "key")
+	if ledger["provider_request_id"] != key {
+		return "", historyInvalid("provider reservation original effect key")
+	}
+	request, _ := effect["payload"].(map[string]any)
+	capability := Str(request, "capability")
+	if capability != "MODEL" && capability != "TOOL" {
+		return "", historyInvalid("provider original typed capability")
+	}
+	prefix := fmt.Sprintf("%s:%s:%v:%s:", run["task_id"], run["id"], run["lease_epoch"], strings.ToLower(capability))
+	var ordinal int64
+	if !strings.HasPrefix(key, prefix) {
+		return "", historyInvalid("provider original typed key")
+	}
+	if _, err = fmt.Sscan(strings.TrimPrefix(key, prefix), &ordinal); err != nil || ordinal < 1 || key != prefix+fmt.Sprint(ordinal) {
+		return "", historyInvalid("provider original typed ordinal")
+	}
+	found := 0
+	var bound any
+	for _, v := range Arr(profile, "effect_routes") {
+		route, _ := v.(map[string]any)
+		if route["id"] == request["route"] && route["capability"] == capability && route["credential_revision"] == request["credential_revision"] {
+			found++
+			bound = route["upper_bound"]
+		}
+	}
+	if found != 1 || bound == nil {
+		return "", historyInvalid("provider ambiguous original typed route")
+	}
+	cost := Object{}
+	for _, field := range []string{"policy_id", "run_id", "operation", "money", "provider_request_id", "provider_event_id", "reservation_id", "cost_basis", "occurred_at"} {
+		v, ok := ledger[field]
+		if !ok {
+			return "", historyInvalid("provider original cost field missing")
+		}
+		cost[field] = v
+	}
+	if cost["operation"] != "RESERVE" || cost["cost_basis"] != "UPPER_BOUND" || cost["provider_event_id"] != "prepare/"+key || cost["reservation_id"] != nil || cost["occurred_at"] != run["created_at"] || Hash(cost["money"]) != Hash(bound) || effect["request_hash"] != Hash([]any{request, cost}) {
+		return "", historyInvalid("provider original request and complete cost")
+	}
+	if capability == "TOOL" && (!modelExactKeys(request, "route", "capability", "credential_revision", "payload") || request["provider_transport"] != nil) {
+		return "", historyInvalid("provider original TOOL request")
+	}
+	return capability, nil
+}
+
+// Every original MODEL is classified before examining removable transport or
+// dispatch markers. Successful empty inventory requires proven nonpolicy.
 func validateProviderInventory(tx *sql.Tx, project, runID string) (map[string]Object, error) {
-	rows, err := tx.Query(`SELECT project,run,body FROM resource_effects WHERE (?='' OR project=?) AND (?='' OR run=?) ORDER BY project,run,effect_key,sequence`, project, project, runID, runID)
+	rows, err := tx.Query(`SELECT project,run,effect_key,sequence,body FROM resource_effects WHERE (?='' OR project=?) AND (?='' OR run=?) ORDER BY project,run,effect_key,sequence`, project, project, runID, runID)
 	if err != nil {
 		return nil, err
 	}
 	type record struct {
-		project, run string
-		body         Object
+		project, run, key string
+		sequence          int64
+		body              Object
 	}
 	all := []record{}
+	prepared := map[string][]Object{}
 	for rows.Next() {
-		var p, r, raw string
-		if err = rows.Scan(&p, &r, &raw); err != nil {
+		var p, r, key, raw string
+		var seq int64
+		if err = rows.Scan(&p, &r, &key, &seq, &raw); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -148,11 +419,22 @@ func validateProviderInventory(tx *sql.Tx, project, runID string) (map[string]Ob
 			rows.Close()
 			return nil, e
 		}
-		all = append(all, record{p, r, v})
+		if v["project_id"] != p || v["run_id"] != r || v["key"] != key || Hash(v["sequence"]) != Hash(seq) || seq < 1 {
+			rows.Close()
+			return nil, historyInvalid("provider effect SQL identity")
+		}
+		if seq == 1 {
+			group := p + "/" + r + "/" + key
+			prepared[group] = append(prepared[group], v)
+		}
+		all = append(all, record{p, r, key, seq, v})
 	}
 	err = rows.Err()
 	rows.Close()
 	if err != nil {
+		return nil, err
+	}
+	if err = providerReconcileReservations(tx, project, runID, prepared); err != nil {
 		return nil, err
 	}
 	transports := map[string]Object{}
@@ -160,84 +442,97 @@ func validateProviderInventory(tx *sql.Tx, project, runID string) (map[string]Ob
 	sequences := map[string]int64{}
 	for _, record := range all {
 		e := record.body
-		var manifestRaw string
-		err := tx.QueryRow(`SELECT manifest FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, record.project, record.run, e["epoch"]).Scan(&manifestRaw)
-		if err == sql.ErrNoRows {
-			request, _ := e["payload"].(map[string]any)
-			if request["provider_transport"] != nil {
-				return nil, historyInvalid("provider dispatch missing")
-			}
-			continue
+		if e["project_id"] != record.project || e["run_id"] != record.run || e["key"] != record.key || Hash(e["sequence"]) != Hash(record.sequence) || record.sequence < 1 {
+			return nil, historyInvalid("provider effect SQL identity")
 		}
+		run, err := providerOriginalRun(tx, record.project, record.run, e)
 		if err != nil {
 			return nil, err
 		}
-		manifest, err := Decode([]byte(manifestRaw))
+		ref, frozen, technical, err := providerOriginalProfile(tx, record.project, run)
 		if err != nil {
 			return nil, err
 		}
-		admission, _ := manifest["admission"].(map[string]any)
-		profile, _ := admission["profile"].(map[string]any)
-		model, _ := profile["model_config"].(map[string]any)
-		// The sealed version is the policy authority. Removing the marker from
-		// the dispatch copy must not exclude that dispatch from this inventory.
-		if ref, ok := admission["profile_ref"].(map[string]any); ok {
-			artifact, e := version(tx, record.project, ref)
-			if e != nil {
-				return nil, e
-			}
-			frozen, e := runtimeProfileBody(tx, record.project, artifact)
-			if e != nil {
-				return nil, e
-			}
-			frozenConfig, _ := frozen["model_config"].(map[string]any)
-			frozenPolicy, e := providerPolicy(frozenConfig)
-			if e != nil {
-				return nil, e
-			}
-			if frozenPolicy && Hash(frozen) != Hash(profile) {
-				return nil, historyInvalid("provider admission removed frozen policy")
-			}
-			if frozenPolicy {
-				model = frozenConfig
-			}
-		}
-		isPolicy, err := providerPolicy(model)
+		config, _ := frozen["model_config"].(map[string]any)
+		policy, err := providerPolicy(config)
 		if err != nil {
 			return nil, err
 		}
-		if !isPolicy {
-			request, _ := e["payload"].(map[string]any)
-			if request["provider_transport"] != nil {
-				return nil, historyInvalid("provider transport without original policy")
-			}
+		request, _ := e["payload"].(map[string]any)
+		key := record.key
+		modelKey := fmt.Sprintf("%s:%s:%v:model:", run["task_id"], record.run, run["lease_epoch"])
+		modelEffect := request["capability"] == "MODEL" || strings.HasPrefix(key, modelKey) || request["provider_transport"] != nil
+		// On a policy Run even a claimed TOOL needs original reservation
+		// proof. Route IDs are intentionally shared across capabilities.
+		if !modelEffect && !policy {
 			continue
 		}
 		d, err := runtimeDispatch(tx, record.project, record.run, e["epoch"])
+		if err == sql.ErrNoRows {
+			// Old generic fixture claims stored no RuntimeRegistration ref.
+			// A later fixture flag/current registration cannot supply that
+			// missing temporal proof. Keep this compatibility gap explicit.
+			return nil, historyInvalid("provider original MODEL dispatch or legacy provenance unavailable")
+		}
 		if err != nil {
 			return nil, err
 		}
 		m, _ := d["manifest"].(map[string]any)
 		a, _ := m["admission"].(map[string]any)
 		p, _ := a["profile"].(map[string]any)
-		config, _ := p["model_config"].(map[string]any)
-		policy, err := providerPolicy(config)
+		runtimeRef, ok := a["runtime_ref"].(map[string]any)
+		if !ok || runtimeRef["entity_type"] != "RuntimeRegistration" || runtimeRef["id"] != run["runtime_id"] || m["task_id"] != run["task_id"] || m["runtime_id"] != run["runtime_id"] || m["executor_principal_id"] != run["executor_principal_id"] || ref == nil || Hash(a["profile_ref"]) != Hash(ref) || a["profile_hash"] != Hash(ref) || Hash(p) != Hash(frozen) || a["technical_hash"] != technical {
+			return nil, historyInvalid("provider original admission provenance")
+		}
+		runtime, err := version(tx, record.project, runtimeRef)
 		if err != nil {
 			return nil, err
+		}
+		if runtime["project_id"] != record.project || runtime["id"] != run["runtime_id"] || Hash(Ref(runtime, "RuntimeRegistration")) != Hash(runtimeRef) || runtimeTechnicalHash(runtime) != technical || a["mode"] != runtime["measurement_mode"] {
+			return nil, historyInvalid("provider original runtime revision")
 		}
 		if !policy {
+			if request["provider_transport"] != nil {
+				return nil, historyInvalid("provider transport without original policy")
+			}
 			continue
 		}
-		request, _ := e["payload"].(map[string]any)
-		// All ordinary non-model effects remain under their existing gates.
-		key := Str(e, "key")
-		modelKey := fmt.Sprintf("%s:%s:%v:model:", m["task_id"], record.run, m["epoch"])
-		if request["capability"] != "MODEL" && !strings.HasPrefix(key, modelKey) {
-			continue
-		}
-		run, err := load(tx, record.project, "Run", record.run)
+		capability, err := providerTypedEffectProof(tx, record.project, run, p, e)
 		if err != nil {
 			return nil, err
+		}
+		seq, err := Num(e, "sequence")
+		if err != nil {
+			return nil, err
+		}
+		group := record.project + "/" + record.run + "/" + key
+		if seq != sequences[group]+1 || e["project_id"] != record.project || e["run_id"] != record.run || e["task_id"] != m["task_id"] || Hash(e["epoch"]) != Hash(m["epoch"]) {
+			return nil, historyInvalid("provider effect sequence or identity")
+		}
+		sequences[group] = seq
+		if seq == 1 {
+			if e["state"] != "PREPARED" {
+				return nil, historyInvalid("provider missing PREPARED")
+			}
+			originals[group] = e
+		} else {
+			old := originals[group]
+			if old == nil || Hash(old["payload"]) != Hash(request) || old["request_hash"] != e["request_hash"] || old["reservation_id"] != e["reservation_id"] {
+				return nil, historyInvalid("provider history rebound")
+			}
+		}
+		if capability == "TOOL" {
+			if e["state"] != "PREPARED" && e["state"] != "STARTED" && e["state"] != "UNKNOWN" && e["state"] != "NOT_APPLIED" && e["state"] != "CONFIRMED" {
+				return nil, historyInvalid("provider invalid effect state")
+			}
+			continue
+		}
+		var ordinal int64
+		if !strings.HasPrefix(key, modelKey) {
+			return nil, historyInvalid("provider original MODEL key")
+		}
+		if _, err = fmt.Sscan(strings.TrimPrefix(key, modelKey), &ordinal); err != nil || ordinal < 1 || key != modelKey+fmt.Sprint(ordinal) {
+			return nil, historyInvalid("provider original MODEL ordinal")
 		}
 		transport, err := providerTransport(tx, record.project, run, d)
 		if err != nil {
@@ -269,26 +564,6 @@ func validateProviderInventory(tx *sql.Tx, project, runID string) (map[string]Ob
 		cost := Object{"policy_id": ledger["policy_id"], "run_id": record.run, "operation": "RESERVE", "money": bound, "provider_request_id": key, "provider_event_id": "prepare/" + key, "reservation_id": nil, "cost_basis": "UPPER_BOUND", "occurred_at": run["created_at"]}
 		if e["request_hash"] != Hash([]any{request, cost}) || ledger["run_id"] != record.run || ledger["provider_request_id"] != key || ledger["operation"] != "RESERVE" || ledger["cost_basis"] != "UPPER_BOUND" || Hash(ledger["money"]) != Hash(bound) {
 			return nil, historyInvalid("provider original request and budget hash")
-		}
-		seq, err := Num(e, "sequence")
-		if err != nil {
-			return nil, err
-		}
-		group := record.project + "/" + record.run + "/" + key
-		if seq != sequences[group]+1 || e["project_id"] != record.project || e["run_id"] != record.run || e["task_id"] != m["task_id"] || Hash(e["epoch"]) != Hash(m["epoch"]) {
-			return nil, historyInvalid("provider effect sequence or identity")
-		}
-		sequences[group] = seq
-		if seq == 1 {
-			if e["state"] != "PREPARED" {
-				return nil, historyInvalid("provider missing PREPARED")
-			}
-			originals[group] = e
-		} else {
-			old := originals[group]
-			if old == nil || Hash(old["payload"]) != Hash(request) || old["request_hash"] != e["request_hash"] || old["reservation_id"] != e["reservation_id"] {
-				return nil, historyInvalid("provider history rebound")
-			}
 		}
 		transports[key] = transport
 		switch e["state"] {

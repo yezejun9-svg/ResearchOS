@@ -1,0 +1,605 @@
+--- authorized-before/internal/domain/runtime_provider_binding_windows_test.go
++++ author-attempt3/internal/domain/runtime_provider_binding_windows_test.go
+@@ -4,16 +4,20 @@
+ 
+ import (
+ 	"bytes"
++	"compress/gzip"
+ 	"context"
+ 	"database/sql"
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
++	"math"
+ 	"net/http"
++	"net/url"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+ 	"researchos.local/research-os/internal/store"
++	"sort"
+ 	"strings"
+ 	"sync/atomic"
+ 	"testing"
+@@ -725,11 +729,19 @@
+ 	if err = os.WriteFile(path, input, 0600); err != nil {
+ 		t.Fatal(err)
+ 	}
++	before, err := providerSemanticVector(path, filepath.Join(dir, "semantic-before.json.gz"))
++	if err != nil {
++		t.Fatal("pre-open full semantic vector", err)
++	}
++	preOpen, err := os.ReadFile(path)
++	if err != nil || Digest(preOpen) != Digest(input) {
++		t.Fatal("pre-open exact copy drift", err)
++	}
+ 	db, err := store.Open(path)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	result := Object{"case": spec["case"], "mutation": spec["mutation"], "input_sha256": Digest(input), "mode": "ZERO_MODEL_PUBLIC_ARCHIVE_CONTROL", "http_calls": 0, "model_calls": 0, "worker_starts": 0}
++	result := Object{"case": spec["case"], "mutation": spec["mutation"], "input_sha256": Digest(input), "pre_open_copy_sha256": Digest(preOpen), "semantic_before_hash": Hash(before), "mode": "ZERO_MODEL_PUBLIC_ARCHIVE_CONTROL", "http_calls": 0, "model_calls": 0, "worker_starts": 0}
+ 	t.Cleanup(func() {
+ 		if _, e := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); e != nil {
+ 			t.Error(e)
+@@ -742,6 +754,36 @@
+ 			t.Error(e)
+ 		}
+ 		result["closed_db_sha256"] = Digest(closed)
++		after, semanticErr := providerSemanticVector(path, filepath.Join(dir, "semantic-after.json.gz"))
++		if semanticErr != nil {
++			t.Error("closed full semantic vector", semanticErr)
++			result["semantic_error"] = semanticErr.Error()
++		} else {
++			result["semantic_after_hash"] = Hash(after)
++			result["semantic_equal"] = Hash(before) == Hash(after)
++			changed := []any{}
++			bt, _ := before["tables"].(map[string]any)
++			at, _ := after["tables"].(map[string]any)
++			allowed := map[string]bool{}
++			for _, name := range Arr(spec, "allowed_mutation_tables") {
++				allowed[fmt.Sprint(name)] = true
++			}
++			if Hash(before["schema"]) != Hash(after["schema"]) || len(bt) != len(at) {
++				t.Error("schema/all-table inventory drift")
++			}
++			for name, value := range bt {
++				if Hash(value) != Hash(at[name]) {
++					changed = append(changed, name)
++					if !allowed[name] || spec["mutation"] == "none" {
++						t.Error("unregistered semantic table delta", name)
++					}
++				}
++			}
++			result["changed_tables"] = changed
++			if spec["want_error"] == false && spec["mutation"] == "none" && Hash(before) != Hash(after) {
++				t.Error("positive archive changed semantically")
++			}
++		}
+ 		original, e := os.ReadFile(Str(spec, "input"))
+ 		if e != nil || Digest(original) != spec["input_sha256"] {
+ 			t.Error("source input drift", e)
+@@ -754,6 +796,24 @@
+ 	})
+ 	// Preserve and restore all original triggers, including unrelated ones:
+ 	// acceptance cannot be attributed to a weakened trigger inventory.
++	counts := Object{}
++	for _, capability := range []string{"MODEL", "TOOL"} {
++		var n int64
++		if err = db.QueryRow(`SELECT count(*) FROM (SELECT project,run,effect_key FROM resource_effects WHERE json_extract(body,'$.payload.capability')=? GROUP BY project,run,effect_key)`, capability).Scan(&n); err != nil {
++			t.Fatal(err)
++		}
++		counts[capability] = n
++	}
++	result["original_effect_key_counts"] = counts
++	if expected, ok := spec["original_effect_key_counts"]; ok && Hash(counts) != Hash(expected) {
++		t.Fatal("original key count mismatch", counts, expected)
++	}
++	budgetRows, err := providerCopiedBodies(db, "domain_objects", `kind='BudgetLedgerEntry'`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	result["original_budget_rows"] = budgetRows
++	result["original_budget_rows_hash"] = Hash(budgetRows)
+ 	readTriggers := func() Object {
+ 		rows, e := db.Query(`SELECT name,sql FROM sqlite_master WHERE type='trigger' ORDER BY name`)
+ 		if e != nil {
+@@ -785,6 +845,29 @@
+ 		}
+ 		statements := []string{}
+ 		switch mode {
++		case "disguise-model-as-tool":
++			statements = []string{`UPDATE resource_effects SET effect_key=replace(effect_key,':model:',':tool:99'),body=json_remove(json_set(body,'$.key',replace(effect_key,':model:',':tool:99'),'$.payload.capability','TOOL','$.payload.credential_revision','local-tools-v1'),'$.payload.provider_transport') WHERE json_extract(body,'$.payload.capability')='MODEL'`}
++		case "swap-tool-reservation", "swap-tool-reservation-rehashed":
++			statements = []string{`UPDATE resource_effects SET body=json_set(body,'$.reservation_id',(SELECT json_extract(t.body,'$.reservation_id') FROM resource_effects t WHERE t.project=resource_effects.project AND t.run=resource_effects.run AND json_extract(t.body,'$.payload.capability')='TOOL' ORDER BY t.sequence LIMIT 1)) WHERE json_extract(body,'$.payload.capability')='MODEL' AND EXISTS(SELECT 1 FROM resource_effects t WHERE t.project=resource_effects.project AND t.run=resource_effects.run AND json_extract(t.body,'$.payload.capability')='TOOL')`}
++		case "erase-model-effects":
++			statements = []string{`DELETE FROM resource_effects WHERE json_extract(body,'$.payload.capability')='MODEL'`}
++		case "tool-key":
++			statements = []string{`UPDATE resource_effects SET effect_key=effect_key||'9',body=json_set(body,'$.key',effect_key||'9') WHERE json_extract(body,'$.payload.capability')='TOOL'`}
++		case "tool-epoch":
++			statements = []string{`UPDATE resource_effects SET body=json_set(body,'$.epoch',999) WHERE json_extract(body,'$.payload.capability')='TOOL'`}
++		case "tool-credential":
++			statements = []string{`UPDATE resource_effects SET body=json_set(body,'$.payload.credential_revision','forged') WHERE json_extract(body,'$.payload.capability')='TOOL'`}
++		case "tool-request-hash":
++			statements = []string{`UPDATE resource_effects SET body=json_set(body,'$.request_hash','sha256:forged') WHERE json_extract(body,'$.payload.capability')='TOOL'`}
++		case "tool-cost-event", "tool-cost-time", "tool-cost-basis", "tool-cost-policy", "tool-cost-money":
++			if err = providerMutateToolCost(db, mode); err != nil {
++				t.Fatal("explicit stored cost mutation", err)
++			}
++		case "synthetic-zero-model", "synthetic-zero-disguise", "synthetic-shared-route", "synthetic-duplicate-route", "synthetic-duplicate-bound":
++			result["mode"] = "SYNTHETIC_NOT_PRODUCT"
++			if err = providerSyntheticTypedProfile(db, mode); err != nil {
++				t.Fatal("synthetic typed proof construction", err)
++			}
+ 		case "missing-dispatch-transport":
+ 			statements = []string{`DELETE FROM runtime_dispatches`, `UPDATE resource_effects SET body=json_remove(body,'$.payload.provider_transport') WHERE json_extract(body,'$.payload.capability')='MODEL'`}
+ 		case "double-marker":
+@@ -799,7 +882,7 @@
+ 		case "forged-fixture-deleted-native":
+ 			statements = []string{`INSERT OR IGNORE INTO orchestration_fixtures(project,runtime) SELECT project,runtime FROM runtime_bindings`, `DELETE FROM runtime_dispatches`, `DELETE FROM runtime_bindings`, `DELETE FROM runtime_qualification_runs`, `DELETE FROM runtime_qualification_plans`, `UPDATE resource_effects SET body=json_remove(body,'$.payload.provider_transport')`}
+ 		case "missing-all-run-history":
+-			statements = []string{`DELETE FROM domain_versions WHERE kind='Run'`, `DELETE FROM runtime_dispatches`, `DELETE FROM runtime_bindings`, `UPDATE resource_effects SET body=json_remove(body,'$.payload.provider_transport')`}
++			statements = []string{`DELETE FROM domain_refs WHERE (kind='Run' AND (project,id) IN (SELECT project,run FROM resource_effects)) OR (target_kind='Run' AND (target_project,target_id) IN (SELECT project,run FROM resource_effects))`, `DELETE FROM domain_versions WHERE kind='Run' AND (project,id) IN (SELECT project,run FROM resource_effects)`, `DELETE FROM runtime_dispatches`, `DELETE FROM runtime_bindings`, `UPDATE resource_effects SET body=json_remove(body,'$.payload.provider_transport')`}
+ 		case "cross-run":
+ 			statements = []string{`UPDATE runtime_dispatches SET manifest=json_set(manifest,'$.run_id','foreign-run')`}
+ 		case "foreign-runtime-ref":
+@@ -824,9 +907,23 @@
+ 			t.Fatal("unregistered control mutation", mode)
+ 		}
+ 		result["mutation_statements"] = statements
++		affected := []any{}
+ 		for _, statement := range statements {
+-			if _, err = db.Exec(statement); err != nil {
++			changed, e := db.Exec(statement)
++			if e != nil {
++				err = e
+ 				t.Fatal("explicit corruption setup", err)
++			}
++			n, e := changed.RowsAffected()
++			if e != nil {
++				t.Fatal(e)
++			}
++			affected = append(affected, Object{"statement": statement, "rows": n})
++		}
++		result["mutation_affected_rows"] = affected
++		if mode == "swap-tool-reservation-rehashed" {
++			if err = providerRehashCopiedEffects(db); err != nil {
++				t.Fatal("explicit forged copied request hash", err)
+ 			}
+ 		}
+ 		// Rehash altered dispatches so the semantic provenance guard, rather
+@@ -893,9 +990,136 @@
+ 		if cause := Str(spec, "required_cause"); cause != "" && (!strings.HasSuffix(inventoryErr.Error(), cause) || !strings.HasSuffix(backupErr.Error(), cause)) {
+ 			t.Fatal("wrong causal rejection layer", inventoryErr, backupErr, cause)
+ 		}
+-	} else if inventoryErr != nil || backupErr != nil || len(inventory) == 0 {
+-		t.Fatal("unexpected sealed original rejected/empty", inventoryErr, backupErr, len(inventory))
+-	}
++	} else {
++		want, e := Num(spec, "expected_inventory")
++		if e != nil || inventoryErr != nil || backupErr != nil || int64(len(inventory)) != want || want < 1 {
++			t.Fatal("unexpected sealed original rejected/inventory", inventoryErr, backupErr, len(inventory), want)
++		}
++		for key := range inventory {
++			if !strings.Contains(key, ":model:") {
++				t.Fatal("non-MODEL leaked into inventory", key)
++			}
++		}
++	}
++}
++
++// Full deterministic public logical image, captured through a read-only
++// immutable connection before store.Open and again after its final close.
++// Rows retain SQLite value types and rowid where it is stored authority.
++func providerSemanticVector(path, output string) (Object, error) {
++	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(path)}
++	q := u.Query()
++	q.Set("mode", "ro")
++	q.Set("immutable", "1")
++	u.RawQuery = q.Encode()
++	db, err := sql.Open("sqlite", u.String())
++	if err != nil {
++		return nil, err
++	}
++	defer db.Close()
++	read := func(query string) (Object, error) {
++		rows, e := db.Query(query)
++		if e != nil {
++			return nil, e
++		}
++		defer rows.Close()
++		columns, e := rows.Columns()
++		if e != nil {
++			return nil, e
++		}
++		encoded := []string{}
++		for rows.Next() {
++			values := make([]any, len(columns))
++			args := make([]any, len(columns))
++			for i := range values {
++				args[i] = &values[i]
++			}
++			if e = rows.Scan(args...); e != nil {
++				return nil, e
++			}
++			typed := []any{}
++			for _, value := range values {
++				switch v := value.(type) {
++				case nil:
++					typed = append(typed, []any{"null"})
++				case int64:
++					typed = append(typed, []any{"integer", fmt.Sprint(v)})
++				case float64:
++					typed = append(typed, []any{"real-ieee754", fmt.Sprintf("%016x", math.Float64bits(v))})
++				case string:
++					typed = append(typed, []any{"text", v})
++				case []byte:
++					typed = append(typed, []any{"blob-hex", fmt.Sprintf("%x", v)})
++				default:
++					return nil, fmt.Errorf("unrecorded SQLite value type %T", value)
++				}
++			}
++			encoded = append(encoded, string(Bytes(typed)))
++		}
++		if e = rows.Err(); e != nil {
++			return nil, e
++		}
++		sort.Strings(encoded)
++		return Object{"columns": columns, "row_count": len(encoded), "typed_row_multiset": encoded}, nil
++	}
++	schema, err := read(`SELECT type,name,tbl_name,sql FROM sqlite_schema`)
++	if err != nil {
++		return nil, err
++	}
++	rows, err := db.Query(`SELECT name,coalesce(sql,'') FROM sqlite_schema WHERE type='table' ORDER BY name`)
++	if err != nil {
++		return nil, err
++	}
++	tableSQL := map[string]string{}
++	for rows.Next() {
++		var name, statement string
++		if err = rows.Scan(&name, &statement); err != nil {
++			rows.Close()
++			return nil, err
++		}
++		tableSQL[name] = statement
++	}
++	err = rows.Err()
++	rows.Close()
++	if err != nil {
++		return nil, err
++	}
++	tables := Object{}
++	for name, statement := range tableSQL {
++		quoted := `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
++		projection := "rowid,*"
++		if strings.Contains(strings.ToUpper(statement), "WITHOUT ROWID") || strings.Contains(strings.ToUpper(statement), "CREATE VIRTUAL TABLE") {
++			projection = "*"
++		}
++		data, e := read("SELECT " + projection + " FROM " + quoted)
++		if e != nil {
++			return nil, e
++		}
++		columns, e := read("PRAGMA table_xinfo(" + quoted + ")")
++		if e != nil {
++			return nil, e
++		}
++		tables[name] = Object{"rows": data, "column_metadata": columns}
++	}
++	vector := Object{"format": "researchos.sqlite-public-semantic.v1", "schema": schema, "tables": tables}
++	f, err := os.OpenFile(output, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
++	if err != nil {
++		return nil, err
++	}
++	z := gzip.NewWriter(f)
++	_, err = z.Write(Bytes(vector))
++	ce := z.Close()
++	fe := f.Close()
++	if err != nil {
++		return nil, err
++	}
++	if ce != nil {
++		return nil, ce
++	}
++	if fe != nil {
++		return nil, fe
++	}
++	return vector, nil
+ }
+ 
+ func TestProviderBindingInventorySyntheticProvenance(t *testing.T) {
+@@ -1000,6 +1224,294 @@
+ 	if (e != nil) != wantError || len(inventory) != 0 {
+ 		t.Fatal("unexpected synthetic provenance decision", e, len(inventory))
+ 	}
++}
++
++// These helpers only mutate newly copied, explicitly synthetic/corrupt fixture
++// databases after the harness has saved every original trigger and logical row.
++// They never generate model traffic or manufacture original accepted history.
++func providerCopiedBodies(db *sql.DB, table string, where string) ([]Object, error) {
++	rows, err := db.Query(`SELECT rowid,body FROM ` + table + ` WHERE ` + where + ` ORDER BY rowid`)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	items := []Object{}
++	for rows.Next() {
++		var row int64
++		var raw string
++		if err = rows.Scan(&row, &raw); err != nil {
++			return nil, err
++		}
++		body, e := Decode([]byte(raw))
++		if e != nil {
++			return nil, e
++		}
++		items = append(items, Object{"rowid": row, "body": body})
++	}
++	return items, rows.Err()
++}
++
++func providerCopiedCost(ledger Object) Object {
++	cost := Object{}
++	for _, key := range []string{"policy_id", "run_id", "operation", "money", "provider_request_id", "provider_event_id", "reservation_id", "cost_basis", "occurred_at"} {
++		cost[key] = ledger[key]
++	}
++	return cost
++}
++
++func providerRehashCopiedEffects(db *sql.DB) error {
++	items, err := providerCopiedBodies(db, "resource_effects", "1=1")
++	if err != nil {
++		return err
++	}
++	for _, item := range items {
++		e := item["body"].(map[string]any)
++		var raw string
++		if err = db.QueryRow(`SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND id=?`, e["project_id"], e["reservation_id"]).Scan(&raw); err != nil {
++			return err
++		}
++		ledger, er := Decode([]byte(raw))
++		if er != nil {
++			return er
++		}
++		e["request_hash"] = Hash([]any{e["payload"], providerCopiedCost(ledger)})
++		if _, err = db.Exec(`UPDATE resource_effects SET body=? WHERE rowid=?`, string(Bytes(e)), item["rowid"]); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func providerWriteCopiedLedger(db *sql.DB, ledger Object) error {
++	ledger["receipt_hash"] = Receipt(ledger)
++	for _, table := range []string{"domain_objects", "domain_versions"} {
++		r, err := db.Exec(`UPDATE `+table+` SET body=?,content_hash=? WHERE project=? AND kind='BudgetLedgerEntry' AND id=? AND revision=?`, string(Bytes(ledger)), ledger["receipt_hash"], ledger["project_id"], ledger["id"], ledger["revision"])
++		if err != nil {
++			return err
++		}
++		n, err := r.RowsAffected()
++		if err != nil || n != 1 {
++			return fmt.Errorf("synthetic ledger exact row: %d %v", n, err)
++		}
++	}
++	return nil
++}
++
++func providerMutateToolCost(db *sql.DB, mode string) error {
++	items, err := providerCopiedBodies(db, "domain_objects", `kind='BudgetLedgerEntry' AND id IN (SELECT json_extract(body,'$.reservation_id') FROM resource_effects WHERE json_extract(body,'$.payload.capability')='TOOL')`)
++	if err != nil {
++		return err
++	}
++	if len(items) == 0 {
++		return fmt.Errorf("no original TOOL reservation")
++	}
++	for _, item := range items {
++		ledger := item["body"].(map[string]any)
++		switch mode {
++		case "tool-cost-event":
++			ledger["provider_event_id"] = "forged/" + Str(ledger, "provider_request_id")
++		case "tool-cost-time":
++			ledger["occurred_at"] = "2026-01-01T00:00:00Z"
++		case "tool-cost-basis":
++			ledger["cost_basis"] = "ACTUAL"
++		case "tool-cost-policy":
++			ledger["policy_id"] = "forged-policy"
++		case "tool-cost-money":
++			ledger["money"] = Object{"currency": "USD", "amount": "99"}
++		default:
++			return fmt.Errorf("unknown copied cost mutation")
++		}
++		if err = providerWriteCopiedLedger(db, ledger); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func providerSyntheticTypedProfile(db *sql.DB, mode string) error {
++	// This is a counterfactual schema-valid copy of the one-PREPARED archive,
++	// not a qualification or an assertion that the modified history occurred.
++	var project, runtime, rawRef string
++	if err := db.QueryRow(`SELECT project,runtime,profile_ref FROM runtime_bindings`).Scan(&project, &runtime, &rawRef); err != nil {
++		return err
++	}
++	ref, err := Decode([]byte(rawRef))
++	if err != nil {
++		return err
++	}
++	var artifactRaw string
++	if err = db.QueryRow(`SELECT body FROM domain_objects WHERE project=? AND kind='Artifact' AND id=?`, project, ref["id"]).Scan(&artifactRaw); err != nil {
++		return err
++	}
++	artifact, err := Decode([]byte(artifactRaw))
++	if err != nil {
++		return err
++	}
++	var content []byte
++	if err = db.QueryRow(`SELECT bytes FROM uploaded_content WHERE storage_key=?`, artifact["storage_key"]).Scan(&content); err != nil {
++		return err
++	}
++	profile, err := Decode(content)
++	if err != nil {
++		return err
++	}
++	routes := Arr(profile, "effect_routes")
++	var model Object
++	for _, value := range routes {
++		r := value.(map[string]any)
++		if r["capability"] == "MODEL" {
++			if model != nil {
++				return fmt.Errorf("synthetic base MODEL tuple ambiguous")
++			}
++			model = r
++		}
++	}
++	if model == nil {
++		return fmt.Errorf("synthetic base MODEL route absent")
++	}
++	zero := mode == "synthetic-zero-model" || mode == "synthetic-zero-disguise"
++	if zero {
++		bound := model["upper_bound"].(map[string]any)
++		bound["amount"] = "0"
++	}
++	if mode == "synthetic-shared-route" {
++		routes = append(routes, Object{"id": model["id"], "capability": "TOOL", "credential_revision": "synthetic-tool", "upper_bound": model["upper_bound"]})
++	}
++	if mode == "synthetic-duplicate-route" || mode == "synthetic-duplicate-bound" {
++		duplicate, e := Decode(Bytes(model))
++		if e != nil {
++			return e
++		}
++		if mode == "synthetic-duplicate-bound" {
++			duplicate["upper_bound"].(map[string]any)["amount"] = "7"
++		}
++		routes = append(routes, duplicate)
++	}
++	profile["effect_routes"] = routes
++	oldContentHash := Str(ref, "content_hash")
++	newContentHash := Digest(Bytes(profile))
++	ref["content_hash"] = newContentHash
++	// Exact digest substitution updates only the synthetic profile asset and
++	// its VersionRefs. All ordinary task/run/budget identities remain fixed.
++	for _, table := range []string{"domain_objects", "domain_versions"} {
++		items, e := providerCopiedBodies(db, table, "1=1")
++		if e != nil {
++			return e
++		}
++		for _, item := range items {
++			body := item["body"].(map[string]any)
++			before := string(Bytes(body))
++			changed := strings.ReplaceAll(before, oldContentHash, newContentHash)
++			if changed == before {
++				continue
++			}
++			if _, e = db.Exec(`UPDATE `+table+` SET body=?,content_hash=CASE WHEN content_hash=? THEN ? ELSE content_hash END WHERE rowid=?`, changed, oldContentHash, newContentHash, item["rowid"]); e != nil {
++				return e
++			}
++		}
++	}
++	if _, err = db.Exec(`UPDATE uploaded_content SET bytes=?,content_hash=? WHERE storage_key=?`, Bytes(profile), newContentHash, artifact["storage_key"]); err != nil {
++		return err
++	}
++	if _, err = db.Exec(`UPDATE runtime_bindings SET profile_ref=?,profile_hash=? WHERE project=? AND runtime=?`, string(Bytes(ref)), Hash(ref), project, runtime); err != nil {
++		return err
++	}
++	var taskID, planRaw string
++	if err = db.QueryRow(`SELECT task,plan FROM runtime_qualification_plans WHERE project=? AND runtime=?`, project, runtime).Scan(&taskID, &planRaw); err != nil {
++		return err
++	}
++	plan, err := Decode([]byte(planRaw))
++	if err != nil {
++		return err
++	}
++	var taskRaw string
++	if err = db.QueryRow(`SELECT body FROM domain_objects WHERE project=? AND kind='Task' AND id=?`, project, taskID).Scan(&taskRaw); err != nil {
++		return err
++	}
++	task, err := Decode([]byte(taskRaw))
++	if err != nil {
++		return err
++	}
++	plan["profile_ref"], plan["task_hash"] = ref, qualificationTaskHash(task)
++	if _, err = db.Exec(`UPDATE runtime_qualification_plans SET plan=?,plan_hash=? WHERE project=? AND task=?`, string(Bytes(plan)), Hash(plan), project, taskID); err != nil {
++		return err
++	}
++	var dispatchRaw, runID string
++	var epoch int64
++	if err = db.QueryRow(`SELECT run,epoch,manifest FROM runtime_dispatches WHERE project=?`, project).Scan(&runID, &epoch, &dispatchRaw); err != nil {
++		return err
++	}
++	m, err := Decode([]byte(dispatchRaw))
++	if err != nil {
++		return err
++	}
++	m, err = Decode([]byte(strings.ReplaceAll(string(Bytes(m)), oldContentHash, newContentHash)))
++	if err != nil {
++		return err
++	}
++	a := m["admission"].(map[string]any)
++	a["profile"], a["profile_ref"], a["profile_hash"] = profile, ref, Hash(ref)
++	if permission, ok := a["permission"].(map[string]any); ok {
++		permission["plan_hash"] = Hash(plan)
++	}
++	if _, err = db.Exec(`UPDATE runtime_qualification_runs SET plan_hash=?,profile_hash=?,input_hash=? WHERE project=? AND task=?`, Hash(plan), Hash(ref), Hash(m["input_refs"]), project, taskID); err != nil {
++		return err
++	}
++	if _, err = db.Exec(`UPDATE runtime_dispatches SET manifest=?,manifest_hash=? WHERE project=? AND run=? AND epoch=?`, string(Bytes(m)), Hash(m), project, runID, epoch); err != nil {
++		return err
++	}
++	if zero {
++		items, e := providerCopiedBodies(db, "domain_objects", `kind='BudgetLedgerEntry' AND json_extract(body,'$.operation')='RESERVE' AND instr(json_extract(body,'$.provider_request_id'),':model:')>0 AND substr(json_extract(body,'$.provider_event_id'),1,8)='prepare/'`)
++		if e != nil {
++			return e
++		}
++		if len(items) != 1 {
++			return fmt.Errorf("synthetic PREPARED expected one MODEL reserve")
++		}
++		ledger := items[0]["body"].(map[string]any)
++		ledger["money"] = model["upper_bound"]
++		if err = providerWriteCopiedLedger(db, ledger); err != nil {
++			return err
++		}
++	}
++	items, err := providerCopiedBodies(db, "resource_effects", "1=1")
++	if err != nil {
++		return err
++	}
++	if len(items) != 1 {
++		return fmt.Errorf("synthetic requires one PREPARED, no observations")
++	}
++	effect := items[0]["body"].(map[string]any)
++	tx, err := db.Begin()
++	if err != nil {
++		return err
++	}
++	run, e := providerOriginalRun(tx, project, runID, effect)
++	var dispatch, transport Object
++	if e == nil {
++		dispatch, e = runtimeDispatch(tx, project, runID, epoch)
++	}
++	if e == nil {
++		transport, e = providerTransport(tx, project, run, dispatch)
++	}
++	rollbackErr := tx.Rollback()
++	if e != nil {
++		return e
++	}
++	if rollbackErr != nil {
++		return rollbackErr
++	}
++	effect["payload"].(map[string]any)["provider_transport"] = transport
++	if _, err = db.Exec(`UPDATE resource_effects SET body=? WHERE rowid=?`, string(Bytes(effect)), items[0]["rowid"]); err != nil {
++		return err
++	}
++	if err = providerRehashCopiedEffects(db); err != nil {
++		return err
++	}
++	if mode == "synthetic-zero-disguise" {
++		_, err = db.Exec(`UPDATE resource_effects SET effect_key=replace(effect_key,':model:',':tool:'),body=json_remove(json_set(body,'$.key',replace(effect_key,':model:',':tool:'),'$.payload.capability','TOOL','$.payload.credential_revision','synthetic-tool'),'$.payload.provider_transport')`)
++	}
++	return err
+ }
+ 
+ func TestProviderBindingOriginalEpochCausalControl(t *testing.T) {

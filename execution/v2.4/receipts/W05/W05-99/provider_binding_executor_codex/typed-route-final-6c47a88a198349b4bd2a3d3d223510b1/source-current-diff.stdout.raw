@@ -1,0 +1,1425 @@
+diff --git a/internal/domain/runtime_model_verification.go b/internal/domain/runtime_model_verification.go
+index 08570830..6e59f60a 100644
+--- a/internal/domain/runtime_model_verification.go
++++ b/internal/domain/runtime_model_verification.go
+@@ -125,21 +125,292 @@ func providerTransport(tx *sql.Tx, project string, run, dispatch Object) (Object
+ 	return Object{"version": "researchos.provider-transport.v1", "provider_policy": runtimeProviderPolicy, "endpoint": config["endpoint"], "user_agent": "ResearchOS/2.4", "session_header": "x-opencode-session", "session_value": value, "affinity_scope": scope, "authority": authority}, nil
+ }
+ 
+-// Inventory is indexed by original dispatch admission, including effects with
+-// zero observations or a removed/changed request policy marker.
++// Resolve the effect's historical Run identity, not the current Run after a
++// lease takeover or runtime replacement. Status-only revisions may repeat it.
++func providerOriginalRun(tx *sql.Tx, project, runID string, effect Object) (Object, error) {
++	epoch, err := Num(effect, "epoch")
++	if err != nil || epoch < 1 {
++		return nil, historyInvalid("provider original Run epoch invalid")
++	}
++	rows, err := tx.Query(`SELECT body FROM domain_versions WHERE project=? AND kind='Run' AND id=? AND json_extract(body,'$.lease_epoch')=? ORDER BY revision`, project, runID, epoch)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	var original Object
++	for rows.Next() {
++		var raw string
++		if err = rows.Scan(&raw); err != nil {
++			return nil, err
++		}
++		run, e := Decode([]byte(raw))
++		if e != nil || run["project_id"] != project || run["id"] != runID || run["task_id"] != effect["task_id"] || Str(run, "runtime_id") == "" || Hash(run["lease_epoch"]) != Hash(effect["epoch"]) {
++			return nil, historyInvalid("provider original Run identity")
++		}
++		if original != nil {
++			for _, key := range []string{"task_id", "runtime_id", "created_at", "executor_principal_id"} {
++				if Hash(original[key]) != Hash(run[key]) {
++					return nil, historyInvalid("provider ambiguous original Run epoch")
++				}
++			}
++		} else {
++			original = run
++		}
++	}
++	if err = rows.Err(); err != nil {
++		return nil, err
++	}
++	if original == nil {
++		return nil, historyInvalid("provider original Run epoch unavailable")
++	}
++	return original, nil
++}
++
++// A binding is independently keyed by the original Run's runtime. Its absence
++// is not proof of legacy: callers still require positive original admission.
++// These tables prevent UPDATE, not DELETE; every required link is checked.
++func providerOriginalProfile(tx *sql.Tx, project string, run Object) (Object, Object, string, error) {
++	var raw, digest, technical string
++	err := tx.QueryRow(`SELECT profile_ref,profile_hash,technical_hash FROM runtime_bindings WHERE project=? AND runtime=?`, project, run["runtime_id"]).Scan(&raw, &digest, &technical)
++	if err == sql.ErrNoRows {
++		return nil, nil, "", nil
++	}
++	if err != nil {
++		return nil, nil, "", err
++	}
++	ref, err := Decode([]byte(raw))
++	if err != nil || ref["entity_type"] != "Artifact" || Hash(ref) != digest {
++		return nil, nil, "", historyInvalid("provider frozen binding reference")
++	}
++	artifact, err := version(tx, project, ref)
++	if err != nil {
++		return nil, nil, "", err
++	}
++	profile, err := runtimeProfileBody(tx, project, artifact)
++	if err != nil {
++		return nil, nil, "", err
++	}
++	if profile["runtime_id"] != run["runtime_id"] || profile["technical_hash"] != technical || artifact["project_id"] != project || artifact["id"] != ref["id"] || Hash(artifact["revision"]) != Hash(ref["revision"]) {
++		return nil, nil, "", historyInvalid("provider frozen binding identity")
++	}
++	return ref, profile, technical, nil
++}
++
++// Follow the original persisted relationship revision, never today's head.
++func providerHistoricalRelation(tx *sql.Tx, project, kind string, owner Object, field, targetKind, targetID string) (Object, error) {
++	revision, err := Num(owner, "revision")
++	if err != nil {
++		return nil, historyInvalid("provider historical relation owner")
++	}
++	rows, err := tx.Query(`SELECT r.target_project,r.target_kind,r.target_id,r.target_revision,v.body FROM domain_refs r JOIN domain_versions v ON v.project=r.target_project AND v.kind=r.target_kind AND v.id=r.target_id AND v.revision=r.target_revision WHERE r.project=? AND r.kind=? AND r.id=? AND r.revision=? AND r.field=?`, project, kind, owner["id"], revision, field)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	var result Object
++	for rows.Next() {
++		var p, k, id, raw string
++		var rev int64
++		if err = rows.Scan(&p, &k, &id, &rev, &raw); err != nil {
++			return nil, err
++		}
++		v, e := Decode([]byte(raw))
++		allowedProject := p == project || (p == "" && targetKind == "BudgetPolicy")
++		if e != nil || result != nil || !allowedProject || k != targetKind || id != targetID || Str(v, "project_id") != p || v["id"] != id || Hash(v["revision"]) != Hash(rev) {
++			return nil, historyInvalid("provider historical relation identity")
++		}
++		result = v
++	}
++	if err = rows.Err(); err != nil {
++		return nil, err
++	}
++	if result == nil {
++		return nil, historyInvalid("provider historical relation missing")
++	}
++	return result, nil
++}
++
++func providerOriginalReservation(tx *sql.Tx, project string, run Object, id string) (Object, error) {
++	var raw, digest, historicalRaw, historicalDigest string
++	var revision, immutable int64
++	err := tx.QueryRow(`SELECT o.body,o.revision,o.content_hash,o.immutable,v.body,v.content_hash FROM domain_objects o JOIN domain_versions v ON v.project=o.project AND v.kind=o.kind AND v.id=o.id AND v.revision=o.revision WHERE o.project=? AND o.kind='BudgetLedgerEntry' AND o.id=?`, project, id).Scan(&raw, &revision, &digest, &immutable, &historicalRaw, &historicalDigest)
++	if err != nil {
++		return nil, historyInvalid("provider original reservation unavailable")
++	}
++	ledger, err := Decode([]byte(raw))
++	historical, he := Decode([]byte(historicalRaw))
++	if err != nil || he != nil || immutable != 1 || revision != 1 || ledger["project_id"] != project || ledger["id"] != id || Hash(ledger["revision"]) != Hash(revision) || ledger["receipt_hash"] != digest || Receipt(ledger) != digest || historicalDigest != digest || Hash(historical) != Hash(ledger) {
++		return nil, historyInvalid("provider original reservation immutable identity")
++	}
++	boundRun, err := providerHistoricalRelation(tx, project, "BudgetLedgerEntry", ledger, "/run_id", "Run", Str(run, "id"))
++	if err != nil {
++		return nil, err
++	}
++	for _, field := range []string{"id", "task_id", "runtime_id", "lease_epoch", "created_at", "executor_principal_id"} {
++		if Hash(boundRun[field]) != Hash(run[field]) {
++			return nil, historyInvalid("provider reservation original Run")
++		}
++	}
++	task, err := providerHistoricalRelation(tx, project, "Run", boundRun, "/task_id", "Task", Str(run, "task_id"))
++	if err != nil {
++		return nil, err
++	}
++	goal, err := providerHistoricalRelation(tx, project, "Task", task, "/goal_id", "Goal", Str(task, "goal_id"))
++	if err != nil {
++		return nil, err
++	}
++	if ledger["policy_id"] != goal["budget_policy_id"] || ledger["run_id"] != run["id"] {
++		return nil, historyInvalid("provider reservation original budget policy")
++	}
++	if _, err = providerHistoricalRelation(tx, project, "Goal", goal, "/budget_policy_id", "BudgetPolicy", Str(ledger, "policy_id")); err != nil {
++		return nil, err
++	}
++	if _, err = providerHistoricalRelation(tx, project, "BudgetLedgerEntry", ledger, "/policy_id", "BudgetPolicy", Str(ledger, "policy_id")); err != nil {
++		return nil, err
++	}
++	return ledger, nil
++}
++
++// Every original MODEL reservation must still have its own PREPARED chain.
++// This also finds erased/aliased effects when no request marker survives.
++func providerReconcileReservations(tx *sql.Tx, project, runID string, prepared map[string][]Object) error {
++	rows, err := tx.Query(`SELECT project,id,body FROM domain_objects WHERE kind='BudgetLedgerEntry' AND (?='' OR project=?) AND (?='' OR json_extract(body,'$.run_id')=?) AND json_extract(body,'$.operation')='RESERVE' AND instr(json_extract(body,'$.provider_request_id'),':model:')>0 AND substr(json_extract(body,'$.provider_event_id'),1,8)='prepare/'`, project, project, runID, runID)
++	if err != nil {
++		return err
++	}
++	items := []Object{}
++	for rows.Next() {
++		var p, id, raw string
++		if err = rows.Scan(&p, &id, &raw); err != nil {
++			rows.Close()
++			return err
++		}
++		v, e := Decode([]byte(raw))
++		if e != nil || v["project_id"] != p || v["id"] != id {
++			rows.Close()
++			return historyInvalid("provider original MODEL reservation identity")
++		}
++		items = append(items, v)
++	}
++	err = rows.Err()
++	rows.Close()
++	if err != nil {
++		return err
++	}
++	for _, ledger := range items {
++		p, r, key := Str(ledger, "project_id"), Str(ledger, "run_id"), Str(ledger, "provider_request_id")
++		parts := strings.Split(key, ":")
++		var epoch, ordinal int64
++		if len(parts) != 5 || parts[1] != r || parts[3] != "model" {
++			return historyInvalid("provider original MODEL reservation key")
++		}
++		if _, err = fmt.Sscan(parts[2], &epoch); err != nil || epoch < 1 || parts[2] != fmt.Sprint(epoch) {
++			return historyInvalid("provider original MODEL reservation epoch")
++		}
++		if _, err = fmt.Sscan(parts[4], &ordinal); err != nil || ordinal < 1 || parts[4] != fmt.Sprint(ordinal) {
++			return historyInvalid("provider original MODEL reservation ordinal")
++		}
++		run, e := providerOriginalRun(tx, p, r, Object{"task_id": parts[0], "epoch": epoch})
++		if e != nil {
++			return e
++		}
++		_, profile, _, e := providerOriginalProfile(tx, p, run)
++		if e != nil {
++			return e
++		}
++		config, _ := profile["model_config"].(map[string]any)
++		policy, e := providerPolicy(config)
++		if e != nil {
++			return e
++		}
++		if !policy {
++			// Individual effects still need positive nonpolicy admission.
++			// Missing bindings cannot justify an erased original MODEL hold.
++			if profile == nil {
++				return historyInvalid("provider original MODEL reservation provenance")
++			}
++			continue
++		}
++		if _, e = providerOriginalReservation(tx, p, run, Str(ledger, "id")); e != nil {
++			return e
++		}
++		facts := prepared[p+"/"+r+"/"+key]
++		if len(facts) != 1 || facts[0]["state"] != "PREPARED" || facts[0]["reservation_id"] != ledger["id"] {
++			return historyInvalid("provider unmatched original MODEL reservation")
++		}
++	}
++	return nil
++}
++
++func providerTypedEffectProof(tx *sql.Tx, project string, run, profile, effect Object) (string, error) {
++	ledger, err := providerOriginalReservation(tx, project, run, Str(effect, "reservation_id"))
++	if err != nil {
++		return "", err
++	}
++	key := Str(effect, "key")
++	if ledger["provider_request_id"] != key {
++		return "", historyInvalid("provider reservation original effect key")
++	}
++	request, _ := effect["payload"].(map[string]any)
++	capability := Str(request, "capability")
++	if capability != "MODEL" && capability != "TOOL" {
++		return "", historyInvalid("provider original typed capability")
++	}
++	prefix := fmt.Sprintf("%s:%s:%v:%s:", run["task_id"], run["id"], run["lease_epoch"], strings.ToLower(capability))
++	var ordinal int64
++	if !strings.HasPrefix(key, prefix) {
++		return "", historyInvalid("provider original typed key")
++	}
++	if _, err = fmt.Sscan(strings.TrimPrefix(key, prefix), &ordinal); err != nil || ordinal < 1 || key != prefix+fmt.Sprint(ordinal) {
++		return "", historyInvalid("provider original typed ordinal")
++	}
++	found := 0
++	var bound any
++	for _, v := range Arr(profile, "effect_routes") {
++		route, _ := v.(map[string]any)
++		if route["id"] == request["route"] && route["capability"] == capability && route["credential_revision"] == request["credential_revision"] {
++			found++
++			bound = route["upper_bound"]
++		}
++	}
++	if found != 1 || bound == nil {
++		return "", historyInvalid("provider ambiguous original typed route")
++	}
++	cost := Object{}
++	for _, field := range []string{"policy_id", "run_id", "operation", "money", "provider_request_id", "provider_event_id", "reservation_id", "cost_basis", "occurred_at"} {
++		v, ok := ledger[field]
++		if !ok {
++			return "", historyInvalid("provider original cost field missing")
++		}
++		cost[field] = v
++	}
++	if cost["operation"] != "RESERVE" || cost["cost_basis"] != "UPPER_BOUND" || cost["provider_event_id"] != "prepare/"+key || cost["reservation_id"] != nil || cost["occurred_at"] != run["created_at"] || Hash(cost["money"]) != Hash(bound) || effect["request_hash"] != Hash([]any{request, cost}) {
++		return "", historyInvalid("provider original request and complete cost")
++	}
++	if capability == "TOOL" && (!modelExactKeys(request, "route", "capability", "credential_revision", "payload") || request["provider_transport"] != nil) {
++		return "", historyInvalid("provider original TOOL request")
++	}
++	return capability, nil
++}
++
++// Every original MODEL is classified before examining removable transport or
++// dispatch markers. Successful empty inventory requires proven nonpolicy.
+ func validateProviderInventory(tx *sql.Tx, project, runID string) (map[string]Object, error) {
+-	rows, err := tx.Query(`SELECT project,run,body FROM resource_effects WHERE (?='' OR project=?) AND (?='' OR run=?) ORDER BY project,run,effect_key,sequence`, project, project, runID, runID)
++	rows, err := tx.Query(`SELECT project,run,effect_key,sequence,body FROM resource_effects WHERE (?='' OR project=?) AND (?='' OR run=?) ORDER BY project,run,effect_key,sequence`, project, project, runID, runID)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	type record struct {
+-		project, run string
+-		body         Object
++		project, run, key string
++		sequence          int64
++		body              Object
+ 	}
+ 	all := []record{}
++	prepared := map[string][]Object{}
+ 	for rows.Next() {
+-		var p, r, raw string
+-		if err = rows.Scan(&p, &r, &raw); err != nil {
++		var p, r, key, raw string
++		var seq int64
++		if err = rows.Scan(&p, &r, &key, &seq, &raw); err != nil {
+ 			rows.Close()
+ 			return nil, err
+ 		}
+@@ -148,97 +419,121 @@ func validateProviderInventory(tx *sql.Tx, project, runID string) (map[string]Ob
+ 			rows.Close()
+ 			return nil, e
+ 		}
+-		all = append(all, record{p, r, v})
++		if v["project_id"] != p || v["run_id"] != r || v["key"] != key || Hash(v["sequence"]) != Hash(seq) || seq < 1 {
++			rows.Close()
++			return nil, historyInvalid("provider effect SQL identity")
++		}
++		if seq == 1 {
++			group := p + "/" + r + "/" + key
++			prepared[group] = append(prepared[group], v)
++		}
++		all = append(all, record{p, r, key, seq, v})
+ 	}
+ 	err = rows.Err()
+ 	rows.Close()
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if err = providerReconcileReservations(tx, project, runID, prepared); err != nil {
++		return nil, err
++	}
+ 	transports := map[string]Object{}
+ 	originals := map[string]Object{}
+ 	sequences := map[string]int64{}
+ 	for _, record := range all {
+ 		e := record.body
+-		var manifestRaw string
+-		err := tx.QueryRow(`SELECT manifest FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, record.project, record.run, e["epoch"]).Scan(&manifestRaw)
+-		if err == sql.ErrNoRows {
+-			request, _ := e["payload"].(map[string]any)
+-			if request["provider_transport"] != nil {
+-				return nil, historyInvalid("provider dispatch missing")
+-			}
+-			continue
++		if e["project_id"] != record.project || e["run_id"] != record.run || e["key"] != record.key || Hash(e["sequence"]) != Hash(record.sequence) || record.sequence < 1 {
++			return nil, historyInvalid("provider effect SQL identity")
+ 		}
++		run, err := providerOriginalRun(tx, record.project, record.run, e)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		manifest, err := Decode([]byte(manifestRaw))
++		ref, frozen, technical, err := providerOriginalProfile(tx, record.project, run)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		admission, _ := manifest["admission"].(map[string]any)
+-		profile, _ := admission["profile"].(map[string]any)
+-		model, _ := profile["model_config"].(map[string]any)
+-		// The sealed version is the policy authority. Removing the marker from
+-		// the dispatch copy must not exclude that dispatch from this inventory.
+-		if ref, ok := admission["profile_ref"].(map[string]any); ok {
+-			artifact, e := version(tx, record.project, ref)
+-			if e != nil {
+-				return nil, e
+-			}
+-			frozen, e := runtimeProfileBody(tx, record.project, artifact)
+-			if e != nil {
+-				return nil, e
+-			}
+-			frozenConfig, _ := frozen["model_config"].(map[string]any)
+-			frozenPolicy, e := providerPolicy(frozenConfig)
+-			if e != nil {
+-				return nil, e
+-			}
+-			if frozenPolicy && Hash(frozen) != Hash(profile) {
+-				return nil, historyInvalid("provider admission removed frozen policy")
+-			}
+-			if frozenPolicy {
+-				model = frozenConfig
+-			}
+-		}
+-		isPolicy, err := providerPolicy(model)
++		config, _ := frozen["model_config"].(map[string]any)
++		policy, err := providerPolicy(config)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		if !isPolicy {
+-			request, _ := e["payload"].(map[string]any)
+-			if request["provider_transport"] != nil {
+-				return nil, historyInvalid("provider transport without original policy")
+-			}
++		request, _ := e["payload"].(map[string]any)
++		key := record.key
++		modelKey := fmt.Sprintf("%s:%s:%v:model:", run["task_id"], record.run, run["lease_epoch"])
++		modelEffect := request["capability"] == "MODEL" || strings.HasPrefix(key, modelKey) || request["provider_transport"] != nil
++		// On a policy Run even a claimed TOOL needs original reservation
++		// proof. Route IDs are intentionally shared across capabilities.
++		if !modelEffect && !policy {
+ 			continue
+ 		}
+ 		d, err := runtimeDispatch(tx, record.project, record.run, e["epoch"])
++		if err == sql.ErrNoRows {
++			// Old generic fixture claims stored no RuntimeRegistration ref.
++			// A later fixture flag/current registration cannot supply that
++			// missing temporal proof. Keep this compatibility gap explicit.
++			return nil, historyInvalid("provider original MODEL dispatch or legacy provenance unavailable")
++		}
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		m, _ := d["manifest"].(map[string]any)
+ 		a, _ := m["admission"].(map[string]any)
+ 		p, _ := a["profile"].(map[string]any)
+-		config, _ := p["model_config"].(map[string]any)
+-		policy, err := providerPolicy(config)
++		runtimeRef, ok := a["runtime_ref"].(map[string]any)
++		if !ok || runtimeRef["entity_type"] != "RuntimeRegistration" || runtimeRef["id"] != run["runtime_id"] || m["task_id"] != run["task_id"] || m["runtime_id"] != run["runtime_id"] || m["executor_principal_id"] != run["executor_principal_id"] || ref == nil || Hash(a["profile_ref"]) != Hash(ref) || a["profile_hash"] != Hash(ref) || Hash(p) != Hash(frozen) || a["technical_hash"] != technical {
++			return nil, historyInvalid("provider original admission provenance")
++		}
++		runtime, err := version(tx, record.project, runtimeRef)
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		if runtime["project_id"] != record.project || runtime["id"] != run["runtime_id"] || Hash(Ref(runtime, "RuntimeRegistration")) != Hash(runtimeRef) || runtimeTechnicalHash(runtime) != technical || a["mode"] != runtime["measurement_mode"] {
++			return nil, historyInvalid("provider original runtime revision")
++		}
+ 		if !policy {
++			if request["provider_transport"] != nil {
++				return nil, historyInvalid("provider transport without original policy")
++			}
+ 			continue
+ 		}
+-		request, _ := e["payload"].(map[string]any)
+-		// All ordinary non-model effects remain under their existing gates.
+-		key := Str(e, "key")
+-		modelKey := fmt.Sprintf("%s:%s:%v:model:", m["task_id"], record.run, m["epoch"])
+-		if request["capability"] != "MODEL" && !strings.HasPrefix(key, modelKey) {
+-			continue
++		capability, err := providerTypedEffectProof(tx, record.project, run, p, e)
++		if err != nil {
++			return nil, err
+ 		}
+-		run, err := load(tx, record.project, "Run", record.run)
++		seq, err := Num(e, "sequence")
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		group := record.project + "/" + record.run + "/" + key
++		if seq != sequences[group]+1 || e["project_id"] != record.project || e["run_id"] != record.run || e["task_id"] != m["task_id"] || Hash(e["epoch"]) != Hash(m["epoch"]) {
++			return nil, historyInvalid("provider effect sequence or identity")
++		}
++		sequences[group] = seq
++		if seq == 1 {
++			if e["state"] != "PREPARED" {
++				return nil, historyInvalid("provider missing PREPARED")
++			}
++			originals[group] = e
++		} else {
++			old := originals[group]
++			if old == nil || Hash(old["payload"]) != Hash(request) || old["request_hash"] != e["request_hash"] || old["reservation_id"] != e["reservation_id"] {
++				return nil, historyInvalid("provider history rebound")
++			}
++		}
++		if capability == "TOOL" {
++			if e["state"] != "PREPARED" && e["state"] != "STARTED" && e["state"] != "UNKNOWN" && e["state"] != "NOT_APPLIED" && e["state"] != "CONFIRMED" {
++				return nil, historyInvalid("provider invalid effect state")
++			}
++			continue
++		}
++		var ordinal int64
++		if !strings.HasPrefix(key, modelKey) {
++			return nil, historyInvalid("provider original MODEL key")
++		}
++		if _, err = fmt.Sscan(strings.TrimPrefix(key, modelKey), &ordinal); err != nil || ordinal < 1 || key != modelKey+fmt.Sprint(ordinal) {
++			return nil, historyInvalid("provider original MODEL ordinal")
++		}
+ 		transport, err := providerTransport(tx, record.project, run, d)
+ 		if err != nil {
+ 			return nil, err
+@@ -270,26 +565,6 @@ func validateProviderInventory(tx *sql.Tx, project, runID string) (map[string]Ob
+ 		if e["request_hash"] != Hash([]any{request, cost}) || ledger["run_id"] != record.run || ledger["provider_request_id"] != key || ledger["operation"] != "RESERVE" || ledger["cost_basis"] != "UPPER_BOUND" || Hash(ledger["money"]) != Hash(bound) {
+ 			return nil, historyInvalid("provider original request and budget hash")
+ 		}
+-		seq, err := Num(e, "sequence")
+-		if err != nil {
+-			return nil, err
+-		}
+-		group := record.project + "/" + record.run + "/" + key
+-		if seq != sequences[group]+1 || e["project_id"] != record.project || e["run_id"] != record.run || e["task_id"] != m["task_id"] || Hash(e["epoch"]) != Hash(m["epoch"]) {
+-			return nil, historyInvalid("provider effect sequence or identity")
+-		}
+-		sequences[group] = seq
+-		if seq == 1 {
+-			if e["state"] != "PREPARED" {
+-				return nil, historyInvalid("provider missing PREPARED")
+-			}
+-			originals[group] = e
+-		} else {
+-			old := originals[group]
+-			if old == nil || Hash(old["payload"]) != Hash(request) || old["request_hash"] != e["request_hash"] || old["reservation_id"] != e["reservation_id"] {
+-				return nil, historyInvalid("provider history rebound")
+-			}
+-		}
+ 		transports[key] = transport
+ 		switch e["state"] {
+ 		case "PREPARED", "STARTED", "UNKNOWN", "NOT_APPLIED":
+diff --git a/internal/domain/runtime_provider_binding_windows_test.go b/internal/domain/runtime_provider_binding_windows_test.go
+index cd915599..21456ad3 100644
+--- a/internal/domain/runtime_provider_binding_windows_test.go
++++ b/internal/domain/runtime_provider_binding_windows_test.go
+@@ -4,16 +4,20 @@ package domain
+ 
+ import (
+ 	"bytes"
++	"compress/gzip"
+ 	"context"
+ 	"database/sql"
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
++	"math"
+ 	"net/http"
++	"net/url"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+ 	"researchos.local/research-os/internal/store"
++	"sort"
+ 	"strings"
+ 	"sync/atomic"
+ 	"testing"
+@@ -700,3 +704,895 @@ func TestProviderBindingArchivedOriginalCorruptions(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// One process executes exactly one explicitly supplied, hashed public archive
++// control. The driver stops on its first unexpected result. This never calls a
++// coordinator, native worker, qualification helper or HTTP client/server.
++func TestProviderBindingInventoryCausalControl(t *testing.T) {
++	raw, err := os.ReadFile(os.Getenv("RESEARCHOS_PROVIDER_CAUSAL_CASE"))
++	if err != nil {
++		t.Fatal("explicit zero-model control specification required", err)
++	}
++	spec, err := Decode(raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	input, err := os.ReadFile(Str(spec, "input"))
++	if err != nil || Digest(input) != spec["input_sha256"] {
++		t.Fatal("sealed public input mismatch", err)
++	}
++	dir := Str(spec, "output")
++	if err = os.Mkdir(dir, 0700); err != nil {
++		t.Fatal("new immutable case directory required", err)
++	}
++	path := filepath.Join(dir, "case.sqlite")
++	if err = os.WriteFile(path, input, 0600); err != nil {
++		t.Fatal(err)
++	}
++	before, err := providerSemanticVector(path, filepath.Join(dir, "semantic-before.json.gz"))
++	if err != nil {
++		t.Fatal("pre-open full semantic vector", err)
++	}
++	preOpen, err := os.ReadFile(path)
++	if err != nil || Digest(preOpen) != Digest(input) {
++		t.Fatal("pre-open exact copy drift", err)
++	}
++	db, err := store.Open(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	result := Object{"case": spec["case"], "mutation": spec["mutation"], "input_sha256": Digest(input), "pre_open_copy_sha256": Digest(preOpen), "semantic_before_hash": Hash(before), "mode": "ZERO_MODEL_PUBLIC_ARCHIVE_CONTROL", "http_calls": 0, "model_calls": 0, "worker_starts": 0}
++	t.Cleanup(func() {
++		if _, e := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); e != nil {
++			t.Error(e)
++		}
++		if e := db.Close(); e != nil {
++			t.Error(e)
++		}
++		closed, e := os.ReadFile(path)
++		if e != nil {
++			t.Error(e)
++		}
++		result["closed_db_sha256"] = Digest(closed)
++		after, semanticErr := providerSemanticVector(path, filepath.Join(dir, "semantic-after.json.gz"))
++		if semanticErr != nil {
++			t.Error("closed full semantic vector", semanticErr)
++			result["semantic_error"] = semanticErr.Error()
++		} else {
++			result["semantic_after_hash"] = Hash(after)
++			result["semantic_equal"] = Hash(before) == Hash(after)
++			changed := []any{}
++			bt, _ := before["tables"].(map[string]any)
++			at, _ := after["tables"].(map[string]any)
++			allowed := map[string]bool{}
++			for _, name := range Arr(spec, "allowed_mutation_tables") {
++				allowed[fmt.Sprint(name)] = true
++			}
++			if Hash(before["schema"]) != Hash(after["schema"]) || len(bt) != len(at) {
++				t.Error("schema/all-table inventory drift")
++			}
++			for name, value := range bt {
++				if Hash(value) != Hash(at[name]) {
++					changed = append(changed, name)
++					if !allowed[name] || spec["mutation"] == "none" {
++						t.Error("unregistered semantic table delta", name)
++					}
++				}
++			}
++			result["changed_tables"] = changed
++			if spec["want_error"] == false && spec["mutation"] == "none" && Hash(before) != Hash(after) {
++				t.Error("positive archive changed semantically")
++			}
++		}
++		original, e := os.ReadFile(Str(spec, "input"))
++		if e != nil || Digest(original) != spec["input_sha256"] {
++			t.Error("source input drift", e)
++		}
++		result["input_after_sha256"] = Digest(original)
++		result["test_failed"] = t.Failed()
++		if e = os.WriteFile(filepath.Join(dir, "actual.json"), Bytes(result), 0600); e != nil {
++			t.Error(e)
++		}
++	})
++	// Preserve and restore all original triggers, including unrelated ones:
++	// acceptance cannot be attributed to a weakened trigger inventory.
++	counts := Object{}
++	for _, capability := range []string{"MODEL", "TOOL"} {
++		var n int64
++		if err = db.QueryRow(`SELECT count(*) FROM (SELECT project,run,effect_key FROM resource_effects WHERE json_extract(body,'$.payload.capability')=? GROUP BY project,run,effect_key)`, capability).Scan(&n); err != nil {
++			t.Fatal(err)
++		}
++		counts[capability] = n
++	}
++	result["original_effect_key_counts"] = counts
++	if expected, ok := spec["original_effect_key_counts"]; ok && Hash(counts) != Hash(expected) {
++		t.Fatal("original key count mismatch", counts, expected)
++	}
++	budgetRows, err := providerCopiedBodies(db, "domain_objects", `kind='BudgetLedgerEntry'`)
++	if err != nil {
++		t.Fatal(err)
++	}
++	result["original_budget_rows"] = budgetRows
++	result["original_budget_rows_hash"] = Hash(budgetRows)
++	readTriggers := func() Object {
++		rows, e := db.Query(`SELECT name,sql FROM sqlite_master WHERE type='trigger' ORDER BY name`)
++		if e != nil {
++			t.Fatal(e)
++		}
++		out := Object{}
++		for rows.Next() {
++			var name, statement string
++			if e = rows.Scan(&name, &statement); e != nil {
++				t.Fatal(e)
++			}
++			out[name] = statement
++		}
++		e = rows.Err()
++		rows.Close()
++		if e != nil {
++			t.Fatal(e)
++		}
++		return out
++	}
++	triggers := readTriggers()
++	result["original_triggers"] = triggers
++	mode := Str(spec, "mutation")
++	if mode != "none" {
++		for name := range triggers {
++			if _, err = db.Exec(`DROP TRIGGER "` + strings.ReplaceAll(name, `"`, `""`) + `"`); err != nil {
++				t.Fatal(err)
++			}
++		}
++		statements := []string{}
++		switch mode {
++		case "disguise-model-as-tool":
++			statements = []string{`UPDATE resource_effects SET effect_key=replace(effect_key,':model:',':tool:99'),body=json_remove(json_set(body,'$.key',replace(effect_key,':model:',':tool:99'),'$.payload.capability','TOOL','$.payload.credential_revision','local-tools-v1'),'$.payload.provider_transport') WHERE json_extract(body,'$.payload.capability')='MODEL'`}
++		case "swap-tool-reservation", "swap-tool-reservation-rehashed":
++			statements = []string{`UPDATE resource_effects SET body=json_set(body,'$.reservation_id',(SELECT json_extract(t.body,'$.reservation_id') FROM resource_effects t WHERE t.project=resource_effects.project AND t.run=resource_effects.run AND json_extract(t.body,'$.payload.capability')='TOOL' ORDER BY t.sequence LIMIT 1)) WHERE json_extract(body,'$.payload.capability')='MODEL' AND EXISTS(SELECT 1 FROM resource_effects t WHERE t.project=resource_effects.project AND t.run=resource_effects.run AND json_extract(t.body,'$.payload.capability')='TOOL')`}
++		case "erase-model-effects":
++			statements = []string{`DELETE FROM resource_effects WHERE json_extract(body,'$.payload.capability')='MODEL'`}
++		case "tool-key":
++			statements = []string{`UPDATE resource_effects SET effect_key=effect_key||'9',body=json_set(body,'$.key',effect_key||'9') WHERE json_extract(body,'$.payload.capability')='TOOL'`}
++		case "tool-epoch":
++			statements = []string{`UPDATE resource_effects SET body=json_set(body,'$.epoch',999) WHERE json_extract(body,'$.payload.capability')='TOOL'`}
++		case "tool-credential":
++			statements = []string{`UPDATE resource_effects SET body=json_set(body,'$.payload.credential_revision','forged') WHERE json_extract(body,'$.payload.capability')='TOOL'`}
++		case "tool-request-hash":
++			statements = []string{`UPDATE resource_effects SET body=json_set(body,'$.request_hash','sha256:forged') WHERE json_extract(body,'$.payload.capability')='TOOL'`}
++		case "tool-cost-event", "tool-cost-time", "tool-cost-basis", "tool-cost-policy", "tool-cost-money":
++			if err = providerMutateToolCost(db, mode); err != nil {
++				t.Fatal("explicit stored cost mutation", err)
++			}
++		case "synthetic-zero-model", "synthetic-zero-disguise", "synthetic-shared-route", "synthetic-duplicate-route", "synthetic-duplicate-bound":
++			result["mode"] = "SYNTHETIC_NOT_PRODUCT"
++			if err = providerSyntheticTypedProfile(db, mode); err != nil {
++				t.Fatal("synthetic typed proof construction", err)
++			}
++		case "missing-dispatch-transport":
++			statements = []string{`DELETE FROM runtime_dispatches`, `UPDATE resource_effects SET body=json_remove(body,'$.payload.provider_transport') WHERE json_extract(body,'$.payload.capability')='MODEL'`}
++		case "double-marker":
++			statements = []string{`UPDATE runtime_dispatches SET manifest=json_remove(manifest,'$.admission.profile.model_config.provider_policy')`, `UPDATE resource_effects SET body=json_remove(body,'$.payload.provider_transport') WHERE json_extract(body,'$.payload.capability')='MODEL'`}
++		case "missing-admission", "missing-profile-ref", "missing-runtime-ref":
++			field := map[string]string{"missing-admission": "$.admission", "missing-profile-ref": "$.admission.profile_ref", "missing-runtime-ref": "$.admission.runtime_ref"}[mode]
++			statements = []string{`UPDATE runtime_dispatches SET manifest=json_remove(manifest,'` + field + `')`, `UPDATE resource_effects SET body=json_remove(body,'$.payload.provider_transport') WHERE json_extract(body,'$.payload.capability')='MODEL'`}
++		case "missing-binding":
++			statements = []string{`DELETE FROM runtime_bindings`}
++		case "missing-qualification":
++			statements = []string{`DELETE FROM runtime_qualification_runs`, `DELETE FROM runtime_qualification_plans`}
++		case "forged-fixture-deleted-native":
++			statements = []string{`INSERT OR IGNORE INTO orchestration_fixtures(project,runtime) SELECT project,runtime FROM runtime_bindings`, `DELETE FROM runtime_dispatches`, `DELETE FROM runtime_bindings`, `DELETE FROM runtime_qualification_runs`, `DELETE FROM runtime_qualification_plans`, `UPDATE resource_effects SET body=json_remove(body,'$.payload.provider_transport')`}
++		case "missing-all-run-history":
++			statements = []string{`DELETE FROM domain_refs WHERE (kind='Run' AND (project,id) IN (SELECT project,run FROM resource_effects)) OR (target_kind='Run' AND (target_project,target_id) IN (SELECT project,run FROM resource_effects))`, `DELETE FROM domain_versions WHERE kind='Run' AND (project,id) IN (SELECT project,run FROM resource_effects)`, `DELETE FROM runtime_dispatches`, `DELETE FROM runtime_bindings`, `UPDATE resource_effects SET body=json_remove(body,'$.payload.provider_transport')`}
++		case "cross-run":
++			statements = []string{`UPDATE runtime_dispatches SET manifest=json_set(manifest,'$.run_id','foreign-run')`}
++		case "foreign-runtime-ref":
++			statements = []string{`UPDATE runtime_dispatches SET manifest=json_set(manifest,'$.admission.runtime_ref.id','foreign-runtime')`}
++		case "ambiguous-epoch":
++			statements = []string{`UPDATE domain_versions SET body=json_set(body,'$.runtime_id','foreign-runtime') WHERE kind='Run' AND revision=(SELECT max(v.revision) FROM domain_versions v WHERE v.project=domain_versions.project AND v.kind='Run' AND v.id=domain_versions.id)`}
++		case "wrong-request-hash":
++			statements = []string{`UPDATE resource_effects SET body=json_set(body,'$.request_hash','sha256:forged')`}
++		case "changed-capability":
++			statements = []string{`UPDATE resource_effects SET body=json_set(body,'$.payload.capability','TOOL') WHERE json_extract(body,'$.payload.capability')='MODEL'`}
++		case "changed-key-and-capability":
++			statements = []string{`UPDATE resource_effects SET effect_key=replace(effect_key,':model:',':tool:'),body=json_set(body,'$.key',replace(effect_key,':model:',':tool:'),'$.payload.capability','TOOL') WHERE json_extract(body,'$.payload.capability')='MODEL'`}
++		case "sparse-sequence":
++			statements = []string{`UPDATE resource_effects SET sequence=sequence+100,body=json_set(body,'$.sequence',sequence+100)`}
++		case "no-prepared":
++			statements = []string{`DELETE FROM resource_effects WHERE sequence=1`}
++		case "wrong-epoch":
++			statements = []string{`UPDATE resource_effects SET body=json_set(body,'$.epoch',999)`}
++		case "wrong-sql-key":
++			statements = []string{`UPDATE resource_effects SET effect_key='foreign-'||effect_key`}
++		default:
++			t.Fatal("unregistered control mutation", mode)
++		}
++		result["mutation_statements"] = statements
++		affected := []any{}
++		for _, statement := range statements {
++			changed, e := db.Exec(statement)
++			if e != nil {
++				err = e
++				t.Fatal("explicit corruption setup", err)
++			}
++			n, e := changed.RowsAffected()
++			if e != nil {
++				t.Fatal(e)
++			}
++			affected = append(affected, Object{"statement": statement, "rows": n})
++		}
++		result["mutation_affected_rows"] = affected
++		if mode == "swap-tool-reservation-rehashed" {
++			if err = providerRehashCopiedEffects(db); err != nil {
++				t.Fatal("explicit forged copied request hash", err)
++			}
++		}
++		// Rehash altered dispatches so the semantic provenance guard, rather
++		// than only the preexisting manifest digest guard, must reject them.
++		rows, e := db.Query(`SELECT project,run,epoch,manifest FROM runtime_dispatches`)
++		if e != nil {
++			t.Fatal(e)
++		}
++		manifests := []Object{}
++		for rows.Next() {
++			var p, r, text string
++			var epoch int64
++			if e = rows.Scan(&p, &r, &epoch, &text); e != nil {
++				t.Fatal(e)
++			}
++			m, e := Decode([]byte(text))
++			if e != nil {
++				t.Fatal(e)
++			}
++			manifests = append(manifests, Object{"project": p, "run": r, "epoch": epoch, "hash": Hash(m)})
++		}
++		e = rows.Err()
++		rows.Close()
++		if e != nil {
++			t.Fatal(e)
++		}
++		for _, m := range manifests {
++			if _, err = db.Exec(`UPDATE runtime_dispatches SET manifest_hash=? WHERE project=? AND run=? AND epoch=?`, m["hash"], m["project"], m["run"], m["epoch"]); err != nil {
++				t.Fatal(err)
++			}
++		}
++		for _, statement := range triggers {
++			if _, err = db.Exec(statement.(string)); err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++	result["triggers_after"] = readTriggers()
++	if Hash(result["triggers_after"]) != Hash(triggers) {
++		t.Fatal("original trigger inventory not restored")
++	}
++	tx, err := db.Begin()
++	if err != nil {
++		t.Fatal(err)
++	}
++	inventory, inventoryErr := validateProviderInventory(tx, "", "")
++	if err = tx.Rollback(); err != nil {
++		t.Fatal(err)
++	}
++	backupErr := validateModelStreamBackup(db)
++	result["inventory"] = inventory
++	result["inventory_count"] = len(inventory)
++	result["inventory_error"], result["stream_backup_error"] = nil, nil
++	if inventoryErr != nil {
++		result["inventory_error"] = inventoryErr.Error()
++	}
++	if backupErr != nil {
++		result["stream_backup_error"] = backupErr.Error()
++	}
++	if spec["want_error"] == true {
++		if inventoryErr == nil || backupErr == nil {
++			t.Fatal("unexpected corrupted original accepted", inventoryErr, backupErr)
++		}
++		if cause := Str(spec, "required_cause"); cause != "" && (!strings.HasSuffix(inventoryErr.Error(), cause) || !strings.HasSuffix(backupErr.Error(), cause)) {
++			t.Fatal("wrong causal rejection layer", inventoryErr, backupErr, cause)
++		}
++	} else {
++		want, e := Num(spec, "expected_inventory")
++		if e != nil || inventoryErr != nil || backupErr != nil || int64(len(inventory)) != want || want < 1 {
++			t.Fatal("unexpected sealed original rejected/inventory", inventoryErr, backupErr, len(inventory), want)
++		}
++		for key := range inventory {
++			if !strings.Contains(key, ":model:") {
++				t.Fatal("non-MODEL leaked into inventory", key)
++			}
++		}
++	}
++}
++
++// Full deterministic public logical image, captured through a read-only
++// immutable connection before store.Open and again after its final close.
++// Rows retain SQLite value types and rowid where it is stored authority.
++func providerSemanticVector(path, output string) (Object, error) {
++	u := url.URL{Scheme: "file", Opaque: filepath.ToSlash(path)}
++	q := u.Query()
++	q.Set("mode", "ro")
++	q.Set("immutable", "1")
++	u.RawQuery = q.Encode()
++	db, err := sql.Open("sqlite", u.String())
++	if err != nil {
++		return nil, err
++	}
++	defer db.Close()
++	read := func(query string) (Object, error) {
++		rows, e := db.Query(query)
++		if e != nil {
++			return nil, e
++		}
++		defer rows.Close()
++		columns, e := rows.Columns()
++		if e != nil {
++			return nil, e
++		}
++		encoded := []string{}
++		for rows.Next() {
++			values := make([]any, len(columns))
++			args := make([]any, len(columns))
++			for i := range values {
++				args[i] = &values[i]
++			}
++			if e = rows.Scan(args...); e != nil {
++				return nil, e
++			}
++			typed := []any{}
++			for _, value := range values {
++				switch v := value.(type) {
++				case nil:
++					typed = append(typed, []any{"null"})
++				case int64:
++					typed = append(typed, []any{"integer", fmt.Sprint(v)})
++				case float64:
++					typed = append(typed, []any{"real-ieee754", fmt.Sprintf("%016x", math.Float64bits(v))})
++				case string:
++					typed = append(typed, []any{"text", v})
++				case []byte:
++					typed = append(typed, []any{"blob-hex", fmt.Sprintf("%x", v)})
++				default:
++					return nil, fmt.Errorf("unrecorded SQLite value type %T", value)
++				}
++			}
++			encoded = append(encoded, string(Bytes(typed)))
++		}
++		if e = rows.Err(); e != nil {
++			return nil, e
++		}
++		sort.Strings(encoded)
++		return Object{"columns": columns, "row_count": len(encoded), "typed_row_multiset": encoded}, nil
++	}
++	schema, err := read(`SELECT type,name,tbl_name,sql FROM sqlite_schema`)
++	if err != nil {
++		return nil, err
++	}
++	rows, err := db.Query(`SELECT name,coalesce(sql,'') FROM sqlite_schema WHERE type='table' ORDER BY name`)
++	if err != nil {
++		return nil, err
++	}
++	tableSQL := map[string]string{}
++	for rows.Next() {
++		var name, statement string
++		if err = rows.Scan(&name, &statement); err != nil {
++			rows.Close()
++			return nil, err
++		}
++		tableSQL[name] = statement
++	}
++	err = rows.Err()
++	rows.Close()
++	if err != nil {
++		return nil, err
++	}
++	tables := Object{}
++	for name, statement := range tableSQL {
++		quoted := `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
++		projection := "rowid,*"
++		if strings.Contains(strings.ToUpper(statement), "WITHOUT ROWID") || strings.Contains(strings.ToUpper(statement), "CREATE VIRTUAL TABLE") {
++			projection = "*"
++		}
++		data, e := read("SELECT " + projection + " FROM " + quoted)
++		if e != nil {
++			return nil, e
++		}
++		columns, e := read("PRAGMA table_xinfo(" + quoted + ")")
++		if e != nil {
++			return nil, e
++		}
++		tables[name] = Object{"rows": data, "column_metadata": columns}
++	}
++	vector := Object{"format": "researchos.sqlite-public-semantic.v1", "schema": schema, "tables": tables}
++	f, err := os.OpenFile(output, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
++	if err != nil {
++		return nil, err
++	}
++	z := gzip.NewWriter(f)
++	_, err = z.Write(Bytes(vector))
++	ce := z.Close()
++	fe := f.Close()
++	if err != nil {
++		return nil, err
++	}
++	if ce != nil {
++		return nil, ce
++	}
++	if fe != nil {
++		return nil, fe
++	}
++	return vector, nil
++}
++
++func TestProviderBindingInventorySyntheticProvenance(t *testing.T) {
++	// SYNTHETIC_NOT_PRODUCT: focused original-reference compatibility, without
++	// qualification, model transport or a claim that this is a historical DB.
++	dir := os.Getenv("RESEARCHOS_PROVIDER_SYNTHETIC_DIR")
++	mode := os.Getenv("RESEARCHOS_PROVIDER_SYNTHETIC_MODE")
++	if dir == "" || os.Mkdir(dir, 0700) != nil {
++		t.Fatal("new synthetic evidence directory required")
++	}
++	db, err := store.Open(filepath.Join(dir, "synthetic.sqlite"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	files, err := filepath.Glob(filepath.Join("..", "..", "migrations", "sqlite", "[0-9][0-9][0-9][0-9]_*.sql"))
++	if err != nil || len(files) == 0 {
++		t.Fatal("actual numbered SQL required", err)
++	}
++	for _, name := range files {
++		raw, e := os.ReadFile(name)
++		if e != nil {
++			t.Fatal(e)
++		}
++		if _, e = db.Exec(string(raw)); e != nil {
++			t.Fatal(name, e)
++		}
++	}
++	project := "synthetic-provider-inventory"
++	runtime := Object{"project_id": project, "id": "runtime", "revision": 1, "adapter": "fixture", "measurement_mode": "FIXTURE", "qualification_ids": Empty()}
++	run := Object{"project_id": project, "id": "run", "revision": 1, "task_id": "task", "runtime_id": "runtime", "lease_epoch": 1, "created_at": "2026-01-01T00:00:00Z", "executor_principal_id": "synthetic"}
++	profile := Object{"runtime_id": "runtime", "technical_hash": runtimeTechnicalHash(runtime), "model_config": Object{"provider": "legacy-fixture"}}
++	content := Bytes(profile)
++	artifact := Object{"project_id": project, "id": "profile", "revision": 1, "storage_key": "synthetic-profile", "content_hash": Digest(content)}
++	for kind, value := range map[string]Object{"Run": run, "RuntimeRegistration": runtime, "Artifact": artifact} {
++		if _, err = db.Exec(`INSERT INTO domain_versions(project,kind,id,revision,body,content_hash) VALUES(?,?,?,?,?,?)`, project, kind, value["id"], 1, string(Bytes(value)), value["content_hash"]); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if _, err = db.Exec(`INSERT INTO auth_principals(id,roles) VALUES('synthetic','["EXECUTOR"]')`); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = db.Exec(`INSERT INTO uploaded_content(storage_key,project,principal,bytes,content_hash,expires_at,sealed) VALUES(?,?,'synthetic',?,?,'2099-01-01T00:00:00Z',1)`, artifact["storage_key"], project, content, artifact["content_hash"]); err != nil {
++		t.Fatal(err)
++	}
++	ref := Ref(artifact, "Artifact")
++	if _, err = db.Exec(`INSERT INTO runtime_bindings(project,runtime,profile_ref,profile_hash,technical_hash,owner) VALUES(?,?,?,?,?,?)`, project, "runtime", string(Bytes(ref)), Hash(ref), runtimeTechnicalHash(runtime), "synthetic"); err != nil {
++		t.Fatal(err)
++	}
++	manifest := Object{"project_id": project, "run_id": "run", "task_id": "task", "runtime_id": "runtime", "executor_principal_id": "synthetic", "epoch": 1, "dispatch_key": "dispatch", "admission": Object{"runtime_ref": Ref(runtime, "RuntimeRegistration"), "profile_ref": ref, "profile_hash": Hash(ref), "profile": profile, "technical_hash": runtimeTechnicalHash(runtime), "mode": "FIXTURE"}}
++	if mode != "generic-missing-ref" {
++		if _, err = db.Exec(`INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES(?,?,?,?,?,?,'PREPARED','synthetic','synthetic')`, project, "run", 1, "dispatch", string(Bytes(manifest)), Hash(manifest)); err != nil {
++			t.Fatal(err)
++		}
++	}
++	effect := Object{"project_id": project, "run_id": "run", "task_id": "task", "epoch": 1, "key": "task:run:1:model:1", "sequence": 1, "state": "PREPARED", "payload": Object{"capability": "MODEL"}}
++	if _, err = db.Exec(`INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,?,?)`, project, "run", effect["key"], 1, string(Bytes(effect))); err != nil {
++		t.Fatal(err)
++	}
++	wantError := false
++	switch mode {
++	case "sealed-no-policy":
++	case "later-runtime-revision":
++		later := Merge(runtime, Object{"revision": 2, "adapter": "changed-later"})
++		if _, err = db.Exec(`INSERT INTO domain_versions(project,kind,id,revision,body) VALUES(?,'RuntimeRegistration','runtime',2,?)`, project, string(Bytes(later))); err != nil {
++			t.Fatal(err)
++		}
++		if _, err = db.Exec(`INSERT INTO domain_objects(project,kind,id,revision,body) VALUES(?,'RuntimeRegistration','runtime',2,?)`, project, string(Bytes(later))); err != nil {
++			t.Fatal(err)
++		}
++	case "generic-missing-ref":
++		wantError = true
++		if _, err = db.Exec(`DELETE FROM runtime_bindings`); err != nil {
++			t.Fatal(err)
++		}
++		if _, err = db.Exec(`INSERT INTO orchestration_fixtures(project,runtime) VALUES(?,'runtime')`, project); err != nil {
++			t.Fatal(err)
++		}
++	case "missing-binding":
++		wantError = true
++		if _, err = db.Exec(`DELETE FROM runtime_bindings`); err != nil {
++			t.Fatal(err)
++		}
++	default:
++		t.Fatal("unknown synthetic mode")
++	}
++	tx, err := db.Begin()
++	if err != nil {
++		t.Fatal(err)
++	}
++	inventory, e := validateProviderInventory(tx, project, "run")
++	if err = tx.Rollback(); err != nil {
++		t.Fatal(err)
++	}
++	result := Object{"label": "SYNTHETIC_NOT_PRODUCT", "mode": mode, "inventory": inventory, "want_error": wantError, "error": nil, "models": 0, "workers": 0, "http": 0}
++	if e != nil {
++		result["error"] = e.Error()
++	}
++	if err = os.WriteFile(filepath.Join(dir, "actual.json"), Bytes(result), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if (e != nil) != wantError || len(inventory) != 0 {
++		t.Fatal("unexpected synthetic provenance decision", e, len(inventory))
++	}
++}
++
++// These helpers only mutate newly copied, explicitly synthetic/corrupt fixture
++// databases after the harness has saved every original trigger and logical row.
++// They never generate model traffic or manufacture original accepted history.
++func providerCopiedBodies(db *sql.DB, table string, where string) ([]Object, error) {
++	rows, err := db.Query(`SELECT rowid,body FROM ` + table + ` WHERE ` + where + ` ORDER BY rowid`)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	items := []Object{}
++	for rows.Next() {
++		var row int64
++		var raw string
++		if err = rows.Scan(&row, &raw); err != nil {
++			return nil, err
++		}
++		body, e := Decode([]byte(raw))
++		if e != nil {
++			return nil, e
++		}
++		items = append(items, Object{"rowid": row, "body": body})
++	}
++	return items, rows.Err()
++}
++
++func providerCopiedCost(ledger Object) Object {
++	cost := Object{}
++	for _, key := range []string{"policy_id", "run_id", "operation", "money", "provider_request_id", "provider_event_id", "reservation_id", "cost_basis", "occurred_at"} {
++		cost[key] = ledger[key]
++	}
++	return cost
++}
++
++func providerRehashCopiedEffects(db *sql.DB) error {
++	items, err := providerCopiedBodies(db, "resource_effects", "1=1")
++	if err != nil {
++		return err
++	}
++	for _, item := range items {
++		e := item["body"].(map[string]any)
++		var raw string
++		if err = db.QueryRow(`SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND id=?`, e["project_id"], e["reservation_id"]).Scan(&raw); err != nil {
++			return err
++		}
++		ledger, er := Decode([]byte(raw))
++		if er != nil {
++			return er
++		}
++		e["request_hash"] = Hash([]any{e["payload"], providerCopiedCost(ledger)})
++		if _, err = db.Exec(`UPDATE resource_effects SET body=? WHERE rowid=?`, string(Bytes(e)), item["rowid"]); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func providerWriteCopiedLedger(db *sql.DB, ledger Object) error {
++	ledger["receipt_hash"] = Receipt(ledger)
++	for _, table := range []string{"domain_objects", "domain_versions"} {
++		r, err := db.Exec(`UPDATE `+table+` SET body=?,content_hash=? WHERE project=? AND kind='BudgetLedgerEntry' AND id=? AND revision=?`, string(Bytes(ledger)), ledger["receipt_hash"], ledger["project_id"], ledger["id"], ledger["revision"])
++		if err != nil {
++			return err
++		}
++		n, err := r.RowsAffected()
++		if err != nil || n != 1 {
++			return fmt.Errorf("synthetic ledger exact row: %d %v", n, err)
++		}
++	}
++	return nil
++}
++
++func providerMutateToolCost(db *sql.DB, mode string) error {
++	items, err := providerCopiedBodies(db, "domain_objects", `kind='BudgetLedgerEntry' AND id IN (SELECT json_extract(body,'$.reservation_id') FROM resource_effects WHERE json_extract(body,'$.payload.capability')='TOOL')`)
++	if err != nil {
++		return err
++	}
++	if len(items) == 0 {
++		return fmt.Errorf("no original TOOL reservation")
++	}
++	for _, item := range items {
++		ledger := item["body"].(map[string]any)
++		switch mode {
++		case "tool-cost-event":
++			ledger["provider_event_id"] = "forged/" + Str(ledger, "provider_request_id")
++		case "tool-cost-time":
++			ledger["occurred_at"] = "2026-01-01T00:00:00Z"
++		case "tool-cost-basis":
++			ledger["cost_basis"] = "ACTUAL"
++		case "tool-cost-policy":
++			ledger["policy_id"] = "forged-policy"
++		case "tool-cost-money":
++			ledger["money"] = Object{"currency": "USD", "amount": "99"}
++		default:
++			return fmt.Errorf("unknown copied cost mutation")
++		}
++		if err = providerWriteCopiedLedger(db, ledger); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func providerSyntheticTypedProfile(db *sql.DB, mode string) error {
++	// This is a counterfactual schema-valid copy of the one-PREPARED archive,
++	// not a qualification or an assertion that the modified history occurred.
++	var project, runtime, rawRef string
++	if err := db.QueryRow(`SELECT project,runtime,profile_ref FROM runtime_bindings`).Scan(&project, &runtime, &rawRef); err != nil {
++		return err
++	}
++	ref, err := Decode([]byte(rawRef))
++	if err != nil {
++		return err
++	}
++	var artifactRaw string
++	if err = db.QueryRow(`SELECT body FROM domain_objects WHERE project=? AND kind='Artifact' AND id=?`, project, ref["id"]).Scan(&artifactRaw); err != nil {
++		return err
++	}
++	artifact, err := Decode([]byte(artifactRaw))
++	if err != nil {
++		return err
++	}
++	var content []byte
++	if err = db.QueryRow(`SELECT bytes FROM uploaded_content WHERE storage_key=?`, artifact["storage_key"]).Scan(&content); err != nil {
++		return err
++	}
++	profile, err := Decode(content)
++	if err != nil {
++		return err
++	}
++	routes := Arr(profile, "effect_routes")
++	var model Object
++	for _, value := range routes {
++		r := value.(map[string]any)
++		if r["capability"] == "MODEL" {
++			if model != nil {
++				return fmt.Errorf("synthetic base MODEL tuple ambiguous")
++			}
++			model = r
++		}
++	}
++	if model == nil {
++		return fmt.Errorf("synthetic base MODEL route absent")
++	}
++	zero := mode == "synthetic-zero-model" || mode == "synthetic-zero-disguise"
++	if zero {
++		bound := model["upper_bound"].(map[string]any)
++		bound["amount"] = "0"
++	}
++	if mode == "synthetic-shared-route" {
++		routes = append(routes, Object{"id": model["id"], "capability": "TOOL", "credential_revision": "synthetic-tool", "upper_bound": model["upper_bound"]})
++	}
++	if mode == "synthetic-duplicate-route" || mode == "synthetic-duplicate-bound" {
++		duplicate, e := Decode(Bytes(model))
++		if e != nil {
++			return e
++		}
++		if mode == "synthetic-duplicate-bound" {
++			duplicate["upper_bound"].(map[string]any)["amount"] = "7"
++		}
++		routes = append(routes, duplicate)
++	}
++	profile["effect_routes"] = routes
++	oldContentHash := Str(ref, "content_hash")
++	newContentHash := Digest(Bytes(profile))
++	ref["content_hash"] = newContentHash
++	// Exact digest substitution updates only the synthetic profile asset and
++	// its VersionRefs. All ordinary task/run/budget identities remain fixed.
++	for _, table := range []string{"domain_objects", "domain_versions"} {
++		items, e := providerCopiedBodies(db, table, "1=1")
++		if e != nil {
++			return e
++		}
++		for _, item := range items {
++			body := item["body"].(map[string]any)
++			before := string(Bytes(body))
++			changed := strings.ReplaceAll(before, oldContentHash, newContentHash)
++			if changed == before {
++				continue
++			}
++			if _, e = db.Exec(`UPDATE `+table+` SET body=?,content_hash=CASE WHEN content_hash=? THEN ? ELSE content_hash END WHERE rowid=?`, changed, oldContentHash, newContentHash, item["rowid"]); e != nil {
++				return e
++			}
++		}
++	}
++	if _, err = db.Exec(`UPDATE uploaded_content SET bytes=?,content_hash=? WHERE storage_key=?`, Bytes(profile), newContentHash, artifact["storage_key"]); err != nil {
++		return err
++	}
++	if _, err = db.Exec(`UPDATE runtime_bindings SET profile_ref=?,profile_hash=? WHERE project=? AND runtime=?`, string(Bytes(ref)), Hash(ref), project, runtime); err != nil {
++		return err
++	}
++	var taskID, planRaw string
++	if err = db.QueryRow(`SELECT task,plan FROM runtime_qualification_plans WHERE project=? AND runtime=?`, project, runtime).Scan(&taskID, &planRaw); err != nil {
++		return err
++	}
++	plan, err := Decode([]byte(planRaw))
++	if err != nil {
++		return err
++	}
++	var taskRaw string
++	if err = db.QueryRow(`SELECT body FROM domain_objects WHERE project=? AND kind='Task' AND id=?`, project, taskID).Scan(&taskRaw); err != nil {
++		return err
++	}
++	task, err := Decode([]byte(taskRaw))
++	if err != nil {
++		return err
++	}
++	plan["profile_ref"], plan["task_hash"] = ref, qualificationTaskHash(task)
++	if _, err = db.Exec(`UPDATE runtime_qualification_plans SET plan=?,plan_hash=? WHERE project=? AND task=?`, string(Bytes(plan)), Hash(plan), project, taskID); err != nil {
++		return err
++	}
++	var dispatchRaw, runID string
++	var epoch int64
++	if err = db.QueryRow(`SELECT run,epoch,manifest FROM runtime_dispatches WHERE project=?`, project).Scan(&runID, &epoch, &dispatchRaw); err != nil {
++		return err
++	}
++	m, err := Decode([]byte(dispatchRaw))
++	if err != nil {
++		return err
++	}
++	m, err = Decode([]byte(strings.ReplaceAll(string(Bytes(m)), oldContentHash, newContentHash)))
++	if err != nil {
++		return err
++	}
++	a := m["admission"].(map[string]any)
++	a["profile"], a["profile_ref"], a["profile_hash"] = profile, ref, Hash(ref)
++	if permission, ok := a["permission"].(map[string]any); ok {
++		permission["plan_hash"] = Hash(plan)
++	}
++	if _, err = db.Exec(`UPDATE runtime_qualification_runs SET plan_hash=?,profile_hash=?,input_hash=? WHERE project=? AND task=?`, Hash(plan), Hash(ref), Hash(m["input_refs"]), project, taskID); err != nil {
++		return err
++	}
++	if _, err = db.Exec(`UPDATE runtime_dispatches SET manifest=?,manifest_hash=? WHERE project=? AND run=? AND epoch=?`, string(Bytes(m)), Hash(m), project, runID, epoch); err != nil {
++		return err
++	}
++	if zero {
++		items, e := providerCopiedBodies(db, "domain_objects", `kind='BudgetLedgerEntry' AND json_extract(body,'$.operation')='RESERVE' AND instr(json_extract(body,'$.provider_request_id'),':model:')>0 AND substr(json_extract(body,'$.provider_event_id'),1,8)='prepare/'`)
++		if e != nil {
++			return e
++		}
++		if len(items) != 1 {
++			return fmt.Errorf("synthetic PREPARED expected one MODEL reserve")
++		}
++		ledger := items[0]["body"].(map[string]any)
++		ledger["money"] = model["upper_bound"]
++		if err = providerWriteCopiedLedger(db, ledger); err != nil {
++			return err
++		}
++	}
++	items, err := providerCopiedBodies(db, "resource_effects", "1=1")
++	if err != nil {
++		return err
++	}
++	if len(items) != 1 {
++		return fmt.Errorf("synthetic requires one PREPARED, no observations")
++	}
++	effect := items[0]["body"].(map[string]any)
++	tx, err := db.Begin()
++	if err != nil {
++		return err
++	}
++	run, e := providerOriginalRun(tx, project, runID, effect)
++	var dispatch, transport Object
++	if e == nil {
++		dispatch, e = runtimeDispatch(tx, project, runID, epoch)
++	}
++	if e == nil {
++		transport, e = providerTransport(tx, project, run, dispatch)
++	}
++	rollbackErr := tx.Rollback()
++	if e != nil {
++		return e
++	}
++	if rollbackErr != nil {
++		return rollbackErr
++	}
++	effect["payload"].(map[string]any)["provider_transport"] = transport
++	if _, err = db.Exec(`UPDATE resource_effects SET body=? WHERE rowid=?`, string(Bytes(effect)), items[0]["rowid"]); err != nil {
++		return err
++	}
++	if err = providerRehashCopiedEffects(db); err != nil {
++		return err
++	}
++	if mode == "synthetic-zero-disguise" {
++		_, err = db.Exec(`UPDATE resource_effects SET effect_key=replace(effect_key,':model:',':tool:'),body=json_remove(json_set(body,'$.key',replace(effect_key,':model:',':tool:'),'$.payload.capability','TOOL','$.payload.credential_revision','synthetic-tool'),'$.payload.provider_transport')`)
++	}
++	return err
++}
++
++func TestProviderBindingOriginalEpochCausalControl(t *testing.T) {
++	mode := os.Getenv("RESEARCHOS_PROVIDER_EPOCH_MODE")
++	dir := os.Getenv("RESEARCHOS_PROVIDER_EPOCH_DIR")
++	if dir == "" || os.Mkdir(dir, 0700) != nil {
++		t.Fatal("new explicit epoch control directory required")
++	}
++	db, err := store.Open(filepath.Join(dir, "epoch.sqlite"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	// Exact existing domain schema, no product admission or history creation.
++	schema, err := os.ReadFile(filepath.Join("..", "..", "migrations", "sqlite", "0002_domain.sql"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = db.Exec(string(schema)); err != nil {
++		t.Fatal(err)
++	}
++	for rev := 1; rev <= 3; rev++ {
++		runtime, epoch := "original-runtime", 1
++		if rev == 3 {
++			runtime, epoch = "later-runtime", 2
++		}
++		run := Object{"project_id": "synthetic", "id": "run", "revision": rev, "task_id": "task", "runtime_id": runtime, "lease_epoch": epoch, "created_at": "synthetic", "executor_principal_id": "synthetic", "status": fmt.Sprint(rev)}
++		if _, err = db.Exec(`INSERT INTO domain_versions(project,kind,id,revision,body) VALUES('synthetic','Run','run',?,?)`, rev, string(Bytes(run))); err != nil {
++			t.Fatal(err)
++		}
++	}
++	effect, err := Decode([]byte(`{"epoch":1,"task_id":"task"}`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := ""
++	switch mode {
++	case "decoded-number":
++		if _, ok := effect["epoch"].(json.Number); !ok {
++			t.Fatal("control must exercise real Decode json.Number")
++		}
++	case "int64":
++		effect["epoch"] = int64(1)
++	case "missing":
++		delete(effect, "epoch")
++		want = "provider original Run epoch invalid"
++	case "string", "fraction", "zero", "negative", "overflow":
++		effect["epoch"] = map[string]any{"string": "1", "fraction": json.Number("1.5"), "zero": json.Number("0"), "negative": json.Number("-1"), "overflow": json.Number("9223372036854775808")}[mode]
++		want = "provider original Run epoch invalid"
++	case "no-match":
++		effect["epoch"] = int64(3)
++		want = "provider original Run epoch unavailable"
++	case "ambiguous":
++		run := Object{"project_id": "synthetic", "id": "run", "revision": 4, "task_id": "task", "runtime_id": "ambiguous-runtime", "lease_epoch": 1, "created_at": "synthetic", "executor_principal_id": "synthetic"}
++		if _, err = db.Exec(`INSERT INTO domain_versions(project,kind,id,revision,body) VALUES('synthetic','Run','run',4,?)`, string(Bytes(run))); err != nil {
++			t.Fatal(err)
++		}
++		want = "provider ambiguous original Run epoch"
++	default:
++		t.Fatal("unregistered epoch control")
++	}
++	tx, err := db.Begin()
++	if err != nil {
++		t.Fatal(err)
++	}
++	run, e := providerOriginalRun(tx, "synthetic", "run", effect)
++	if err = tx.Rollback(); err != nil {
++		t.Fatal(err)
++	}
++	result := Object{"label": "SYNTHETIC_NOT_PRODUCT", "mode": mode, "epoch_type": fmt.Sprintf("%T", effect["epoch"]), "epoch_repr": fmt.Sprint(effect["epoch"]), "run": run, "required_cause": want, "error": nil, "models": 0, "workers": 0, "http": 0}
++	if e != nil {
++		result["error"] = e.Error()
++	}
++	if err = os.WriteFile(filepath.Join(dir, "actual.json"), Bytes(result), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if want != "" {
++		if e == nil || !strings.HasSuffix(e.Error(), want) {
++			t.Fatal("incorrect epoch refusal layer", e, want)
++		}
++	} else if e != nil || run["runtime_id"] != "original-runtime" || Hash(run["lease_epoch"]) != Hash(1) {
++		t.Fatal("original epoch not selected", e, run)
++	}
++}
