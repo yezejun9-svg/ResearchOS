@@ -245,6 +245,29 @@ class W07RawControls(unittest.TestCase):
         context, tools = self.inventory_control(mutate)
         self.rejects(lambda: PROFILE.product(API, self.reader(), context, tools), {"SOURCE_COVERAGE"})
 
+    def test_embedded_compilation_input_cannot_be_omitted(self):
+        context, tools = self.product_control()
+        proof = deepcopy(self.template)
+        embedded = "internal/domain/contracts/new-project-rules-v24.md"
+        before = dict(self.source_before)
+        del before[embedded]
+        proof["source_before_ref"] = self.write_control("omitted-embed-before.json", before)
+        proof["source_after_ref"] = self.write_control("omitted-embed-after.json", before)
+        vector = PROFILE._document(API, self.reader(), proof["version_vector_ref"])
+        vector["source"] = before
+        proof["version_vector_ref"] = self.write_control("omitted-embed-vector.json", vector)
+        context["proof_ref"] = self.write_control("omitted-embed-proof.json", proof)
+        # Changing current bytes and repinning the candidate cannot recapture
+        # an older compiled executable; restore shared local controls afterward.
+        path = self.repo / embedded
+        original = path.read_bytes()
+        try:
+            path.write_bytes(original + b"\nchanged local control\n")
+            next(r for r in context["version_vector"]["source_files"] if r["path"] == embedded)["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.rejects(lambda: PROFILE.product(API, self.reader(), context, tools), {"SOURCE_COVERAGE"})
+        finally:
+            path.write_bytes(original)
+
     def test_h07_forged_command_rejected(self):
         row = deepcopy(self.template["h07_invocations"][0])
         row["actualargv"] = ["C:/missing/forged-python.exe", "--claim-success"]
