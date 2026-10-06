@@ -902,13 +902,34 @@ def _canonical_state(reader, state_path, planned):
     return {row["id"]: row for row in rows}
 
 
+def _profile_api():
+    from types import SimpleNamespace
+    return SimpleNamespace(**globals())
+
+
+def _w07_profile(reader):
+    from types import SimpleNamespace
+    source = reader.path("execution/v2.4/formal_profile_w07.py")
+    fixed_parent = reader.repo / "execution/v2.4"
+    require(source.parent == fixed_parent and not source.is_symlink(), "PROFILE_SOURCE", str(source))
+    raw_source = source.read_bytes()
+    digest = hashlib.sha256(raw_source).hexdigest()
+    require(source not in reader.read_hashes or reader.read_hashes[source] == digest,
+            "INPUT_CHANGED_DURING_READ", str(source))
+    reader.read_hashes[source] = digest
+    namespace = {"__name__": "researchos_trusted_w07_profile", "__file__": str(source)}
+    exec(compile(raw_source, str(source), "exec"), namespace)
+    require(sha256(source) == digest, "INPUT_CHANGED_DURING_READ", str(source))
+    return SimpleNamespace(**namespace)
+
+
 def _registered_roots(reader, owner, task_id):
     selected = {"review": [], "context": [], "issuance": []}
-    schemas = {
-        "researchos.w04.independent-review.v1": "review",
-        "researchos.w04.current-context.v1": "context",
-        "researchos.w04.root-observed-issuance.v1": "issuance",
-    }
+    require(task_id in {"W04", "W07"}, "UNSUPPORTED_PROTOCOL", task_id)
+    protocol = task_id.lower()
+    schemas = {"researchos." + protocol + "." + name + ".v1": kind
+               for kind, name in (("review", "independent-review"), ("context", "current-context"),
+                                  ("issuance", "root-observed-issuance"))}
     seen = set()
     for reference in sequence(owner.get("evidence"), "registered owner evidence"):
         fields(reference, ("path", "sha256"), label="registered reference")
@@ -920,7 +941,6 @@ def _registered_roots(reader, owner, task_id):
             continue
         value = reader.read(path)
         if type(value) is dict and value.get("schema") in schemas:
-            require(task_id == "W04", "UNSUPPORTED_PROTOCOL", task_id)
             key = schemas[value["schema"]]
             selected[key].append(path)
     require(all(len(values) == 1 for values in selected.values()),
@@ -952,6 +972,8 @@ def _currentness(reader, context_path):
 
 
 def _verify_owner(reader, owner, task_id, roots, plan_path):
+    if task_id == "W07":
+        return _w07_profile(reader).verify_owner(_profile_api(), reader, owner, roots, plan_path)
     require(task_id == "W04", "UNSUPPORTED_PROTOCOL", "No verified evidence profile is implemented for " + task_id)
     context, _ = _currentness(reader, roots["context"])
     require(not reader.read(roots["review"]).get("supersedes_review_refs"), "SUPERSESSION_NOT_SUPPORTED", task_id)
@@ -998,6 +1020,7 @@ def derive_formal_cases(repo_root, state_path, plan_path):
         reader = Reader(repo_root)
         cases, tasks, parents, owned, planned = _catalog(reader, plan_path)
         rows = _canonical_state(reader, state_path, planned)
+        _w07_profile(reader)  # Trusted module participates in every dependency/CAS snapshot.
     except (InvalidEvidence, OSError, ValueError, KeyError, TypeError, StopIteration) as exc:
         result.update(integrity="INVALID", reasons=[{"code": getattr(exc, "code", "GLOBAL_INPUT_INVALID"), "detail": str(exc)}])
         if reader is not None:
@@ -1014,7 +1037,7 @@ def derive_formal_cases(repo_root, state_path, plan_path):
             owner["integrity"] = "NOT_RUN" if row.get("status", "NOT_STARTED") == "NOT_STARTED" else "PENDING_OWNER_ACCEPTANCE"
         else:
             try:
-                require(task_id == "W04", "UNSUPPORTED_PROTOCOL", "Evidence profile has not been independently implemented for " + task_id)
+                require(task_id in {"W04", "W07"}, "UNSUPPORTED_PROTOCOL", "Evidence profile has not been independently implemented for " + task_id)
                 roots = _registered_roots(reader, row, task_id)
                 context = _verify_owner(reader, row, task_id, roots, plan_path)
                 owner.update(integrity="VALID_ACCEPTED", accepted_case_ids=list(owned[task_id]))
