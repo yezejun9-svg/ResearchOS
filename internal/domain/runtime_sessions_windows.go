@@ -112,7 +112,7 @@ func (c *RuntimeCoordinator) projectCurrentSessionRuns(ctx context.Context) erro
 	rows, err := tx.Query(`SELECT r.project,r.body FROM client_sessions s
 		JOIN domain_objects t ON t.project=s.project_id AND t.kind='Task' AND t.id=s.task_id
 		JOIN domain_objects r ON r.project=t.project AND r.kind='Run' AND r.id=json_extract(t.body,'$.active_run_id')
-		WHERE json_extract(t.body,'$.task_type')='mu_turn'`)
+		WHERE json_extract(t.body,'$.task_type')='mu_turn' AND s.sealed_at IS NULL`)
 	if err != nil {
 		return err
 	}
@@ -148,6 +148,9 @@ func (c *RuntimeCoordinator) projectCurrentSessionRuns(ctx context.Context) erro
 			return err
 		}
 	}
+	if err = c.projectHistoricalSessionUsage(tx); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -159,9 +162,12 @@ func (c *RuntimeCoordinator) projectSessionRun(tx *sql.Tx, project string, run O
 	if task["task_type"] != "mu_turn" {
 		return nil
 	}
+	if err = c.projectSessionEffects(tx, project, run, nil); err != nil {
+		return err
+	}
 	var sid, build string
 	var revision, epoch, watermark int64
-	e := tx.QueryRow("SELECT id,core_build_id,revision,writer_epoch,event_watermark FROM client_sessions WHERE project_id=? AND task_id=?", project, run["task_id"]).Scan(&sid, &build, &revision, &epoch, &watermark)
+	e := tx.QueryRow("SELECT id,core_build_id,revision,writer_epoch,event_watermark FROM client_sessions WHERE project_id=? AND task_id=? AND sealed_at IS NULL", project, run["task_id"]).Scan(&sid, &build, &revision, &epoch, &watermark)
 	if e == sql.ErrNoRows {
 		return nil
 	}
