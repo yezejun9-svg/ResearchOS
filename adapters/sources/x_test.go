@@ -67,7 +67,7 @@ func TestW07XOnlyPublicPostAndNoFalseComplete(t *testing.T) {
 	runner := &fakeXRunner{}
 	a := XBrowser{Runner: runner, BrowserID: "existing-authorized-browser"}
 	p, e := a.Fetch(context.Background(), Query{SourceID: "x-source", Text: "paperclip agents", From: from, To: to, Limit: 1})
-	if e != nil || p.Failure != "" || len(p.Items) != 1 || p.Complete || p.NextCursor != "observed_tail:2105011808327401690" {
+	if e != nil || p.Failure != "" || len(p.Items) != 1 || p.Complete || p.NextCursor != "" || p.ObservationMarker != "observed_tail:2105011808327401690" {
 		t.Fatalf("public post: %+v %v", p, e)
 	}
 	item := p.Items[0]

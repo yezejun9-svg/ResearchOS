@@ -303,8 +303,6 @@ func (s *Service) researchCoverage(tx *sql.Tx, project string, profile Object, f
 			}
 			if time.Now().Before(wait) {
 				c["status"], c["gap_reason"] = "RATE_LIMITED", "retry after "+retry
-				out = append(out, c)
-				continue
 			}
 		}
 		// Only W07's durable raw page chain can prove a covered window.
@@ -378,6 +376,27 @@ func (s *Service) researchCoverage(tx *sql.Tx, project string, profile Object, f
 		}
 		if c["status"] != "COMPLETE" && kind == "X" {
 			c["gap_reason"] = "X visible observations do not prove a complete bounded window"
+		}
+		if c["status"] != "COMPLETE" {
+			health, e := s.latestSourceHealth(tx, project, profile, config, cursor, from, to)
+			if e != nil {
+				return nil, e
+			}
+			if health != nil {
+				if health.Status != "COMPLETE" {
+					c["status"] = health.Status
+				}
+				if health.Reason != "" {
+					c["gap_reason"] = health.Reason
+				}
+				c["record_count"] = health.FullReadCount
+				if health.ObservedFrom != nil {
+					c["observed_from"] = health.ObservedFrom.UTC().Format(time.RFC3339Nano)
+				}
+				if health.ObservedTo != nil {
+					c["observed_to"] = health.ObservedTo.UTC().Format(time.RFC3339Nano)
+				}
+			}
 		}
 		out = append(out, c)
 	}

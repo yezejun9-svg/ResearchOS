@@ -270,10 +270,12 @@ func (s *Service) verifySourcePageChain(tx *sql.Tx, project string, cursor Objec
 // SourceCapture is the product adapter's durable result. Only a trusted
 // adapter fetch can create a page checkpoint; HTTP callers cannot report one.
 type SourceCapture struct {
-	Page        sources.Page
-	RawArtifact Object
-	Evidence    []Object
-	Manifest    Object
+	Page           sources.Page
+	RawArtifact    Object
+	Evidence       []Object
+	Manifest       Object
+	Health         sources.SourceHealth
+	HealthArtifact Object
 }
 
 // CaptureSourcePage chooses the configured public provider, authenticates the
@@ -292,6 +294,8 @@ func (s *Service) CaptureSourcePage(ctx context.Context, token, project, cursorI
 	case "GITHUB":
 		if strings.HasPrefix(Str(config, "query"), "readme:") {
 			adapter = sources.GitHubReadme{AllowedOrigins: allowed}
+		} else if strings.HasPrefix(Str(config, "query"), "pr:") {
+			adapter = sources.GitHubPR{AllowedOrigins: allowed}
 		} else {
 			adapter = sources.GitHubReleases{AllowedOrigins: allowed}
 		}
@@ -299,7 +303,11 @@ func (s *Service) CaptureSourcePage(ctx context.Context, token, project, cursorI
 		adapter = &sources.Arxiv{AllowedOrigins: allowed}
 	case "X":
 		if browserActPath == "" || browserID == "" {
-			return SourceCapture{}, Fail(503, "RESOURCE_UNAVAILABLE", "authorized X browser unavailable")
+			result, err := s.captureSourcePage(ctx, token, project, cursor, config, from, to, limit, sources.Unconfigured{})
+			if err != nil {
+				return result, err
+			}
+			return result, Fail(503, "RESOURCE_UNAVAILABLE", "authorized X browser unavailable: NOT_CONFIGURED")
 		}
 		adapter = sources.XBrowser{Runner: sources.BrowserActCLI{Executable: browserActPath}, BrowserID: browserID}
 	default:
@@ -361,13 +369,27 @@ func (s *Service) captureSourcePageBound(ctx context.Context, token, project str
 	}
 	pageCursor := Str(cursor, "opaque_cursor")
 	q := sources.Query{SourceID: Str(config, "source_id"), Text: Str(config, "query"), From: from.UTC(), To: to.UTC(), Cursor: pageCursor, Limit: limit}
+	if config["kind"] == "X" && strings.HasPrefix(q.Cursor, "observed_tail:") {
+		q.Cursor = ""
+	}
 	page, e := adapter.Fetch(ctx, q)
+	result.Health = sources.NormalizeSourceHealth(&page, e)
+	if result.Health.Status == "RATE_LIMITED" && (page.RetryAfter == nil || !page.RetryAfter.After(time.Now())) {
+		fallback := time.Now().UTC().Add(time.Minute)
+		page.RetryAfter = &fallback
+		result.Health.RetryAfter = &fallback
+	}
 	result.Page = page
 	// A page that read items completely and then hit a gap is a partial observation, not a failed one. The verified
 	// prefix still gets sealed and the caller persists a pending window, so the gap is resumed on the next cycle
 	// instead of being skipped or lost. Discarding it would throw away real bytes and make one collapsed post look
 	// exactly like an unavailable source - the conflation this path exists to remove.
-	if e != nil || (page.Failure != "" && len(page.Items) == 0) {
+	if (e != nil || page.Failure != "") && result.Health.FullReadCount == 0 {
+		var healthErr error
+		result.HealthArtifact, healthErr = s.persistSourceHealth(ctx, token, project, cursor, config, result)
+		if healthErr != nil {
+			return result, healthErr
+		}
 		if e == nil && page.Failure == "RATE_LIMITED" {
 			wait := page.RetryAfter
 			if wait == nil || !wait.After(time.Now()) {
@@ -461,6 +483,9 @@ func (s *Service) captureSourcePageBound(ctx context.Context, token, project str
 	refs := []string{}
 	seenEvidence := map[string]bool{}
 	for _, item := range page.Items {
+		if item.ReadLevel == "INDEX" {
+			continue
+		}
 		if item.SourceID != config["source_id"] || item.CanonicalURL == "" || item.UpstreamID == "" || len(item.Body) == 0 || item.MediaType == "" || item.PublishedAt.IsZero() || item.PublishedAt.Before(q.From) || !item.PublishedAt.Before(q.To) {
 			return SourceCapture{}, Fail(422, "GATE_FAILED", "source item is incomplete or outside window")
 		}
@@ -503,7 +528,7 @@ func (s *Service) captureSourcePageBound(ctx context.Context, token, project str
 	}
 	// The production XBrowser never reports a complete page or a durable cursor.
 	// A trusted adapter with actual pagination can checkpoint its bounded window.
-	if config["kind"] != "X" || page.Complete || page.NextCursor != "" {
+	if page.Complete || page.NextCursor != "" {
 		if !page.Complete && page.NextCursor == "" {
 			return SourceCapture{}, Fail(422, "GATE_FAILED", "incomplete page lacks resumable provider cursor")
 		}
@@ -544,15 +569,19 @@ func (s *Service) captureSourcePageBound(ctx context.Context, token, project str
 			}
 			result.Manifest, e = Decode([]byte(priorManifest))
 			if e == nil {
+				result.Health.FullReadCount = len(result.Evidence)
+				result.HealthArtifact, e = s.sealSourceHealth(tx, p, project, current, config, result)
+			}
+			if e == nil {
 				e = s.effective(tx, project, Ref(result.Manifest, "Artifact"))
 			}
 			if e == nil && bind != nil {
 				e = bind(tx, result)
-				if e == nil {
-					e = tx.Commit()
-				}
 			}
-			return result, e // Unbound replay preserves exact idempotence.
+			if e == nil {
+				e = tx.Commit()
+			}
+			return result, e // Exact replay reuses IDs; a distinct observation keeps its durable health report.
 		} else if errors.Is(e, sql.ErrNoRows) {
 			_, e = tx.Exec("INSERT INTO source_pages(project,cursor_id,source_id,query_hash,window_from,window_to,page_cursor_in,page_cursor_out,raw_artifact_id,item_refs_json,complete,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", project, cursor["id"], config["source_id"], cursor["query_hash"], q.From.Format(time.RFC3339Nano), q.To.Format(time.RFC3339Nano), pageCursor, page.NextCursor, raw["id"], string(encoded), complete, Now())
 		}
@@ -571,7 +600,40 @@ func (s *Service) captureSourcePageBound(ctx context.Context, token, project str
 	if page.ObservedTo != nil {
 		observedTo = page.ObservedTo.UTC().Format(time.RFC3339Nano)
 	}
-	manifestBytes := Bytes(Object{"source_id": config["source_id"], "query_hash": cursor["query_hash"], "window_from": q.From.Format(time.RFC3339Nano), "window_to": q.To.Format(time.RFC3339Nano), "observed_from": observedFrom, "observed_to": observedTo, "fetched_at": page.FetchedAt.UTC().Format(time.RFC3339Nano), "request_urls": page.RequestURLs, "final_urls": page.FinalURLs, "page_cursor_in": pageCursor, "page_cursor_out": page.NextCursor, "complete": page.Complete, "visible_empty": page.VisibleEmpty, "raw_artifact_ref": Ref(raw, "Artifact"), "evidence_refs": manifestRefs[1:]})
+
+	itemMetadata := Empty()
+	for _, item := range page.Items {
+		itemMetadata = append(itemMetadata, Object{"source_id": item.SourceID, "upstream_id": item.UpstreamID, "canonical_url": item.CanonicalURL, "read_level": item.ReadLevel, "pr_state": item.PRState, "body_sha256": Digest(item.Body)})
+	}
+	manifestBytes := Bytes(Object{"item_metadata": itemMetadata, "source_id": config["source_id"], "query_hash": cursor["query_hash"], "window_from": q.From.Format(time.RFC3339Nano), "window_to": q.To.Format(time.RFC3339Nano), "observed_from": observedFrom, "observed_to": observedTo, "fetched_at": page.FetchedAt.UTC().Format(time.RFC3339Nano), "request_urls": page.RequestURLs, "final_urls": page.FinalURLs, "page_cursor_in": pageCursor, "page_cursor_out": page.NextCursor, "complete": page.Complete, "health": result.Health, "visible_empty": page.VisibleEmpty, "raw_artifact_ref": Ref(raw, "Artifact"), "evidence_refs": manifestRefs[1:]})
+
+	// Visible observations have no source_pages row. Replay their exact sealed
+	// manifest by bytes/provenance, preserving one health receipt and event.
+	if !page.Complete && page.NextCursor == "" {
+		var prior string
+		replayErr := tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='Artifact' AND json_extract(body,'$.kind')='MANIFEST' AND json_extract(body,'$.content_hash')=?", project, Digest(manifestBytes)).Scan(&prior)
+		if replayErr == nil {
+			result.Manifest, replayErr = Decode([]byte(prior))
+			if replayErr != nil {
+				return SourceCapture{}, replayErr
+			}
+			if Hash(result.Manifest["input_refs"]) != Hash([]any{Ref(cursor, "SourceCursor")}) || Hash(result.Manifest["source_refs"]) != Hash(manifestRefs) {
+				return SourceCapture{}, Fail(409, "STATE_CONFLICT", "partial manifest provenance changed")
+			}
+			result.Health.FullReadCount = len(result.Evidence)
+			result.HealthArtifact, replayErr = s.sealSourceHealth(tx, p, project, current, config, result)
+			if replayErr == nil && bind != nil {
+				replayErr = bind(tx, result)
+			}
+			if replayErr == nil {
+				replayErr = tx.Commit()
+			}
+			return result, replayErr
+		}
+		if replayErr != sql.ErrNoRows {
+			return SourceCapture{}, replayErr
+		}
+	}
 	u, e := s.upload(tx, p, project, manifestBytes)
 	if e != nil {
 		return SourceCapture{}, e
@@ -581,6 +643,11 @@ func (s *Service) captureSourcePageBound(ctx context.Context, token, project str
 		return SourceCapture{}, e
 	}
 	result.Manifest = manifest
+	result.Health.FullReadCount = len(result.Evidence)
+	result.HealthArtifact, e = s.sealSourceHealth(tx, p, project, current, config, result)
+	if e != nil {
+		return SourceCapture{}, e
+	}
 	eventType := "PROJECT_UPDATED"
 	if len(result.Evidence) > 0 {
 		eventType = "EVIDENCE_ADDED"
@@ -717,7 +784,7 @@ func capturedSourceArtifact(tx *sql.Tx, project string, artifact Object) (bool, 
 		var complete int
 		e = tx.QueryRow("SELECT raw_artifact_id,page_cursor_out,item_refs_json,complete FROM source_pages WHERE project=? AND cursor_id=? AND source_id=? AND query_hash=? AND window_from=? AND window_to=? AND page_cursor_in=?", project, cursor["id"], cursor["source_id"], cursor["query_hash"], manifest["window_from"], manifest["window_to"], manifest["page_cursor_in"]).Scan(&rawID, &next, &itemJSON, &complete)
 		if errors.Is(e, sql.ErrNoRows) {
-			return false, nil
+			return healthBoundSourceArtifact(tx, project, artifact, cursor)
 		}
 		if e != nil {
 			return false, e
@@ -751,5 +818,8 @@ func capturedSourceArtifact(tx *sql.Tx, project string, artifact Object) (bool, 
 		(p.raw_artifact_id=? OR EXISTS (SELECT 1 FROM json_each(p.item_refs_json) ids JOIN domain_objects e ON e.project=p.project AND e.kind='Evidence' AND e.id=ids.value
 		WHERE json_extract(e.body,'$.snapshot_artifact_ref.id')=? AND json_extract(e.body,'$.snapshot_artifact_ref.content_hash')=? AND json_extract(e.body,'$.snapshot_artifact_ref.revision')=?))`,
 		project, cursor["id"], cursor["source_id"], cursor["query_hash"], artifact["id"], artifact["id"], artifact["content_hash"], revision).Scan(&count)
+	if err == nil && count == 0 {
+		return healthBoundSourceArtifact(tx, project, artifact, cursor)
+	}
 	return count > 0, err
 }

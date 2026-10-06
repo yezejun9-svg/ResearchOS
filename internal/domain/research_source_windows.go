@@ -118,6 +118,8 @@ func (c *RuntimeCoordinator) brokerResearchSource(ctx context.Context, route Run
 	case "GITHUB":
 		if strings.HasPrefix(Str(config, "query"), "readme:") {
 			adapter = sources.GitHubReadme{AllowedOrigins: allowed}
+		} else if strings.HasPrefix(Str(config, "query"), "pr:") {
+			adapter = sources.GitHubPR{AllowedOrigins: allowed}
 		} else {
 			adapter = sources.GitHubReleases{AllowedOrigins: allowed}
 		}
@@ -155,7 +157,7 @@ func (c *RuntimeCoordinator) captureResearchSource(ctx context.Context, route Ru
 	}
 	limit := int(limitValue)
 	var receipt Object
-	result, err := c.service.captureSourcePageBound(ctx, provider.SourceToken, route.ProjectID, cursor, config, from, to, limit, adapter, func(tx *sql.Tx, captured SourceCapture) error {
+	_, err = c.service.captureSourcePageBound(ctx, provider.SourceToken, route.ProjectID, cursor, config, from, to, limit, adapter, func(tx *sql.Tx, captured SourceCapture) error {
 		// A completed old-epoch read may settle only its original durable intent.
 		original, e := latestEffect(tx, route.ProjectID, runID, frame.Key)
 		if e != nil {
@@ -216,7 +218,7 @@ func (c *RuntimeCoordinator) captureResearchSource(ctx context.Context, route Ru
 		original["state"], original["receipt"] = "CONFIRMED", receipt
 		return effectAppend(tx, route.ProjectID, runID, frame.Key, original)
 	})
-	if err != nil || result.Page.Failure != "" {
+	if err != nil || receipt == nil {
 		c.service.ObserveEffect(context.Background(), route.ProjectID, runID, frame.Key, "UNKNOWN", Object{"reason": "source read did not commit a complete bound receipt"})
 		if err != nil {
 			return nil, err

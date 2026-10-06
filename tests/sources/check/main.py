@@ -132,7 +132,7 @@ def forward(task, check, case):
     # in whichever mode happened to be configured.
     if check == 'W07-G01' and not case:
         mode = 'fixture'
-    elif check == 'W07-G02' or (not check and case == 'A05'):
+    elif (check in {'W07-G02', 'W07-H07'} and not case) or (not check and case == 'A05'):
         mode = 'live'
     else:
         mode = ''

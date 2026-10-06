@@ -138,7 +138,7 @@ func (s *Service) researchCycleFacts(tx *sql.Tx, project string, cycle Object, m
 	}
 	for _, raw := range coverage {
 		source := raw.(map[string]any)
-		if source["status"] == "COMPLETE" {
+		if count, _ := Num(source, "record_count"); source["status"] == "COMPLETE" || count > 0 {
 			progress = true
 		}
 		if source["required"] == true && source["status"] != "COMPLETE" {

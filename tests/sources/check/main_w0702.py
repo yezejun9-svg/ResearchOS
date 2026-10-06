@@ -21,6 +21,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -144,19 +145,34 @@ def main():
            "page_complete=%s covered_until=%s next_cursor=%s" % (rep.get("page_complete"),
                                                                   rep.get("covered_until"), rep.get("next_cursor")))
 
-    # X cursor semantics: an incomplete page persists a pending window, never a covered one
+    # UI observation markers identify the read prefix; they are not pagination tokens.
     x_dir = got["X"][-1]["dir"]
     state = cursor_state(x_dir, "X")
     x_rep = (got["X"][-1].get("report") or {})
-    mine = [c for c in state.get("cursors") or [] if c.get("opaque_cursor") or c.get("pending_window_from")]
-    if x_rep.get("page_complete") is False:
-        ok("W0702-X-CURSOR-PENDING-NOT-COVERED", bool(mine) and all(c.get("covered_until") is None for c in mine),
-           json.dumps(state, ensure_ascii=False)[:500])
-    else:
-        ok("W0702-X-CURSOR-PENDING-NOT-COVERED", False, "expected an incomplete X page, got complete: " +
-           json.dumps(x_rep, ensure_ascii=False)[:300])
-    ok("W0702-X-CURSOR-ADVANCED-PAST-READ-ITEMS", bool(x_rep.get("next_cursor")) and bool(mine),
-       json.dumps({"next_cursor": x_rep.get("next_cursor"), "cursors": mine[:2]}, ensure_ascii=False)[:400])
+    mine = [c for c in state.get("cursors") or [] if c.get("id") == x_rep.get("cursor_id")]
+    # Older cursor_state versions omit id; the probe's X source is the configured X row.
+    if not mine:
+        mine = [c for c in state.get("cursors") or [] if c.get("source_id") == x_rep.get("source_id")]
+    health = x_rep.get("health") or {}
+    health_ok = False
+    try:
+        db = sqlite3.connect(os.path.join(ROOT, x_rep["db_path"]))
+        row = db.execute("SELECT u.bytes FROM domain_objects a JOIN uploaded_content u ON u.project=a.project AND u.storage_key=json_extract(a.body,'$.storage_key') WHERE a.id=? AND a.kind='Artifact' AND u.sealed=1", (x_rep["health_artifact_ref"]["id"],)).fetchone()
+        db.close()
+        doc = json.loads(row[0]) if row else {}
+        health_ok = (doc.get("health") == health and "sha256:" + hashlib.sha256(row[0]).hexdigest() == x_rep["health_artifact_ref"]["content_hash"])
+    except (KeyError, ValueError, sqlite3.Error, TypeError):
+        pass
+    ok("W0702-X-WINDOW-OBSERVED-NOT-COVERED", x_rep.get("page_complete") is False and
+       health_ok and health.get("requested_from") == x_rep.get("window_from") and
+       health.get("requested_to") == x_rep.get("window_to") and
+       all(c.get("covered_until") is None and not c.get("opaque_cursor") for c in mine) and bool(mine),
+       json.dumps({"state": state, "health": health}, ensure_ascii=False)[:500])
+    ok("W0702-X-OBSERVATION-MARKER-NOT-PROVIDER-CURSOR", health_ok and bool(x_rep.get("items")) and
+       health.get("observation_marker") == "observed_tail:" + str(x_rep["items"][-1]["upstream_id"]) and
+       not x_rep.get("next_cursor"), json.dumps(health, ensure_ascii=False)[:400])
+    report["historical_assertion_mapping"] = {"W0702-X-CURSOR-PENDING-NOT-COVERED": "W0702-X-WINDOW-OBSERVED-NOT-COVERED",
+        "W0702-X-CURSOR-ADVANCED-PAST-READ-ITEMS": "W0702-X-OBSERVATION-MARKER-NOT-PROVIDER-CURSOR"}
 
     # the claim verdict is research output, not a transport status
     ok("W0702-X-CLAIM-VERDICT-IS-SEPARATE-FROM-HEALTH",
