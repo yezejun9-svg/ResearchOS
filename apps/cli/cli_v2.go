@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -219,27 +220,34 @@ func v2CallContext(budget context.Context, ctx *v2Context, method string, payloa
 }
 
 func v2CallTransport(budget context.Context, ctx *v2Context, method string, payload map[string]any, strictIdentity bool) (map[string]any, string, int) {
+	reply, reason, code, _ := v2CallTransportWithCause(budget, ctx, method, payload, strictIdentity)
+	return reply, reason, code
+}
+
+// Only the read-only status flow consumes this private I/O cause. A context
+// cancelled after another failure does not turn that failure into an interrupt.
+func v2CallTransportWithCause(budget context.Context, ctx *v2Context, method string, payload map[string]any, strictIdentity bool) (map[string]any, string, int, bool) {
 	env, refusal := v2EnvelopeFor(ctx, method, payload)
 	if refusal != "" {
 		if refusal == "CREDENTIAL_ABSENT" {
 			// contracts/product.contract.json maps 3 to "blocked_missing_resource_or_authorization"; a CLI with no
 			// bearer is blocked, not given an invalid argument.
-			return nil, refusal, exitNotImplemented
+			return nil, refusal, exitNotImplemented, false
 		}
-		return nil, refusal, exitUsage
+		return nil, refusal, exitUsage, false
 	}
 	body, _ := json.Marshal(env)
 	ctx.requestLog = append(ctx.requestLog, method)
 	client := http.Client{Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	req, err := http.NewRequestWithContext(budget, "POST", ctx.baseURL+v2CommandPath, bytes.NewReader(body))
 	if err != nil {
-		return nil, "REQUEST_UNBUILDABLE:" + err.Error(), exitFailed
+		return nil, "REQUEST_UNBUILDABLE:" + err.Error(), exitFailed, false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+ctx.credential)
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, "HOST_UNREACHABLE:" + err.Error(), exitFailed
+		return nil, "HOST_UNREACHABLE:" + err.Error(), exitFailed, errors.Is(err, context.Canceled)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -247,21 +255,21 @@ func v2CallTransport(budget context.Context, ctx *v2Context, method string, payl
 		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
 			code = exitFailed
 		}
-		return nil, "HOST_HTTP_" + strconv.Itoa(resp.StatusCode), code
+		return nil, "HOST_HTTP_" + strconv.Itoa(resp.StatusCode), code, false
 	}
 	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if readErr != nil || len(raw) > 1<<20 {
-		return nil, "INCOMPLETE_OR_OVERSIZE_REPLY", exitFailed
+		return nil, "INCOMPLETE_OR_OVERSIZE_REPLY", exitFailed, len(raw) <= 1<<20 && errors.Is(readErr, context.Canceled)
 	}
 	var reply map[string]any
 	if e := json.Unmarshal(raw, &reply); e != nil {
-		return nil, "MALFORMED_REPLY", exitFailed
+		return nil, "MALFORMED_REPLY", exitFailed, false
 	}
 	if strictIdentity && (reply["protocol_version"] != clientProtocol || reply["command_id"] != ctx.commandID || reply["method"] != method) {
-		return reply, "REPLY_IDENTITY_MISMATCH", exitFailed
+		return reply, "REPLY_IDENTITY_MISMATCH", exitFailed, false
 	}
 	if sid, ok := reply["session_id"].(string); strictIdentity && ok && ctx.sessionID != "" && sid != ctx.sessionID {
-		return reply, "REPLY_SESSION_MISMATCH", exitFailed
+		return reply, "REPLY_SESSION_MISMATCH", exitFailed, false
 	}
 	status, _ := reply["status"].(string)
 	switch status {
@@ -269,9 +277,9 @@ func v2CallTransport(budget context.Context, ctx *v2Context, method string, payl
 		if method != "goal.start" {
 			adoptV2Snapshot(ctx, reply)
 		}
-		return reply, "", exitCompleted
+		return reply, "", exitCompleted, false
 	case "IN_PROGRESS":
-		return reply, "", exitCompleted
+		return reply, "", exitCompleted, false
 	case "REJECTED":
 		code, _ := reply["error_code"].(string)
 		exit := exitFailed
@@ -281,11 +289,11 @@ func v2CallTransport(budget context.Context, ctx *v2Context, method string, payl
 		case "INVALID_REQUEST", "UNSUPPORTED_PROTOCOL", "UNSUPPORTED_METHOD":
 			exit = exitUsage
 		}
-		return reply, "HOST_REJECTED:" + orDefault(code, "UNSPECIFIED"), exit
+		return reply, "HOST_REJECTED:" + orDefault(code, "UNSPECIFIED"), exit, false
 	case "NOT_IMPLEMENTED":
-		return reply, "HOST_NOT_IMPLEMENTED:" + method, exitNotImplemented
+		return reply, "HOST_NOT_IMPLEMENTED:" + method, exitNotImplemented, false
 	default:
-		return reply, "UNKNOWN_STATUS:" + orDefault(status, "<absent>"), exitFailed
+		return reply, "UNKNOWN_STATUS:" + orDefault(status, "<absent>"), exitFailed, false
 	}
 }
 
