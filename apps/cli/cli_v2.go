@@ -242,6 +242,13 @@ func v2CallTransport(budget context.Context, ctx *v2Context, method string, payl
 		return nil, "HOST_UNREACHABLE:" + err.Error(), exitFailed
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		code := exitNotImplemented
+		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
+			code = exitFailed
+		}
+		return nil, "HOST_HTTP_" + strconv.Itoa(resp.StatusCode), code
+	}
 	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if readErr != nil || len(raw) > 1<<20 {
 		return nil, "INCOMPLETE_OR_OVERSIZE_REPLY", exitFailed
@@ -249,9 +256,6 @@ func v2CallTransport(budget context.Context, ctx *v2Context, method string, payl
 	var reply map[string]any
 	if e := json.Unmarshal(raw, &reply); e != nil {
 		return nil, "MALFORMED_REPLY", exitFailed
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return reply, "HOST_HTTP_" + strconv.Itoa(resp.StatusCode), exitNotImplemented
 	}
 	if strictIdentity && (reply["protocol_version"] != clientProtocol || reply["command_id"] != ctx.commandID || reply["method"] != method) {
 		return reply, "REPLY_IDENTITY_MISMATCH", exitFailed
