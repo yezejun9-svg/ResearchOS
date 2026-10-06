@@ -1,0 +1,215 @@
+{
+  "artifact_kind": "INDEPENDENT_EARLY_RETRIEVAL_REVIEW",
+  "task_id": "W09",
+  "status": "FINDINGS_CONFIRMED_NOT_ACCEPTED",
+  "stage_accepted": false,
+  "verifier_identity": "codex:/root/route_verifier",
+  "reviewed_revision": "38ebf4031a5d78bdc1c3cdf10e5f3171e630f13f",
+  "source_hashes_reference": "execution/verifier/W09/early-review/source-hashes.json",
+  "source_hashes_sha256": "ea620ea1862e2cb2c0b81106b5d3fca4185117df2c8b65c5136646c6b17086cf",
+  "environment": {
+    "os": "Windows",
+    "version": "10.0.26200",
+    "architecture": "AMD64",
+    "go_executable_sha256": "d3ccdb604eafa6031133aefe1a3db24f0bb7362b857bc2125ac4e4c178b4b490"
+  },
+  "scope": "Independent fixture-domain HTTP/SQLite tests plus actual Windows junction creation/rename on synthetic verifier-owned directories. No private user files, credentials, external network or model calls.",
+  "findings": [
+    {
+      "id": "W09-APP-01",
+      "severity": "P1",
+      "status": "REPRODUCED_ON_WINDOWS",
+      "title": "Registered root identity is lost when its path is replaced by a junction",
+      "contract_assertion": "A06-02",
+      "locations": [
+        {
+          "path": "internal/domain/retrieval_local.go",
+          "line": 16
+        },
+        {
+          "path": "internal/domain/retrieval_local.go",
+          "line": 32
+        },
+        {
+          "path": "adapters/retrieval/local.go",
+          "line": 18
+        }
+      ],
+      "reproduction": [
+        "Create sibling synthetic directories A and unregistered B with distinct marker text in same.txt.",
+        "Register A using RegisterLocalRoot and positively capture A text; nested A/escape junction to B is correctly rejected.",
+        "Rename self-created A to A-original, then create a real Windows junction at the original A path targeting synthetic B. Exact rename and junction endpoints are verified under the synthetic base.",
+        "Call CaptureLocalSnapshot with the unchanged registered root ID and same.txt.",
+        "GET captured Artifact content and POST search using the returned snapshot ID."
+      ],
+      "actual": {
+        "nested_junction_denied": true,
+        "replacement_capture_error": null,
+        "content_http": 200,
+        "unregistered_B_marker_read": true,
+        "search_hits": 1
+      },
+      "expected": "Original registration must not authorize a different directory reached after root path replacement; B marker leakage must be zero.",
+      "cause": "Registration resolves a path, opens and closes a root handle, then stores only the pathname. Each ReadFile reopens that mutable pathname with os.OpenRoot, so B becomes the new security root and child traversal checks no longer detect the substitution.",
+      "minimum_fix": "Persist and check the approved directory identity, and validate/read through the same opened handle. Reject a replaced root or require fresh authorization; separate identity validation followed by a second path reopen is insufficient.",
+      "test": "TestVerifierW09RegisteredRootReplacement"
+    },
+    {
+      "id": "W09-APP-02",
+      "severity": "P1",
+      "status": "REPRODUCED",
+      "title": "Fresh ContextBundle exports invalidated local bytes through an old task input VersionRef",
+      "contract_assertion": "A06-01",
+      "locations": [
+        {
+          "path": "internal/domain/context.go",
+          "line": 149
+        },
+        {
+          "path": "internal/domain/retrieval.go",
+          "line": 207
+        },
+        {
+          "path": "internal/domain/materialize.go",
+          "line": 84
+        }
+      ],
+      "reproduction": [
+        "Capture local source v1; create Task with input_refs=[VersionRef(v1 Artifact)] and materialize an initial bundle successfully.",
+        "Modify, delete, or move the source outside its registered root before maintenance RefreshLocalSnapshots.",
+        "Repeat identical search key/body: HTTP 200 with zero hits. Old bundle materialization correctly rejects.",
+        "Create a fresh bundle for the same Task. Its authorized_snapshot_ids is empty because live source validation excludes v1.",
+        "Materialize this fresh bundle; recursive version_vector/input_refs traversal fetches the old sealed uploaded_content bytes."
+      ],
+      "actual": {
+        "scenarios": [
+          "modify",
+          "delete",
+          "move_outside_root"
+        ],
+        "same_key_search_http": 200,
+        "same_key_hits": 0,
+        "old_bundle_rejected": true,
+        "fresh_bundle_authorized_snapshot_count": 0,
+        "fresh_materialize_error": null,
+        "old_v1_body_written": true
+      },
+      "expected": "A new ContextBundle/materialization must not contain changed, deleted, moved-out or revoked local body content, including via transitive input references.",
+      "cause": "validateBundleSnapshots checks only IDs present in bundle.authorized_snapshot_ids. A newly excluded snapshot is absent from that list, but the Task input VersionRef remains in version_vector. Artifact traversal checks generic visibility/hash only and reads sealed bytes without readLocalSnapshot/current local-source validation.",
+      "minimum_fix": "Enforce current local-source authorization/content validation on every Artifact byte dereference, including transitive materialization inputs, rather than only filtering the authorized snapshot ID list. Reject or revalidate tasks whose local input version has become invalid before writing the output directory.",
+      "test": "TestVerifierW09ChangedSourceReadPaths/{modify,delete,move_outside_root}"
+    },
+    {
+      "id": "W09-APP-03",
+      "severity": "P1",
+      "status": "REPRODUCED",
+      "title": "Direct snapshot content endpoint bypasses local source revocation/currentness",
+      "contract_assertion": "A06-01",
+      "locations": [
+        {
+          "path": "internal/domain/http.go",
+          "line": 490
+        },
+        {
+          "path": "internal/domain/http.go",
+          "line": 501
+        }
+      ],
+      "reproduction": [
+        "Capture local source v1, warm search and direct content GET.",
+        "RevokeLocalRoot through the trusted Owner API; verify metadata validity becomes REVOKED, same-key search returns 412 and old bundle materialization rejects.",
+        "GET /v1/projects/{project}/artifacts/{oldArtifact}/content using the still-valid same-project principal.",
+        "For modify/delete/move variants, invoke RefreshLocalSnapshots and confirm metadata becomes STALE, then repeat direct content GET."
+      ],
+      "actual": {
+        "revoked": {
+          "validity": "REVOKED",
+          "same_key_search_http": 412,
+          "old_bundle_rejected": true,
+          "content_http": 200,
+          "old_v1_body_returned": true
+        },
+        "modified_deleted_moved_after_refresh": {
+          "validity": "STALE",
+          "content_http": 200,
+          "old_v1_body_returned": true
+        }
+      },
+      "expected": "Retain old evidence metadata and immutable audit history without serving revoked/deleted local body content through the ordinary current-source API. A06 explicitly requires old evidence only as STALE/REVOKED metadata.",
+      "cause": "content() checks principal/project/access_class and stored hash only, then returns uploaded_content. It does not consult local-root authorization, current local bytes, or revoked/stale local-source state.",
+      "minimum_fix": "Use the shared local source read gate for direct content access and return a structured unavailable/stale/revoked error while preserving metadata/history. Do not solve this by physically deleting immutable evidence.",
+      "test": "TestVerifierW09ChangedSourceReadPaths/{modify,delete,revoke,move_outside_root}"
+    }
+  ],
+  "independent_positive_controls": [
+    {
+      "status": "PASS",
+      "check": "Authorized A capture and raw content return the expected A marker before replacement."
+    },
+    {
+      "status": "PASS",
+      "check": "Actual Windows child junction A/escape to B rejected by CaptureLocalSnapshot."
+    },
+    {
+      "status": "PASS",
+      "check": "All four source scenarios have successful initial same-project search, raw content and materialization."
+    },
+    {
+      "status": "PASS",
+      "check": "Exact same-key/body search after modify/delete/move returns 200 and zero hits; revoke returns 412, with no old-body excerpt."
+    },
+    {
+      "status": "PASS",
+      "check": "Old ContextBundle materialization is rejected after all four changes."
+    },
+    {
+      "status": "PASS",
+      "check": "Refresh projects modified/deleted/moved snapshot metadata to STALE; root revoke projects REVOKED."
+    }
+  ],
+  "read_snapshot_ids_interpretation": {
+    "sources": [
+      {
+        "path": "spec/v2.0/03_DATA_CONTRACTS.md",
+        "line": 20,
+        "basis": "ProjectProfile includes authorized snapshots."
+      },
+      {
+        "path": "spec/v2.0/02_TECHNICAL_DESIGN.md",
+        "line": 176,
+        "basis": "Authorized snapshot retrieval; source changes/deletion/revocation invalidate cache immediately."
+      },
+      {
+        "path": "spec/v2.0/contracts/acceptance.json",
+        "assertion": "A06-01",
+        "basis": "New context excludes invalid bodies; old evidence only STALE/REVOKED metadata."
+      }
+    ],
+    "conclusion": "The snapshot list is authorization/context input, not merely a relevance suggestion. However schema/openapi do not expressly define it as the sole ACL for every otherwise authorized PROJECT Artifact. No separate finding is based only on an arbitrary non-listed ordinary Artifact. Confirmed findings concern explicitly invalidated or revoked registered local snapshots and actual content disclosure."
+  },
+  "execution": {
+    "command_reference": "execution/verifier/W09/early-review/probe-command.json",
+    "command_sha256": "8ee01f21c62cb850e32c7aacc9f089204eecca0a145198f3d2893cc9c19dedc6",
+    "exit_code": 1,
+    "probe_reference": "execution/verifier/W09/early-review/probe_test.go.txt",
+    "probe_sha256": "b929c5385f7094952bf5d7b0e97f4d678408a26ca80b28ca1fa0d1c9a021306f",
+    "stdout_reference": "execution/verifier/W09/early-review/probe.stdout.txt",
+    "stdout_sha256": "a1ecb3e326fbc27badf627cd317dc2cdd0c5bc87331a2e588c613c1f92dd2ce6",
+    "stderr_reference": "execution/verifier/W09/early-review/probe.stderr.txt",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "top_level_tests": 2,
+    "mutation_subtests": 4,
+    "negative_boundaries_failed": true,
+    "positive_controls_recorded_in_same_raw_stdout": true
+  },
+  "limits": [
+    "Early review only; W09/A06 are not accepted and no frozen status/threshold changed.",
+    "Only frozen 38ebf40 reviewed; subsequent formatting/coverage or owner fixes not assessed.",
+    "No owner test was substituted for independent verification.",
+    "Windows root replacement and source file changes use only self-created synthetic marker files.",
+    "Snapshot and junction-bearing test data retained without recursive removal. No prior policy-rejected cleanup retried.",
+    "W06 APP-01/02 reports remain historical and have not been independently closed by this review.",
+    "C19 and optional backend qualification are outside this focused review."
+  ],
+  "created_at": "2026-09-29T20:37:38.783867+00:00"
+}

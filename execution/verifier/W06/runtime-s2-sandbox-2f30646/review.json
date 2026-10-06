@@ -1,0 +1,142 @@
+{
+  "artifact_kind": "INDEPENDENT_ASYNC_BOUNDARY_SLICE_REVIEW",
+  "verifier": "codex:/root/evolution_verifier",
+  "source_revision": "2f30646a57c0c18a022c2080ec3aeb2e9d9d559e",
+  "main_base": "33d92302755f723ca1c2392a33a86199d0c9ac34",
+  "verdict": "NEEDS_FIX_ASYNC_WRITE_CANCELLATION",
+  "maximum_acceptance_scope": "PASS_ASYNC_BOUNDARY_SLICE",
+  "findings": [
+    {
+      "id": "S2-ASYNC-001",
+      "priority": "P2",
+      "status": "OPEN",
+      "title": "Queued Write ignores its own context deadline while waiting for the serial lock",
+      "source": "ops/experiment_sandbox/async_windows.go",
+      "line": 90,
+      "trigger": "A live child does not consume stdin. A first 64KiB Write blocks while holding writeMu; a second Write has a 40ms deadline.",
+      "observed": "The second Write remained blocked after 200ms, then returned process input closed only after explicit Process.Cancel killed the job and released the first writer.",
+      "impact": "Concurrent protocol senders cannot rely on Write(ctx) to stop waiting at their own deadline. Queued senders may wait for the preceding writer (up to its 5-second cap) rather than returning their own cancellation.",
+      "requested_fix": "Use cancellation-aware serialized write admission, select on caller context and process completion while waiting, and reject already-cancelled frames before launching the pipe write. Preserve one-frame-at-a-time writes and job cancellation for an in-flight blocked write.",
+      "evidence": [
+        "queued-command.json",
+        "queued.stdout.jsonl",
+        "queued_write_test.go",
+        "native/queued-write.json"
+      ],
+      "non_claim": "No isolation escape, real provider access, permanent process leak or deadlock is demonstrated. Explicit cancellation stopped the owned child and released both writers."
+    }
+  ],
+  "P1_findings": [],
+  "validation": {
+    "primary_command_exit": 0,
+    "primary_independent_assertions_pass": 34,
+    "targeted_command_exit": 1,
+    "targeted_assertions_pass": 2,
+    "targeted_assertions_fail": 1,
+    "total_independent_assertions_pass": 36,
+    "total_independent_assertions_fail": 1,
+    "tests": [
+      {
+        "log": "stdout.jsonl",
+        "test": "TestRuntimeSandboxAsync",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestRuntimeSandboxBeforeResumeVeto",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestRuntimeSandboxStreamLimit",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestIndependentS2PersistBeforeResume",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestIndependentS2Veto",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestIndependentS2ConcurrentLifecycle",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestIndependentS2BlockedWriteCancel",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestIndependentS2StreamError/callback",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestIndependentS2StreamError/overflow",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestIndependentS2StreamError",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestIndependentS2RunCompatibility/normal",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestIndependentS2RunCompatibility/timeout",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestIndependentS2RunCompatibility",
+        "verdict": "pass"
+      },
+      {
+        "log": "stdout.jsonl",
+        "test": "TestSandboxRootOverlap",
+        "verdict": "pass"
+      },
+      {
+        "log": "queued.stdout.jsonl",
+        "test": "TestIndependentS2QueuedWriteDeadline",
+        "verdict": "fail"
+      }
+    ],
+    "commands": [
+      "command.json",
+      "queued-command.json"
+    ]
+  },
+  "passed_behaviors": [
+    "Callback identity matches actual Windows process creation time/PID; an fsynced identity record and callback return timestamp precede the child first-execution timestamp.",
+    "Vetoed suspended process emits no child output, publishes no output file, and is already terminated when Start returns an error.",
+    "Eight concurrent bounded frames are delivered atomically and completely; timed-out Wait does not cancel the process, CloseInput ends stdin, post-close Write refuses, and repeated Wait returns the same completed result.",
+    "A blocked 64KiB write hits a 100ms deadline, cancels the job, releases the writer and allows bounded Cancel/Wait without deadlock.",
+    "A failing stream callback and stderr overflow stop the child, retain bounded evidence, and mark streams undrained.",
+    "Normal and timed-out Run preserve expected exit behavior; process stopped, staging removed, and no capabilities granted."
+  ],
+  "limits": [
+    "Only the native asynchronous AppContainer boundary at source 2f30646 is reviewed. No complete S2 coordinator/domain/typed-bridge/workbench acceptance, construction gate, LIVE or BOUNDED_AUTO qualification is granted.",
+    "Three frozen source files are overlaid on main 33d9230. The two remaining package files match the frozen source after line-ending normalization; product source and the active author worktree were not edited.",
+    "All native processes use newly created no-secret fixtures, fresh owned AppContainers and temporary directories. No protected production service, provider or external network destination is contacted.",
+    "BeforeResume and OnStream are trusted host callbacks; this review exercises callback rejection and prompt consumption, not indefinitely hung arbitrary callback code. The API documents prompt stream consumption.",
+    "Stream bounds are 4MiB per stream. A cancelled process can legitimately have drained EOF streams; callback rejection and stream overflow correctly produce StreamsDrained=false.",
+    "Run compatibility covers ordinary completion, timeout and existing root-overlap refusal. The older TestNativeSandbox external-network probe was intentionally excluded because external access was outside this task.",
+    "Three standard pipe handles remain the only explicit inherited handles; zero capabilities, minimal environment, active-process limit and private staging ACL logic were preserved by source comparison. Child host-canary/proxy environment absence and capabilities were also checked natively; arbitrary handle enumeration was not performed.",
+    "The author original SetWriteDeadline failure and subsequent successful run are retained as immutable Git-sourced evidence. This review also retains the failing queued-deadline probe and does not report it as PASS."
+  ],
+  "source_and_author_evidence_unchanged": true,
+  "whole_S2_accepted": false,
+  "LIVE_qualified": false,
+  "BOUNDED_AUTO_granted": false
+}

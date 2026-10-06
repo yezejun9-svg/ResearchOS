@@ -1,0 +1,243 @@
+{
+  "schema": "researchos.w05.durable-queue-scope-supplement.v1",
+  "actor": "codex:/root/w05_merge_review",
+  "role": "INDEPENDENT_ARCHITECTURE_REVIEW_NOT_IMPLEMENTER_NOT_PARENT_VERIFIER",
+  "reviewed_at_utc": "2026-10-06T07:36:09.750633+00:00",
+  "parent_acceptance": false,
+  "formal_case_count_delta": 0,
+  "provider_calls": 0,
+  "product_tests_run_by_reviewer": 0,
+  "frozen_review": {
+    "path": "execution/v2.4/receipts/W05/W05-99/resume_review_codex/durable_queue_scope_review.json",
+    "sha256": "3db1153fd3355519810d3e3573938d7f354994d70291fa163fcfda6ed5c0f738"
+  },
+  "source_head_observed": "fbf661c142a98db72d273204615a9b20641b3cc3",
+  "registration_note": "Root agreed numbered0022 and exact30-path proposal. This supplement defines implementation gates; it is not an implementation acceptance.",
+  "queue_state_machine": {
+    "authority": "Go SQLite is sole business authority. New tables are internal operational data, not a new frozen domain kind. Existing scheduler remains sole Goal/Task/Run creator and claimer.",
+    "enqueue_transaction": [
+      "Authenticate existing writer/lease; check exact binding, request hash, session revision, writer epoch, runtime epoch and OPEN fence; do not relax qualified runtime admission.",
+      "Allocate monotonically increasing per-bound-queue order and command/message IDs; preserve original text and attachment provenance. Apply bounded capacity and transport representability before acceptance.",
+      "Atomically persist entry, accepted watermark, MESSAGE event, original idempotency result and session revision. COMPLETED SendMessageResult proves durable enqueue only; no additional Goal/Task/Run."
+    ],
+    "phases": [
+      "ENQUEUED -> SENDING (persist before process write) -> SDK_ACCEPTED -> CONSUMED",
+      "SENDING -> CONSUMED allowed when authenticated exact SDK consumption witness arrives before method/accepted receipt; late acceptance verifies identity without state regression.",
+      "ENQUEUED -> DROPPED only under committed cancellation/fence proof before any dispatch.",
+      "SENDING or SDK_ACCEPTED -> DROP_REQUESTED -> DROPPED requires exact SDK clear plus idle/dead-process and receipt reconciliation.",
+      "Any ambiguous transport/process/restore boundary -> UNKNOWN; do not silently re-enqueue. UNKNOWN remains unsettled until reconciled by original evidence."
+    ],
+    "history": "Append-only receipt transitions retain prior acceptance/consumption evidence. CONSUMED is not rewritten to DROPPED during cancellation. An accepted send response stays its original enqueue result even if downstream later fails; snapshot/events reflect later state.",
+    "identity": [
+      "session_id",
+      "goal_id",
+      "task_id",
+      "run_id (nullable before admission)",
+      "command_id",
+      "message_id",
+      "queue_generation",
+      "queue_sequence",
+      "content_hash",
+      "accepted_writer_epoch",
+      "runtime_epoch",
+      "dispatch_key",
+      "manifest_hash",
+      "worker_process_identity"
+    ],
+    "fences": "OPEN -> SEALING -> SEALED; cancellation/restore can fence at any phase. Writer handoff never erases accepted commands. Prior-writer commands already legally accepted retain original identity; newly submitted stale-writer or stale-runtime commands reject.",
+    "public_contract": "Only existing schema fields/event kinds. pending_command_ids is derived from actual outstanding queue/control records. No invented QUEUE event, Task cancel target, command cancel verb or claim that downstream consumption is SendMessageResult completion."
+  },
+  "mu_control_design": {
+    "chosen_adapter": "Use actual AgentSession.sendCustomMessage({customType: internal queue marker, content: original content, display: true, details: {command_id, queue_generation, queue_sequence, content_hash}}, {deliverAs: steer|followUp, triggerTurn: true}) on the existing AgentSession. No vendor changes.",
+    "source_basis": "agent-session.ts custom messages reach agent.steer/followUp while streaming and _runAgentPrompt while idle; messages.ts convertToLlm maps custom content to role=user unchanged and omits details/customType. Repeated identical text remains distinguishable by details.command_id in message events.",
+    "required_proof": [
+      "Exercise the installed SDK, not a mocked session method. Capture actual outgoing model request and prove complete original user content and attachment handling, no metadata instructions, no duplication, and exactly matched message_start/end receipts.",
+      "Validate allowable attachments against the installed custom-message conversion; reject unsupported representations before enqueue success rather than silently dropping attachments.",
+      "Observe real underlying agent queue/idle state. AgentSession.pendingMessageCount and clearQueue returned text lists omit custom messages and cannot prove emptiness. Keep a bounded per-command adapter ledger and inspect supported underlying agent queue state."
+    ],
+    "transport_host_frames": [
+      "command.deliver",
+      "command.clear_abort",
+      "command.prepare_seal",
+      "command.commit_seal"
+    ],
+    "transport_worker_frames": [
+      "command.accepted",
+      "command.consumed",
+      "command.cleared",
+      "command.abort_observed",
+      "command.idle",
+      "command.sealed"
+    ],
+    "frame_binding": "Strict bounded fields include full original process/dispatch/epoch/generation identity and per-command IDs/hashes. Unknown/stale/foreign/duplicate conflicting receipts fail closed. Same exact duplicate receipt is idempotent. Control receipts participate in ordered bridge journal durability.",
+    "concurrency": [
+      "Do not await delivery/idle-triggered SDK prompt completion inside the stdin frame reader; it must continue accepting effect acknowledgements and abort. Serialize SDK decisions through one adapter actor while reader remains responsive.",
+      "Make stdout sequence allocation and pending-ACK registration atomic before asynchronous writes. Current next=sequence+1 pattern must not race newly concurrent events. One process stdin writer serializes effect ACKs and control frames.",
+      "Current coordinator synchronous brokerEffect wait cannot block control delivery/receipt processing. Add bounded transport/read pump and cancellation propagation while retaining existing single effect/business authority.",
+      "Mark command consumption synchronously in SDK message events, flush bounded receipt writes before idle/seal completion. Serialize streaming/idle/settling transitions to prevent an admitted command from falling after worker disposal.",
+      "Honor cancellation in real pending MODEL/tool effects and AbortSignal. session.abort waiting for idle cannot depend forever on a pending protocol.effect acknowledgement. Keep physical-process-stop fallback and distinguish forced termination from SDK acknowledgement."
+    ],
+    "budgets": "All steer/followUp turns share the original Task/Run/process/session, capability envelope and total effect/model/time/frame budgets. Do not reset counters, obtain another business Run or expand tool permissions. Preserve exact supplementary input provenance without mutating original frozen Task input references.",
+    "qualification": "Changing worker/bundle invalidates source-current qualification assumptions. Rebuild hashed runtime bundle and rerun applicable existing qualification gates; local SDK loopback tests do not establish LIVE provider acceptance."
+  },
+  "completion_and_cancel": {
+    "normal_seal": [
+      "At real SDK idle the worker remains alive. Host transaction changes OPEN to SEALING and records exact accepted high watermark; concurrent enqueue before fence is included, after fence is rejected before success.",
+      "Drain all legally accepted messages through actual SDK consumption or explicit reconciled disposition. Worker returns exact generation/watermark, adapter ledger and real SDK queue-empty/idle evidence.",
+      "Go verifies no nonterminal entries or outstanding controls, commits SEALED, then sends commit_seal. Only then may worker emit final turn.completed, result artifact and dispose. No orphan accepted message can survive terminal Run completion."
+    ],
+    "queue_empty_predicate": [
+      "Canonical queue has no ENQUEUED/SENDING/SDK_ACCEPTED/DROP_REQUESTED/UNKNOWN entry in settled scope.",
+      "No pending control request or unprocessed bound receipt; accepted and sealed watermark/generation match.",
+      "Actual SDK queue and adapter ledger are empty with authenticated idle proof, or physical process termination plus sufficient exact command reconciliation proves no remaining execution.",
+      "Protocol Frames/Acknowledged is consistent but is not the user queue predicate.",
+      "children_stopped and EffectsReconciled remain separate mandatory facts; no unknown effect becomes success because messages were cleared."
+    ],
+    "cancel_targets": "Public Run/Goal only, per frozen schema. Goal cancel resolves and freezes owned task membership plus future admission; pending no-Run Task cancellation is internal through that Goal, not a new public target.",
+    "cancel_transaction": [
+      "Record original CANCEL command id/hash and durable IN_PROGRESS/ACKNOWLEDGED response. Atomically fence target Goal/Run queues, record task cancel controls and prevent competing scheduler claim/new Task creation.",
+      "Use the same shared cancellation hooks from existing actGoal/controlTask and protocol entrypoints, so existing direct APIs cannot bypass queue fencing. CANCEL dominates PAUSE, resource permission recovery and resume.",
+      "For a no-Run Task, settle only after proof that no dispatch/process/effect was admitted; keep Run null and create no placeholder Run. For active tasks, issue same-worker clear/abort, cancel actual effects/children, then reconcile receipts and effects.",
+      "Complete original CANCEL response only when every target member is settled with true queue_empty, children_stopped and effect reconciliation. Preserve original request hash, monotonic response history and same-command replay identity. Goal status CANCELLED by itself is not this proof."
+    ],
+    "unknowns": "Transport loss, old process journal gaps or unknown effects remain pending/reconciling. Do not return settled=true or clear pending IDs to make UI appear terminal. Force-kill is evidence of stopped process, never fabricated SDK command acceptance/consumption.",
+    "handoff_pause": "Handoff preserves accepted followups and command IDs. If PAUSE is supported in this slice, it must use real same-worker suspension/abort and explicit resumable disposition under existing semantics; do not implement PAUSE by secretly cancelling queued inputs. Unsupported behavior remains explicit and must not be advertised as completed."
+  },
+  "migration_21_to_22": {
+    "scope": "Implement separate explicit 21-to22 path in backup_queue_upgrade.go and narrow dispatch in backup_upgrade.go. Preserve exact prior13-to14/20 code paths and their history/protected checks.",
+    "release_identity": [
+      "Source manifest must pin exact numbered0001..0021 bytes plus existing next_v24_sessions.sql bytes and source executable/code identity. Target manifest pins0001..0022, unchanged additive session schema and target executable/code identity. Manifesting only numbered SQL misses typed-session dependencies.",
+      "The old upgradeRelease supports counts13/14/20 and fixed historical hashes. Do not silently treat21 as20 or auto-accept arbitrary latest migration hashes. Record reviewed0021/0022 hashes in the new explicit plan after implementation freeze.",
+      "Check schema_migrations exact expected set, required additive session tables/columns/indexes and existing installClientSessionFence effects. Do not infer additive schema presence from numbered version21."
+    ],
+    "fresh_database": "Service.New currently runs numbered SQL then next_v24_sessions.sql and installClientSessionFence in the same transaction.0022 must create its own empty tables/indexes without querying/seeding client_sessions before it exists. App-level binding checks plus post-install FK/schema verification can enforce relations; do not alter next_v24_sessions or store.go merely to evade ordering. Missing/corrupt additive schema must roll back the entire transaction, including0022.",
+    "populated_database": [
+      "Keep CheckMigrationSafety refusal for unverified in-place migration. Source remains offline and unchanged. Create matching-program source backup, restore to isolated candidate, verify source identity and all source rows, then apply0022 in controlled isolated upgrade transaction.",
+      "Install/verify the unchanged additive session schema and fence at the normal source-compatible point. Confirm preexisting session rows, idempotency/replay rows, ownership/CAS, event watermarks and indexes survive exactly. Do not drop or reconstruct sessions.",
+      "No existing queue records exist at version21. Create empty new operational tables only. Any pending runtime admission/control already present in original tables remains fenced by existing recovery rules; it is not inferred consumed or erased.",
+      "Verify row/logical hashes of all previous tables before/after, permitting only explicitly specified existing restore-recovery mutations and schema_migrations addition. Preserve source backup and rollback usability. Produce target backup, isolated restore and rebackup roundtrip. No stable/live DB is switched by this implementation task."
+    ],
+    "legacy_opaque_baseline": {
+      "finding": "Production putOpaque intentionally writes WorkspaceBinding, BootstrapStage, BootstrapReplay and Project only to domain_objects. Current upgradeProtection.refresh rejects any such row without matching domain_versions; routing a normal v21 bootstrap database through that old guard will fail.",
+      "complete_solution": "The NEW21-to22 verifier must explicitly separate the four source-defined internal operational kinds from versioned domain entities. For every versioned kind retain exact current-to-history equality and all protected-history checks. For each allowed operational kind validate exact existing shape/identity/project/principal/reference rules, body content hash/revision consistency, absence of unexpected version-history masquerading, and pin a sorted full-row before/after manifest. No row rewriting, synthesized history or discarded row is permitted.",
+      "allowlist": [
+        "WorkspaceBinding",
+        "BootstrapStage",
+        "BootstrapReplay",
+        "Project"
+      ],
+      "restriction": "This is a source-specific typed operational-data verifier, not WHERE history IS NULL exclusion and not an exemption for arbitrary unknown kinds. Unknown kind, malformed allowed-kind row, known versioned entity missing history, content mismatch, changed operational row or protected-history drift must fail. Existing13/14/20 guard behavior remains unchanged.",
+      "scope_fit": "New backup_queue_upgrade.go/test helpers and narrow backup_upgrade.go selection fit registered30 files. If current source shape cannot be validated with these files or source snapshot differs, report exact extension before implementation, never omit opaque fixture and claim full upgrade.",
+      "evidence_required": "Build populated v21 fixture via actual existing bootstrap/workspace paths covering all four kinds, active/inactive sessions and history. Upgrade and roundtrip it. Also corrupt one row of each category and prove fail-closed. Tests use local fixtures; no protected holdout or credentials."
+    }
+  },
+  "recovery_backup_and_drain": {
+    "crash_boundaries": [
+      "Before enqueue commit: nothing accepted. After commit/before dispatch: persisted entry remains outstanding. After SENDING or OS write but before SDK ack: UNKNOWN until original journal/worker evidence resolves it.",
+      "After SDK acceptance/before consumed: retain exact same-worker queue ownership. After consumed/before host receipt commit: recover authenticated original receipt/journal; never replay into another worker on speculation.",
+      "Seal/cancel crashes preserve fence and watermark. Restart cannot reopen SEALED/CANCEL_FENCED or move terminal receipt backward. Foreign process/runtime epoch/generation evidence is rejected.",
+      "On restore, even an ENQUEUED snapshot may predate a later external send in the lost future. Fence restored queues and no-Run controls before any admission; do not automatically treat every restored ENQUEUED record as safe to send."
+    ],
+    "resolution": "Import exact original dispatch/process-bound receipts if available. Otherwise retain UNKNOWN/reconciling and pending cancellation. A dead original process proves no future execution but does not prove which inputs were consumed; preserve that distinction. No automatic retry of uncertain command under another Run/session/epoch. Explicit continued work must follow existing authority/recovery semantics and must not relabel old command as successfully consumed.",
+    "effects": "Existing unfinished external effects become/stay UNKNOWN per recovery. Queue clearing, worker death, backup restoration and old-epoch rejection do not reconcile an unknown effect. Cancel remains pending until existing effect reconciliation succeeds.",
+    "full_backup": "SQLite snapshot already includes new tables, but add explicit inventory/hashes and relational validation for queue/fence/control/receipt state and referenced session/Task/Run identities. Preserve terminal receipt history and pending null-Run commands.",
+    "portable": "Portable export currently reads domain_versions. Include new operational queue/control evidence in an explicit versioned internal sidecar/inventory with validation, not a new frozen domain kind. Preserve authorizations/provenance while applying existing workspace-remap rules; restore must fence any runnable state. Verify sidecar and database cannot disagree. If the portable format is documented as non-restorable, prove preserved evidence/export behavior without falsely claiming executable restore.",
+    "drain": "Count unresolved queues/controls including null-Run ones; fence intake before snapshot/update. Include real worker/SKD idle-seal evidence and existing Runs/effects/reservations/dispatch accounting. Waiting, UNKNOWN or unconfirmed cancel makes drain noncomplete. No forced dropping to satisfy update drain.",
+    "portable_and_upgrade_negative_tests": [
+      "missing sidecar/table",
+      "modified receipt/content hash",
+      "foreign session or Goal binding",
+      "orphan queue entry",
+      "broken receipt chain or watermark",
+      "old epoch with empty-looking protocol ACK count",
+      "pending queue with no Run",
+      "unknown effects despite physical child stop"
+    ]
+  },
+  "cli_single_writer_design": {
+    "files": [
+      "apps/cli/cli_verbs.go",
+      "apps/cli/cli_stream.go",
+      "apps/cli/cli_queue_integration_windows_test.go"
+    ],
+    "existing_problem": "cliInteractive awaits synchronous runCLIVerb; unbuffered lines stops stdin consumption during an active Run. Host/worker fixes alone do not provide usable interactive steering.",
+    "architecture": [
+      "One bounded stdin reader parses/queues user intents only. One cliFlow owner serializes context state, admission responses, stream/snapshot application and outgoing mutation envelopes. No goroutine independently mutates context, claims writer lease or starts another session/Run.",
+      "The existing wait/event-page loop consumes queued intents at safe points. First reconcile any uncertain in-flight original admission using original commandID/hash before issuing a new command; refresh canonical session revision/epoch once for a genuinely new intent.",
+      "Use explicit steer/follow-up syntax without changing all NORMAL input into STEER. Hold/reject intents when no bound active Task or seal/cancel fence forbids them; never create a second Task merely to accept input.",
+      "CAS/writer conflict stays visible and does not auto-retry the user mutation with a newer revision or silently seize writer. Preserve unacknowledged draft text under backpressure/errors. Observer mode cannot send controls.",
+      "Ctrl-C targets existing Run or current Goal before Run admission. Keep original cancel command for pending polls/replay and exit130 only on existing documented confirmed cancellation semantics. EOF/quit handling must preserve documented behavior and never imply cancellation confirmation.",
+      "CLI pause action must retain existing truthful support status; do not advertise completed pause based on input buffering alone. Followup retains original user text, stable command identity, and current authority."
+    ],
+    "proof": "Real stdin/CLI -> real local API -> domain SQLite -> original bridge/SDK path with bounded loopback provider; hold initial turn open, submit steer then followup and cancel before initial runCLIVerb returns. Assert one shared-context writer, one business Task/Run/session/process, exact input consumption/clear and cancel gating. Do not modify active composition worker cli_stream_test.go.",
+    "w13_obligation": "W13 UI is outside this slice. It must later use same typed send/control/pending snapshots, CAS/replay and real queue/settlement semantics. No independent UI queue truth or fake success."
+  },
+  "acceptance_matrix": [
+    {
+      "id": "Q01",
+      "case": "Real SDK consumption and same original execution",
+      "required": "Real installed Mu plus bounded local model endpoint, actual API/SQLite/bridge. Hold initial turn active; send steer/followUp, identical text twice with distinct command IDs, verify exact user text in outgoing model inputs and identity-bearing SDK consumption receipts. One Goal/Task/Run/session/process; no reset budget.",
+      "counterexample": "Only rows/ACK mocks, text matching instead of ID, second Run, metadata used as instruction, truncated attachment/text."
+    },
+    {
+      "id": "Q02",
+      "case": "Protocol nonblocking and atomic frame sequence",
+      "required": "Interleave effect requests/ACKs with controls and long-running effect. Abort reaches same session before effect completes; unique contiguous frame sequence and correct pending registration. Receipt event ordering may precede accepted acknowledgement without state regression.",
+      "counterexample": "stdin handler awaits prompt, effect wait prevents cancel, sequence collision, consumed command regressed to accepted."
+    },
+    {
+      "id": "Q03",
+      "case": "Seal/enqueue race",
+      "required": "Deterministically race final idle, enqueue commit, prepare-seal and crash. Every accepted command is included in exact watermark and has witnessed disposition before completion; post-fence enqueue rejects before success. Real custom SDK queue and adapter ledger empty.",
+      "counterexample": "queue_empty = Frames == ACK, pendingMessageCount==0 while custom message exists, worker disposed after accepting orphan."
+    },
+    {
+      "id": "Q04",
+      "case": "Pending Goal cancellation and Task claim race",
+      "required": "Real Goal start before Run; race cancel with Task claim/creation. Exactly one outcome fenced by shared transaction; no placeholder Run, no later admitted Task under cancelled Goal. Repeated original CANCEL remains pending until every member settles then replays original typed confirmed result.",
+      "counterexample": "Goal status or Task CANCELLED alone means settled; stale resource grant resumes cancelled Task; public Task target invented."
+    },
+    {
+      "id": "Q05",
+      "case": "Active cancel and unknown effects",
+      "required": "Same worker clear/abort under streaming/tool/resource wait; all children stopped and commands reconciled; forced termination distinguishable from SDK receipt. Unknown effect keeps cancellation pending. Cancel consumes no new writer or business Run.",
+      "counterexample": "Terminate process -> immediate confirmed success with unknown effects or ambiguous commands."
+    },
+    {
+      "id": "Q06",
+      "case": "Crash and epoch replay",
+      "required": "Fault injection before/after enqueue commit, SENDING write, SDK acceptance/consumption, receipt commit, seal and cancel. Restart/restore reject foreign and old-epoch evidence; exact original receipts idempotently reconcile; no blind resend of uncertain command.",
+      "counterexample": "Reset SENDING/UNKNOWN to ENQUEUED; restore snapshot labelled unsent solely from row state."
+    },
+    {
+      "id": "Q07",
+      "case": "Fresh schema and populated21-to22",
+      "required": "Fresh install atomic0022+additive sessions; missing/corrupt additive file rolls back. Actual populated21 fixtures include all4 opaque kinds, sessions, replay data and versioned history; migration + backup/isolated restore/rebackup preserve explicit row manifests. Existing13-to14/20 tests unchanged.",
+      "counterexample": "Only empty database; skip opaque fixture; wildcard history exception; mutate next_v24 to hide migration."
+    },
+    {
+      "id": "Q08",
+      "case": "Backup portable drain completeness",
+      "required": "Snapshot/inventory/portable evidence cover all queue/control/receipt tables, pending null-Run inputs and terminal history. Restored state fenced. Drain refuses pending/UNKNOWN queue or cancel. Tampered/orphan bindings fail.",
+      "counterexample": "Full SQLite copy alone claimed portable/recovery support; noRun commands disappear from drain."
+    },
+    {
+      "id": "Q09",
+      "case": "CLI actual active input",
+      "required": "Actual running CLI stdin can enqueue explicit steer/followup and request cancel while original admission/run wait active. Single flow context writer; current CAS with no conflict retries; draft text retained after errors; true pending/confirmed distinction.",
+      "counterexample": "Buffered lines only processed after completion; parallel second session/run or writer; changed NORMAL default."
+    },
+    {
+      "id": "Q10",
+      "case": "Existing semantics and proof scope",
+      "required": "Current combined CLI/domain/runtime/backup tests and new targeted concurrency/SDK tests pass after source/bundle freeze; no skip or input drift. Route qualification evidence source-current. Record local fixture scope separate from LIVE/provider and W05/A04 acceptance.",
+      "counterexample": "Fixture successful reply counted as provider success; rows-only safe subset labelled complete."
+    }
+  ],
+  "implementation_completion_gate": "All Q01..Q10 gates with attributable raw receipts and frozen source pass together; migration/opaque preservation, active CLI input, SDK consumption/seal and cancel/recovery are required parts of this slice. If any required gate cannot be implemented, report the exact blocker and preserve nonterminal truth; do not ship a different claimed final state.",
+  "reviewer_limitations": [
+    "Independent source/architecture review only, no product tests/model calls executed by this reviewer.",
+    "Existing integrated CLI67/domain174 audit proves raw hash/count/exit facts only; it does not prove new queue design or future implementation.",
+    "Proposed internal frame names and table names are implementation choices within reviewed scope, not changes to frozen client contract."
+  ]
+}

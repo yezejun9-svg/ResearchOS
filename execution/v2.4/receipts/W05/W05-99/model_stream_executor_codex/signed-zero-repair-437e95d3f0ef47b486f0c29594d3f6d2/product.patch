@@ -1,0 +1,89 @@
+diff --git a/apps/cli/cli_model_stream_integration_windows_test.go b/apps/cli/cli_model_stream_integration_windows_test.go
+index 6fdd6cc9..e5cb74a1 100644
+--- a/apps/cli/cli_model_stream_integration_windows_test.go
++++ b/apps/cli/cli_model_stream_integration_windows_test.go
+@@ -34,7 +34,7 @@ func TestCLIModelStreamSecretQuarantine(t *testing.T)     { testCLIModelStream(t
+ func TestCLIModelStreamDurableCommitFailure(t *testing.T) { testCLIModelStream(t, "commit-failure") }
+ func TestCLIModelStreamPipelinedTerminal(t *testing.T)    { testCLIModelStream(t, "pipeline") }
+ func TestCLIModelStreamSemanticSecretQuarantine(t *testing.T) {
+-	for _, kind := range []string{"alias", "reasoning.text", "reasoning.summary", "tool-json"} {
++	for _, kind := range []string{"alias", "reasoning.text", "reasoning.summary", "tool-json", "tool-json-signed-zero"} {
+ 		t.Run(kind, func(t *testing.T) { testCLIModelStream(t, "secret-"+kind) })
+ 	}
+ }
+@@ -213,12 +213,20 @@ func testCLIModelStream(t *testing.T, mode string) {
+ 			kind := strings.TrimPrefix(mode, "secret-")
+ 			for i, text := range []string{"permission-", "loopback-fixture"} {
+ 				delta := domain.Object{}
+-				if kind == "tool-json" {
++				if kind == "tool-json" || kind == "tool-json-signed-zero" {
+ 					part := `{"value":"perm\u0069`
+ 					if i == 1 {
+ 						part = `ssion-loopback-fixture"}`
+ 					}
+ 					delta["tool_calls"] = []any{domain.Object{"index": 0, "id": "synthetic-tool", "type": "function", "function": domain.Object{"name": "synthetic_tool", "arguments": part}}}
++					if kind == "tool-json-signed-zero" {
++						call := delta["tool_calls"].([]any)[0].(domain.Object)
++						if i == 0 {
++							call["index"] = json.RawMessage("-0")
++						} else {
++							delete(call, "id")
++						}
++					}
+ 				} else if kind == "alias" {
+ 					key := "reasoning"
+ 					if i == 1 {
+diff --git a/internal/domain/runtime_model_stream.go b/internal/domain/runtime_model_stream.go
+index e11a26e3..c53c1665 100644
+--- a/internal/domain/runtime_model_stream.go
++++ b/internal/domain/runtime_model_stream.go
+@@ -830,6 +830,11 @@ func (q *modelSSEQuarantine) inspectSDKTools(delta map[string]any) bool {
+ 			continue
+ 		}
+ 		index, indexed := call["index"].(float64)
++		// SDK Map keys use SameValueZero: JSON numbers are binary64 and both
++		// signed zeros select the same accumulated tool-argument stream.
++		if index == 0 {
++			index = 0
++		}
+ 		indexKey := "index:" + strconv.FormatFloat(index, 'g', -1, 64)
+ 		id, _ := call["id"].(string)
+ 		var tool *modelSSEToolStrings
+diff --git a/internal/domain/runtime_model_stream_test.go b/internal/domain/runtime_model_stream_test.go
+index a5e6e4ec..da518bec 100644
+--- a/internal/domain/runtime_model_stream_test.go
++++ b/internal/domain/runtime_model_stream_test.go
+@@ -386,6 +386,33 @@ func TestModelStreamQuarantineOtherConcatenatedLanes(t *testing.T) {
+ 	}
+ }
+ 
++func TestModelStreamQuarantineSDKNumberToolIdentity(t *testing.T) {
++	for _, indexes := range [][2]string{{"-0", "0"}, {"0", "-0"}, {"-0e123", "0.0"}, {"1", "1.0"}, {"9007199254740992", "9007199254740993"}, {"1e-400", "0"}} {
++		t.Run(indexes[0]+"_"+indexes[1], func(t *testing.T) {
++			q, _ := newModelSSEQuarantine("permission-loopback-fixture")
++			for i, part := range []string{`{"value":"perm\u0069`, `ssion-loopback-fixture"}`} {
++				call := Object{"index": json.RawMessage(indexes[i]), "function": Object{"arguments": part}}
++				if i == 0 {
++					call["id"] = "synthetic-call"
++				}
++				out, err := q.Feed(streamTestDelta(Object{"tool_calls": []any{call}}))
++				if len(out) != 0 || i == 0 && err != nil || i == 1 && err == nil {
++					t.Fatalf("SDK numeric identity split its semantic lane: part=%d released=%d err=%v", i, len(out), err)
++				}
++			}
++		})
++	}
++	q, _ := newModelSSEQuarantine("permission-loopback-fixture")
++	first := streamTestDelta(Object{"tool_calls": []any{Object{"index": json.RawMessage("-0"), "function": Object{"arguments": `{"value":"perm\u0069`}}}})
++	second := streamTestDelta(Object{"tool_calls": []any{Object{"index": 0, "function": Object{"arguments": `ssion-benign"}`}}}})
++	if out, err := q.Feed(first); err != nil || len(out) != 0 {
++		t.Fatal("suspected JSON prefix must remain held", err)
++	}
++	if out, err := q.Feed(second); err != nil || !bytes.Equal(out, append(first, second...)) {
++		t.Fatal("same numeric lane must release benign bytes before EOF", err)
++	}
++}
++
+ func TestModelStreamQuarantineNestedToolJSON(t *testing.T) {
+ 	for _, encoded := range []string{`{"value":"perm\u0069ssion-loopback-fixture"}`, `{"value":"perm\u0069ssion-\ud83d\ude42-fixture"}`} {
+ 		secret := "permission-loopback-fixture"

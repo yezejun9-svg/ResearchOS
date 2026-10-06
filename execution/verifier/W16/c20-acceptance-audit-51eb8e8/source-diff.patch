@@ -1,0 +1,113 @@
+diff --git a/ops/ci/acceptance_audit.py b/ops/ci/acceptance_audit.py
+index eccaa70..9ddfb54 100644
+--- a/ops/ci/acceptance_audit.py
++++ b/ops/ci/acceptance_audit.py
+@@ -35,6 +35,14 @@ def check_hashes(base, hashes):
+         require(digest(bounded(base, name)) == 'sha256:' + expected.removeprefix('sha256:'), 'evidence hash mismatch')
+ 
+ 
++def hashed_bytes(base, name, hashes):
++    require(name in hashes, 'consumed evidence absent from frozen inventory')
++    path = bounded(base, name)
++    raw = path.read_bytes()
++    require('sha256:' + hashlib.sha256(raw).hexdigest() == 'sha256:' + hashes[name].removeprefix('sha256:'), 'consumed evidence changed')
++    return raw
++
++
+ def audit_invocation(path, key, head):
+     path = bounded(ROOT / 'execution/invocations', path)
+     invocation = read(path)
+@@ -48,23 +56,31 @@ def audit_invocation(path, key, head):
+     report_path = bounded(ROOT / 'execution/receipts', output['receipt'])
+     report = read(report_path)
+     require(report['status'] == 'PASS' and report['exit_code'] == 0, 'upstream child did not pass')
+-    check_hashes(report_path.parent, report.get('hashes', report.get('raw_evidence_hashes', {})))
++    hashes = report.get('hashes', report.get('raw_evidence_hashes', {}))
++    check_hashes(report_path.parent, hashes)
+     rows = report['assertions']
+     require(len(rows) == len(invocation['assertion_ids']) and {r['assertion_id'] for r in rows} == set(invocation['assertion_ids']), 'assertion inventory mismatch')
+-    raw_lines = (report_path.parent / 'stdout.txt').read_text(encoding='utf-8').splitlines()
++    raw_lines = hashed_bytes(report_path.parent, 'stdout.txt', hashes).decode('utf-8').splitlines()
+     for row in rows:
+         require(row['status'] == 'PASS' and row['expected'] == row['actual'], 'failed upstream assertion')
+-        line = raw_lines[row.get('raw', row.get('raw_evidence'))['line'] - 1]
++        location = row.get('raw', row.get('raw_evidence'))
++        require(location['path'] == 'stdout.txt' and type(location['line']) is int and 1 <= location['line'] <= len(raw_lines), 'invalid assertion line binding')
++        line = raw_lines[location['line'] - 1]
++        require(line.startswith('W16_ASSERTION ' if key == 'test.evolution' else 'W11_ASSERTION '), 'unexpected assertion output')
+         recorded = json.loads(line.split(' ', 1)[1])
+         require(recorded == {k: v for k, v in row.items() if k not in ('raw', 'raw_evidence')}, 'assertion not bound to actual output')
+-    before = read(report_path.parent / 'before.json')
++    before = json.loads(hashed_bytes(report_path.parent, 'before.json', hashes))
+     if key == 'test.evolution':
+         check_hashes(ROOT, before['version_manifest']['files'])
+         require(before['version_manifest']['code_commit'] == head, 'stale evolution source')
+     else:
+         check_hashes(ROOT, before['version_manifest'])
+         require(before['code_revision'] == head, 'stale Jev source')
+-    return report_path.parent, report, invocation
++    inputs = {str(path.relative_to(ROOT)): digest(path), str(report_path.relative_to(ROOT)): digest(report_path)}
++    inputs.update({str((report_path.parent / p).relative_to(ROOT)): 'sha256:' + h.removeprefix('sha256:') for p, h in hashes.items()})
++    for stream in ('stdout', 'stderr'):
++        inputs[invocation[stream]['path']] = 'sha256:' + invocation[stream]['sha256']
++    return report_path.parent, report, invocation, inputs
+ 
+ 
+ def main():
+@@ -73,16 +89,26 @@ def main():
+     evidence = {}
+     for key, variable in [('test.evolution', 'RESEARCHOS_C20_EVOLUTION_RECEIPT'), ('test.jev.fixture', 'RESEARCHOS_C20_JEV_RECEIPT')]:
+         evidence[key] = audit_invocation(Path(os.environ[variable]), key, head)
+-    directory, report, invocation = evidence['test.evolution']
++    directory, report, invocation, _ = evidence['test.evolution']
++    paths = list(directory.glob('*-C20-promotion-rejection.json'))
++    require(len(paths) == 1, 'missing or duplicate promotion rejection')
++    prefix = paths[0].name.removesuffix('-C20-promotion-rejection.json')
+     def one(suffix):
+-        paths = list(directory.glob('*-' + suffix + '.json'))
+-        require(len(paths) == 1, 'missing or duplicate C20 artifact')
+-        return read(paths[0])
++        return json.loads(hashed_bytes(directory, prefix + '-' + suffix + '.json', report['hashes']))
+     benefit, conclusion, locator, rejected = (one(s) for s in ('C20-private-benefit', 'C20-conclusion', 'C20-protected-locator', 'C20-promotion-rejection'))
++    regression = one('REGRESSION')
++    candidate, execution, experiment = (regression[k] for k in ('candidate', 'execution', 'experiment'))
+     require(rejected['status'] == 'REJECTED', 'promotion was not rejected')
++    require(prefix == candidate['id'] == rejected['id'] == execution['candidate_id'] and rejected['project_id'] == candidate['project_id'] == execution['project_id'] == experiment['project_id'], 'candidate identity mismatch')
++    require(rejected['experiment_id'] == candidate['experiment_id'] == experiment['id'] and experiment['outcome'] == 'NO_IMPROVEMENT' and execution['improved'] is False, 'experiment binding changed')
++    for key, field in [('stable_artifact_ref', 'baseline_hash'), ('candidate_artifact_ref', 'candidate_hash')]:
++        require(rejected[key] == candidate[key] and candidate[key]['content_hash'] == execution[field], 'sealed build identity changed')
++    require(locator['stable_build_sha256'] == execution['baseline_hash'] and locator['candidate_build_sha256'] == execution['candidate_hash'], 'protected proof build locator changed')
++    require(regression['acceptance']['verdict'] == 'PASS' and rejected['regression_acceptance_id'] == regression['acceptance']['id'], 'rejection lacks exact accepted regression')
+     require(benefit['frozen_case_count'] >= 2 and benefit['baseline_correct'] == benefit['candidate_correct'] and benefit['outcome_gain'] is False and benefit['new_score'] > benefit['old_score'] and benefit['new_rubric'] != benefit['old_rubric'], 'score-only benefit was misstated')
+     require(conclusion['quality_improved'] is False and conclusion['project_closed'] is False and conclusion['experiment_outcome'] == benefit['experiment_outcome'] == 'NO_IMPROVEMENT' and conclusion['real_world_gain'] == 'NOT_ESTABLISHED', 'final quality or project closure claim changed')
+     require(conclusion['private_proof_hash'] == benefit['private_proof_sha256'] == locator['dual_rubric_raw_proof_sha256'] and locator['reopened_and_recomputed'] is True, 'private proof binding changed')
++    require(execution['holdout_proof_hash'] == conclusion['private_proof_hash'] and execution['holdout_summary']['total'] == benefit['frozen_case_count'] and execution['holdout_summary']['baseline_correct'] == benefit['baseline_correct'] and execution['holdout_summary']['candidate_correct'] == benefit['candidate_correct'] and execution['holdout_summary']['gain'] is False and execution['holdout_summary']['outcomes_equal'] is True, 'private aggregate binding changed')
+     protected = Path(locator['protected_store']).resolve()
+     require(protected.is_relative_to((ROOT.parent / 'verifier-evidence/W16/c20').resolve()), 'private evidence must remain outside repository')
+     blobs = {digest(p): p for p in protected.glob('*.bin')}
+@@ -97,6 +123,7 @@ def main():
+     result = {'status': 'PASS', 'exit_code': 0, 'scope': 'C20_EXISTING_FIXTURE_EVIDENCE_ONLY', 'assertion_ids': ids, 'assertions': rows,
+               'source_revision': head, 'independent_acceptance': 'NONE', 'ended_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+               'upstream_invocations': {k: v[2]['invocation_id'] for k, v in evidence.items()},
++              'audited_input_hashes': {p: h for v in evidence.values() for p, h in v[3].items()},
+               'hashes': {}, 'private_proof_sha256': locator['dual_rubric_raw_proof_sha256'],
+               'limits': ['Integrity and public conclusion audit; independent verifier must re-evaluate the protected objective proof.', 'No LIVE evaluation, promotion or whole W16 acceptance.']}
+     (out / 'report.json').write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+diff --git a/tests/evolution/test_acceptance_audit.py b/tests/evolution/test_acceptance_audit.py
+index b2135ae..2f42dde 100644
+--- a/tests/evolution/test_acceptance_audit.py
++++ b/tests/evolution/test_acceptance_audit.py
+@@ -12,6 +12,13 @@ with tempfile.TemporaryDirectory(prefix='researchos-audit-check-') as directory:
+     sample.write_bytes(b'{"actual":true}')
+     frozen = {'raw.json': audit.digest(sample)}
+     audit.check_hashes(root, frozen)
++    assert audit.hashed_bytes(root, 'raw.json', frozen) == sample.read_bytes()
++    try:
++        audit.hashed_bytes(root, 'raw.json', {'unrelated.json': frozen['raw.json']})
++    except ValueError:
++        pass
++    else:
++        raise AssertionError('unlisted consumed evidence accepted')
+     sample.write_bytes(b'{"actual":false}')
+     for inventory in (frozen, {}, {'missing': frozen['raw.json']}, {str(root.parent / 'outside'): frozen['raw.json']}):
+         try:

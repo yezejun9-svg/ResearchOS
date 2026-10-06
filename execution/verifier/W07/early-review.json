@@ -1,0 +1,120 @@
+{
+  "record_type": "INDEPENDENT_EARLY_REVIEW",
+  "task_id": "W07",
+  "status": "FINDINGS_NOT_ACCEPTANCE",
+  "reviewer": "codex:/root/route_verifier",
+  "recorded_at": "2026-09-29T19:29:01.085994+00:00",
+  "scope": "Focused review of implemented arXiv full-text completeness and fetch-origin boundaries. Existing GitHub pagination/missing-field/retry classification findings were not repeated.",
+  "source_snapshot": {
+    "repository": "D:/作品集/ResearchOS/research-os/.local/worktrees/command-dispatcher",
+    "branch": "work/source-adapters",
+    "observed_head": "1e21aba230e709396187e38469d20608c17fbc23",
+    "state": "Dirty worktree under active implementation; the tested source snapshot is identified by the copied-file hashes, not by HEAD alone.",
+    "copied_files": [
+      {
+        "path": "adapters/sources/sources.go",
+        "sha256": "249c27630210c3098b6fae9c36ce5353355d1ea2539a28c7e46d8fbd0fabd440"
+      },
+      {
+        "path": "adapters/sources/arxiv.go",
+        "sha256": "cd60202c4ad1f4f9cb9cb1118d1a5e00cd1b323dcf0ede16a9538e9dab544af7"
+      },
+      {
+        "path": "adapters/sources/github.go",
+        "sha256": "1687b6be71fdbf48b6e37deab9175aa33c0afff820fd2a66195f986f4d83de57"
+      }
+    ],
+    "snapshot_method": "Read each source file as bytes, hash exactly those bytes, copy into one temporary standalone Go package, then execute the probe against those copies. No live product files modified."
+  },
+  "execution": {
+    "evidence_class": "EXECUTED_LOCAL_HTTP_FIXTURE",
+    "tool": "project-local Go 1.27.1",
+    "go_executable": "D:/作品集/ResearchOS/research-os/.local/tools/go1.27.1/go/bin/go.exe",
+    "command": [
+      "go.exe",
+      "test",
+      "-run",
+      "^TestVerifierArxivPartialAndRedirect$",
+      "-count=1",
+      "-v",
+      "."
+    ],
+    "go_test_exit_code": 1,
+    "subtests": [
+      "redirect_false",
+      "redirect_true"
+    ],
+    "raw_stdout_retained": false,
+    "raw_stderr_retained": false,
+    "observation_provenance": "Transcript-derived observations from functions.exec result chunk e33eaa. No original stdout/stderr artifact was retained, and no reconstructed file is presented as raw execution output.",
+    "environment": "Only two httptest HTTP servers on loopback; no external HTTP or browser/provider calls.",
+    "cleanup": "Temporary standalone package and local servers cleaned after execution. No rerun performed while persisting this review."
+  },
+  "findings": [
+    {
+      "id": "W07-EARLY-001",
+      "title": "An invalid PDF fragment is marked as complete full text",
+      "status": "REPRODUCED_ON_COPIED_SOURCE",
+      "subtest": "redirect_false",
+      "input": {
+        "metadata": "A matching arXiv Atom entry for 2304.03442v2, valid publication/update times and one author.",
+        "pdf_body_construction": "[]byte(\"%PDF-1.7\\n\") followed by bytes.Repeat([]byte(\"incomplete-page-stream \"),100)",
+        "body_byte_count": 2309,
+        "response": "HTTP 200; Content-Type application/pdf; chunked after explicit Flush(), no Content-Length.",
+        "structural_condition": "No PDF objects, cross-reference/trailer or EOF; body is a header plus repeated plain text."
+      },
+      "observed": {
+        "error": null,
+        "complete": true,
+        "failure": "",
+        "items": 1,
+        "foreign_hits": 0,
+        "canonical_url": "https://arxiv.org/abs/2304.03442v2"
+      },
+      "mechanism": "The reviewed adapter accepts length >=1024 and a %PDF- prefix; it does not establish PDF structural completeness. Absent Content-Length does not block Complete.",
+      "expected": "Invalid/truncated full-text bytes must not be promoted to a complete full-text item."
+    },
+    {
+      "id": "W07-EARLY-002",
+      "title": "Redirect fetches an unconfigured origin while retaining the trusted canonical label",
+      "status": "REPRODUCED_ON_COPIED_SOURCE",
+      "subtest": "redirect_true",
+      "input": {
+        "configured_origin": "httptest origin A supplied as APIURL and PDFBaseURL",
+        "redirect": "The PDF route returns HTTP 302 to origin B /unexpected-origin, a distinct loopback port not included in the adapter configuration.",
+        "target_response": "Origin B returns the same 2309-byte fragment as the first subtest."
+      },
+      "observed": {
+        "error": null,
+        "complete": true,
+        "failure": "",
+        "items": 1,
+        "foreign_hits": 1,
+        "canonical_url": "https://arxiv.org/abs/2304.03442v2"
+      },
+      "mechanism": "The supplied ordinary http.Client follows redirects; adapter does not enforce a configured origin boundary on the actual request chain. Item canonical URL is synthesized from requested arXiv ID and does not identify the response origin.",
+      "expected": "Validate or deny redirect destinations before an unauthorized origin is fetched; a synthesized canonical URL cannot stand in for authorized fetch provenance.",
+      "isolation_note": "foreign_hits=1 proves the origin crossing independently of PDF parsing. After PDF validation is repaired, Complete may become false while the redirect defect still exists; assert foreign_hits==0 or an explicitly authorized destination, not merely Complete==false."
+    }
+  ],
+  "probe": {
+    "path": "execution/verifier/W07/arxiv_partial_redirect_test.go.txt",
+    "sha256": "95b2ad9ed272ca71ce26091b9ada5b48b325abdabcc56cfaba291f29db7fb4cd",
+    "content": "Exact Go probe source used in the observed run. No raw-output reconstruction.",
+    "reproduction_steps": [
+      "Create an isolated temporary directory outside the product source tree.",
+      "Copy sources.go, arxiv.go and github.go from the adapter snapshot being reviewed; record their hashes. The original bytes are identified above but not embedded in this review record.",
+      "Copy this probe into the temporary directory as verifier_test.go.",
+      "Create go.mod containing module researchos-verifier-source-probe, a blank line, and go 1.27.1.",
+      "Run the pinned Go executable with test -run ^TestVerifierArxivPartialAndRedirect$ -count=1 -v . from that directory.",
+      "For independent regression checks, assess redirect_false complete/items and redirect_true foreign_hits separately. The original test intentionally failed both on the reviewed snapshot; it does not independently fail solely on foreign_hits.",
+      "Retain new raw output and hashes as new verification evidence, then clean the temporary directory."
+    ]
+  },
+  "limits": [
+    "Early review only; no W07 acceptance or A05 live-source PASS.",
+    "Both failures were shown against copied dirty-worktree source, not a release build or actual arXiv service.",
+    "No product source, contract, ledger or previous receipt was modified.",
+    "Do not treat a future passing original combined probe as sufficient origin-boundary proof without checking foreign_hits independently."
+  ]
+}

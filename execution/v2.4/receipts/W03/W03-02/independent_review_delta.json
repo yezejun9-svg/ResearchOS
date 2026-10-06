@@ -1,0 +1,80 @@
+{
+ "reviewer_id": "qoder-desktop:/root/w0302_verifier_delta",
+ "step_id": "W03-02",
+ "reviewed_at": "2026-10-01T21:49:43Z",
+ "scope": "post-review delta (VB-1 closure) + final binding",
+ "identity_note": "Independent of qoder-desktop:/root/w0302_verifier_b (the ACCEPT_WITH_RESERVATIONS review at execution/v2.4/receipts/W03/W03-02/independent_review.json) and of the executor qoder-desktop:/root/construction. This run re-measures only the VB-1 claim plus the final binding and tree discipline; W0302-VB-2..VB-5 were not re-litigated.",
+ "commands": [
+  {
+   "argv": "export GOTOOLCHAIN=local GOENV=off GOPATH=$PWD/.local/gopath GOCACHE=$PWD/.local/gocache RESEARCHOS_GO=$PWD/.local/tools/go1.27.1/go/bin/go.exe ; python execution/command_dispatcher/dispatch.py contracts.validate --task-id W03 --check-id W03-02 --spec v2.4",
+   "exit_code": 0,
+   "observation": "status=PASS, assertions=136, failures absent, invocation_id=362c120e-1189-4ab7-8bc5-e989baf0c9e4 (written by the dispatcher itself). Its execution/invocations/362c120e-1189-4ab7-8bc5-e989baf0c9e4/stdout.txt carries 136 assertion_ids, 136 unique, 0 blank, and contains both WRITE-ONLY-DEF-ALLOWED-IN-DIRECTION and WRITE-ONLY-DEF-READ-DIRECTION-REJECTED. The executor's claimed invocation execution/invocations/0c25e5ce-2a09-4857-8212-b3aeaaa82525/stdout.txt was re-parsed too: PASS, 136 assertions, 136 unique, same two ids present. So the registered binding reproduces the claimed count and the claimed new ids from a clean, self-run dispatcher call."
+  },
+  {
+   "argv": "cp internal/domain/client_protocol_schema.go .local/backup_schema.go (sha256 834d22188e2103161a8913ec7e0443cbe06e06ce3adcd23ea6e12b152d1e4312 both sides) ; single-line edit at client_protocol_schema.go:201 'if !allowWriteOnly {' -> 'if false && !allowWriteOnly {' ; go run ./tests/contracts/check",
+   "exit_code": 1,
+   "observation": "status=FAIL, assertions=135 (the failing id drops out of assertion_ids), failures=[{\"id\":\"WRITE-ONLY-DEF-READ-DIRECTION-REJECTED\",\"detail\":\"<nil>\"}]. Exactly one assertion broke and it is the direction-rule one; WRITE-ONLY-DEF-ALLOWED-IN-DIRECTION stayed green in the same mutated run, and no other assertion changed state. stderr 14 bytes (run header only), no panic."
+  },
+  {
+   "argv": "cp .local/backup_schema.go internal/domain/client_protocol_schema.go ; cmp .local/backup_schema.go internal/domain/client_protocol_schema.go ; sha256sum ; git status --porcelain -- internal/domain ; go run ./tests/contracts/check ; rm .local/backup_schema.go",
+   "exit_code": 0,
+   "observation": "cmp: no difference (exit 0) and sha256 returned to 834d22188e...4312, which is the value the receipt records for this artifact, so the restore is byte-exact. git status --porcelain -- internal/domain shows only the five ?? client_protocol*.go untracked entries (this file is untracked, so porcelain cannot prove equality - cmp plus sha256 is the proof used). Clean re-run: PASS, 136 assertions, 136 unique ids, failures=null, both WRITE-ONLY-DEF-* ids present again."
+  },
+  {
+   "argv": "python -c (walk tests/contracts/fixtures/client_protocol.schema copy for writeOnly:true; parse $defs/NativeCredentialImportRequest) ; grep -n 'WRITE-ONLY-DEF' tests/contracts/check/main.go",
+   "exit_code": 0,
+   "observation": "Fixture hash prefix 8943fe363bcfda4a matches the pinned client.protocol.schema.json. Exactly ONE writeOnly:true annotation exists in the whole pinned document, at #/$defs/NativeCredentialImportRequest/properties/credential_value, and that def is additionalProperties:false with all four properties required. main.go:725-737 builds that exact shape and grades it through schemaDoc.ValidateDefInput (write) and schemaDoc.ValidateDef (read), mapping each result into the two new assertions."
+  },
+  {
+   "argv": "python -c (re-read receipt.json check_results/commands/artifacts/independent_review/known_limitations_and_obligations) ; git diff --name-only ; git status --porcelain",
+   "exit_code": 0,
+   "observation": "Receipt consistency check plus final tree state; details in receipt_consistent and tree_after."
+  }
+ ],
+ "mutation_d": {
+  "what_was_disabled": "internal/domain/client_protocol_schema.go validate() line 201: the write-direction guard around the writeOnly rejection. `if !allowWriteOnly {` became `if false && !allowWriteOnly {`, so firstWriteOnly(...) -> WRITE_ONLY_IN_READ_PATH is never reached in either direction. Nothing else in the file was touched (single-line edit, no other mutation, fixtures and check program left untouched).",
+  "assertion_ids_failed": ["WRITE-ONLY-DEF-READ-DIRECTION-REJECTED"],
+  "assertion_ids_that_stayed_green": ["WRITE-ONLY-DEF-ALLOWED-IN-DIRECTION", "and the other 134 ids - including NATIVE-TRANSIENT-REQUEST-OK, the CredentialSummary/additionalProperties:false response negatives and the firstSensitiveKey durable-event red list, which the previous review identified as the redundant defence that used to mask this mutant"],
+  "exit_code": 1,
+  "suite_shape_under_mutation": "FAIL 135/136",
+  "restored_byte_exact": true,
+  "restore_proof": "cmp returned no differences and sha256sum returned 834d22188e2103161a8913ec7e0443cbe06e06ce3adcd23ea6e12b152d1e4312, identical to the pre-mutation backup and to receipt.json artifacts entry for this file. git status --porcelain -- internal/domain shows only the five client_protocol*.go untracked entries, no new files. The .local backup was deleted after verification.",
+  "clean_rerun": "PASS 136"
+ },
+ "vb1_closed": true,
+ "vb1_reasoning": "The previous reviewer's finding was that the writeOnly read-direction rule was unobservable redundancy - an equivalent mutant, because the credential-leak property was already enforced by other layers ($defs/CredentialSummary + additionalProperties:false on the response side, firstSensitiveKey red list on the durable-event side). The added pair now isolates the rule itself, and the isolation is real rather than claimed: (1) the value under test is the single writeOnly annotation the pinned contract actually declares (NativeCredentialImportRequest.credential_value, confirmed by walking the fixture - one occurrence, no others), (2) it is structurally schema-legal, since disabling the rule makes ValidateDef return nil (the failure detail literally reads <nil>), which proves no JSON-Schema keyword and no other guard can reject that value in read direction - i.e. the direction rule is the ONLY thing that can fail WRITE-ONLY-DEF-READ-DIRECTION-REJECTED, (3) the same value is still accepted in write direction in that very same mutated run, so the pair expresses the direction asymmetry rather than a blanket rejection, (4) the mutation now makes the suite exit 1 with a named failing id, so the rule is no longer self-certifying redundancy. I accept closure. One honest limit worth recording, and it is not a reversal of VB-1: the assertion calls SchemaDoc.ValidateDef/ValidateDefInput directly on a def that the contract reserves for the native-transient write path, so it observes the production direction rule at the API surface rather than through an end-to-end read path that would genuinely carry a NativeCredentialImportRequest. That end-to-end credential-never-returns-back property is what the other, already-asserted layers cover. Non-vacuity on the write side holds by construction: ValidateDefInput hard-codes allowWriteOnly=true, so any mutation that collapses the two directions fails READ-DIRECTION-REJECTED while any mutation that removes the write allowance fails ALLOWED-IN-DIRECTION - each id has its own distinct minimal mutation.",
+ "receipt_consistent": true,
+ "receipt_consistency_detail": {
+  "assertions_recorded": "136 in check_results.W03-02-OUTPUT evidence and in the binding command record; matches my own dispatcher run and the direct go run.",
+  "invocation_id": "0c25e5ce-2a09-4857-8212-b3aeaaa82525 recorded for the post-change binding; that directory exists and its stdout.txt parses to PASS/136/136-unique with both new ids. My independent re-run produced 362c120e-1189-4ab7-8bc5-e989baf0c9e4 with the same content, so the claim reproduces rather than merely restates.",
+  "mutation_evidence_file": "execution/v2.4/receipts/W03/W03-02/mutation_d_direction_rule.json exists (3824 bytes, mtime after the review file) and is cited as evidence in the receipt's executor-side mutation command; the receipt's own words for that mutation - 'FAIL 135/136 with exactly WRITE-ONLY-DEF-READ-DIRECTION-REJECTED failing; source restored byte-exactly afterwards' - are what I measured independently.",
+  "vb1_recorded_as": "closed, in independent_review.post_review_strengthening, with the mechanism (both-direction grading of the single writeOnly annotation) correctly described.",
+  "vb3_vb4_recorded_as": "OPEN, not closed: independent_review.open_reservations lists VB-3 (SessionSnapshot graded against the schema definition only, no separate runtime snapshot decoder) and VB-4 (writer attribution still trusts envelope client_id, not the authenticated OS principal), plus VB-2 (RESEARCHOS_GO dependence and the pre-registered W17 failure). VB-4 additionally appears in known_limitations_and_obligations as 'a new carry-forward obligation, not silently closed' against the handoff/native-bootstrap card. No reservation was quietly deleted from the receipt.",
+  "status_field": "still EXECUTION_REPORTED with 'Acceptance requires an independent verifier identity'; verifier_id/verdict field carries ACCEPT_WITH_RESERVATIONS from verifier_b, which is honest - no executor self-acceptance."
+ },
+ "scope_discipline_delta": {
+  "card_write_scope": ["internal/api/**", "internal/domain/client_protocol*.go", "tests/contracts/**", "execution/v2.4/receipts/W03/W03-02/**"],
+  "tracked_dirty": ["execution/v2.4/commands.json", "internal/api/server.go"] ,
+  "tracked_dirty_note": "Exactly the two files verifier_b recorded; git diff --name-only did not grow during this delta review.",
+  "card_untracked": ["internal/api/v2.go", "internal/api/contracts/", "internal/domain/client_protocol.go", "internal/domain/client_protocol_auth.go", "internal/domain/client_protocol_events.go", "internal/domain/client_protocol_journal.go", "internal/domain/client_protocol_schema.go", "tests/contracts/", "execution/v2.4/receipts/W03/W03-02/"],
+  "prompt_list_discrepancy_resolved": "The delta brief's allowed-untracked list omitted internal/api/v2.go, but the card's registered write_scope covers internal/api/**, and internal/api/v2.go's recorded sha256 (9396fc7d...) is listed among the receipt artifacts. It is in scope, matching verifier_b's scope_discipline finding; nothing here is out of write_scope.",  "registers_allowed": "execution/invocations/** is the dispatcher's own register (243 directories; my single binding run added 362c120e-...), execution/v2.4/receipts/W03/W03-02/** is in write_scope.",
+  "pre_existing_not_from_this_card": "execution/readiness/windows-sleep/**, execution/receipts/W08|W11|W18/**, execution/verifier/W05..W11/**, qualification/v2.4/mu/ - identical set to verifier_b's baseline, unchanged, no new out-of-scope entries appeared.",
+  "protected_paths": "migrations/, apps/, adapters/, spec/** show no dirty and no untracked entries; no gitlinks.",
+  "verifier_footprint": "This review writes only execution/v2.4/receipts/W03/W03-02/independent_review_delta.json. Its one mutated file was restored byte-exactly; .local scratch files it created were removed afterwards, and .local is git-ignored."
+ },
+ "remaining_reservations": [
+  "W0302-VB-3 (P3, open): SessionSnapshot fixtures are graded against the schema definition only (tests/contracts/check/main.go:92-95) while envelope/response/event get double schema+runtime grading. Not reversed by this delta; SNAPSHOT-* assertions against live responses still cover snapshot decode.",
+  "W0302-VB-4 (P2, open): writer attribution on session writes is authorised by the envelope client_id plus revision CAS and writer_epoch fence, not by the authenticated OS principal carried by the host credential. Must close before any multi-principal or LIVE exposure.",
+  "W0302-VB-2 (P3, open as an environment-hygiene note): internal/domain collapses into ~22 false failures when RESEARCHOS_GO is not exported, and checkpoint.json carries no warning about that dependency. TestW17UpgradeActiveRecovery is registered; TestW17C22ProtectedIsolation is load-flaky and passes isolated.",
+  "W0302-VB-5 (P3, open): register hygiene - the volume of untracked execution/** directories makes porcelain-style checks noisy for the next reviewer. Not a scope violation.",
+  "SCOPE-OF-CLAIM (standing): the binding's own scope is CONSTRUCTION_CHECK_NOT_PRODUCT_ACCEPTANCE. Nothing in this delta is a parent (W03) or product acceptance."
+ ],
+ "verdict_final": "ACCEPT_WITH_RESERVATIONS",
+ "required_before_parent_acceptance": [
+  "Close VB-4: bind writer authority on session writes to the authenticated OS principal from the host credential, not only the envelope client_id, before any multi-principal or LIVE credential-handling claim (this is also the gate for relying on the writeOnly direction rule in production).",
+  "Close VB-3: either add a runtime snapshot decoder grade for SessionSnapshot fixtures or amend the double-grading wording so it says schema-only for that def.",
+  "Register the RESEARCHOS_GO dependency of the internal/domain package in execution/v2.4/checkpoint.json so a future 'domain suite is green' claim cannot be produced from a mis-exported environment (VB-2).",
+  "Parent W03 acceptance must state that this binding is CONSTRUCTION_CHECK_NOT_PRODUCT_ACCEPTANCE and cite the apps/cli and apps/desktop v2 client wiring as other cards' scope, since neither was touched here."
+ ],
+ "tree_after": "git diff --name-only -> execution/v2.4/commands.json, internal/api/server.go (unchanged, the executor's own two files). git status --porcelain -- internal/domain -> only the five ?? internal/domain/client_protocol*.go entries; client_protocol_schema.go sha256 834d22188e2103161a8913ec7e0443cbe06e06ce3adcd23ea6e12b152d1e4312, byte-identical to the pre-mutation backup (cmp exit 0) and to the receipt artifact hash. Untracked additions attributable to the card remain inside its write_scope (internal/api/v2.go, internal/api/contracts/, 5 internal/domain/client_protocol*.go, tests/contracts/, execution/v2.4/receipts/W03/W03-02/) plus the dispatcher register execution/invocations/** and the pre-existing execution/readiness, execution/receipts/W08|W11|W18, execution/verifier/W05..W11 and qualification/v2.4/mu directories that pre-date this card. Only new file written by this review: execution/v2.4/receipts/W03/W03-02/independent_review_delta.json. Backup file .local/backup_schema.go and all .local scratch removed. Tree NOT left modified by the verifier."
+}

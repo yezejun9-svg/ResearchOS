@@ -1,0 +1,190 @@
+diff --git a/apps/cli/cli_continuation.go b/apps/cli/cli_continuation.go
+index 11f15b0b..1a0544eb 100644
+--- a/apps/cli/cli_continuation.go
++++ b/apps/cli/cli_continuation.go
+@@ -16,6 +16,10 @@ const continuationReadLimit = 2 << 20
+ // This projection only reads public, principal-scoped objects. It does not
+ // acquire a writer, dispatch work, or interpret a pending task as executable.
+ func cliReadContinuation(c *v2Context, snapshot map[string]any) (map[string]any, string, int) {
++	return cliReadContinuationContext(context.Background(), c, snapshot)
++}
++
++func cliReadContinuationContext(parent context.Context, c *v2Context, snapshot map[string]any) (map[string]any, string, int) {
+ 	goalID := continuationString(snapshot, "goal_id")
+ 	if goalID == "" {
+ 		return nil, "", exitCompleted
+@@ -31,7 +35,7 @@ func cliReadContinuation(c *v2Context, snapshot map[string]any) (map[string]any,
+ 		!continuationID(c.projectID) || !continuationID(goalID) {
+ 		return fail("CONTINUATION_SCOPE_MISMATCH")
+ 	}
+-	budget, cancel := context.WithTimeout(context.Background(), 8*time.Second)
++	budget, cancel := context.WithTimeout(parent, 8*time.Second)
+ 	defer cancel()
+ 	remaining := int64(continuationReadLimit)
+ 	client := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+diff --git a/apps/cli/cli_stream.go b/apps/cli/cli_stream.go
+index 5f8fe76d..7ca50ffc 100644
+--- a/apps/cli/cli_stream.go
++++ b/apps/cli/cli_stream.go
+@@ -11,9 +11,70 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"strings"
++	"sync"
++	"syscall"
+ 	"time"
+ )
+ 
++// Only a read-only status call uses this observer. Its goroutine cancels the
++// request context; the calling goroutine remains the sole context/log writer.
++type cliReadInterrupt struct {
++	mu          sync.Mutex
++	interrupted bool
++	finished    bool
++	cancel      context.CancelFunc
++	stop        chan struct{}
++	done        chan struct{}
++}
++
++func observeCLIReadInterrupt(signals <-chan os.Signal, cancel context.CancelFunc) *cliReadInterrupt {
++	r := &cliReadInterrupt{cancel: cancel, stop: make(chan struct{}), done: make(chan struct{})}
++	go func() {
++		defer close(r.done)
++		for {
++			select {
++			case <-r.stop:
++				return
++			case signal, ok := <-signals:
++				if !ok {
++					return
++				}
++				if signal != os.Interrupt && signal != syscall.SIGTERM {
++					continue
++				}
++				r.mu.Lock()
++				if !r.finished {
++					r.interrupted = true
++					r.cancel()
++				}
++				r.mu.Unlock()
++				return
++			}
++		}
++	}()
++	return r
++}
++
++func (r *cliReadInterrupt) observed() bool {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.interrupted
++}
++
++// This is the report's linearization point. A later signal cannot change it,
++// and the observer is joined before the caller returns or saves its context.
++func (r *cliReadInterrupt) finish() bool {
++	r.mu.Lock()
++	if !r.finished {
++		r.finished = true
++		close(r.stop)
++	}
++	interrupted := r.interrupted
++	r.mu.Unlock()
++	<-r.done
++	return interrupted
++}
++
+ // These bounds govern observation, never a retry of model/tool execution.
+ type cliFollowOptions struct {
+ 	timeout, poll, cancelTimeout time.Duration
+@@ -39,6 +100,7 @@ type cliFlow struct {
+ 	inputs           <-chan cliInputLine
+ 	cancelCommand    *v2Context
+ 	cancelPayload    map[string]any
++	readInterrupt    *cliReadInterrupt
+ }
+ 
+ func (f *cliFlow) interrupt() {
+@@ -61,6 +123,13 @@ func (f *cliFlow) expired() bool {
+ func (f *cliFlow) pause() {
+ 	timer := time.NewTimer(f.options.poll)
+ 	defer timer.Stop()
++	if f.readInterrupt != nil {
++		select {
++		case <-timer.C:
++		case <-f.budget.Done():
++		}
++		return
++	}
+ 	if f.cancelRequested {
+ 		select {
+ 		case <-timer.C:
+@@ -94,6 +163,9 @@ func (f *cliFlow) call(method string, payload map[string]any, wait bool) (map[st
+ 	attempted := false
+ 	for {
+ 		if f.expired() {
++			if f.readInterrupt != nil && f.readInterrupt.observed() {
++				return nil, "READ_INTERRUPTED", exitInterrupted
++			}
+ 			return nil, "WAIT_FOR_SETTLEMENT", exitNotImplemented
+ 		}
+ 		if (method == "session.send" || method == "goal.start") && f.cancelRequested && !attempted {
+@@ -104,6 +176,10 @@ func (f *cliFlow) call(method string, payload map[string]any, wait bool) (map[st
+ 		attempt.requestLog = nil
+ 		reply, reason, code := v2CallContext(f.budget, &attempt, method, payload)
+ 		f.c.requestLog = append(f.c.requestLog, attempt.requestLog...)
++		if f.readInterrupt != nil && f.budget.Err() == context.Canceled && f.readInterrupt.observed() && reply == nil &&
++			(strings.HasPrefix(reason, "HOST_UNREACHABLE:") || reason == "INCOMPLETE_OR_OVERSIZE_REPLY") {
++			return nil, "READ_INTERRUPTED", exitInterrupted
++		}
+ 		if code != exitCompleted {
+ 			return reply, reason, code
+ 		}
+@@ -493,6 +569,16 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
+ 	budget, stop := context.WithTimeout(context.Background(), options.timeout)
+ 	defer stop()
+ 	f := &cliFlow{c: c, budget: budget, options: options, base: c.commandID, goalFlow: name == "goal" || name == "go" || name == "/goal"}
++	if name == "status" || name == "/status" {
++		readContext, cancelRead := context.WithCancel(budget)
++		defer cancelRead()
++		f.budget = readContext
++		f.readInterrupt = observeCLIReadInterrupt(options.interrupts, cancelRead)
++		defer f.readInterrupt.finish()
++		// The observer is the only receiver for read-only calls. Active calls
++		// retain their original cancellation/settlement signal handling.
++		f.options.interrupts = nil
++	}
+ 	if input, ok := cliInputPumps.Load(c); ok {
+ 		f.inputs = input.(<-chan cliInputLine)
+ 	}
+@@ -578,10 +664,19 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
+ 		code = exitUsage
+ 	}
+ 	if code == 0 && (name == "status" || name == "/status") {
+-		continuation, why, statusCode := cliReadContinuation(c, snapshot)
++		continuation, why, statusCode := cliReadContinuationContext(f.budget, c, snapshot)
+ 		out["continuation"] = continuation
+ 		if statusCode != 0 {
+ 			code, reason = statusCode, why
++			if why == "CONTINUATION_READ_FAILED" && f.budget.Err() == context.Canceled && f.readInterrupt.observed() {
++				code, reason = exitInterrupted, "READ_INTERRUPTED"
++			}
++		}
++	}
++	if f.readInterrupt != nil {
++		interrupted := f.readInterrupt.finish()
++		if interrupted && code == exitCompleted {
++			code, reason = exitInterrupted, "READ_INTERRUPTED"
+ 		}
+ 	}
+ 	out["status"], out["exit_code"] = "COMPLETED", code
+@@ -592,6 +687,9 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
+ 		}
+ 	} else if code != 0 {
+ 		out["status"] = "REJECTED"
++		if f.readInterrupt != nil && code == exitInterrupted {
++			out["status"] = "INTERRUPTED_READ_ONLY"
++		}
+ 	}
+ 	out["operations"], out["requests_sent"] = f.operations, c.requestLog
+ 	out["admission_command_id"] = f.admissionCommand
