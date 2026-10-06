@@ -1,0 +1,46 @@
+package domain
+import("testing";"context";"bytes";"net/http";"net/http/httptest";"io";"fmt";"os";"path/filepath";"time")
+type independentExperiment struct{o *orchestrationFixture;r *runtimeFixture;x Object;server *httptest.Server;events []any;t *testing.T}
+func(v *independentExperiment) call(method,path,key,etag,token string,b any)(int,Object){var raw []byte;if b!=nil{raw=Bytes(b)};req,e:=http.NewRequest(method,v.server.URL+path,bytes.NewReader(raw));if e!=nil{v.t.Fatal(e)};req.Header.Set("Authorization","Bearer "+token);if key!=""{req.Header.Set("Idempotency-Key",key)};if etag!=""{req.Header.Set("If-Match",etag)};resp,e:=http.DefaultClient.Do(req);if e!=nil{v.t.Fatal(e)};data,_:=io.ReadAll(resp.Body);resp.Body.Close();body,_:=Decode(data);v.events=append(v.events,Object{"method":method,"path":path,"idempotency_key":key,"if_match":etag,"request":b,"status":resp.StatusCode,"response":body});return resp.StatusCode,body}
+func(v *independentExperiment) expect(want int,method,path,key,etag,token string,b any)Object{c,r:=v.call(method,path,key,etag,token,b);if c!=want{v.t.Fatalf("%s %s want%d got%d %s",method,path,want,c,Bytes(r))};return r}
+func independentDomainCheck(t *testing.T,id string,want,got any){t.Helper();fmt.Println("INDEPENDENT_W10 "+string(Bytes(Object{"id":id,"expected":want,"actual":got})));if string(Bytes(want))!=string(Bytes(got)){t.Errorf("%s want%v got%v",id,want,got)}}
+func newIndependentExperiment(t *testing.T)*independentExperiment{
+ o:=orchestrationSetup(t);f:=o.f;v:=&independentExperiment{o:o,t:t,server:httptest.NewServer(f.h)}
+ t.Cleanup(func(){v.server.Close();rows,e:=f.db.Query("SELECT kind,body FROM domain_objects WHERE kind IN ('Experiment','Task','AcceptanceReceipt','Artifact','Requirement') ORDER BY rowid");if e!=nil{t.Error(e);return};state:=[]any{};for rows.Next(){var kind,raw string;rows.Scan(&kind,&raw);body,_:=Decode([]byte(raw));state=append(state,Object{"kind":kind,"body":body})};rows.Close();if dir:=os.Getenv("W10_REVIEW_OUT");dir!=""{name:=filepath.Base(t.Name());os.WriteFile(filepath.Join(dir,"domain-"+name+".json"),Bytes(Object{"events":v.events,"sqlite_rows":state}),0600)}})
+ c:=orchestrationContract();check:=Arr(c,"checks")[0].(map[string]any);check["command_key"]="experiments.paired-mean-v1";check["expected"]=`{"expected_case_ids":["pair-1","pair-2"]}`;c["contract_hash"]=contractDigest(c)
+ profile:=f.expect(200,"GET",f.path("/profile"),"","",nil);refs:=[]any{Ref(o.req,"Requirement")};stop:=Object{"wall_time_seconds":30,"max_attempts":1,"max_parallel_runs":1,"stop_conditions":[]any{"bounded"}}
+ body:=Object{"cycle_id":nil,"scope":"PROJECT","hypothesis":"independent two-case comparison","candidate_ref":refs[0],"baseline_refs":refs,"input_refs":refs,"metrics":[]any{Object{"metric_id":"quality","description":"frozen mean","unit":"points","operator":"GTE","target":"2","upper_target":nil,"mandatory":true}},"acceptance_contract":c,"stop_policy":stop,"budget_policy_id":profile["budget_policy_id"],"measurement_mode":"FIXTURE"}
+ v.x=v.expect(201,"POST",f.path("/experiments"),ID(),f.stateTag(),o.owner,body)
+ path:=f.path("/experiments/"+Str(v.x,"id")+"/register")
+ status,_:=v.call("POST",path,ID(),testTag(v.x),o.owner,Object{"expected_preregistration_hash":Digest([]byte("changed-config"))});independentDomainCheck(t,"register_rejects_wrong_frozen_hash",422,status)
+ v.x=v.expect(200,"POST",path,ID(),testTag(v.x),o.owner,Object{"expected_preregistration_hash":v.x["preregistration_hash"]})
+ status,_=v.call("POST",path,ID(),testTag(v.x),o.owner,Object{"expected_preregistration_hash":v.x["preregistration_hash"]});independentDomainCheck(t,"registered_plan_cannot_reregister",409,status)
+ // Independent direct persistence negative probe; transaction rolls back after protected update.
+ tx,_:=f.db.Begin();_,e:=tx.Exec("UPDATE domain_objects SET body=json_set(body,'$.metrics[0].target','0') WHERE kind='Experiment' AND id=?",v.x["id"]);tx.Rollback();independentDomainCheck(t,"registered_metric_sql_mutation_rejected",true,e!=nil)
+ task:=v.expect(201,"POST",f.path("/tasks"),ID(),testTag(f.read("goals",Str(o.goal,"id"))),o.owner,Object{"goal_id":o.goal["id"],"title":"independent experiment","task_type":"paired-review","stage":"verification","dependency_task_ids":Empty(),"requirement_refs":refs,"input_refs":refs,"acceptance_contract":c,"origin_problem_id":"orchestration-problem","candidate_id":t.Name(),"stop_policy":stop});f.bundle(task);task=f.read("tasks",Str(task,"id"));task=v.expect(200,"POST",f.path("/tasks/"+Str(task,"id")+"/actions"),ID(),testTag(task),o.owner,Object{"action":"SUBMIT","reason":"independent review"})
+ if e=f.s.BindExperimentTask(context.Background(),o.owner,f.project,Str(v.x,"id"),Str(task,"id"));e!=nil{t.Fatal(e)}
+ v.r=o.claim(task);v.x,e=f.s.BeginExperiment(context.Background(),o.owner,f.project,Str(v.x,"id"),Str(v.r.run,"id"));if e!=nil{t.Fatal(e)}
+ return v
+}
+func TestIndependentExperimentEvidence(t *testing.T){
+ for _,scenario:=range []string{"positive","missing","duplicate","unknown","config_tamper","result_tamper","hard_failure_high_claim","all_null","stale_input","permissions"}{t.Run(scenario,func(t *testing.T){
+ v:=newIndependentExperiment(t);f:=v.o.f;ids:=[]any{"pair-1","pair-2"};base,cand:=[]any{"1","1"},[]any{"3","3"};meanBase,meanCand:=any("1"),any("3");status,outcome:="PASS","IMPROVED";n:=2
+ switch scenario{case "missing":ids=ids[:1];base=base[:1];cand=cand[:1];n=1;case "duplicate":ids=[]any{"pair-1","pair-1"};case "unknown":ids=[]any{"pair-1","unregistered"};case "hard_failure_high_claim":base=[]any{"0","0"};cand=[]any{"1","1"};meanBase="0";meanCand="1";status="FAIL";case "all_null":cand=[]any{nil,nil};meanCand=nil;status="INCONCLUSIVE";outcome="INCONCLUSIVE"}
+ result:=Object{"metric_id":"quality","baseline":meanBase,"candidate":meanCand,"sample_count":n,"evidence_refs":Empty(),"status":status};results:=[]any{result};raw:=Object{"experiment_id":v.x["id"],"preregistration_hash":v.x["preregistration_hash"],"observations":[]any{Object{"metric_id":"quality","case_ids":ids,"baseline":base,"candidate":cand}},"results":results,"outcome":outcome}
+ if scenario=="config_tamper"{raw["preregistration_hash"]=Digest([]byte("tamper"))};if scenario=="result_tamper"{result["candidate"]="999"};if scenario=="hard_failure_high_claim"{raw["score"]="0.999"}
+ artifact:=v.o.report(v.r,Bytes(raw));request:=v.o.acceptance(v.r,artifact);verifierToken:=f.token
+ resultPath:=f.path("/experiments/"+Str(v.x,"id")+"/result");body:=Object{"run_ids":v.x["run_ids"],"results":results,"outcome":outcome,"acceptance_id":ID()}
+ code,_:=v.call("POST",resultPath,ID(),testTag(v.x),v.o.owner,body);independentDomainCheck(t,"result_requires_real_acceptance",404,code)
+ if scenario=="stale_input"{v.expect(200,"POST",f.path("/requirements/"+Str(v.o.req,"id")+"/actions"),ID(),testTag(v.o.req),v.o.owner,Object{"action":"REVOKE","reason":"input superseded before verification","source_validation_refs":Empty()});code,_=v.call("POST",f.path("/acceptances"),ID(),testTag(v.r.task),verifierToken,request);independentDomainCheck(t,"stale_input_cannot_be_accepted",true,code>=400&&code<500);return}
+ if scenario=="permissions"{
+  alias:=ID();if e:=f.s.ProvisionPrincipal(context.Background(),Principal{ID:alias,Roles:[]string{"VERIFIER"},Grants:[]Grant{{ProjectID:f.project}}});e!=nil{t.Fatal(e)};if e:=f.s.RegisterExecutionIdentity(context.Background(),alias,v.r.executor);e!=nil{t.Fatal(e)};token,e:=f.s.IssueCredential(context.Background(),alias,time.Minute);if e!=nil{t.Fatal(e)}
+  code,_=v.call("POST",f.path("/acceptances"),ID(),testTag(v.r.task),token,request);independentDomainCheck(t,"executor_authority_alias_cannot_accept",403,code)
+  code,_=v.call("POST",f.path("/acceptances"),ID(),`"r1"`,verifierToken,request);independentDomainCheck(t,"stale_task_etag_rejected",412,code)
+ }
+ receipt:=v.expect(201,"POST",f.path("/acceptances"),ID(),testTag(v.r.task),verifierToken,request)
+ if scenario=="positive"||scenario=="all_null"||scenario=="permissions"{independentDomainCheck(t,"independent_observation_verdict","PASS",receipt["verdict"]);body["acceptance_id"]=receipt["id"]
+  if scenario=="permissions"{code,_=v.call("POST",resultPath,ID(),testTag(v.x),verifierToken,body);independentDomainCheck(t,"verifier_cannot_write_scheduler_results",403,code)}
+  final:=v.expect(200,"POST",resultPath,ID(),testTag(v.x),v.o.owner,body);independentDomainCheck(t,"preserve_observed_outcome",outcome,final["outcome"]);independentDomainCheck(t,"preserve_explicit_values",results,final["results"])
+ }else{independentDomainCheck(t,"invalid_observations_not_accepted","FAIL",receipt["verdict"]);body["acceptance_id"]=receipt["id"];code,_=v.call("POST",resultPath,ID(),testTag(v.x),v.o.owner,body);independentDomainCheck(t,"failed_receipt_cannot_complete_experiment",422,code)}
+ })}
+}

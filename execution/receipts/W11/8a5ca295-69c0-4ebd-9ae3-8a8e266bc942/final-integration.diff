@@ -1,0 +1,110 @@
+diff --git a/execution/go.mod b/execution/go.mod
+new file mode 100644
+index 0000000..881578e
+--- /dev/null
++++ b/execution/go.mod
+@@ -0,0 +1,4 @@
++// Archived verifier source excerpts are evidence, not product packages.
++module researchos.local/research-os-execution-evidence
++
++go 1.27.1
+diff --git a/internal/domain/protected_artifacts.go b/internal/domain/protected_artifacts.go
+index c0977fb..bc4c83b 100644
+--- a/internal/domain/protected_artifacts.go
++++ b/internal/domain/protected_artifacts.go
+@@ -146,6 +146,13 @@ func (s *Service) RegisterProtectedArtifact(ctx context.Context, token, project,
+ 	if e = s.put(tx, "Artifact", artifact); e != nil {
+ 		return nil, e
+ 	}
++	for _, field := range []string{"input_refs", "source_refs"} {
++		for _, ref := range Arr(b, field) {
++			if _, e = s.impactLink(tx, project, Object{"from_ref": Ref(artifact, "Artifact"), "to_ref": ref, "relation": "DERIVED_FROM", "basis": "DETERMINISTIC", "evidence_refs": Empty()}); e != nil {
++				return nil, e
++			}
++		}
++	}
+ 	if e = s.event(tx, project, "Artifact", artifact, p.ID, ID(), "PROJECT_UPDATED"); e != nil {
+ 		return nil, e
+ 	}
+diff --git a/internal/domain/protected_artifacts_test.go b/internal/domain/protected_artifacts_test.go
+index 32ce465..43d8d8b 100644
+--- a/internal/domain/protected_artifacts_test.go
++++ b/internal/domain/protected_artifacts_test.go
+@@ -88,6 +88,11 @@ func TestProtectedAPIAndStorage(t *testing.T) {
+ 	derived["access_class"] = "PROJECT"
+ 	child := protectedRegister(t, f, store, "derived synthetic canary", derived)
+ 	protectedAssert(t, "PROTECTED-DERIVED-CLASSIFICATION", "VERIFIER_ONLY", child["access_class"], "trusted registration always inherits the protected boundary")
++	var links int
++	if e = f.db.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='ImpactLink' AND json_extract(body,'$.from_ref.id')=? AND json_extract(body,'$.to_ref.id')=? AND json_extract(body,'$.relation')='DERIVED_FROM'", f.project, child["id"], a["id"]).Scan(&links); e != nil {
++		t.Fatal(e)
++	}
++	protectedAssert(t, "PROTECTED-DERIVED-IMPACT-LINK", 1, links, "same canonical impactLink helper as public seal")
+ 	// Public upload/seal cannot declassify a protected reference, including for an authorized verifier.
+ 	upload := f.expect(201, "POST", f.path("/content"), ID(), "", []byte("public candidate summary"))
+ 	seal := Object{"run_id": nil, "kind": "REPORT", "evidence_kind": "SIMULATED", "measurement_mode": "FIXTURE", "content_hash": upload["content_hash"], "storage_key": upload["storage_key"], "media_type": "text/plain", "byte_size": len("public candidate summary"), "input_refs": []any{Ref(a, "Artifact")}, "source_refs": Empty(), "produced_by": "canary-restricted-verifier", "access_class": "PROJECT"}
+diff --git a/ops/ci/build.py b/ops/ci/build.py
+index e2941b1..a0e2535 100644
+--- a/ops/ci/build.py
++++ b/ops/ci/build.py
+@@ -25,7 +25,7 @@ def run(name, argv, cwd=ROOT):
+ 
+ def main():
+     task = os.getenv("RESEARCHOS_TASK_ID", "W02")
+-    if task not in ("W02", "W03", "W04", "W05", "W06", "W07", "W08", "W09", "W10", "W12", "W18") or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", *(f"{task}-G0{n}" for n in (1, 2, 3))) or os.getenv("RESEARCHOS_CASE_ID"):
++    if task not in ("W02", "W03", "W04", "W05", "W06", "W07", "W08", "W09", "W10", "W11", "W12", "W18") or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", *(f"{task}-G0{n}" for n in (1, 2, 3))) or os.getenv("RESEARCHOS_CASE_ID"):
+         raise NotImplementedError("unbound task/check/case selection")
+     go = os.environ["RESEARCHOS_GO"]
+     node = os.environ["RESEARCHOS_NODE"]
+diff --git a/ops/ci/contracts.py b/ops/ci/contracts.py
+index 6a65807..df17554 100644
+--- a/ops/ci/contracts.py
++++ b/ops/ci/contracts.py
+@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
+ 
+ def main():
+     task = os.getenv("RESEARCHOS_TASK_ID", "W02")
+-    if task not in ("W02", "W03", "W04", "W05", "W06", "W07", "W08", "W09", "W10", "W12", "W18") or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", *(f"{task}-G0{n}" for n in (1, 2, 3))) or os.getenv("RESEARCHOS_CASE_ID"):
++    if task not in ("W02", "W03", "W04", "W05", "W06", "W07", "W08", "W09", "W10", "W11", "W12", "W18") or os.getenv("RESEARCHOS_CHECK_ID", "") not in ("", *(f"{task}-G0{n}" for n in (1, 2, 3))) or os.getenv("RESEARCHOS_CASE_ID"):
+         raise NotImplementedError("unbound task/check/case selection")
+     command = [sys.executable, str(ROOT / "spec" / "v2.0" / "tools" / "validate_package.py")]
+     result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=120)
+diff --git a/tests/jev/protected/README.md b/tests/jev/protected/README.md
+index 4493dc1..c08e15a 100644
+--- a/tests/jev/protected/README.md
++++ b/tests/jev/protected/README.md
+@@ -41,7 +41,7 @@ python tests/jev/protected/run.py
+ ```
+ 
+ The runner records the pre-run source revision/manifest, Windows/Go versions,
+-exact command, raw logs and all **40** frozen assertions in `expected.json` under
++exact command, raw logs and all **41** frozen assertions in `expected.json` under
+ `execution/receipts/W11/protected/<run_id>`. Missing/duplicate/malformed assertions,
+ source drift, test errors and incorrect scope fields fail the runner. It makes no
+ network or model calls and propagates no Jev/Typesafe environment credentials.
+diff --git a/tests/jev/protected/expected.json b/tests/jev/protected/expected.json
+index 2a4310c..8ab1e23 100644
+--- a/tests/jev/protected/expected.json
++++ b/tests/jev/protected/expected.json
+@@ -24,6 +24,7 @@
+     "PROTECTED-AUTHORIZED-CONTENT",
+     "PROTECTED-REPEATED-REGISTRATION",
+     "PROTECTED-DERIVED-CLASSIFICATION",
++    "PROTECTED-DERIVED-IMPACT-LINK",
+     "PROTECTED-PUBLIC-DERIVATION-REFUSED",
+     "PROTECTED-DIRECT-DENY-READER",
+     "PROTECTED-DIRECT-DENY-READER-content",
+diff --git a/tests/jev/protected/run.py b/tests/jev/protected/run.py
+index 075a201..3f06cfb 100644
+--- a/tests/jev/protected/run.py
++++ b/tests/jev/protected/run.py
+@@ -31,8 +31,8 @@ def main():
+         raise SystemExit('pinned Go 1.27.1 required')
+     inventory = json.loads((ROOT / 'tests/jev/protected/expected.json').read_text(encoding='utf-8'))
+     expected = [item for items in inventory.values() for item in items]
+-    if len(expected) != 40 or len(set(expected)) != 40:
+-        raise SystemExit('exact frozen 40-assertion inventory required')
++    if len(expected) != 41 or len(set(expected)) != 41:
++        raise SystemExit('exact frozen 41-assertion inventory required')
+     run_id = str(uuid.uuid4())
+     out = ROOT / 'execution/receipts/W11/protected' / run_id
+     out.mkdir(parents=True)

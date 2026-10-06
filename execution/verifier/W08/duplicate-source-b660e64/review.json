@@ -1,0 +1,60 @@
+{
+  "schema_version": "independent-review-1",
+  "reviewed_commit": "b660e647c94a3545202708720b24d45121e885a8",
+  "verdict": "NEEDS_FIX",
+  "scope": "W08 adjacent W07 source capture duplicate identity and historical cursor provenance only",
+  "stage_1_ready": false,
+  "scenarios": {
+    "distinct_two_page_capture": "PASS",
+    "identical_item_after_cursor_advance": "FAIL",
+    "same_page_replay_without_cursor_advance": "FAIL"
+  },
+  "findings": [
+    {
+      "id": "W08-SOURCE-REUSE-01",
+      "priority": "P1",
+      "file": "internal/domain/sources.go",
+      "line": 573,
+      "title": "Durable source snapshot becomes ineffective when capture cursor advances",
+      "actual": "Page 1 success; legitimate cursor revision 1 -> 2; page 2 identical canonical URL/upstream ID/body returns STALE_INPUT. Direct sealSourceBytes in rolled-back diagnostic transaction reproduces it. Distinct page items succeed.",
+      "cause": "SOURCE_SNAPSHOT input_refs includes mutable SourceCursor revision; canonical content reuse recursively checks old cursor as current semantic input."
+    },
+    {
+      "id": "W08-SOURCE-REUSE-02",
+      "priority": "P2",
+      "file": "internal/domain/sources.go",
+      "line": 82,
+      "title": "Identical source page replay violates Evidence idempotence",
+      "actual": "Second identical page capture without cursor advance returns SQLite evidence_snapshot UNIQUE constraint failure (2067).",
+      "cause": "createEvidence always creates new identity despite canonical URL/upstream revision/snapshot hash unique contract."
+    }
+  ],
+  "contract_basis": [
+    "03_DATA_CONTRACTS.md:65 same snapshot Evidence is idempotent",
+    "03_DATA_CONTRACTS.md:67 bytes canonical but origin chains retained",
+    "02_TECHNICAL_DESIGN.md:164 cursor advances after page results and dedup records persist"
+  ],
+  "recommended_boundary": [
+    "Only exact captured SourceCursor edges proved by immutable source_pages and sealed manifests may be historical; verify referenced revision/hash and exact project/cursor/source/query identity. Item proof joins page item_refs through exact Evidence snapshot ref.",
+    "Preserve CURRENT/STALE/REVOKED, visibility, sealed byte/hash, all other semantic refs and current capture configuration/cursor authorization. No kind-wide exemption.",
+    "Private source capture may reuse canonical bytes and valid exact natural-key Evidence while retaining new page/manifest provenance; general reusableArtifact remains strict.",
+    "Same-page replay must match raw hash, input/output cursor, window, complete status and normalized item refs. Conflicting durable pages must not be overwritten."
+  ],
+  "evidence_boundary": "Real SQLite; trusted sealed source adapter fixture invoking production captureSourcePage; actual cursor PUT through product HTTP handler. Direct diagnostic transaction rolled back before actual capture.",
+  "limits": [
+    "No product edits, live providers, browser, model calls, general W06 gate bypass or final W08 acceptance.",
+    "Five original W08 findings/root proposed repairs not rerun in this bounded review."
+  ],
+  "raw_audit": {
+    "pass": 15,
+    "fail": 0
+  },
+  "reproduction": {
+    "go": "go1.27.1",
+    "source": "review_test.go.txt",
+    "test_selectors": [
+      "^TestIndependentW08DuplicateSource$",
+      "^TestIndependentW08SamePageIdempotence$"
+    ]
+  }
+}
