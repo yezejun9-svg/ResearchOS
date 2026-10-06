@@ -21,6 +21,18 @@ spec.loader.exec_module(forward)
 
 
 class ParentGateTests(unittest.TestCase):
+    def test_filtered_go_cache_environment_has_project_defaults(self):
+        for mode in ("fixture", "live"):
+            with self.subTest(mode=mode), patch.dict(os.environ, {"RESEARCHOS_SOURCE_MODE": mode, "GOPATH": ""}, clear=True):
+                gate.prepare_go_environment()
+                self.assertEqual(os.environ["GOPATH"], str(ROOT / ".local/gopath"))
+                self.assertEqual(os.environ["GOCACHE"], str(ROOT / ".local/gocache"))
+                self.assertNotIn("GOMODCACHE", os.environ)
+        explicit = {"GOPATH": "explicit-path", "GOCACHE": "explicit-cache", "GOMODCACHE": "explicit-modules"}
+        with patch.dict(os.environ, explicit, clear=True):
+            gate.prepare_go_environment()
+            self.assertEqual(dict(os.environ), explicit)
+
     def test_zero_missing_or_skipped_tests_cannot_pass(self):
         for result in ({"exit_code": 0, "passed": [], "missing": []},
                        {"exit_code": 0, "passed": sorted(gate.EXPECTED - {next(iter(gate.EXPECTED))}), "missing": []},

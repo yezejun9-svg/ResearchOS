@@ -82,6 +82,14 @@ def sha256(path):
     return "sha256:" + h.hexdigest()
 
 
+def prepare_go_environment():
+    # Native dispatch filters inherited cache variables. Both collection modes
+    # must therefore derive the same project-owned defaults before Go runs.
+    for name, directory in (("GOPATH", "gopath"), ("GOCACHE", "gocache")):
+        if not os.environ.get(name):
+            os.environ[name] = str(ROOT / ".local" / directory)
+
+
 def run_process(command, evidence, stem, *, env=None, timeout=180):
     started = datetime.now(timezone.utc).isoformat()
     stdout, stderr = evidence / (stem + ".stdout"), evidence / (stem + ".stderr")
@@ -630,10 +638,15 @@ def main():
     )["tools"]["go"]["path"]
     if not Path(go).is_file():
         raise FileNotFoundError("pinned Go executable unavailable")
+    prepare_go_environment()
     before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
     dirty = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.splitlines()
     evidence = ROOT / "execution/v2.4/receipts/W07/W07-99/source_executor_codex" / ("run-" + uuid.uuid4().hex)
     evidence.mkdir(parents=True, exist_ok=False)
+    env_code, env_out, _, env_timeout = run_process(
+        [go, "env", "-json", "GOPATH", "GOCACHE", "GOMODCACHE", "GOROOT", "GOTOOLCHAIN", "GOENV"], evidence, "go-env")
+    if env_code != 0 or env_timeout: raise ValueError("cannot record actual Go environment")
+    go_environment = json.loads(env_out.read_text(encoding="utf-8"))
     dep_command = [go, "list", "-deps", "-json", "./tests/sources/live"]
     dep_code, dep_out, dep_err, dep_timeout = run_process(dep_command, evidence, "go-list")
     if dep_code != 0 or dep_timeout: raise ValueError("cannot freeze actual compiled package dependencies")
@@ -647,6 +660,11 @@ def main():
             for field in ("GoFiles", "CgoFiles", "EmbedFiles"):
                 for name in package.get(field, []):
                     local_files.add(str((directory / name).relative_to(ROOT)).replace("\\", "/"))
+            # Freeze every current project package source, including tests and
+            # platform variants that this host's GoFiles selection excludes.
+            if directory.relative_to(ROOT).parts[:1] != (".local",):
+                local_files.update(path.relative_to(ROOT).as_posix()
+                                   for path in directory.glob("*.go") if path.is_file())
     SOURCE_FILES[:] = sorted(set(SOURCE_FILES) | local_files)
     source_before = {name: sha256(ROOT / name) for name in SOURCE_FILES}
     tool_before = {"go": sha256(go), "browser_act": sha256(browser_act) if (browser_act := os.getenv("RESEARCHOS_BROWSER_ACT")) and Path(browser_act).is_file() else None}
@@ -668,6 +686,7 @@ def main():
             ["A05-01", "A05-02", "A05-03", "A05-04", "A05-05"] if selected_live else sorted(EXPECTED),
         "started_at": started, "ended_at": datetime.now(timezone.utc).isoformat(),
         "execution_head": before, "dirty_before": dirty,
+        "go_environment": go_environment, "go_environment_ref": file_ref(env_out),
         "source_hashes": source_before,
         "source_hashes_after": {name: sha256(ROOT / name) for name in SOURCE_FILES},
         "tool_hashes_before": tool_before,
