@@ -62,15 +62,53 @@ func clientPrincipal(ctx context.Context, tx *sql.Tx, id, project string, owner 
 	return p, nil
 }
 
-// The original creation receipt is the existing durable principal attribution.
+// A real project-level goal.start can create a mapped session. Its response has
+// a null top-level session_id and the created identity in result.snapshot. A
+// session-scoped goal.start has a non-null top-level session_id, so it is never
+// mistaken for a second creation receipt. Conflicting receipts fail closed.
+func clientSessionCreationPrincipal(ctx context.Context, tx *sql.Tx, project, session string) (string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT project,principal FROM idempotency WHERE
+		(operation='v2:session.create' AND json_extract(body,'$.status')='COMPLETED' AND json_extract(body,'$.result.session_id')=?) OR
+		(operation='v2:goal.start' AND json_extract(body,'$.status')='COMPLETED' AND json_extract(body,'$.session_id') IS NULL AND json_extract(body,'$.result.snapshot.session_id')=?)`, session, session)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	owner := ""
+	count := 0
+	for rows.Next() {
+		var receiptProject, receiptOwner string
+		if err = rows.Scan(&receiptProject, &receiptOwner); err != nil {
+			return "", err
+		}
+		if receiptProject != project || receiptOwner == "" {
+			return "", Fail(403, "FORBIDDEN", "session creation attribution conflicts with its project")
+		}
+		owner = receiptOwner
+		count++
+	}
+	if err = rows.Err(); err != nil {
+		return "", err
+	}
+	if count == 0 {
+		return "", sql.ErrNoRows
+	}
+	if count != 1 {
+		return "", Fail(403, "FORBIDDEN", "session has conflicting creation receipts")
+	}
+	return owner, nil
+}
+
 // Older administratively mapped sessions retain their existing project grants.
 func clientSessionOwner(ctx context.Context, tx *sql.Tx, project, session, principal string) error {
-	var owner string
-	err := tx.QueryRowContext(ctx, `SELECT principal FROM idempotency WHERE project=? AND operation='v2:session.create' AND json_extract(body,'$.result.session_id')=?`, project, session).Scan(&owner)
-	if err != nil && err != sql.ErrNoRows {
+	owner, err := clientSessionCreationPrincipal(ctx, tx, project, session)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-	if err == nil && owner != principal {
+	if owner != principal {
 		return Fail(403, "FORBIDDEN", "session belongs to another principal")
 	}
 	return nil
@@ -118,23 +156,35 @@ func (s *ClientService) createClientSession(ctx context.Context, tx *sql.Tx, env
 	if err := json.Unmarshal(env.Payload, &p); err != nil {
 		return nil, err
 	}
-	if err := s.checkClientBinding(ctx, tx, principal, project, p.Workspace, p.Model); err != nil {
+	sid, err := s.createBoundClientSession(ctx, tx, env, principal, p.Workspace, p.Model, p.Title)
+	if err != nil {
 		return clientFault(env, err)
-	}
-	if s.Host.LeaseTTL <= 0 || s.Host.CoreBuildID == "" {
-		return NewTypedRejection(env, "HOST_UNAVAILABLE", "host session policy unavailable"), nil
-	}
-	now := time.Now().UTC()
-	expires := now.Add(s.Host.LeaseTTL)
-	sid, native := ID(), ID()
-	if err := MapClientSession(ctx, tx, ClientSession{ID: sid, ProjectID: project, Revision: 1, WriterEpoch: 1, WriterClientID: deref(env.ClientID), CreatedAt: now, UpdatedAt: now, LeaseExpiresAt: &expires, UpstreamSession: native, WorkspaceRef: &p.Workspace, ModelConfigRef: &p.Model, Title: &p.Title, CoreBuildID: &s.Host.CoreBuildID, Protocol: ProtocolV2}); err != nil {
-		return nil, err
 	}
 	snap, err := BuildSessionSnapshot(ctx, tx, s.Doc, project, sid)
 	if err != nil {
 		return nil, err
 	}
 	return &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method, Status: strptr("COMPLETED"), SessionID: &sid, Revision: revPtr(1), Result: snap}, nil
+}
+
+// Both session.create and a project-level goal.start mint the same durable
+// mapped session. Their own successful idempotency receipts attribute creation;
+// this helper never manufactures a session.create command or receipt.
+func (s *ClientService) createBoundClientSession(ctx context.Context, tx *sql.Tx, env *Envelope, principal, workspace, model, title string) (string, error) {
+	project := deref(env.ProjectID)
+	if err := s.checkClientBinding(ctx, tx, principal, project, workspace, model); err != nil {
+		return "", err
+	}
+	if s.Host.LeaseTTL <= 0 || s.Host.CoreBuildID == "" {
+		return "", Fail(503, "HOST_UNAVAILABLE", "host session policy unavailable")
+	}
+	now := time.Now().UTC()
+	expires := now.Add(s.Host.LeaseTTL)
+	sid, native := ID(), ID()
+	if err := MapClientSession(ctx, tx, ClientSession{ID: sid, ProjectID: project, Revision: 1, WriterEpoch: 1, WriterClientID: deref(env.ClientID), CreatedAt: now, UpdatedAt: now, LeaseExpiresAt: &expires, UpstreamSession: native, WorkspaceRef: &workspace, ModelConfigRef: &model, Title: &title, CoreBuildID: &s.Host.CoreBuildID, Protocol: ProtocolV2}); err != nil {
+		return "", err
+	}
+	return sid, nil
 }
 
 func (s *ClientService) listClientSessions(ctx context.Context, tx *sql.Tx, env *Envelope, principal string) (*Response, error) {
@@ -158,7 +208,11 @@ func (s *ClientService) listClientSessions(ctx context.Context, tx *sql.Tx, env 
 		}
 		after = cursor[2]
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT s.id FROM client_sessions s WHERE s.project_id=? AND s.id>? AND NOT EXISTS (SELECT 1 FROM idempotency i WHERE i.project=s.project_id AND i.operation='v2:session.create' AND json_extract(i.body,'$.result.session_id')=s.id AND i.principal<>?) ORDER BY s.id LIMIT ?`, project, after, principal, p.Limit+1)
+	rows, err := tx.QueryContext(ctx, `SELECT s.id FROM client_sessions s WHERE s.project_id=? AND s.id>? AND NOT EXISTS
+		(SELECT 1 FROM idempotency i WHERE i.project=s.project_id AND i.principal<>? AND json_extract(i.body,'$.status')='COMPLETED' AND
+		 ((i.operation='v2:session.create' AND json_extract(i.body,'$.result.session_id')=s.id) OR
+		 (i.operation='v2:goal.start' AND json_extract(i.body,'$.session_id') IS NULL AND json_extract(i.body,'$.result.snapshot.session_id')=s.id)))
+		ORDER BY s.id LIMIT ?`, project, after, principal, p.Limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -175,6 +229,15 @@ func (s *ClientService) listClientSessions(ctx context.Context, tx *sql.Tx, env 
 	rows.Close()
 	if err != nil {
 		return nil, err
+	}
+	for _, id := range ids {
+		owner, attributionErr := clientSessionCreationPrincipal(ctx, tx, project, id)
+		if attributionErr != nil && attributionErr != sql.ErrNoRows {
+			return nil, attributionErr
+		}
+		if owner != "" && owner != principal {
+			return nil, Fail(403, "FORBIDDEN", "session belongs to another principal")
+		}
 	}
 	var cursor any
 	if len(ids) > p.Limit {
@@ -261,74 +324,21 @@ func (s *ClientService) sendClientMessage(ctx context.Context, tx *sql.Tx, env *
 	if err != nil {
 		return clientFault(env, err)
 	}
-	// The authenticated NORMAL message authorizes precisely this finite response.
-	// It neither approves a model-created requirement nor enables goal continuation.
-	req, err := s.Domain.createRequirement(tx, sess.project, Object{"requirement_key": "SESSION-" + ID(), "text": payload.Text, "basis": "USER_STATED", "source_refs": refs, "rationale": "Authenticated Owner NORMAL message for one finite Mu turn", "supersedes_id": nil, "acceptance_check_ids": Empty()})
-	if err != nil {
-		return nil, err
-	}
-	req, err = s.Domain.actRequirement(tx, sess.project, Str(req, "id"), Object{"action": "ACCEPT", "source_validation_refs": Empty()})
-	if err != nil {
-		return nil, err
-	}
+	sourceRefs := append(Empty(), refs...)
 	if historyArtifact != nil {
 		refs = append(refs, Ref(historyArtifact, "Artifact"))
 	}
-	refs = append(refs, Ref(req, "Requirement"))
-	if authority, ok := s.SessionRuntime.(ClientTaskInputAuthority); ok {
-		frozen, freezeErr := authority.FreezeClientTaskInputs(ctx, tx, sess.project, model)
-		if freezeErr != nil {
-			return clientFault(env, freezeErr)
-		}
-		refs = append(refs, frozen...)
-	}
-	contract, problem := clientTurnContract(), ID()
-	goal, err := s.Domain.createGoal(tx, sess.project, Object{"title": "Client message", "original_intent": payload.Text, "scope": "PROJECT", "requirement_refs": []any{Ref(req, "Requirement")}, "problem_ids": []any{problem}, "deliverables": []any{"One finite Mu response to the authenticated client message"}, "acceptance_contract": contract})
+	// The authenticated NORMAL message authorizes one finite response. The
+	// shared builder preserves its Requirement/Goal/Task/runtime gates.
+	created, err := s.buildFiniteClientGoal(ctx, tx, env, p, sess, model, finiteGoalSpec{
+		Objective: payload.Text, Title: "Client message", Deliverable: "One finite Mu response to the authenticated client message",
+		RequirementKey: "SESSION-" + ID(), Rationale: "Authenticated Owner NORMAL message for one finite Mu turn",
+		ProblemID: ID(), CandidateID: sess.sessionID, SourceRefs: sourceRefs, InputRefs: refs, Contract: clientTurnContract(),
+	})
 	if err != nil {
-		return nil, err
+		return clientFault(env, err)
 	}
-	task, err := s.Domain.createTask(tx, sess.project, Object{"goal_id": goal["id"], "title": "Client message", "task_type": "mu_turn", "stage": "delivery", "dependency_task_ids": Empty(), "requirement_refs": []any{Ref(req, "Requirement")}, "input_refs": refs, "acceptance_contract": contract, "origin_problem_id": problem, "candidate_id": sess.sessionID, "stop_policy": Object{"wall_time_seconds": 900, "max_attempts": 1, "max_parallel_runs": 1, "stop_conditions": []any{"turn complete", "model or tool effect unknown", "lease or authority lost", "Owner cancellation"}}})
-	if err != nil {
-		return nil, err
-	}
-	if _, err = s.Domain.actGoal(tx, sess.project, Str(goal, "id"), Object{"action": "ACTIVATE", "reason": "Authenticated finite client message"}); err != nil {
-		return nil, err
-	}
-	state, err := singleton(tx, sess.project, "ProjectState")
-	if err != nil {
-		return nil, err
-	}
-	if _, err = s.Domain.createContext(tx, p, sess.project, Object{"task_id": task["id"], "expected_project_state_revision": state["revision"]}); err != nil {
-		return nil, err
-	}
-	task, err = load(tx, sess.project, "Task", Str(task, "id"))
-	if err != nil {
-		return nil, err
-	}
-	task, err = s.Domain.orchestrateTask(tx, sess.project, task, Object{"action": "SUBMIT"})
-	if err != nil {
-		return nil, err
-	}
-	blocked := s.SessionRuntime.AdmitTurn(ctx, tx, sess.project, model, task)
-	if blocked != nil {
-		var fault *Fault
-		if !errors.As(blocked, &fault) {
-			return nil, blocked
-		}
-		if task["status"] != "BLOCKED" {
-			task["status"] = "BLOCKED"
-			if err = bump(task); err != nil {
-				return nil, err
-			}
-			if err = s.Domain.put(tx, "Task", task); err != nil {
-				return nil, err
-			}
-		}
-	}
-	if _, err = tx.ExecContext(ctx, "UPDATE client_sessions SET goal_id=?,task_id=?,run_id=NULL WHERE id=? AND project_id=?", goal["id"], task["id"], sess.sessionID, sess.project); err != nil {
-		return nil, err
-	}
-	sess.runID = ""
+	task, blocked := created.Task, created.Blocked
 	messageID := ID()
 	for _, part := range []Object{{"phase": "START", "text": "", "content_offset_utf8_bytes": 0}, {"phase": "DELTA", "text": payload.Text, "content_offset_utf8_bytes": 0}, {"phase": "END", "text": "", "content_offset_utf8_bytes": len([]byte(payload.Text))}} {
 		part["message_id"], part["role"], part["part_index"] = messageID, "USER", 0

@@ -140,11 +140,19 @@ func DecodeEnvelope(raw []byte) (*Envelope, error) {
 		if err := requiredString("project_id", e.ProjectID); err != nil {
 			return nil, err
 		}
-		if e.ExpectedRevision == nil {
-			return nil, fmt.Errorf("MISSING_FIELD:expected_revision")
-		}
-		if e.WriterEpoch == nil {
-			return nil, fmt.Errorf("MISSING_FIELD:writer_epoch")
+		// A project-level Goal creates its own real session. Only a Goal naming an
+		// existing session may claim that session's revision and writer epoch.
+		if *e.Method == "goal.start" && e.SessionID == nil {
+			if e.ExpectedRevision != nil || e.WriterEpoch != nil {
+				return nil, fmt.Errorf("INVALID_REQUEST:project goal must not claim a session writer")
+			}
+		} else {
+			if e.ExpectedRevision == nil {
+				return nil, fmt.Errorf("MISSING_FIELD:expected_revision")
+			}
+			if e.WriterEpoch == nil {
+				return nil, fmt.Errorf("MISSING_FIELD:writer_epoch")
+			}
 		}
 	}
 	if *e.Method == "host.configure" {
@@ -823,6 +831,8 @@ func (s *ClientService) dispatch(ctx context.Context, tx *sql.Tx, env *Envelope,
 		switch *env.Method {
 		case "host.configure", "project.bootstrap", "workspace.register":
 			return s.handleWrite(ctx, tx, env, principal, nil, reject)
+		case "goal.start":
+			return s.startClientGoal(ctx, tx, env, principal, nil)
 		}
 		return reject(0, nil, "INVALID_REQUEST", "write command requires a session id"), nil
 	}
@@ -1003,6 +1013,8 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		return s.clientFirstUse(ctx, tx, env, principal)
 	case "session.send":
 		return s.sendClientMessage(ctx, tx, env, principal, sess)
+	case "goal.start":
+		return s.startClientGoal(ctx, tx, env, principal, sess)
 	case "artifact.import":
 		return s.importClientArtifact(ctx, tx, env, principal, sess)
 	case "workspace.write":

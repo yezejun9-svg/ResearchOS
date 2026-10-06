@@ -80,8 +80,12 @@ func (c *RuntimeCoordinator) runtimeToolGate(ctx context.Context, tx *sql.Tx, ro
 	if calls >= limit {
 		return request, Fail(403, "FORBIDDEN", "frozen tool call limit exhausted")
 	}
-	var workspace, model, principal string
-	if e = tx.QueryRow(`SELECT s.workspace_ref,s.model_config_ref,i.principal FROM client_sessions s JOIN idempotency i ON i.project=s.project_id AND i.operation='v2:session.create' AND json_extract(i.body,'$.result.session_id')=s.id WHERE s.project_id=? AND s.task_id=? AND s.run_id=? AND s.archived_at IS NULL AND s.sealed_at IS NULL`, route.ProjectID, task["id"], runID).Scan(&workspace, &model, &principal); e != nil {
+	var sessionID, workspace, model string
+	if e = tx.QueryRow(`SELECT s.id,s.workspace_ref,s.model_config_ref FROM client_sessions s WHERE s.project_id=? AND s.task_id=? AND s.run_id=? AND s.archived_at IS NULL AND s.sealed_at IS NULL`, route.ProjectID, task["id"], runID).Scan(&sessionID, &workspace, &model); e != nil {
+		return request, Fail(403, "FORBIDDEN", "tool session provenance unavailable")
+	}
+	principal, e := clientSessionCreationPrincipal(ctx, tx, route.ProjectID, sessionID)
+	if e != nil {
 		return request, Fail(403, "FORBIDDEN", "tool session provenance unavailable")
 	}
 	if model != Str(config, "ref") {
