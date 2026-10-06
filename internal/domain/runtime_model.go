@@ -3,12 +3,37 @@ package domain
 import (
 	"database/sql"
 	"encoding/json"
+	"net"
 	"net/url"
 	"strings"
 	"unicode/utf8"
 )
 
 const runtimeMuBackend = "mu-sdk-broker-v1"
+
+const runtimeProviderPolicy = "opencode-go-deepseek-v1"
+const runtimeProviderEndpoint = "https://opencode.ai/zen/go/v1/chat/completions"
+
+func providerPolicy(config Object) (bool, error) {
+	v, exists := config["provider_policy"]
+	if !exists {
+		return false, nil
+	}
+	if v != runtimeProviderPolicy {
+		return false, Fail(403, "FORBIDDEN", "unknown frozen provider policy")
+	}
+	return true, nil
+}
+
+func providerPolicyEndpoint(endpoint string, fixture bool) bool {
+	if endpoint == runtimeProviderEndpoint {
+		return true
+	}
+	u, err := url.Parse(endpoint)
+	return fixture && err == nil && u.User == nil && u.RawQuery == "" && u.Fragment == "" && u.Port() != "" &&
+		(u.Scheme == "http" || u.Scheme == "https") && u.Path == "/zen/go/v1/chat/completions" && u.RawPath == "" &&
+		net.ParseIP(u.Hostname()) != nil && net.ParseIP(u.Hostname()).IsLoopback()
+}
 
 // Only a complete final SSE data event terminates the transport. A model may
 // legitimately mention [DONE] inside JSON content; that is not a terminator.
@@ -60,6 +85,13 @@ func validateRuntimeModelConfig(profile Object) error {
 	if e != nil || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" {
 		return Fail(422, "GATE_FAILED", "frozen model endpoint required")
 	}
+	policy, e := providerPolicy(config)
+	if e != nil {
+		return e
+	}
+	if policy && (config["provider"] != "opencode-go" || config["model"] != "deepseek-v4.1-flash" || !providerPolicyEndpoint(Str(config, "endpoint"), true)) {
+		return Fail(403, "FORBIDDEN", "frozen provider tuple differs")
+	}
 	limit, e := Num(config, "max_output_tokens")
 	if e != nil || limit < 1 || limit > 8192 {
 		return Fail(422, "GATE_FAILED", "bounded model output required")
@@ -79,6 +111,9 @@ func validateRuntimeModelConfig(profile Object) error {
 		fn, ok := tool["function"].(map[string]any)
 		if !ok || Str(fn, "name") == "" || fn["parameters"] == nil {
 			return Fail(422, "GATE_FAILED", "complete function schema required")
+		}
+		if policy && fn["strict"] == true {
+			return Fail(403, "FORBIDDEN", "provider policy strict tools unsupported")
 		}
 	}
 	if len(Str(profile, "bundle_hash")) != 71 {
@@ -128,6 +163,10 @@ func qualificationModelEffectAllowed(tx *sql.Tx, project string, task, payload O
 // The SDK decides how to encode model context. The host checks authority and
 // bounded provider parameters before accepting that complete body for dispatch.
 func validateRuntimeModelRequest(config, payload Object) (Object, error) {
+	policy, err := providerPolicy(config)
+	if err != nil {
+		return nil, err
+	}
 	if len(payload) != 1 {
 		return nil, Fail(400, "INVALID_REQUEST", "model request must contain only body")
 	}
@@ -136,6 +175,13 @@ func validateRuntimeModelRequest(config, payload Object) (Object, error) {
 		return nil, Fail(403, "FORBIDDEN", "model or transport differs from frozen configuration")
 	}
 	allowed := map[string]bool{"model": true, "messages": true, "stream": true, "stream_options": true, "max_tokens": true, "max_completion_tokens": true, "temperature": true, "top_p": true, "presence_penalty": true, "frequency_penalty": true, "reasoning_effort": true, "stop": true, "tools": true, "tool_choice": true, "parallel_tool_calls": true, "seed": true}
+	if policy {
+		allowed["thinking"] = true
+		_, conflict := body["max_completion_tokens"]
+		if conflict || Hash(body["thinking"]) != Hash(Object{"type": "enabled"}) || body["reasoning_effort"] != "high" || Hash(body["max_tokens"]) != Hash(config["max_output_tokens"]) {
+			return nil, Fail(403, "FORBIDDEN", "provider thinking or output policy differs")
+		}
+	}
 	for key := range body {
 		if !allowed[key] {
 			return nil, Fail(403, "FORBIDDEN", "model parameter is not permitted: "+key)

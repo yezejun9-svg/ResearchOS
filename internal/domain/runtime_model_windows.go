@@ -86,6 +86,19 @@ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoord
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
+	policy, e := providerPolicy(provider.ModelConfig)
+	if e != nil {
+		return nil, e
+	}
+	if policy {
+		original, _ := intent["payload"].(map[string]any)
+		transport, _ := original["provider_transport"].(map[string]any)
+		if transport["endpoint"] != provider.Endpoint || transport["user_agent"] != "ResearchOS/2.4" || transport["session_header"] != "x-opencode-session" || Str(transport, "session_value") == "" {
+			return nil, historyInvalid("provider HTTP original binding")
+		}
+		req.Header.Set("User-Agent", Str(transport, "user_agent"))
+		req.Header.Set("x-opencode-session", Str(transport, "session_value"))
+	}
 	if provider.BearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+provider.BearerToken)
 	}
@@ -122,6 +135,9 @@ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoord
 					return unknown("model response rejected by quarantine")
 				}
 				if len(released) > 0 {
+					if policy && providerSSEPolicy(released) != nil {
+						return unknown("provider reasoning alternative unsupported")
+					}
 					if err = stream.Send(ctx, released, false); err != nil {
 						return unknown("model stream transport failed")
 					}
@@ -138,6 +154,9 @@ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoord
 		if err != nil {
 			return unknown("model returned no complete bounded SSE response")
 		}
+		if policy && providerSSEPolicy(raw) != nil {
+			return unknown("provider reasoning alternative unsupported")
+		}
 	} else {
 		raw, e = io.ReadAll(io.LimitReader(response.Body, runtimeModelMaxSSEBytes+1))
 		if e != nil || len(raw) > runtimeModelMaxSSEBytes || !completeRuntimeModelSSE(raw) {
@@ -147,6 +166,21 @@ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoord
 			if secret != "" && bytes.Contains(raw, []byte(secret)) {
 				return unknown("model response contained host credential material")
 			}
+		}
+		if policy {
+			quarantine, err := newModelSSEQuarantine(provider.BearerToken, c.config.SchedulerToken, route.ExecutorToken)
+			if err != nil {
+				return unknown("provider quarantine unavailable")
+			}
+			if _, err = quarantine.Feed(raw); err != nil {
+				return unknown("provider response rejected by quarantine")
+			}
+			if _, _, err = quarantine.Finish(); err != nil {
+				return unknown("provider response quarantine incomplete")
+			}
+		}
+		if policy && providerSSEPolicy(raw) != nil {
+			return unknown("provider reasoning alternative unsupported")
 		}
 	}
 	result := Object{"status": response.StatusCode, "content_type": "text/event-stream", "body": string(raw)}

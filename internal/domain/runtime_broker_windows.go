@@ -81,6 +81,13 @@ func (c *RuntimeCoordinator) providerRoute(tx *sql.Tx, route RuntimeCoordinatorR
 			if provider.MeasurementMode == "LIVE" && (provider.CredentialRef == "" || provider.CredentialRef != provider.CredentialRevision || c.config.ModelCredential == nil || provider.BearerToken != "") {
 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "LIVE model requires a current protected credential reference")
 			}
+			policy, err := providerPolicy(provider.ModelConfig)
+			if err != nil {
+				return RuntimeProviderRoute{}, err
+			}
+			if policy && (!providerPolicyEndpoint(provider.Endpoint, provider.MeasurementMode == "FIXTURE" && admission["mode"] == "FIXTURE") || provider.UpperBound == nil) {
+				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "provider policy endpoint or monetary bound missing")
+			}
 		}
 		if provider.Capability == "TOOL" {
 			if profile["backend"] != runtimeMuBackend || provider.ID != Str(profile["model_config"].(map[string]any), "route") || c.config.RunTool == nil || provider.Endpoint != "" || provider.BearerToken != "" || provider.CredentialRef != "" {
@@ -160,6 +167,14 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 			tx.Rollback()
 			return nil, e
 		}
+		transport, err := providerTransport(tx, route.ProjectID, run, dispatch)
+		if err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+		if transport != nil {
+			request["provider_transport"] = transport
+		}
 	}
 	if provider.Capability == "EXPERIMENT" {
 		if _, _, e = c.researchExperimentGate(tx, route.ProjectID, task, run, frame, payload); e != nil {
@@ -199,6 +214,17 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 	if _, e = c.providerRoute(tx, route, run, dispatch, frame); e != nil {
 		tx.Rollback()
 		return nil, e
+	}
+	if provider.Capability == "MODEL" {
+		transport, err := providerTransport(tx, route.ProjectID, run, dispatch)
+		original, _ := intent["payload"].(map[string]any)
+		if err != nil || Hash(original["provider_transport"]) != Hash(transport) {
+			tx.Rollback()
+			if err != nil {
+				return nil, err
+			}
+			return nil, historyInvalid("provider PREPARED authority changed")
+		}
 	}
 	if provider.Capability == "TOOL" {
 		if _, e = c.runtimeToolGate(ctx, tx, route, task, dispatch, frame, payload); e != nil {

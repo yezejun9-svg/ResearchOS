@@ -278,6 +278,9 @@ func validateModelStreamBackup(db *sql.DB) error {
 		return err
 	}
 	defer tx.Rollback()
+	if _, err = validateProviderInventory(tx, "", ""); err != nil {
+		return err
+	}
 	streams, err := modelStreamEvidence(tx, "", "")
 	if err != nil {
 		return err
@@ -412,6 +415,9 @@ func (s *Service) modelStreamAcceptanceSnapshot(tx *sql.Tx, project string, run 
 // This proof starts at canonical dispatch/effect rows. A publicly sealed REPORT
 // with the same vocabulary cannot create stream authority or public END events.
 func (s *Service) modelStreamFinalEvidence(ctx context.Context, tx *sql.Tx, project string, run Object) ([]*modelObservedStream, map[string]int, error) {
+	if _, err := validateProviderInventory(tx, project, Str(run, "id")); err != nil {
+		return nil, nil, err
+	}
 	streams, err := modelStreamEvidence(tx, project, Str(run, "id"))
 	if err != nil || len(streams) == 0 {
 		return streams, nil, err
@@ -558,10 +564,21 @@ func (s *Service) modelStreamFinalEvidence(ctx context.Context, tx *sql.Tx, proj
 		if intent["state"] != "CONFIRMED" || receipt["state"] != "CONFIRMED" || receipt["model_transport"] != true || receipt["actual_cost"] != nil || receipt["run_id"] != run["id"] || Hash(receipt["epoch"]) != Hash(run["lease_epoch"]) || receipt["key"] != stream.binding["effect_key"] || receipt["receipt_id"] != Digest([]byte(responseRaw)) || response["content_type"] != "text/event-stream" || Hash(response["status"]) != Hash(200) || len(responseRaw) > modelStreamMaxRaw || !completeRuntimeModelSSE([]byte(responseRaw)) {
 			return nil, nil, historyInvalid("model confirmed SSE receipt")
 		}
-		expected, e := muResponse(responseRaw)
+		expected, e := providerResponse(config, responseRaw)
 		actual, ae := muSDKAssistant(m)
 		if e != nil || ae != nil || Hash(actual) != Hash(expected) || m["model"] != config["model"] || m["provider"] != config["provider"] || m["api"] != config["api"] || m["errorMessage"] != nil {
 			return nil, nil, historyInvalid("SDK differs from original confirmed SSE")
+		}
+		if policy, _ := providerPolicy(config); policy {
+			request, _ := intent["payload"].(map[string]any)
+			payload, _ := request["payload"].(map[string]any)
+			body, _ := payload["body"].(map[string]any)
+			if e = verifyProviderReasoning(responseRaw, m); e != nil {
+				return nil, nil, e
+			}
+			if e = verifyProviderWireHistory(Arr(body, "messages"), messages[:pos], providerOriginalCWD(dispatch)); e != nil {
+				return nil, nil, e
+			}
 		}
 		content := Arr(m, "content")
 		text := ""

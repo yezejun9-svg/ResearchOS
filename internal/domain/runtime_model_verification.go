@@ -7,6 +7,586 @@ import (
 	"unicode/utf8"
 )
 
+// Reconstruct from immutable admission and original receipts, never a session's
+// current head or a worker/terminal claim. Used before PREPARED and by restore.
+func providerTransport(tx *sql.Tx, project string, run, dispatch Object) (Object, error) {
+	m, _ := dispatch["manifest"].(map[string]any)
+	a, _ := m["admission"].(map[string]any)
+	p, _ := a["profile"].(map[string]any)
+	config, _ := p["model_config"].(map[string]any)
+	policy, err := providerPolicy(config)
+	if err != nil || !policy {
+		return nil, err
+	}
+	if err = validateRuntimeModelConfig(p); err != nil {
+		return nil, err
+	}
+	if m["project_id"] != project || m["run_id"] != run["id"] || m["task_id"] != run["task_id"] || m["runtime_id"] != run["runtime_id"] || Hash(m) != dispatch["manifest_hash"] || !providerPolicyEndpoint(Str(config, "endpoint"), a["mode"] == "FIXTURE") {
+		return nil, historyInvalid("provider original admission binding")
+	}
+	ref, ok := a["profile_ref"].(map[string]any)
+	if !ok || a["profile_hash"] != Hash(ref) {
+		return nil, historyInvalid("provider profile reference")
+	}
+	artifact, err := version(tx, project, ref)
+	if err != nil {
+		return nil, err
+	}
+	profile, err := runtimeProfileBody(tx, project, artifact)
+	if err != nil || Hash(profile) != Hash(p) {
+		return nil, historyInvalid("provider immutable profile")
+	}
+	kind, id := "session", ""
+	var witness Object
+	if a["qualification_bootstrap"] == true {
+		kind, id = "qualification_task", Str(m, "task_id")
+		var taskRun, runtime, planHash, profileHash, contractHash, inputHash, contextID, owner string
+		var epoch int64
+		err = tx.QueryRow(`SELECT run,runtime,epoch,plan_hash,profile_hash,contract_hash,input_hash,context_bundle,owner_root FROM runtime_qualification_runs WHERE project=? AND task=?`, project, id).Scan(&taskRun, &runtime, &epoch, &planHash, &profileHash, &contractHash, &inputHash, &contextID, &owner)
+		if err != nil {
+			return nil, err
+		}
+		plan, digest, root, e := qualificationPlan(tx, project, id, runtime)
+		if e != nil {
+			return nil, e
+		}
+		task, e := load(tx, project, "Task", id)
+		if e != nil {
+			return nil, e
+		}
+		if task["task_type"] != "runtime_qualification" || taskRun != run["id"] || runtime != m["runtime_id"] || Hash(epoch) != Hash(m["epoch"]) || planHash != digest || owner != root || profileHash != Hash(ref) || Hash(plan["profile_ref"]) != Hash(ref) || contractHash != m["contract_hash"] || inputHash != Hash(m["input_refs"]) || contextID != m["context_bundle_id"] || plan["task_hash"] != qualificationTaskHash(task) {
+			return nil, historyInvalid("provider original qualification witness")
+		}
+		witness = Object{"plan_hash": planHash, "contract_hash": contractHash, "input_hash": inputHash, "context_bundle": contextID, "owner_root": owner}
+	} else {
+		var generation, session string
+		var count int
+		if err = tx.QueryRow(`SELECT count(*) FROM client_queue_fences WHERE project=? AND run_id=? AND runtime_epoch=?`, project, run["id"], m["epoch"]).Scan(&count); err != nil {
+			return nil, err
+		}
+		if count != 1 {
+			return nil, historyInvalid("provider unique original session")
+		}
+		if err = tx.QueryRow(`SELECT generation,session_id FROM client_queue_fences WHERE project=? AND task_id=? AND run_id=? AND runtime_epoch=? AND dispatch_key=? AND manifest_hash=?`, project, m["task_id"], run["id"], m["epoch"], dispatch["dispatch_key"], dispatch["manifest_hash"]).Scan(&generation, &session); err != nil {
+			return nil, err
+		}
+		if err = tx.QueryRow(`SELECT count(*) FROM client_sessions WHERE project_id=? AND id=?`, project, session).Scan(&count); err != nil {
+			return nil, err
+		}
+		if count != 1 {
+			return nil, historyInvalid("provider session project")
+		}
+		binding := Object{"project_id": project, "session_id": session, "task_id": m["task_id"], "run_id": run["id"], "runtime_epoch": m["epoch"], "queue_generation": generation, "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "process_identity": dispatch["identity"]}
+		read := func(receiptID, kind string) (Object, string, error) {
+			var raw, hash string
+			if e := tx.QueryRow(`SELECT body,body_hash FROM client_control_receipts WHERE project=? AND generation=? AND receipt_id=? AND kind=?`, project, generation, receiptID, kind).Scan(&raw, &hash); e != nil {
+				return nil, "", e
+			}
+			v, e := Decode([]byte(raw))
+			if e != nil || Digest([]byte(raw)) != hash {
+				return nil, "", historyInvalid("provider receipt hash")
+			}
+			for key, want := range binding {
+				if Hash(v[key]) != Hash(want) {
+					return nil, "", historyInvalid("provider receipt identity")
+				}
+			}
+			return v, hash, nil
+		}
+		deliveredID := Str(dispatch, "dispatch_key") + ":initialize-delivered"
+		delivered, dh, e := read(deliveredID, "command.initialize.delivered")
+		if e != nil {
+			return nil, e
+		}
+		seq, e := Num(delivered, "initialization_sequence")
+		if e != nil || seq < 1 || delivered["delivered"] != true {
+			return nil, historyInvalid("provider delivered initialization")
+		}
+		acceptedID := fmt.Sprintf("%s:%d", dispatch["dispatch_key"], seq)
+		accepted, ah, e := read(acceptedID, "command.accepted")
+		if e != nil {
+			return nil, e
+		}
+		if accepted["initialized"] != true {
+			return nil, historyInvalid("provider initialization acceptance")
+		}
+		if err = tx.QueryRow(`SELECT count(*) FROM client_control_receipts WHERE project=? AND generation=? AND kind='command.accepted' AND json_extract(body,'$.initialized')=1`, project, generation).Scan(&count); err != nil {
+			return nil, err
+		}
+		if count != 1 {
+			return nil, historyInvalid("provider ambiguous initialization")
+		}
+		id = session
+		witness = Object{"session_id": session, "queue_generation": generation, "initialization_sequence": seq, "initialized_receipt_id": acceptedID, "initialized_receipt_body_hash": ah, "delivered_receipt_id": deliveredID, "delivered_receipt_body_hash": dh}
+	}
+	scope := Object{"kind": kind, "project_id": project, "id": id}
+	value := "ros-v1-" + strings.TrimPrefix(Hash(Merge(Merge(Object{}, scope), Object{"version": "researchos-opencode-session-v1"})), "sha256:")
+	authority := Object{"kind": kind, "project_id": project, "task_id": m["task_id"], "run_id": run["id"], "runtime_id": m["runtime_id"], "runtime_epoch": m["epoch"], "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "profile_ref_hash": Hash(ref), "model_config_hash": Hash(config), "witness": witness}
+	return Object{"version": "researchos.provider-transport.v1", "provider_policy": runtimeProviderPolicy, "endpoint": config["endpoint"], "user_agent": "ResearchOS/2.4", "session_header": "x-opencode-session", "session_value": value, "affinity_scope": scope, "authority": authority}, nil
+}
+
+// Inventory is indexed by original dispatch admission, including effects with
+// zero observations or a removed/changed request policy marker.
+func validateProviderInventory(tx *sql.Tx, project, runID string) (map[string]Object, error) {
+	rows, err := tx.Query(`SELECT project,run,body FROM resource_effects WHERE (?='' OR project=?) AND (?='' OR run=?) ORDER BY project,run,effect_key,sequence`, project, project, runID, runID)
+	if err != nil {
+		return nil, err
+	}
+	type record struct {
+		project, run string
+		body         Object
+	}
+	all := []record{}
+	for rows.Next() {
+		var p, r, raw string
+		if err = rows.Scan(&p, &r, &raw); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		v, e := Decode([]byte(raw))
+		if e != nil {
+			rows.Close()
+			return nil, e
+		}
+		all = append(all, record{p, r, v})
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	transports := map[string]Object{}
+	originals := map[string]Object{}
+	sequences := map[string]int64{}
+	for _, record := range all {
+		e := record.body
+		var manifestRaw string
+		err := tx.QueryRow(`SELECT manifest FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, record.project, record.run, e["epoch"]).Scan(&manifestRaw)
+		if err == sql.ErrNoRows {
+			request, _ := e["payload"].(map[string]any)
+			if request["provider_transport"] != nil {
+				return nil, historyInvalid("provider dispatch missing")
+			}
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		manifest, err := Decode([]byte(manifestRaw))
+		if err != nil {
+			return nil, err
+		}
+		admission, _ := manifest["admission"].(map[string]any)
+		profile, _ := admission["profile"].(map[string]any)
+		model, _ := profile["model_config"].(map[string]any)
+		// The sealed version is the policy authority. Removing the marker from
+		// the dispatch copy must not exclude that dispatch from this inventory.
+		if ref, ok := admission["profile_ref"].(map[string]any); ok {
+			artifact, e := version(tx, record.project, ref)
+			if e != nil {
+				return nil, e
+			}
+			frozen, e := runtimeProfileBody(tx, record.project, artifact)
+			if e != nil {
+				return nil, e
+			}
+			frozenConfig, _ := frozen["model_config"].(map[string]any)
+			frozenPolicy, e := providerPolicy(frozenConfig)
+			if e != nil {
+				return nil, e
+			}
+			if frozenPolicy && Hash(frozen) != Hash(profile) {
+				return nil, historyInvalid("provider admission removed frozen policy")
+			}
+			if frozenPolicy {
+				model = frozenConfig
+			}
+		}
+		isPolicy, err := providerPolicy(model)
+		if err != nil {
+			return nil, err
+		}
+		if !isPolicy {
+			request, _ := e["payload"].(map[string]any)
+			if request["provider_transport"] != nil {
+				return nil, historyInvalid("provider transport without original policy")
+			}
+			continue
+		}
+		d, err := runtimeDispatch(tx, record.project, record.run, e["epoch"])
+		if err != nil {
+			return nil, err
+		}
+		m, _ := d["manifest"].(map[string]any)
+		a, _ := m["admission"].(map[string]any)
+		p, _ := a["profile"].(map[string]any)
+		config, _ := p["model_config"].(map[string]any)
+		policy, err := providerPolicy(config)
+		if err != nil {
+			return nil, err
+		}
+		if !policy {
+			continue
+		}
+		request, _ := e["payload"].(map[string]any)
+		// All ordinary non-model effects remain under their existing gates.
+		key := Str(e, "key")
+		modelKey := fmt.Sprintf("%s:%s:%v:model:", m["task_id"], record.run, m["epoch"])
+		if request["capability"] != "MODEL" && !strings.HasPrefix(key, modelKey) {
+			continue
+		}
+		run, err := load(tx, record.project, "Run", record.run)
+		if err != nil {
+			return nil, err
+		}
+		transport, err := providerTransport(tx, record.project, run, d)
+		if err != nil {
+			return nil, err
+		}
+		if request["capability"] != "MODEL" || !modelExactKeys(request, "route", "capability", "credential_revision", "payload", "provider_transport") || Hash(request["provider_transport"]) != Hash(transport) {
+			return nil, historyInvalid("provider original transport")
+		}
+		payload, _ := request["payload"].(map[string]any)
+		if _, err = validateRuntimeModelRequest(config, payload); err != nil {
+			return nil, err
+		}
+		var bound any
+		found := 0
+		for _, value := range Arr(p, "effect_routes") {
+			r, _ := value.(map[string]any)
+			if r["id"] == request["route"] && r["capability"] == "MODEL" && r["credential_revision"] == request["credential_revision"] {
+				bound = r["upper_bound"]
+				found++
+			}
+		}
+		if found != 1 || bound == nil {
+			return nil, historyInvalid("provider monetary route")
+		}
+		ledger, err := load(tx, record.project, "BudgetLedgerEntry", Str(e, "reservation_id"))
+		if err != nil {
+			return nil, err
+		}
+		cost := Object{"policy_id": ledger["policy_id"], "run_id": record.run, "operation": "RESERVE", "money": bound, "provider_request_id": key, "provider_event_id": "prepare/" + key, "reservation_id": nil, "cost_basis": "UPPER_BOUND", "occurred_at": run["created_at"]}
+		if e["request_hash"] != Hash([]any{request, cost}) || ledger["run_id"] != record.run || ledger["provider_request_id"] != key || ledger["operation"] != "RESERVE" || ledger["cost_basis"] != "UPPER_BOUND" || Hash(ledger["money"]) != Hash(bound) {
+			return nil, historyInvalid("provider original request and budget hash")
+		}
+		seq, err := Num(e, "sequence")
+		if err != nil {
+			return nil, err
+		}
+		group := record.project + "/" + record.run + "/" + key
+		if seq != sequences[group]+1 || e["project_id"] != record.project || e["run_id"] != record.run || e["task_id"] != m["task_id"] || Hash(e["epoch"]) != Hash(m["epoch"]) {
+			return nil, historyInvalid("provider effect sequence or identity")
+		}
+		sequences[group] = seq
+		if seq == 1 {
+			if e["state"] != "PREPARED" {
+				return nil, historyInvalid("provider missing PREPARED")
+			}
+			originals[group] = e
+		} else {
+			old := originals[group]
+			if old == nil || Hash(old["payload"]) != Hash(request) || old["request_hash"] != e["request_hash"] || old["reservation_id"] != e["reservation_id"] {
+				return nil, historyInvalid("provider history rebound")
+			}
+		}
+		transports[key] = transport
+		switch e["state"] {
+		case "PREPARED", "STARTED", "UNKNOWN", "NOT_APPLIED":
+		case "CONFIRMED":
+			receipt, _ := e["receipt"].(map[string]any)
+			payload, _ := receipt["payload"].(map[string]any)
+			raw := Str(payload, "body")
+			if receipt["state"] != "CONFIRMED" || receipt["key"] != key || receipt["run_id"] != record.run || Hash(receipt["epoch"]) != Hash(m["epoch"]) || receipt["model_transport"] != true || receipt["actual_cost"] != nil || receipt["receipt_id"] != Digest([]byte(raw)) || payload["content_type"] != "text/event-stream" || Hash(payload["status"]) != Hash(200) || len(raw) > modelStreamMaxRaw || !completeRuntimeModelSSE([]byte(raw)) || providerSSEPolicy([]byte(raw)) != nil {
+				return nil, historyInvalid("provider original sealed response")
+			}
+			var settled int
+			if err = tx.QueryRow(`SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.provider_request_id')=? AND (json_extract(body,'$.cost_basis')='ACTUAL' OR json_extract(body,'$.operation') IN ('RELEASE','RECONCILE'))`, record.project, record.run, key).Scan(&settled); err != nil {
+				return nil, err
+			}
+			if settled != 0 {
+				return nil, historyInvalid("provider unknown monetary cost settled")
+			}
+		default:
+			return nil, historyInvalid("provider invalid effect state")
+		}
+	}
+	return transports, nil
+}
+
+func providerSSEChunks(raw []byte) ([]Object, error) {
+	chunks := []Object{}
+	for _, event := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n\n") {
+		data := []string{}
+		for _, line := range strings.Split(event, "\n") {
+			if strings.HasPrefix(line, "data:") {
+				data = append(data, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+			}
+		}
+		text := strings.Join(data, "\n")
+		if text == "" || text == "[DONE]" {
+			continue
+		}
+		chunk, err := Decode([]byte(text))
+		if err != nil {
+			return nil, err
+		}
+		for _, v := range Arr(chunk, "choices") {
+			choice, _ := v.(map[string]any)
+			delta, _ := choice["delta"].(map[string]any)
+			for _, key := range []string{"reasoning_details", "reasoning_signature", "signature"} {
+				if _, present := delta[key]; present {
+					return nil, historyInvalid("unsupported provider reasoning alternative")
+				}
+			}
+			for _, v := range Arr(delta, "tool_calls") {
+				call, _ := v.(map[string]any)
+				if call["thoughtSignature"] != nil || call["custom"] != nil {
+					return nil, historyInvalid("unsupported provider tool alternative")
+				}
+			}
+		}
+		chunks = append(chunks, chunk)
+	}
+	return chunks, nil
+}
+func providerSSEPolicy(raw []byte) error { _, err := providerSSEChunks(raw); return err }
+
+func providerReasoningParts(raw string) (string, []Object, error) {
+	chunks, err := providerSSEChunks([]byte(raw))
+	if err != nil {
+		return "", nil, err
+	}
+	var normalized strings.Builder
+	parts := []Object{}
+	textIndex, thinkingIndex := -1, -1
+	tools := map[int64]bool{}
+	for _, chunk := range chunks {
+		choices := Arr(chunk, "choices")
+		if len(choices) > 0 {
+			choice, _ := choices[0].(map[string]any)
+			delta, _ := choice["delta"].(map[string]any)
+			if text := Str(delta, "content"); text != "" {
+				if textIndex < 0 {
+					textIndex = len(parts)
+					parts = append(parts, Object{"type": "text", "text": ""})
+				}
+				parts[textIndex]["text"] = Str(parts[textIndex], "text") + text
+			}
+			selected, text := "", ""
+			for _, key := range []string{"reasoning_content", "reasoning", "reasoning_text"} {
+				if Str(delta, key) != "" {
+					selected, text = key, Str(delta, key)
+					break
+				}
+			}
+			for _, key := range []string{"reasoning_content", "reasoning", "reasoning_text"} {
+				delete(delta, key)
+			}
+			if selected != "" {
+				delta["reasoning_content"] = text
+				if thinkingIndex < 0 {
+					if selected == "reasoning" {
+						selected = "reasoning_content"
+					}
+					thinkingIndex = len(parts)
+					parts = append(parts, Object{"type": "thinking", "thinking": "", "thinkingSignature": selected})
+				}
+				parts[thinkingIndex]["thinking"] = Str(parts[thinkingIndex], "thinking") + text
+			}
+			for _, v := range Arr(delta, "tool_calls") {
+				call, _ := v.(map[string]any)
+				index, e := Num(call, "index")
+				if e != nil {
+					return "", nil, e
+				}
+				if !tools[index] {
+					tools[index] = true
+					parts = append(parts, Object{"type": "toolCall", "index": index})
+				}
+			}
+		}
+		fmt.Fprintf(&normalized, "data: %s\n\n", Bytes(chunk))
+	}
+	normalized.WriteString("data: [DONE]\n\n")
+	return normalized.String(), parts, nil
+}
+
+func providerResponse(config Object, raw string) (muAssistant, error) {
+	policy, err := providerPolicy(config)
+	if err != nil {
+		return muAssistant{}, err
+	}
+	if !policy {
+		return muResponse(raw)
+	}
+	if !completeRuntimeModelSSE([]byte(raw)) {
+		return muAssistant{}, historyInvalid("provider incomplete SSE")
+	}
+	text, _, err := providerReasoningParts(raw)
+	if err != nil {
+		return muAssistant{}, err
+	}
+	return muResponse(text)
+}
+
+func verifyProviderReasoning(raw string, message Object) error {
+	_, parts, err := providerReasoningParts(raw)
+	if err != nil {
+		return err
+	}
+	actual := Arr(message, "content")
+	if len(parts) != len(actual) {
+		return historyInvalid("provider SDK content ordering")
+	}
+	for i, want := range parts {
+		got, ok := actual[i].(map[string]any)
+		if !ok || got["type"] != want["type"] {
+			return historyInvalid("provider SDK content type ordering")
+		}
+		switch want["type"] {
+		case "thinking":
+			if got["thinking"] != want["thinking"] || got["thinkingSignature"] != want["thinkingSignature"] {
+				return historyInvalid("provider SDK original reasoning signature or bytes")
+			}
+		case "text":
+			if got["text"] != want["text"] {
+				return historyInvalid("provider SDK original text")
+			}
+		case "toolCall":
+			if got["thoughtSignature"] != nil {
+				return historyInvalid("provider SDK unsupported tool signature")
+			}
+		}
+	}
+	return nil
+}
+
+func providerWireReasoning(message Object, sdk bool) (Object, error) {
+	result := Object{}
+	if !sdk {
+		for _, key := range []string{"reasoning_content", "reasoning", "reasoning_text", "reasoning_details"} {
+			if value, exists := message[key]; exists {
+				if _, ok := value.(string); !ok || key == "reasoning_details" {
+					return nil, historyInvalid("provider wire reasoning type")
+				}
+				result[key] = value
+			}
+		}
+		return result, nil
+	}
+	texts := []string{}
+	signature := ""
+	for _, v := range Arr(message, "content") {
+		part, _ := v.(map[string]any)
+		if part["type"] != "thinking" {
+			continue
+		}
+		text, ok := part["thinking"].(string)
+		if !ok {
+			return nil, historyInvalid("provider SDK reasoning type")
+		}
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		sig := Str(part, "thinkingSignature")
+		if sig != "reasoning" && sig != "reasoning_content" && sig != "reasoning_text" {
+			return nil, historyInvalid("provider SDK unsupported signature")
+		}
+		if len(texts) == 0 {
+			signature = sig
+		}
+		texts = append(texts, text)
+	}
+	if len(texts) > 0 {
+		if signature == "reasoning" {
+			signature = "reasoning_content"
+		}
+		result[signature] = strings.Join(texts, "\n")
+	}
+	if _, exists := result["reasoning_content"]; !exists {
+		result["reasoning_content"] = ""
+	}
+	return result, nil
+}
+
+func verifyProviderWireHistory(wire, sdk []any, cwd ...string) error {
+	previous := []Object{}
+	custom := map[string]Object{}
+	for _, v := range sdk {
+		m, _ := v.(map[string]any)
+		if m["role"] == "assistant" {
+			previous = append(previous, m)
+		}
+		if m["role"] == "custom" {
+			d, _ := m["details"].(map[string]any)
+			custom[Str(d, "command_id")] = m
+		}
+	}
+	wh, we := providerRequestHistory(wire, cwd...)
+	sh, se := muRequestHistory(sdk, true, custom)
+	if we != nil || se != nil || Hash(wh) != Hash(sh) {
+		return historyInvalid("provider complete original request history")
+	}
+	n := 0
+	for _, v := range wire {
+		m, _ := v.(map[string]any)
+		if m["role"] != "assistant" {
+			continue
+		}
+		if n >= len(previous) {
+			return historyInvalid("provider injected assistant")
+		}
+		got, e := providerWireReasoning(m, false)
+		want, ee := providerWireReasoning(previous[n], true)
+		if e != nil || ee != nil || Hash(got) != Hash(want) {
+			return historyInvalid("provider original reasoning wire history")
+		}
+		n++
+	}
+	if n != len(previous) {
+		return historyInvalid("provider omitted assistant")
+	}
+	return nil
+}
+
+func providerRequestHistory(wire []any, cwd ...string) ([]any, error) {
+	// The pinned reasoning model serializes the worker's fixed system prompt as
+	// developer. This exception does not authorize arbitrary developer messages.
+	const instruction = "You are the ResearchOS task worker. Use only the supplied task, context, and explicitly declared tools. Preserve relevant evidence in the final answer. Do not assume access to files, shell commands, network, or credentials."
+	expected := instruction
+	if len(cwd) == 1 && cwd[0] != "" {
+		expected += "\n\n<cwd>\n" + cwd[0] + "\n</cwd>"
+	}
+	checked := make([]any, 0, len(wire))
+	seen := false
+	for i, v := range wire {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return nil, historyInvalid("provider message shape")
+		}
+		if m["role"] == "developer" || m["role"] == "system" {
+			text, ok := muText(m["content"])
+			if !ok || text != expected || seen || i != 0 {
+				return nil, historyInvalid("provider Host instruction changed")
+			}
+			seen = true
+			checked = append(checked, Merge(Merge(Object{}, m), Object{"role": "system"}))
+			continue
+		}
+		checked = append(checked, m)
+	}
+	if len(cwd) == 1 && !seen {
+		return nil, historyInvalid("provider Host instruction missing")
+	}
+	return muRequestHistory(checked, false)
+}
+
+func providerOriginalCWD(dispatch Object) string {
+	identity, _ := dispatch["identity"].(map[string]any)
+	return strings.TrimRight(strings.ReplaceAll(Str(identity, "staging_directory"), "\\", "/"), "/") + "/output"
+}
+
 // muTurnSnapshot adds immutable broker history to BOTH acceptance snapshots.
 // Worker counters and SDK placeholder costs are never independent evidence.
 func (s *Service) muTurnSnapshot(tx *sql.Tx, project string, task, run, contract, observation Object) (Object, error) {
@@ -119,6 +699,13 @@ func (s *Service) muTurnSnapshot(tx *sql.Tx, project string, task, run, contract
 		return nil, err
 	}
 	snapshot := Object{"dispatch": dispatch, "profile": profile, "request": request, "prompt": prompt, "effects": history, "ledger": ledger}
+	if policy, _ := providerPolicy(profile["model_config"].(map[string]any)); policy {
+		transports, e := validateProviderInventory(tx, project, Str(run, "id"))
+		if e != nil {
+			return nil, e
+		}
+		snapshot["provider_transports"] = transports
+	}
 	stream, err := s.modelStreamAcceptanceSnapshot(tx, project, run)
 	if err != nil {
 		return nil, err
@@ -420,6 +1007,16 @@ func verifyMuTurn(snapshot Object) (string, string) {
 		e := history[len(history)-1]
 		receipt, _ := e["receipt"].(map[string]any)
 		request, _ := e["payload"].(map[string]any)
+		if policy, _ := providerPolicy(config); policy && request["capability"] == "MODEL" {
+			transports, _ := mu["provider_transports"].(map[string]Object)
+			var expected any = transports[key]
+			if decoded, ok := mu["provider_transports"].(map[string]any); ok {
+				expected = decoded[key]
+			}
+			if expected == nil || Hash(expected) != Hash(request["provider_transport"]) {
+				return fail("Provider original canonical transport missing or changed.")
+			}
+		}
 		if e["state"] != "CONFIRMED" || receipt["state"] != "CONFIRMED" || e["project_id"] != task["project_id"] || e["task_id"] != task["id"] || e["run_id"] != run["id"] || Hash(e["epoch"]) != Hash(run["lease_epoch"]) || e["context_bundle_id"] != run["context_bundle_id"] || receipt["run_id"] != run["id"] || receipt["key"] != key || Hash(receipt["epoch"]) != Hash(run["lease_epoch"]) {
 			return fail("Every effect must be confirmed for this exact run and epoch.")
 		}
@@ -630,9 +1227,17 @@ func verifyMuTurn(snapshot Object) (string, string) {
 		}
 		providerMessages := Arr(body, "messages")
 		wireHistory, wireErr := muRequestHistory(providerMessages, false)
+		if policy, _ := providerPolicy(config); policy {
+			wireHistory, wireErr = providerRequestHistory(providerMessages, providerOriginalCWD(mu["dispatch"].(map[string]any)))
+		}
 		sdkHistory, sdkErr := muRequestHistory(messages[:cursor], true, customAllowed)
 		if wireErr != nil || sdkErr != nil || Hash(wireHistory) != Hash(sdkHistory) {
 			return fail("Broker request history differs from preceding confirmed SDK messages.")
+		}
+		if policy, _ := providerPolicy(config); policy {
+			if e := verifyProviderWireHistory(providerMessages, messages[:cursor], providerOriginalCWD(mu["dispatch"].(map[string]any))); e != nil {
+				return fail(e.Error())
+			}
 		}
 		found := false
 		for _, v := range providerMessages {
@@ -665,7 +1270,7 @@ func verifyMuTurn(snapshot Object) (string, string) {
 		if status != 200 || response["content_type"] != "text/event-stream" || receipt["receipt_id"] != Digest([]byte(responseRaw)) {
 			return fail("Broker model response seal mismatch.")
 		}
-		expected, err := muResponse(responseRaw)
+		expected, err := providerResponse(config, responseRaw)
 		if err != nil {
 			return fail("Broker model response: " + err.Error())
 		}
@@ -674,6 +1279,11 @@ func verifyMuTurn(snapshot Object) (string, string) {
 		}
 		message, _ := messages[cursor].(map[string]any)
 		actual, err := muSDKAssistant(message)
+		if policy, _ := providerPolicy(config); policy {
+			if e := verifyProviderReasoning(responseRaw, message); e != nil {
+				return fail(e.Error())
+			}
+		}
 		if err != nil || message["role"] != "assistant" || message["model"] != config["model"] || message["provider"] != config["provider"] || message["api"] != config["api"] || Hash(actual) != Hash(expected) {
 			return fail("SDK assistant differs from broker response.")
 		}
