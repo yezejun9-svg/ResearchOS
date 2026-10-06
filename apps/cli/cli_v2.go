@@ -27,10 +27,15 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"researchos.local/research-os/internal/api"
 )
 
 const v2CommandPath = "/v2/command"
+
+var cliProtocolDocument = sync.OnceValues(api.ClientProtocolDocument)
 
 // v2WriteMethods mirrors client_protocol.go:7. session.attach is excluded because it has its own epoch rule.
 var v2WriteMethods = map[string]bool{"session.send": true, "session.control": true, "session.update": true,
@@ -257,7 +262,9 @@ func v2CallTransport(budget context.Context, ctx *v2Context, method string, payl
 	status, _ := reply["status"].(string)
 	switch status {
 	case "COMPLETED", "ACKNOWLEDGED":
-		adoptV2Snapshot(ctx, reply)
+		if method != "goal.start" {
+			adoptV2Snapshot(ctx, reply)
+		}
 		return reply, "", exitCompleted
 	case "IN_PROGRESS":
 		return reply, "", exitCompleted
@@ -276,6 +283,35 @@ func v2CallTransport(budget context.Context, ctx *v2Context, method string, payl
 	default:
 		return reply, "UNKNOWN_STATUS:" + orDefault(status, "<absent>"), exitFailed
 	}
+}
+
+// Goal adoption is atomic: validate the host's pinned typed result and all
+// cross-object identities before changing even the in-memory session context.
+func adoptCLIGoal(ctx *v2Context, reply map[string]any, draft bool) string {
+	result := cliObject(reply["result"])
+	doc, err := cliProtocolDocument()
+	if err != nil || doc.ValidateDef("StartGoalResult", result) != nil {
+		return "INVALID_GOAL_RESULT"
+	}
+	snap := cliObject(result["snapshot"])
+	sid := continuationString(snap, "session_id")
+	revision, revisionOK := cliInteger(snap["revision"])
+	goalRevision, goalRevisionOK := cliInteger(result["goal_revision"])
+	if !continuationID(sid) || !continuationID(continuationString(result, "goal_id")) || !revisionOK || revision < 1 || !goalRevisionOK || goalRevision < 1 ||
+		snap["project_id"] != ctx.projectID || snap["goal_id"] != result["goal_id"] || snap["goal_status"] != result["goal_status"] ||
+		ctx.sessionID != "" && ctx.sessionID != sid || reply["session_id"] != nil && reply["session_id"] != sid {
+		return "GOAL_SCOPE_MISMATCH"
+	}
+	if draft && result["goal_status"] != "DRAFT" {
+		return "GOAL_DRAFT_STATE_MISMATCH"
+	}
+	writer := cliObject(snap["writer"])
+	epoch, epochOK := cliInteger(writer["epoch"])
+	if writer == nil || writer["client_id"] != ctx.clientID || !epochOK || epoch < 1 || !cliDate(writer["expires_at"]) {
+		return "GOAL_WRITER_UNRESOLVED"
+	}
+	ctx.sessionID, ctx.revision, ctx.epoch = sid, revision, epoch
+	return ""
 }
 
 // A successful response supplies the next revision/epoch. Never infer either

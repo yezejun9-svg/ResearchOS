@@ -113,8 +113,12 @@ func verbSteps(name string, args []string, ctx *v2Context, cfg cliConfig) ([]v2S
 				}
 			}
 		}
-		return []v2Step{{"goal.start", map[string]any{"objective": objective, "contract_artifact_ids": refs,
-			"start_as_draft": flagBool(args, "draft")}, ""}}, "", ""
+		steps := []v2Step{}
+		if ctx.sessionID != "" {
+			steps = append(steps, v2Step{"session.get", map[string]any{}, ""})
+		}
+		return append(steps, v2Step{"goal.start", map[string]any{"objective": objective, "contract_artifact_ids": refs,
+			"start_as_draft": flagBool(args, "draft")}, ""}), "", ""
 	case "cancel", "/cancel":
 		target, has := flagValue(args, "run")
 		if !has {
