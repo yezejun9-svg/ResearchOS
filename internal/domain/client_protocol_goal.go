@@ -296,11 +296,12 @@ func (s *ClientService) startClientGoal(ctx context.Context, tx *sql.Tx, env *En
 			return nil, err
 		}
 	} else {
-		var workspace, lease, previous string
+		var workspace, previous string
+		var lease sql.NullString
 		if err = tx.QueryRowContext(ctx, `SELECT workspace_ref,model_config_ref,lease_expires_at,coalesce(task_id,'') FROM client_sessions WHERE id=? AND project_id=?`, sess.sessionID, project).Scan(&workspace, &model, &lease, &previous); err != nil {
 			return nil, err
 		}
-		expires, parseErr := time.Parse(time.RFC3339Nano, lease)
+		expires, parseErr := time.Parse(time.RFC3339Nano, lease.String)
 		if parseErr != nil || !expires.After(time.Now()) {
 			return NewTypedRejection(env, "LEASE_EXPIRED", "writer lease expired; acquire a current writer lease"), nil
 		}

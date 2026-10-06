@@ -282,7 +282,7 @@ func TestClientGoalSessionWriterAndSettlementGates(t *testing.T) {
 	sid := Str(created.Result["snapshot"].(map[string]any), "session_id")
 	base := goalEnvelope(f, client, "second bounded Goal", true)
 	base.SessionID, base.ExpectedRevision, base.WriterEpoch = &sid, revPtr(*created.Revision), revPtr(1)
-	for _, name := range []string{"stale_revision", "stale_epoch", "foreign_client", "expired_lease", "unsettled_task", "archived"} {
+	for _, name := range []string{"stale_revision", "stale_epoch", "foreign_client", "expired_lease", "missing_lease", "unsettled_task", "archived"} {
 		t.Run(name, func(t *testing.T) {
 			env := *base
 			id := ID()
@@ -297,6 +297,8 @@ func TestClientGoalSessionWriterAndSettlementGates(t *testing.T) {
 				env.ClientID = &other
 			case "expired_lease":
 				f.db.Exec("UPDATE client_sessions SET lease_expires_at=? WHERE id=?", time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), sid)
+			case "missing_lease":
+				f.db.Exec("UPDATE client_sessions SET lease_expires_at=NULL WHERE id=?", sid)
 			case "archived":
 				f.db.Exec("UPDATE client_sessions SET archived_at=? WHERE id=?", Now(), sid)
 			}
@@ -304,10 +306,13 @@ func TestClientGoalSessionWriterAndSettlementGates(t *testing.T) {
 			if deref(reply.Status) != "REJECTED" {
 				t.Fatalf("%s bypassed writer/settlement gate: %s", name, Bytes(reply))
 			}
+			if (name == "expired_lease" || name == "missing_lease") && deref(reply.ErrorCode) != "LEASE_EXPIRED" {
+				t.Fatalf("%s did not give typed lease refusal: %s", name, Bytes(reply))
+			}
 			if _, goals, tasks, runs := goalCounts(t, f); goals != 1 || tasks != 1 || runs != 0 {
 				t.Fatalf("%s changed business rows: %d %d %d", name, goals, tasks, runs)
 			}
-			if name == "expired_lease" {
+			if name == "expired_lease" || name == "missing_lease" {
 				f.db.Exec("UPDATE client_sessions SET lease_expires_at=? WHERE id=?", time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano), sid)
 			}
 			if name == "archived" {
