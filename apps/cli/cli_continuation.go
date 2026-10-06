@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,22 +17,32 @@ const continuationReadLimit = 2 << 20
 // This projection only reads public, principal-scoped objects. It does not
 // acquire a writer, dispatch work, or interpret a pending task as executable.
 func cliReadContinuation(c *v2Context, snapshot map[string]any) (map[string]any, string, int) {
+	return cliReadContinuationContext(context.Background(), c, snapshot)
+}
+
+func cliReadContinuationContext(parent context.Context, c *v2Context, snapshot map[string]any) (map[string]any, string, int) {
+	out, reason, code, _ := cliReadContinuationWithCause(parent, c, snapshot)
+	return out, reason, code
+}
+
+func cliReadContinuationWithCause(parent context.Context, c *v2Context, snapshot map[string]any) (map[string]any, string, int, bool) {
+	cancelledIO := false
 	goalID := continuationString(snapshot, "goal_id")
 	if goalID == "" {
-		return nil, "", exitCompleted
+		return nil, "", exitCompleted, false
 	}
 	out := map[string]any{"status": "UNAVAILABLE", "project_id": c.projectID,
 		"session_id": c.sessionID, "goal_id": goalID, "event_watermark": snapshot["event_sequence"],
 		"goal": nil, "unfinished_tasks": []any{}, "next_step": nil, "selection": "NONE"}
-	fail := func(reason string) (map[string]any, string, int) {
+	fail := func(reason string) (map[string]any, string, int, bool) {
 		out["reason"] = reason
-		return out, reason, exitFailed
+		return out, reason, exitFailed, cancelledIO
 	}
 	if snapshot["project_id"] != c.projectID || snapshot["session_id"] != c.sessionID ||
 		!continuationID(c.projectID) || !continuationID(goalID) {
 		return fail("CONTINUATION_SCOPE_MISMATCH")
 	}
-	budget, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	budget, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
 	remaining := int64(continuationReadLimit)
 	client := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
@@ -48,6 +59,7 @@ func cliReadContinuation(c *v2Context, snapshot map[string]any) (map[string]any,
 		c.requestLog = append(c.requestLog, "GET "+req.URL.RequestURI())
 		resp, err := client.Do(req)
 		if err != nil {
+			cancelledIO = errors.Is(err, context.Canceled)
 			return nil, "CONTINUATION_READ_FAILED"
 		}
 		defer resp.Body.Close()
@@ -57,6 +69,9 @@ func cliReadContinuation(c *v2Context, snapshot map[string]any) (map[string]any,
 		}
 		remaining -= int64(len(body))
 		if err != nil {
+			// Non-200 headers already identify a terminal HTTP failure, even
+			// when cancellation happens while reading its error body.
+			cancelledIO = resp.StatusCode == http.StatusOK && errors.Is(err, context.Canceled)
 			return nil, "CONTINUATION_READ_FAILED"
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -223,7 +238,7 @@ func cliReadContinuation(c *v2Context, snapshot map[string]any) (map[string]any,
 	} else if len(unfinished) > 1 {
 		out["selection"] = "AMBIGUOUS"
 	}
-	return out, "", exitCompleted
+	return out, "", exitCompleted, false
 }
 
 func continuationString(object map[string]any, key string) string {
