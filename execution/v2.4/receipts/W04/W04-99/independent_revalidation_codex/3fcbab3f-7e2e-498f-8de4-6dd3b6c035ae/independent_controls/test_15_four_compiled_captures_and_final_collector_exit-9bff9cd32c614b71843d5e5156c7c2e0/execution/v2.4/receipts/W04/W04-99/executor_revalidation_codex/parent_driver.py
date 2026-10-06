@@ -1,4 +1,0 @@
-{
-  "scope": "SYNTHETIC_NOT_PRODUCT",
-  "inert_source_name": "parent_driver.py"
-}
