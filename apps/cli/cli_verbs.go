@@ -14,8 +14,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+type cliInputLine struct {
+	text string
+	err  error
+}
+
+var cliInputPumps sync.Map // *v2Context -> receive-only channel; reader never writes context.
 
 // v2Step is one protocol operation of a command. A command may name several, and the record shows each one's
 // outcome: a verb that silently performed one of two operations is the failure mode this file exists to prevent.
@@ -211,9 +219,8 @@ func newV2Context(name string, args []string, cfg cliConfig, baseURL string) *v2
 	return ctx
 }
 
-// Each complete input is dispatched while stdin remains open. A synchronous
-// turn follower prevents a second NORMAL from becoming another active writer;
-// durable STEER/FOLLOW_UP and a full TUI remain a separate host capability.
+// The scanner only forwards text. The turn follower remains the sole context
+// and network writer while it admits durable queue controls during execution.
 func cliInteractive(args []string) {
 	d, path, err := hostDiscovery()
 	if err != nil || d.URL == "" {
@@ -233,11 +240,9 @@ func cliInteractive(args []string) {
 	if code != 0 || statusOf(reply) != "COMPLETED" {
 		fail("interactive", exitNotImplemented, orDefault(reason, "SESSION_LIST_PENDING"))
 	}
-	type inputLine struct {
-		text string
-		err  error
-	}
-	lines := make(chan inputLine)
+	lines := make(chan cliInputLine, 16)
+	cliInputPumps.Store(c, (<-chan cliInputLine)(lines))
+	defer cliInputPumps.Delete(c)
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -246,14 +251,14 @@ func cliInteractive(args []string) {
 		scanner.Buffer(make([]byte, 4096), 1<<20)
 		for scanner.Scan() {
 			select {
-			case lines <- inputLine{text: scanner.Text()}:
+			case lines <- cliInputLine{text: scanner.Text()}:
 			case <-done:
 				return
 			}
 		}
 		if err := scanner.Err(); err != nil {
 			select {
-			case lines <- inputLine{err: err}:
+			case lines <- cliInputLine{err: err}:
 			case <-done:
 			}
 		}
