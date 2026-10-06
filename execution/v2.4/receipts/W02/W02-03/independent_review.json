@@ -1,0 +1,151 @@
+{
+  "template_version": "2.4.0",
+  "artifact": "independent_review",
+  "step_id": "W02-03",
+  "parent_task": "W02",
+  "reviewer_id": "qoder-desktop:/root/independent_verifier_w0203",
+  "reviewer_identity_source": "self-declared verifier identity, distinct from executor qoder-desktop:/root/construction; every statement below is first-hand execution against the repository at HEAD 4e4286c9 (candidate commits ad4cf118 + 4e4286c9), not a restatement of the executor's receipts",
+  "verdict": "ACCEPT",
+  "subject": {
+    "commits": ["ad4cf1180dc36a3e5b35d03183cdc78bad6cb5b8", "4e4286c976af5ab43447cdc3e8bf4e5f0b650be9"],
+    "repository_head_at_review": "4e4286c976af5ab43447cdc3e8bf4e5f0b650be9",
+    "card": "D:/作品集/ResearchOS/ResearchOS_Implementation_Package_v2.4/tasks/steps/W02-03.md",
+    "allowed_scope": [
+      "CLI/** (apps/cli/**)",
+      "DESKTOP/main/** (apps/desktop/main/**)",
+      "DESKTOP/preload/** (apps/desktop/preload/**)",
+      "execution/v2.4/receipts/W02/**",
+      "execution/v2.4/receipts/W02/W02-03/**"
+    ],
+    "files_in_commits": "apps/cli/{main.go,build_check.py}, apps/desktop/{main/main.js,main/status.html,preload/preload.js,package.json,package-lock.json}, execution/v2.4/commands.json (append-only rev2), execution/v2.4/receipts/W02/W02-03/** (4 files), execution/v2.4/step_state.json (append-only)"
+  },
+  "checked_at": "2026-10-01T16:33:01Z",
+  "methods": [
+    "Read apps/cli/main.go (86 lines), apps/cli/build_check.py (136 lines), apps/desktop/main/main.js, apps/desktop/preload/preload.js, apps/desktop/main/status.html, apps/desktop/package.json, execution/command_dispatcher/dispatch.py and internal/api/server.go + apps/control/main.go in full; confirmed no echo-PASS, no hard-coded success, no fake assertion labels.",
+    "Rebuilt both binaries myself with the locked Go only: .local/tools/go1.27.1/go/bin/go.exe (`go version go1.27.1 windows/amd64`) with GOTOOLCHAIN=local GOENV=off GOPATH=.local/gopath GOCACHE=.local/gocache -> ./apps/cli and ./apps/control both exit 0 (to throwaway -o targets so the executor's .local/bin artifacts were not destroyed).",
+    "Drove the rebuilt CLI directly: version / help / no-arg / doctor(no discovery) / doctor(dead host) / doctor(malformed discovery) / chat / init; recorded stdout and exit codes.",
+    "Ran the bound command twice through the dispatcher exactly as the card specifies: `python execution/command_dispatcher/dispatch.py build.check --task-id W02 --check-id W02-03` (attempt 1 FAILED, attempt 2 PASS) and read both on-disk invocation receipts field-by-field against the executor's copied receipt d09f57a0.",
+    "Started my own isolated control host on 127.0.0.1:18931-18934 with RESEARCHOS_DATA_DIR=.local/v24verify_host (never .local/data), wrote a temporary discovery file, and cross-probed the same live host from urllib, from the researchos CLI, from Electron's bundled Node (ELECTRON_RUN_AS_NODE) and from the shipped Electron shell, to test the shared-discovery claim and to characterise the A8 flake.",
+    "Ran the shipped shell (node_modules/.bin/electron.cmd + main/main.js + ROS_DESKTOP_SMOKE=1) 25 times against a live host and 2 times against dead/absent discovery, capturing ROS_DESKTOP_REPORT each time.",
+    "Verified the Electron supply chain: apps/desktop/node_modules/electron/dist/electron.exe present (204,521,984 bytes), dist/version = 37.10.3, node_modules/electron/package.json version 37.10.3, path.txt = electron.exe; recomputed the cached official zip sha256 over %LOCALAPPDATA%/electron/Cache/020e126c.../electron-v37.10.3-win32-x64.zip and compared with the sha256 field of node_modules/electron/checksums.json; `git ls-files apps/desktop/node_modules | wc -l`; package-lock.json lockfileVersion 3 pin.",
+    "Isolation discipline: full-file sha256 + size + mtime of every file under .local/data captured before my first dispatcher run and re-checked after all runs; direct TCP connect + netstat probes on 8787 and 18923 before, during and after; verified build_check A9 kills only its own Popen pid and unlinks the discovery file.",
+    "Registry discipline: `git diff 4e4286c9~2..HEAD -- execution/v2.4/commands.json` plus a programmatic per-key JSON comparison of revision 1 vs revision 2; sha256 of both registry versions; cross-checked the revision-1 hash against the value recorded in W02-02's receipt and independent_review.",
+    "Scope/overclaim audit: git show --name-status for both commits; sha256 of the 6 code files named in receipt.input.code_hashes; sha256 of the committed receipt.json/assertion_report.json vs the hashes pinned in execution/v2.4/step_state.json; grep of the W02-03 receipt set for A04/C23/ACCEPT wording; read of the plan entry (contracts/execution.plan.json W02-03) for write_scope, verification_commands, checks.",
+    "Cleanup: terminated every process I started (tasklist electron/ros-control/researchos = 0), removed my temp scripts, logs, temp data dir, temp binaries and the temp discovery file; verified `git status --porcelain` shows 0 tracked modifications."
+  ],
+  "required_findings": {
+    "1_code_names_match": "PASS. apps/cli/main.go really switches on argv and does a real net/http GET to <discovery.url>/healthz with a 4s timeout (main.go:61-62); it exits 3 on missing/malformed discovery, 4 when the host is not UP, 3 for every unclaimed command - no branch prints a bare PASS. build_check.py performs real work per assertion: two `go build` invocations, a real Popen of the host, an urllib healthz wait loop, a real CLI subprocess handshake, a real Electron launch, and a real taskkill + byte-hash comparison; the only file that could echo PASS (assertion_report.json) is produced by the child report, not by the handler. apps/desktop/preload/preload.js is 5 lines and exposes exactly one key - researchos.hostStatus() -> ipcRenderer.invoke('ros:host-status'); no fs/shell/http/global surface. apps/desktop/main/main.js requires only electron/node:http/node:fs/node:path (grep for child_process|spawn|exec(|fork( = 0 hits), never starts a process, never opens a listener, and registers exactly one ipcMain.handle channel; webPreferences are contextIsolation:true, nodeIntegration:false, sandbox:true. status.html only calls window.researchos.hostStatus(); it is an Electron window fed by the IPC bridge, not a browser page and not a renamed Mu window. No fake stdin-JSONL over IPC anywhere.",
+    "2_own_rebuild_and_cli": "PASS. Locked go1.27.1 + GOTOOLCHAIN=local rebuilt ./apps/cli and ./apps/control both exit 0. My rebuilt binary: `version` -> 'researchos 0.2.4-w0203 protocol=researchos-client/2' exit 0; `help` and no-arg -> usage plus 8 explicit NOT_IMPLEMENTED lines exit 0; `chat` -> exit 3 'NOT_IMPLEMENTED'; `init` -> exit 3; `doctor` with no discovery -> exit 3 NOT_FOUND; `doctor` with discovery pointing at a dead port -> exit 4 with health DOWN and http_code 0; `doctor` with a truncated/non-JSON discovery -> exit 3 INVALID_JSON; `doctor` against my live isolated host -> exit 0 {\"health\":\"UP\",\"client_protocol\":\"researchos-client/2\",\"host_data_dir\":\".local/v24verify_host\",\"host_pid\":40040}. Every negative path is non-zero and honest - no silent success.",
+    "3_dispatcher_rerun": "PARTIAL PASS - the gate is bound and real but NOT first-try deterministic. Attempt 1 (invocation 526d6cf4-5bd4-4ba9-83e6-a7dceda0381c): exit 1, status COMMAND_FAILED, 8 assertions, failure A8_DESKTOP_SHELL_UP with the shell honestly reporting host_health DOWN. Attempt 2 (retry 1, within this card's max-2-retries policy): exit 0, status PASS, 9 assertions, registry_spec=v2.4, registered_command_revision=daf398d3..., toolchain_revision=0958d3f3..., dispatcher_sha256=69c94d63..., code_revision=4e4286c9. Field-by-field diff of my PASS receipt against the executor's d09f57a0 copy: identical for every non-volatile field including stdout sha256 26577f3f6ee906a5f356697492067e372cdb4de6bcd7fb449516cbbd4c4fd845 and stderr sha256 e3b0c442... (empty); differences are only invocation_id, started_at, ended_at, pid and code_revision (ba9ea5e3 -> 4e4286c9, because the lockfile commit landed after the executor's run). So the recorded 9-assertion PASS is genuine and byte-reproducible; the flake is in the handler's A8 step, see P1.",
+    "4_electron_binary_lockfile": "PASS. apps/desktop/node_modules/electron/dist/electron.exe exists (204,521,984 bytes, executable), dist/version reads 37.10.3, path.txt reads 'electron.exe', node_modules/electron/package.json version 37.10.3, and the directory contains a complete real extraction (chrome_100_percent.pak, icudtl.dat, ffmpeg.dll, libEGL.dll, ... - i.e. the targeted_repair_1 claim that the zip had not been extracted on attempt 1 and was then extracted by hand is consistent with the shipped state). I recomputed the cached zip myself: sha256(electron-v37.10.3-win32-x64.zip) = af69b8a4326432a8bf655eb23f808dcff02bcb2555cac9667e72e943f53542e4, which equals checksums.json['electron-v37.10.3-win32-x64.zip'] exactly and starts with the claimed af69b8a4 - the targeted_repair_1 claim is TRUE and the binary is the official 37.10.3 build. node_modules is not in Git: `git ls-files apps/desktop/node_modules` = 0 entries (and 0 for apps/web), while `git ls-files apps/desktop` returns only main/main.js, main/status.html, package.json, package-lock.json, preload/preload.js. The lockfile pins 37.10.3 exactly (lockfileVersion 3, packages['node_modules/electron'].version 37.10.3, dev:true, integrity sha512-3IjCGSjQmH50IbW2PFveaTzK+KwcFX9PE...); package.json devDependency is the exact string '37.10.3' (no caret). Version alignment with the reuse source is real: third_party/mu/desktop/package.json pins \"electron\": \"^37.10.3\", i.e. the same 37.10.3 line, so the shell runs the same Electron runtime the Mu desktop shell is built against, and Electron itself reports 37.10.3 at runtime (ROS_DESKTOP_REPORT electron field).",
+    "5_isolation_discipline": "PASS. Old 8787 stayed CLOSED through the whole review (TCP connect_ex before, netstat during, and after all runs: 'no listener on 18923/8787'); build_check never binds it because it passes RESEARCHOS_LISTEN=127.0.0.1:18923 and apps/control hard-fails a non-loopback listen but would otherwise default to 127.0.0.1:8787 (apps/control/main.go:155) - so the isolation depends on that env var and it is set. .local/data was NOT written: all 4 files (pre-w17-20260930T1342.sqlite, researchos.sqlite, -shm, -wal) kept identical full-file sha256, identical size and identical mtime 2026-09-30T13:40:54Z/14:28:44Z/14:29:50Z/14:29:02Z, i.e. more than a day before the executor's 2026-10-02 00:10-00:14 local test window and before any of my runs. RESEARCHOS_DATA_DIR=.local/v24test_host is really used: that directory holds coordinator.lock, researchos.sqlite, -shm and -wal with mtimes inside the executor's run window, and apps/control acquires a data-root lease on it (rt.AcquireDataRootLease) before opening the DB. My own host runs used a separate .local/v24verify_host so I never touched the executor's or the old data root. A9's cleanup is real: after each of my runs the test pid was gone, port 18923 refused, and .local/v24_host.json was unlinked.",
+    "6_scope_and_registry_registration": "PASS with disclosure. `git diff 4e4286c9~2..HEAD -- execution/v2.4/commands.json` shows exactly three hunks: revision 1 -> 2, one appended 'build.check' entry, one appended 'revision_note'; a programmatic per-key comparison confirms added = [build.check], removed = [], changed-among-old-keys = [] - so the prior 10 entries are unchanged and the append-only claim holds. The registry chain is consistent: v2.4 commands.json sha256 at revision 1 = bf8de03b50eeafe05d1447b145c74024c0f8d77c6ff563c6391d457225641f8a (this is the value W02-02's own receipt pins as execution/v2.4/commands.json; the 'ac54e...' figure floated in the review brief does not exist in any v2.4 receipt - the only ac54e hits are unrelated legacy execution/receipts/W0x artifacts), and at revision 2 = daf398d35ceff40c86dc18cff7a18c7d56c83ad5c10cb797150b8e71227fd59b, which is what both my dispatcher receipts record as registered_command_revision. The registration续写 is legitimate and annotated: the plan's own verification_commands entry for W02-03 is key 'build.check' with binding 'W02 registers this exact selector and real handler before use; UNBOUND/zero assertions is not PASS', commands.json carries \"revision_note\": \"W02-03 added build.check; prior 10 entries unchanged\", the entry carries the note 'bound by W02 registry owner per card binding line (registration continuation of W02-02)', and receipt.registration_note discloses the scope-adjacency explicitly. Both commits touch only in-scope files plus commands.json (justified above) and step_state.json (append-only EXECUTION_REPORTED, same pattern W02-02's review recorded as P2).",
+    "7_counterexamples_and_helper_coverage": "PASS on counterexamples, PARTIAL on coverage. Counterexamples are absent and were correctly not used: the entry points are self-written apps/cli/main.go and self-written apps/desktop/main/main.js + preload/preload.js; nothing loads apps/web/dist or any URL in a plain browser; no Mu/AionUi/Qoder source file is copied into the shell (grep of apps/desktop for upstream imports = 0); the only upstream artifacts used are the pinned Electron runtime binary and the existing Go control plane (apps/control), which is exactly the blueprint's default route ('现有 Go/SQLite 控制面 + ... Electron 壳'). Mu appears only as a version-alignment source, not as the delivered window. Helper coverage of the four card steps: step 2 -> A6/A7/A8 plus the read of main.js (no spawn, discovery only) is genuine; step 3 -> A2/A3/A4/A7/A8 genuine (protocol version displayed, unimplemented shown as NOT_IMPLEMENTED); step 4 -> A1/A5/A6/A8/A9 genuine (real builds, real launches, shutdown isolation proof). Gaps against step 1's literal wording: no assertion or artifact covers the 'ResearchOS 图标' part - there is no .ico/.png anywhere under apps/ and BrowserWindow is created without an icon, so the shipped window shows Electron's default icon; and the '上游已有CLI启动器' is not wired yet (main.go's own comment says the Mu/Pi starter is 'attached later'). Step 1's name and build-entry parts are met (productName researchos, title 'ResearchOS', pinned runtime, version 0.2.4-w0203). See P1/P3.",
+    "8_no_final_acceptance_claims": "PASS. grep for 'A04' and 'C23' across all four files in execution/v2.4/receipts/W02/W02-03 returns 0 hits; the plan lists A04/C23 as affected formal cases and the card defers them to 父任务-99, which the receipt honours. receipt.json status is EXECUTION_REPORTED with notice 'Executor reports only', verifier_id null, independent_review.status NOT_RUN; check_results use EXECUTION_REPORTED/PASS only for the three incremental check ids; remaining_blocks keeps TUI/jsonl (W03/W05) and installer (W16) open instead of claiming them. execution/v2.4/step_state.json records W02-03 as EXECUTION_REPORTED with executor_id only and NO verifier_id / accepted_at (unlike the W02-02 entry, which does carry verifier_id + accepted_at from the previous independent reviewer), so the executor did not self-accept. Both evidence hashes pinned in step_state match the committed files (receipt.json 18c4dc94d4006e23f98a053650521a9ec70b46c45eefc08b176372783b4f3122, assertion_report.json a53a21a35c6eeb3a0960f346c90bbdc56bc92cd64cfd6de515359954ca83d4ef)."
+  },
+  "problems": [
+    {
+      "id": "P1",
+      "severity": "major",
+      "where": "apps/desktop/main/main.js hostStatus() + apps/cli/build_check.py A8_DESKTOP_SHELL_UP",
+      "detail": "The bound gate is not deterministic on first attempt. My first dispatcher replay FAILED (invocation 526d6cf4..., exit 1, 8 assertions, A8 detail: {'host_health':'DOWN','host_url':'http://127.0.0.1:18923','electron':'37.10.3'}), and it passed only on retry 1 (ff3d1863..., exit 0, 9 assertions). This is not a dead host and not a proxy artifact: over 25 shell launches against a live isolated host on my own ports/data dir, 5 reported DOWN, and at the failing instants urllib GET on the same URL returned 200, netstat still showed the LISTENING socket, the host child process poll was alive and the host log held only the single 'listening' line; 25 back-to-back requests from Electron's own bundled Node all returned 200 in 1-6 ms, and a dispatcher-like whitelisted environment (no HTTP_PROXY/NO_PROXY, build.check's allowed_env contains no proxy key) still reproduced the DOWN 3 times out of 8. So main.js's single-shot probe intermittently sees a client-side connection error against a healthy host. Aggravating factor: the ROS_DESKTOP_REPORT line omits the probe's error field (main.js:40 keeps only health/url/electron/protocol/pid), and A8 keeps only the report plus empty stderr, so a failure of this assertion is not diagnosable from the invocation receipt. Required before this handler is reused for the parent gate: (a) include the resolved error/code (and elapsed ms) in ROS_DESKTOP_REPORT, (b) make the probe bounded-retry (e.g. 3 attempts, 300-500 ms apart) instead of single-shot, (c) re-run dispatch build.check --check-id W02-03 several times and record the observed pass rate. The card's own deliverable is unaffected in substance - the window really boots and the probe really speaks HTTP - which is why this is a hardening requirement rather than a rejection; but a gate that flips green/red on the same input cannot be treated as a reproducible PASS for W02-99."
+    },
+    {
+      "id": "P2",
+      "severity": "minor",
+      "where": "execution/v2.4/commands.json 'build.check'.selectors.check_id + execution/v2.4/receipts/W02/W02-03/receipt.json registration_note",
+      "detail": "The new entry registers check_id ['W02-03','W02-99'], but the parent card's gate commands in the plan invoke build.check with check_id W02-G01 / W02-G02 / W02-G03 and expect assertion ids named W02-G0x, which this handler can never emit; 'W02-99' is therefore a selector no registered command will ever route to, and it slightly overstates reusability of this handler for parent acceptance beyond the card's 'registers this exact selector' mandate. Related disclosure gap: the receipt does not mention that six UNBOUND entries still name owner_card 'W02-03' (fork.install_deps, fork.build_worker, fork.worker_launch_rpc, fork.worker_stop, cli.entry_run, desktop.shell_launch) while W02 has no card left after W02-03 except W02-99. That is consistent with the thin-entry scope (the card's own verification command is only build.check) but the ownership hand-off must be stated and re-assigned by the W02 registry owner before the parent gates."
+    },
+    {
+      "id": "P3",
+      "severity": "minor",
+      "where": "apps/desktop (no icon asset), apps/cli/main.go header comment, receipt.remaining_blocks",
+      "detail": "Card step 1 asks for a ResearchOS 名称/图标/构建入口. Name (productName 'researchos', BrowserWindow title 'ResearchOS', window identity 'researchos-desktop') and build entry are delivered; the 图标 is not - there is no .ico/.png under apps/ and BrowserWindow is created without an icon option, so the launched window carries Electron's default icon. Likewise the '上游已有CLI启动器' is not attached yet (main.go states the Mu/Pi starter is attached later; nothing in apps/cli invokes upstream code). Neither omission is a counterexample under the card's NEGATIVE clause, but they are not listed in remaining_blocks either, so the receipt understates what step 1 left open."
+    },
+    {
+      "id": "P4",
+      "severity": "minor",
+      "where": "apps/cli/build_check.py A7 and A9",
+      "detail": "Two assertions are weaker than their labels. A7_DOCTOR_HANDSHAKE asserts j['host_pid'] == host_proc.pid, but the handler itself wrote that pid into .local/v24_host.json one line earlier, so the pid equality is self-attested; the only independent content is health UP plus the client_protocol string, and the host never echoes a protocol id (internal/api/server.go /healthz returns {status,scope,database} only). A9_SHUTDOWN_ISOLATION hashes 'old data root' as only the files under .local/data whose name contains 'lock' or whose suffix is exactly '.sqlite', and only their first 64 KiB - .local/data contains no lock file and the -wal/-shm siblings are outside the set, so the receipt wording 'old data-root files byte-identical' overstates the helper's coverage. I closed both gaps by hand (full-file sha256 of all 4 files including -wal/-shm unchanged, and my own live-host doctor run), so the conclusions stand."
+    }
+  ],
+  "limitations": [
+    {
+      "id": "L1",
+      "where": "apps/cli/main.go:19 vs apps/desktop/main/main.js:11",
+      "detail": "The shared discovery contract is asymmetric: the CLI reads the CWD-relative path '.local/v24_host.json' while the shell resolves an absolute module-relative path to the repository root. They agree only when the CLI is run from the repository root; `researchos doctor` from any other directory reports NOT_FOUND exit 3 even with a healthy host. Acceptable for a thin development entry, must become a real per-user path (blueprint 19 §5 item 1) before any product claim."
+    },
+    {
+      "id": "L2",
+      "where": "handshake semantics",
+      "detail": "What is verified is: both clients discover the host through the same file, issue a real HTTP GET /healthz, and display their own declared protocol id researchos-client/2 plus host liveness/pid/data_dir. What is NOT implemented is negotiation - the host has no protocol field, no UNSUPPORTED_PROTOCOL path and no rejection of a /1 client (doc 22 §1), which the registry attributes to protocol.v2_roundtrip (UNBOUND, owner W03+). The card only asks Desktop to display 宿主状态和协议版本 and CLI doctor to give real feedback, so the increment is compliant, but 'version handshake' must not be read as negotiated compatibility."
+    },
+    {
+      "id": "L3",
+      "where": "apps/cli/build_check.py:10, apps/desktop/package-lock.json resolved field",
+      "detail": "build_check.py hard-codes .local/tools/go1.27.1/go/bin/go.exe instead of using the RESEARCHOS_GO path the dispatcher injects from execution/toolchains/locked.json (the dispatcher does hash-verify that locked go on every run, so the pinned toolchain is enforced independently of this shortcut; the handler is just less portable than it could be). The Electron tarball resolved from registry.npmmirror.com rather than registry.npmjs.org; I established binary integrity independently by re-hashing the cached official zip against the package's own checksums.json, but the install source is a mirror and no registry pin exists in the card scope."
+    },
+    {
+      "id": "L4",
+      "where": "what this review did not exercise",
+      "detail": "I verified the shell in ROS_DESKTOP_SMOKE=1 mode (hidden window, exits after 300 ms) and via the IPC/preload surface in code; I did not capture a screenshot of a visible window, did not drive the rendered page as a user, did not test the single-worker chain or any worker launch (fork.* still UNBOUND), did not test installer/packaging (W16), and did not exercise an interactive TUI (owned by W03/W05). The P1 flake rate estimate is 5 DOWN / 25 live-host launches (~20%) from my own samples, not a long-run measurement; the underlying layer (why Electron's main-process request errors against a healthy loopback listener) is not root-caused, only isolated to the client side."
+    },
+    {
+      "id": "L5",
+      "where": "execution/v2.4/checkpoint.json",
+      "detail": "The checkpoint is still at revision 14 with head ee58a389 (a W00-era commit) and next_step_id W02-03, i.e. it has not been advanced by W02-01/02/03. checkpoint.json is outside this card's write scope, so this is not a W02-03 violation, but the card's 下一步 expects a checkpoint update and the orchestrator/integrator owes that revision (including the failing-attempt count for A8) before the next card is picked."
+    }
+  ],
+  "measured": {
+    "go_used": ".local/tools/go1.27.1/go/bin/go.exe go1.27.1 windows/amd64, GOTOOLCHAIN=local",
+    "own_cli_rebuild_exit": 0,
+    "own_control_rebuild_exit": 0,
+    "cli_version_exit": 0,
+    "cli_help_exit": 0,
+    "cli_doctor_no_discovery_exit": 3,
+    "cli_doctor_dead_host_exit": 4,
+    "cli_doctor_malformed_exit": 3,
+    "cli_doctor_live_host_exit": 0,
+    "cli_chat_exit": 3,
+    "cli_init_exit": 3,
+    "dispatcher_attempt1": "exit 1 COMMAND_FAILED, 8 assertions, failure A8_DESKTOP_SHELL_UP",
+    "dispatcher_attempt2": "exit 0 PASS, 9 assertions, registry_spec v2.4",
+    "dispatcher_stdout_sha256_pass_runs": "26577f3f6ee906a5f356697492067e372cdb4de6bcd7fb449516cbbd4c4fd845",
+    "dispatcher_stdout_sha256_note": "the executor's d09f57a0 PASS and my retry ff3d1863 PASS produced byte-identical child stdout; my failed attempt1 stdout hash was a90a5f400393640d1d0e32714b82280116f862d8a1ac381d3b9f6bcf1ff03817",
+    "electron_zip_sha256_recomputed": "af69b8a4326432a8bf655eb23f808dcff02bcb2555cac9667e72e943f53542e4",
+    "electron_checksums_json": "af69b8a4326432a8bf655eb23f808dcff02bcb2555cac9667e72e943f53542e4",
+    "electron_zip_match": true,
+    "electron_dist_exe_bytes": 204521984,
+    "electron_runtime_reported": "37.10.3",
+    "mu_desktop_electron_pin": "^37.10.3",
+    "node_modules_tracked_files": 0,
+    "package_lock_version": 3,
+    "commands_revision1_sha256": "bf8de03b50eeafe05d1447b145c74024c0f8d77c6ff563c6391d457225641f8a",
+    "commands_revision2_sha256": "daf398d35ceff40c86dc18cff7a18c7d56c83ad5c10cb797150b8e71227fd59b",
+    "commands_added_keys": ["build.check"],
+    "commands_changed_old_keys": [],
+    "commands_total": 11,
+    "commands_bound": 3,
+    "commands_unbound": 8,
+    "shell_launches_against_live_host": 25,
+    "shell_launches_reporting_DOWN_while_host_listening": 5,
+    "electron_node_requests_against_live_host": 25,
+    "electron_node_failures": 0,
+    "local_data_files_checked": 4,
+    "local_data_drift": 0,
+    "local_data_newest_mtime_utc": "2026-09-30T14:29:50Z",
+    "port_8787_state": "CLOSED throughout",
+    "port_18923_state": "CLOSED before and after every run",
+    "tracked_modifications_after_review": 0,
+    "leftover_test_processes": 0,
+    "code_hashes_matching_receipt": "6/6 (apps/cli/main.go 50a84780..., apps/cli/build_check.py c11e0f80..., main.js 148e50a5..., preload.js bb4dc309..., package.json c4d61147..., commands.json daf398d3...)"
+  },
+  "verifier_invocations": {
+    "build.check W02/W02-03 attempt1 COMMAND_FAILED (8 assertions, A8 DOWN)": "526d6cf4-5bd4-4ba9-83e6-a7dceda0381c",
+    "build.check W02/W02-03 attempt2 PASS (9 assertions, exit 0)": "ff3d1863-a66e-4ed6-b4cf-9145e37c0b83",
+    "executor_copied_receipt_verified_content_identical": "d09f57a0-23ee-4126-b48b-20e6f00cf18e",
+    "note": "Both verifier invocation receipts remain on disk under execution/invocations/ (untracked dispatcher evidence, same practice as the W02-03 and W02-02 evidence sets); all other reviewer scratch artifacts were deleted."
+  },
+  "scope_note": "Independent review of the W02-03 increment only (thin own CLI + thin Electron desktop shell + shared host discovery + isolation proof + build.check registration). It does not accept parent task W02, does not run or pre-judge formal cases A04/C23, does not accept the W02-99 parent gates, and does not alter step_state.json or any earlier receipt; registering ACCEPTED and advancing the checkpoint stays with the orchestrator.",
+  "summary": "ACCEPT. The claim is real work, not a mock: I rebuilt both Go binaries myself with the locked go1.27.1 (GOTOOLCHAIN=local), observed version/help/doctor/chat behaving exactly as reported including non-zero exits 3/3/4/3 for the negative paths, watched the CLI doctor reach a host I started on my own port with my own data dir, watched the shipped Electron 37.10.3 window boot with a constrained one-method preload and report host_health UP plus protocol researchos-client/2, verified the official electron-v37.10.3-win32-x64.zip by re-hashing it (af69b8a4... == checksums.json, so targeted_repair_1 is truthful), confirmed node_modules is untracked (0 files) and the lockfile pins 37.10.3 exactly, confirmed the old 8787 stayed closed and every byte and mtime under .local/data is untouched (newest 2026-09-30), and confirmed the commands.json write is append-only with an explicit revision_note and registry disclosure (rev1 bf8de03b -> rev2 daf398d3, 0 old keys changed, and the plan itself mandates key build.check). The binding gate reproduced the recorded PASS field-for-field, byte-identical stdout (26577f3f...), registry_spec v2.4 and 9 assertions - but only on retry: my first replay failed A8 because main.js's single-shot health probe intermittently reports DOWN against a provably live host (5 of 25 launches, dispatcher-whitelisted env, no proxy involved) and the ROS_DESKTOP_REPORT omits the error code, so the failure is un-diagnosable from the receipt. That is P1 and must be hardened (surface error, bounded retry, report the observed pass rate) before build.check is reused for W02-99; P2-P4 are the unexplained W02-99 selector plus six still-UNBOUND entries owned by W02-03, the missing ResearchOS icon and unwired upstream CLI starter, and the self-attested A7 pid check and narrow A9 hash set. Limitations L1-L5 record the CWD-relative CLI discovery, the one-sided (non-negotiated) protocol handshake, the hard-coded go path and mirror install source, the surfaces I did not exercise, and the stale checkpoint that the integrator still owes. No executor self-acceptance, no A04/C23 or parent-level claim: step_state keeps W02-03 at EXECUTION_REPORTED with verifier_id null."
+}
