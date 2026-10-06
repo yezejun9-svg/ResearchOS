@@ -285,19 +285,58 @@ func TestW14SessionProjectionRecoveryAfterReportCommit(t *testing.T) {
 	}
 	doc, sid := sessionProjectionMapping(t, r.f, task)
 	c.config.ClientSchema = doc
+	var firstProjection string
 	for i := 0; i < 2; i++ {
 		if err := c.Recover(context.Background()); err != nil {
 			t.Fatal(err)
 		}
+		var actual string
+		if err := r.f.db.QueryRow("SELECT group_concat(body,char(10)) FROM (SELECT body FROM outbox WHERE json_extract(body,'$.session_id')=? ORDER BY json_extract(body,'$.sequence'))", sid).Scan(&actual); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			firstProjection = actual
+		} else if actual != firstProjection {
+			t.Fatal("recovery changed event IDs, payload or sequence")
+		}
 	}
-	var events int
-	if err := r.f.db.QueryRow("SELECT count(*) FROM outbox WHERE json_extract(body,'$.session_id')=?", sid).Scan(&events); err != nil {
+	var events, states, artifacts, usages int
+	if err := r.f.db.QueryRow("SELECT count(*),sum(json_extract(body,'$.kind')='RUN_STATE'),sum(json_extract(body,'$.kind')='ARTIFACT'),sum(json_extract(body,'$.kind')='USAGE') FROM outbox WHERE json_extract(body,'$.session_id')=?", sid).Scan(&events, &states, &artifacts, &usages); err != nil {
 		t.Fatal(err)
 	}
-	if events != 2 {
-		t.Fatalf("recovered projection should contain one state and one native JSON artifact: %d", events)
+	if events != 3 || states != 1 || artifacts != 1 || usages != 1 {
+		t.Fatalf("recovery needs exactly one original state, native JSON artifact and canonical usage: %d/%d/%d/%d", events, states, artifacts, usages)
 	}
 	sourceTx(t, r.f.db, func(tx *sql.Tx) error {
+		var raw string
+		if err := tx.QueryRow("SELECT body FROM outbox WHERE json_extract(body,'$.session_id')=? AND json_extract(body,'$.kind')='USAGE'", sid).Scan(&raw); err != nil {
+			return err
+		}
+		event, err := Decode([]byte(raw))
+		if err != nil {
+			return err
+		}
+		payload := event["payload"].(map[string]any)
+		ledger, err := load(tx, r.f.project, "BudgetLedgerEntry", Str(payload, "ledger_entry_id"))
+		if err != nil {
+			return err
+		}
+		if event["run_id"] != task["active_run_id"] || ledger["run_id"] != task["active_run_id"] || ledger["cost_basis"] != "UPPER_BOUND" || ledger["operation"] != "RESERVE" || payload["cost_known"] != false || payload["money"] != nil || payload["provider_usage_id"] != nil || payload["input_tokens"] != nil || payload["output_tokens"] != nil {
+			t.Fatal("recovery invented cost or changed original immutable ledger attribution")
+		}
+		var immutable, ledgerCount int
+		if err := tx.QueryRow("SELECT immutable FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND id=?", r.f.project, ledger["id"]).Scan(&immutable); err != nil {
+			return err
+		}
+		if immutable != 1 || Receipt(ledger) != ledger["receipt_hash"] {
+			t.Fatal("recovered usage did not reference a canonical immutable ledger receipt")
+		}
+		if err := tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?", r.f.project, task["active_run_id"]).Scan(&ledgerCount); err != nil {
+			return err
+		}
+		if ledgerCount != 1 {
+			t.Fatalf("recovery duplicated the original Run ledger: %d", ledgerCount)
+		}
 		if !clientTurnSettled(tx, r.f.project, sid, task) {
 			t.Fatal("recovered terminal response did not release turn")
 		}

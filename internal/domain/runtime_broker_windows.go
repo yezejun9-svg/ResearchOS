@@ -217,6 +217,10 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		tx.Rollback()
 		return nil, e
 	}
+	if e = c.projectSessionEffects(tx, route.ProjectID, run, nil); e != nil {
+		tx.Rollback()
+		return nil, e
+	}
 	if e = tx.Commit(); e != nil {
 		return nil, e
 	}
@@ -383,7 +387,14 @@ func (c *RuntimeCoordinator) ingestEffectFact(ctx context.Context, fact Object) 
 		return Fail(422, "GATE_FAILED", "host tool evidence hash or bound mismatch")
 	}
 	if intent["state"] == receipt["state"] && Hash(intent["receipt"]) == Hash(receipt) {
-		return nil
+		current, err := load(tx, project, "Run", run)
+		if err != nil {
+			return err
+		}
+		if err = c.projectSessionEffects(tx, project, current, fact); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	if intent["state"] != "STARTED" && intent["state"] != "UNKNOWN" {
 		return Fail(409, "STATE_CONFLICT", "effect outcome cannot be rewritten")
@@ -396,6 +407,13 @@ func (c *RuntimeCoordinator) ingestEffectFact(ctx context.Context, fact Object) 
 		intent["state"], intent["receipt"] = receipt["state"], receipt
 		if e = effectAppend(tx, project, run, key, intent); e != nil {
 			return e
+		}
+		current, err := load(tx, project, "Run", run)
+		if err != nil {
+			return err
+		}
+		if err = c.projectSessionEffects(tx, project, current, fact); err != nil {
+			return err
 		}
 		return tx.Commit()
 	}
@@ -413,6 +431,13 @@ func (c *RuntimeCoordinator) ingestEffectFact(ctx context.Context, fact Object) 
 	intent["state"], intent["receipt"] = receipt["state"], receipt
 	if e = effectAppend(tx, project, run, key, intent); e != nil {
 		return e
+	}
+	current, err := load(tx, project, "Run", run)
+	if err != nil {
+		return err
+	}
+	if err = c.projectSessionEffects(tx, project, current, fact); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
