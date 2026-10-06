@@ -1,0 +1,81 @@
+{
+  "schema": "researchos.cli-interrupt-readonly-advice.v1",
+  "actor": "codex:/root/command_queue_impl",
+  "issued_at": "2026-10-06T14:43:50.473847+00:00",
+  "status": "READONLY_EXECUTABLE_HARNESS_PROPOSAL_NOT_TEST_PASS",
+  "source_manifest": {
+    "path": "execution/v2.4/receipts/W05/W05-99/cli_interrupt_readonly_codex/console-1f2ee09a7a1842eda2d606a7302f4412/source_read_manifest.json",
+    "sha256": "dd69985849b025737d6a1be2b39db247eefafdb529b77978858290b221d0d782",
+    "bytes": 8028
+  },
+  "typed_fixture": {
+    "path": "execution/v2.4/receipts/W05/W05-99/cli_interrupt_readonly_codex/console-1f2ee09a7a1842eda2d606a7302f4412/typed-fixture.json",
+    "sha256": "8b80c9c43a42a99d39232038171507d7dcc4484036302d0c1ce21526026f1609",
+    "bytes": 3039
+  },
+  "optional_hidden_sender": {
+    "path": "execution/v2.4/receipts/W05/W05-99/cli_interrupt_readonly_codex/console-1f2ee09a7a1842eda2d606a7302f4412/send-break.ps1",
+    "sha256": "cef88f61b17bb3b9b294d51c8db6457def9c62aee645eed1dc4434aa00b49974",
+    "bytes": 2927
+  },
+  "critical_facts": [
+    "0x200 CREATE_NEW_PROCESS_GROUP defines group=childPID but does not create console. Plain pipes alone do not imply console; TTY/ConPTY alone is not test proof.",
+    "0x08000000 CREATE_NO_WINDOW means CLI has no console. Do not set it on test CLI. 0x10 CREATE_NEW_CONSOLE combined with0x200 ignores the new-group flag: do not claim directed group from0x210.",
+    "Stable isolation: test self-exec helper branch with SysProcAttr{CreationFlags:0x10,HideWindow:true}; stdout/stderr explicit files/pipes. Helper owns private console. It launches actual CLI with SysProcAttr{CreationFlags:0x200,HideWindow:true}, inheriting console and setting real group=CLI PID. Do not inherit ignore-handler as a replacement for signal.Notify.",
+    "Helper can call GenerateConsoleCtrlEvent(1,CLIpid) directly because sameconsole. Or separate dedicated hidden PowerShell sender FreeConsole then AttachConsole(CLIpid), then GenerateConsoleCtrlEvent(1,CLIpid); attach must return nonzero. Group0 forbidden.",
+    "Optional sender may be started with Start-Process -WindowStyle Hidden and explicit quoted parameter array/file path; no visible window, no user shell console mutation. Sender must use TargetPid variable, never PowerShell readonly $PID. Existing console detached only in this disposable sender."
+  ],
+  "sequence": [
+    "Build current compiled CLI and test binary with locked Go in Root owned temp namespace; hash binary/source+buildinfo. No source writes by this advisor.",
+    "Outer test spawns exact helper subtest in hidden private console0x10. Unique env marks helper to prevent recursion, -test.run anchors one test. Outer captures helper raw and actual exit.",
+    "Helper makes isolated httptest and exact discovery/config/env above; remove inherited duplicate RESEARCHOS_* keys then set explicit fixture values. Nonempty synthetic credential bypasses native renewal.",
+    "First positive control returns complete typed session.get and host.status, both echo dynamic request identity. Validate schema and require two actual POST operations, exit0, valid JSONL. GET health is not a substitute.",
+    "Interrupt caseA: validate session.get request then signal arrived channel or uniquely named EventWaitHandle. Keep response blocked until r.Context().Done or cleanup release. Only after arrived send actualCTRL_BREAK.",
+    "Interrupt caseB: return typed session.get first, then validate+block host.status at HTTP barrier before signal. Record order and actual elapsed from barrier/signal. No sleep determines readiness.",
+    "Wait bounded for child process exit and handler ctx.Done; require actual OS exit130, JSONL statusINTERRUPTED_READ_ONLY/reasonREAD_INTERRUPTED/exit_code130; no session.control/no mutating request/no later status leg if first leg interrupted, config exact bytes unchanged. A Generate return1 proves only delivery attempt, not handler execution.",
+    "Test missing/bad credential or malformed response as separate negative, never use their fast failure as interrupt success. Console attach/generate refusal is harness failure with Win32 code, not skipped product success."
+  ],
+  "cleanup": [
+    "Hold actual exec.Cmd.Process handle and child creation identity from launch. Exactly one goroutine/call owns cmd.Wait. Use timeout only as failure bound; on failure release server barrier and kill only that held child process handle then drain Wait.",
+    "Track helper/sender child handles too and bound Wait; no name-based taskkill, no broad PowerShell process stop, no PID-only kill after reuse. A fallback Stop-Process must first compare expected creation ticks and absolute image, but actual retained process handle is preferred.",
+    "httptest handler select on ctx.Done plus cleanup release prevents server.Close hang. Close listeners/pipe ends/events and owned command handles; ensure all helper/sender/CLI children reaped. Keep raw receipts, remove only unneeded owned temp workspace after outcome captured."
+  ],
+  "original_reference": {
+    "path": "tests/runtime/cli_contract/main.go",
+    "line": 477,
+    "limits": "Uses0x200, sleep600ms, sleep5s server and malformed stateREADY response; reports skipped if no console. It demonstrates previous mechanism only, not fulltyped status or reliable readiness. apps/cli/cli_contract_test.go does not exist in this WT."
+  },
+  "official_sources": [
+    {
+      "url": "https://learn.microsoft.com/en-us/windows/console/generateconsolectrlevent",
+      "support": "Same console; group=processID for new group; event1 CTRL_BREAK; nonzero return only API success."
+    },
+    {
+      "url": "https://learn.microsoft.com/en-us/windows/console/attachconsole",
+      "support": "Already attached ->ACCESS_DENIED; target no console ->INVALID_HANDLE; FreeConsole needed in dedicated sender."
+    },
+    {
+      "url": "https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags",
+      "support": "0x200 ignored with0x10; CREATE_NO_WINDOW has no console handle."
+    },
+    {
+      "url": "https://learn.microsoft.com/en-us/windows/console/allocconsole",
+      "support": "If deliberately used in dedicated helper only, AllocConsole creates inherited child console; process can own one console."
+    }
+  ],
+  "actual_actions": {
+    "product_source_writes": 0,
+    "canonical_writes": 0,
+    "child_test_execution": 0,
+    "native_host_starts": 0,
+    "paid_calls": 0,
+    "credential_reads": 0,
+    "provider_original_receipt_changes": 0
+  },
+  "read_failure_origins": [
+    "Initial suggested apps/cli/cli_contract_test.go missing(error2); located actual tests/runtime/cli_contract/main.go.",
+    "rg apps/cli/*.go literal glob rejected Windows123; corrected directory -g search.",
+    "PowerShell schema diagnostic output truncated at depth5 for response; full original schema saved, fixture should be validated using actual schema engine."
+  ],
+  "remaining": "Console strategy is grounded in Microsoft API semantics and existing code, not empirically run here. Root executes actual fixture under approved L02 lease; no NativeHost required."
+}

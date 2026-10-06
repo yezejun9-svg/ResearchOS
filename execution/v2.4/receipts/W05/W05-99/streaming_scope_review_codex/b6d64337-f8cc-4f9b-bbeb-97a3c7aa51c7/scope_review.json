@@ -1,0 +1,93 @@
+{
+  "schema": "researchos.w05.independent-streaming-scope-review.v1",
+  "reviewer_id": "codex:/root/w05_merge_review",
+  "decision": "SOURCE_SCOPE_READY_WITH_RECORDED_D01_D04_CONSTRAINTS",
+  "scope_only": true,
+  "proposal_commit": "ef4e1ba03431305351cef58137e64c5de24a8e6c",
+  "proposal_sha256": "d89ca4e4c7b4d7f9996f8119ec5d5c3577d027d19f0b5e76966bb941e7387f01",
+  "handoff_sha256": "b0247a6087d86380e909c1bcfb6985d00a51f39a41d05bdce4a237492a9cd6f0",
+  "audit_ref": {
+    "path": "execution/v2.4/receipts/W05/W05-99/streaming_scope_review_codex/b6d64337-f8cc-4f9b-bbeb-97a3c7aa51c7/audit.json",
+    "sha256": "e5c8bb9e49209b900dc4554932ab73eebe5be66be879face819842464efdafd7"
+  },
+  "actual_audit": "All10 commit blobs and handoff files verified against actual bytes;48 before/after/current inputs equal. Additional actual reader/SDK/event-stream/queue source inspected. Current public schema equals frozen schema. No timing/product/provider test was run in this scope review.",
+  "exact_source_paths": [
+    "adapters/runtime/mu/worker.mjs",
+    "adapters/runtime/bridge_windows.go",
+    "adapters/runtime/bridge_stream_windows.go",
+    "internal/domain/runtime_model_windows.go",
+    "internal/domain/runtime_effect_wire_windows.go",
+    "internal/domain/runtime_command_queue_windows.go",
+    "internal/domain/runtime_model_stream.go",
+    "internal/domain/runtime_model_stream_windows.go",
+    "internal/domain/runtime_sessions_windows.go",
+    "internal/domain/client_protocol_journal.go",
+    "internal/domain/v24_sessions.go",
+    "internal/domain/client_transcript.go",
+    "internal/domain/client_protocol_history.go",
+    "internal/domain/runtime_model_stream_test.go",
+    "internal/domain/runtime_model_stream_windows_test.go",
+    "internal/domain/client_stream_transcript_test.go",
+    "adapters/runtime/bridge_stream_windows_test.go",
+    "adapters/runtime/mu/worker-stream.test.mjs",
+    "apps/cli/cli_model_stream_integration_windows_test.go"
+  ],
+  "scope_bounds": "Each path retains the proposal's narrow purpose. No frozen/public schema, third_party fork, dependency lock, builder source, S5 test suffix, migration, opaque store, credentials, provider configuration, registry or canonical receipt mutation. New common helpers must remain compilable outside Windows; Windows transport helpers cannot be referenced unconditionally from common transcript code. Root must register this exact scope and actual owner before implementation.",
+  "source_confirmed_gaps": [
+    "brokerModel uses ReadAll; worker awaits final effect then builds Response from full SSE; runtime_sessions emits text after SETTLED. These cannot demonstrate early streaming.",
+    "agent.subscribe listeners are awaited in order with AbortSignal; AgentSession.subscribe/_emit listeners are void. Only the former supplies an awaited SDK observation boundary.",
+    "Additional gap: ai/utils/event-stream.ts push():void queues events while openai-completions.ts runs its own asynchronous producer. Awaited agent listeners alone do not impose bounded provider-producer backpressure.",
+    "Bridge.Acknowledge requires contiguous original frame order; MODEL remains outstanding while SDK observations arrive. Putting awaited observations behind MODEL deadlocks.",
+    "AppendSessionEvent calls AdvanceWatermark, which increments revision. Frozen22 explicitly excludes token events from control-revision conflicts.",
+    "transcriptProvenance currently refuses unfinished text, snapshotTranscriptRef requires exact complete journal match, and clientHistoryArtifact rejects any interleaved lifetimes. STEER calls transcript sealing inside its admission transaction. All must be adapted together."
+  ],
+  "architecture_decisions": {
+    "D01": {
+      "decision": "Approve an auxiliary fixed internal MODEL_SSE_V1 union, distinct from ordinary BridgeFrame sequence and ACK state, under these bounds and handshake.",
+      "envelope_contract": "Strict exact-key tagged records for stream.open/data/terminal/fail, stream.transport_credit and stream.observe/observation_credit; no arbitrary payload passthrough. Every record binds initialized Task/Run/session/runtime epoch/dispatch key/manifest hash/process generation, original MODEL frame/key/request hash and a deterministic stream_id. Direction-specific sequence, byte offset and rolling digest are mandatory where data or observations are present. Exact duplicate identity+bytes is idempotent; changed duplicate, gaps, wrong direction/type/version or old binding fail closed.",
+      "limits": "One active MODEL stream per current single-agent worker; retain the existing frozen max_calls for sequential calls. Whole original raw SSE <=2MiB, wire envelope <=64KiB, data fragment <=8KiB, <=4 uncredited data fragments per direction (<=32KiB wire-data window), <=4 pending observation records, public text fragments <=8KiB UTF-8 and <=16384 codepoints. Parser may hold one bounded whole SSE event up to the existing2MiB total limit; do not accidentally narrow accepted SSE event size to the wire frame limit. Declare and test finite limits for every map/queue and decoded event batch before opening the stream. Transport-control waits must be context/abort cancellable; use the original90s request deadline and existing cancellation escalation deadline, never an infinite wait or a second retry budget.",
+      "initialization": "Capability accepted only after source/bundle-bound worker initialization has been durably acknowledged and delivered. No stream observation before that barrier. A legacy worker or qualification path without queue initialization retains the existing buffered path and cannot claim streaming; do not synthesize initialization or change public contracts.",
+      "backpressure": "Use actual awaited agent.subscribe for observed assistant events AND a separate bounded producer gate at the existing awaited onProviderStreamEvent hook or an equally demonstrated wrapper boundary. That hook is invoked before parsing the current provider chunk: never wait for its own future text_delta. Release previous-batch credits only after their actual SDK outputs are durably acknowledged, or after explicit no-public-output classification. Role-only, usage, comments, tool-only and thinking-only input must progress without waiting for nonexistent text events. One provider chunk may generate multiple SDK events and mixed text/tool content; count the whole bounded batch, not one chunk=one delta. Preserve any existing SDK hook by chaining it without changing content. Test the actual producer-consumer chain, not merely ReadableStream desiredSize.",
+      "authority": "Transport credit only releases buffers. Observation credit requires Go SQLite commit and matching journal identity. Neither advances original journal.Acknowledged, confirms resource_effects, consumes a command, releases budget, proves idle or proves QUEUE_EMPTY. Keep a single stdin writeMu/stdout write chain; no DB/bridge lock held while awaiting credits. Cancellation/control processing must not depend on an outstanding observation promise.",
+      "terminal_barrier": "Do not expose [DONE], EOF or SDK terminal success until the complete original stream passes existing terminal validation and its original CONFIRMED fact is durable. Return the ordinary effect ACK with exact final raw hash/receipt/stream watermarks; late exact ACK identity remains retained after abort. Never wait for terminal SDK message_end/text_end before issuing the terminal effect ACK that allows those events: that is another circular wait. SDK text_end may occur on block changes before EOF; treat it as a staged observation, not immediate public END."
+    },
+    "D02": {
+      "decision": "Approve immutable partial OBSERVED transcripts with explicit complete=false; publish final END only after successful verified final artifact reconciliation. No new public ABORT phase.",
+      "snapshot_atomicity": "Every transaction that advances the committed MESSAGE prefix must also leave transcript_artifact_id referring to an immutable exact snapshot of that same committed message prefix, or use an equally proven existing-schema lazy policy that never leaves a stale pointer visible. The minimal in-scope choice is eager sealing once per bounded committed observation batch. START/DELTA/END, pointer and watermark commit together; failure rolls all back before credit. Record the message-prefix watermark separately from session-wide nonmessage watermark as existing replay does. Do not claim an older snapshot covers a newer committed prefix. >200 messages must retain the complete artifact and last200 projection without omission.",
+      "resource_policy": "Batch only already-arrived real deltas within the declared window; first visible output must precede provider completion. Measure retained artifact bytes and transaction work under the maximum configured response/call bounds and long history. If a supported storage limit is reached, visibly block/fence with original UNKNOWN semantics; never truncate history or discard immutable prior artifacts to manufacture a bound. Do not rebuild an unbounded history per byte without batching/resource evidence.",
+      "interleave": "Preserve every USER/ASSISTANT message and original journal sequence. Validate roles, run ownership, dense public part indices, per-part START/DELTA/END and UTF-8 offsets independently; allow a USER admission inside an active assistant lifetime. Map SDK text-only content indices to dense public parts because thinking/tool indices create holes. Queued USER admission order is not necessarily SDK consumption order: FOLLOW_UP may be consumed after additional tool/model turns. Executable history must use verified SDK/custom-message consumption order bound to canonical command_id/message_id receipts, with original display sequences retained as provenance. Do not infer model context from event START order, or silently treat unconsumed/dropped queued text as consumed.",
+      "interrupted_policy": "After abort, invalid terminal, UNKNOWN or crash, retain already committed text as incomplete and OBSERVED. No fake END or empty success. session.get/events and allowed cancel/recovery remain usable. A new NORMAL that would require this partial history must explicitly fail closed using existing typed refusal; no automatic replay, omission or promotion. The supported escape is an explicit new session/context operation already available in the product; do not claim an unimplemented in-place rebuild command exists."
+    },
+    "D03": {
+      "decision": "Approve an existing-storage design only if the implementation demonstrates the following reconstruction; do not add opaque authority or silently require new SQL.",
+      "durable_identity": "Use canonical resource_effects intent/receipt plus runtime dispatch/queue binding and trusted outbox event IDs. A deterministic event/message identity must include project/session/run/epoch/dispatch/effect key/request hash/SDK message+text-part ordinal/observation sequence; private validators recompute it. Public schema receives only its existing fields. In-memory transport state is a cache, not truth; an UNKNOWN interrupted stream is never reopened for execution after restart.",
+      "positive_final_provenance": "For stream-bound messages, replace SETTLED-before-START only with a stronger exact predicate: original effect request/receipt/raw SSE hash, canonical dispatch/runtime measurement, real SDK visible-text order and bytes, final host-validated sealed result artifact, canonical command consumption mapping and actual Run SETTLED projection all agree. Recompute concatenated visible bytes and every prefix/part from original provider data and verified SDK artifacts; matching a self-described artifact tag or deterministic ID alone proves nothing. Preserve legacy provenance logic for legacy messages; no global removal of its guard. FIXTURE remains FIXTURE and incomplete/unknown remains OBSERVED. Existing turn acceptance gates are not weakened merely because a streamed result displayed successfully.",
+      "storage_boundary": "Canonical confirmed receipts already persist the full original MODEL body in resource_effects and final artifacts carry SDK messages. Use those existing bounded records and the trusted outbox for reconstruction, with any new internal result metadata validated against them. A publicly sealable REPORT with a chosen media type/body/produced_by value must never supply authoritative stream reconciliation. If exact reconstruction requires an independently durable receipt table or new schema field, stop and request a numbered migration/backup/restore amendment before implementing it.",
+      "backup_restore": "Demonstrate the chosen existing-storage closure survives backup/restore: all visible prefixes, final facts/artifacts and IDs remain reconstructible, restored epoch/fences reject subsequent old-worker data, and source21/22 compatibility is preserved. No filesystem-only proof may be required to call a restored final transcript LIVE. Existing full receipt/dispatch chain and budget remain authoritative."
+    },
+    "D04": {
+      "decision": "Approve a private runtime MESSAGE watermark-only append, plus before-forward secret quarantine; existing user-command control CAS remains unchanged.",
+      "CAS": "Within the same transaction check project/session, original Task/Run association, current writer/runtime epoch, exact dispatch/process generation, lease/current execution authority and cancel/restore fence; read current revision+watermark under the existing lock and CAS both while advancing only watermark. Token START/DELTA/END and derived transcript pointer do not change control revision. Do not freeze the start-of-stream revision forever: legitimate STEER changes it; re-read for the internal observation transaction while preserving all user-command expected_revision checks. Old owner/epoch or cancelled run cannot append. Never expose this helper as a generic client bypass.",
+      "secret_quarantine": "Before worker forwarding, inspect complete valid SSE event structure and decoded string sequences, carrying unresolved credential-prefix suffixes across reads and decoded content events. JSON escapes and multibyte UTF-8 boundaries must not evade checks. Retain exact original accepted bytes for final hash; do not rewrite/redact model content and then call it the original response. Never emit a suspect prefix that can complete into a known credential; hold it until disambiguated, bounded by original stream limits. If detected, abort with original UNKNOWN and sanitized diagnostics; do not persist the secret-bearing body in formal raw evidence. Tests use only labelled synthetic secrets."
+    }
+  },
+  "required_completion_gates": [
+    "T01-T09 in the proposal remain mandatory, with actual per-assertion raw evidence, exact tools/build/SDKdist/input vectors and zero invented successes. Current broad tests run only when relevant changed code or an unresolved failure justifies them.",
+    "Causal fixture: actual upstream httptest SSE flushA waits until actual SDK observation, SQLite durable DELTA and compiled CLI JSONL arrival are recorded; thenB and its identical barrier; only afterward permit provider terminal. Include actual host/API/named pipe and rebuilt pinned bundle. Record explicit barrier events, not sleeps or post-completion text slicing.",
+    "Run more auxiliary deltas than the old32 completion queue while original MODEL remains unacknowledged, concurrent command receipts and cancellation occur. Assert fixed transport/SDK queue bounds, no busy-loop, no blocked cancellation and no original ACK/QUEUE_EMPTY advance from credit.",
+    "Test zero-text, usage-only, tool-only, multiple text/thinking parts, many small chunks, one huge valid bounded event and one chunk producing multiple SDK events. Verify no text leakage from reasoning/tool arguments and dense public part indexing.",
+    "Test partial snapshot and >200-message exact artifact during SSE barrier; STEER and FOLLOW_UP admission, real custom-message consumption, same-writer CAS and final next-turn context order. Tokens alone leave revision unchanged. Admission order and SDK consumption order deliberately differ in at least one case.",
+    "Failure at each header/delta/credit/final-ACK boundary: original request UNKNOWN or canonical terminal reconciliation as actually proven, no auto re-dispatch/budget reset, no END for interrupted messages, unchanged original effect identity and late exact ACK handling. Restore and restart reject old-generation data while preserving visible incomplete history.",
+    "Final Run success/SEAL requires original SDK idle+queue-empty+command consumption, effect reconciliation AND stream closure/observation reconciliation. Fulltext equality alone, ordinary ACK, transport credits or OS process exit are insufficient.",
+    "Final reconciliation mismatch, forged generic REPORT/provenance labels, modified provider bytes, changed duplicate, stale binding, incomplete artifact and fixture-labeled runtime cannot produce LIVE history or successful business acceptance. Keep all old failure records; this work does not close W05/A04/LIVE provider or historical Q10 gates."
+  ],
+  "review_limits": [
+    "This authorizes a reviewable19-path architecture scope for Root registration, not implementation correctness or performance. D01-D04 constraints are mandatory and must be shown in source and actual controls.",
+    "If the actual design cannot satisfy producer backpressure, public snapshot atomicity or durable provenance within these paths, return a concrete scope amendment instead of shipping only early text output.",
+    "Changes to these domain/bridge inputs may stale W04/W07 applicability; Root must freeze and revalidate final composed vectors. No exemption is granted by this scope review."
+  ],
+  "product_tests_executed_by_reviewer": 0,
+  "source_changes_by_reviewer": 0,
+  "canonical_registry_changes": 0,
+  "formal_acceptance_delta": 0
+}

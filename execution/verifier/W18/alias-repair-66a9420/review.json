@@ -1,0 +1,49 @@
+{
+  "task_id": "W18",
+  "source_revision": "66a9420995770c02c65d815dea60cd60678dbf45",
+  "verdict": "NEEDS_FIX",
+  "stage_accepted": false,
+  "closed_findings": [
+    "W18-RESTORE-ALIAS-01"
+  ],
+  "open_findings": [
+    {
+      "id": "W18-RESTORE-IDENTITY-02",
+      "priority": "P2",
+      "file": "internal/domain/backup_recovery.go",
+      "line": 100,
+      "summary": "Lstat FileInfo defers native identity lookup on Windows; replacing path before first SameFile fools created-file identity guard",
+      "steps": [
+        "backupWriteSource creates item.txt and stores Lstat FileInfo",
+        "Rename original item.txt to item.txt.preserved without deleting it",
+        "Create a different native file at item.txt containing identical bytes",
+        "Second backupWriteSource returns nil despite distinct volume/file-index identity"
+      ],
+      "proof": "replaced-native-id-proof.json records GetFileInformationByHandle original/replacement/preserved IDs; original remains same and replacement differs",
+      "cause": "Go1.27.1 os/types_windows.go loadFileId at287 resolves fs.path lazily; SameFile at353 first loads identity after replacement. Stored FileInfo has not frozen original native identity.",
+      "repair": "Capture identity from creation handle before closing; inspect identity and bytes using a single opened reuse handle. Preserve reparse-point and containment checks.",
+      "limits": "Independent direct private helper boundary probe; no concurrent adversarial end-to-end RestoreBackup race claimed."
+    }
+  ],
+  "checks": {
+    "total": 56,
+    "pass": 54,
+    "fail": 2
+  },
+  "author_evidence_hashes": {
+    "total": 27,
+    "pass": 27
+  },
+  "passed": [
+    "Original ./input.txt plus input.txt legal full backup/restore succeeds.",
+    "Windows mixed-case and mixed-separator real CaptureLocalSnapshot aliases restore successfully; both aliases read original sealed bytes and are os.SameFile after relocation.",
+    "Changing bytes between alias snapshots rejects restore before target publication. Source current bytes, DB inventory, original snapshot row identities and encrypted package hashes unchanged.",
+    "Same file identical hash/bytes succeeds; unrelated existing file identity, wrong expected hash, different candidate bytes, directory and junction targets reject.",
+    "Cancelled backup, correctly MAC-signed invalid/duplicate manifest paths, occupied destination and original source-preservation probes still pass."
+  ],
+  "scope_notes": [
+    "No unrelated full suite repeated; previous recovery/credentials/process proof unaffected by one helper diff.",
+    "Backup package remains encrypted; original capture manifests/artifact IDs preserved.",
+    "No product edits or stage acceptance. Owner evidence index27 validated from backup-repair working tree frozen evidence commit93d65fe."
+  ]
+}
