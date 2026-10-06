@@ -162,3 +162,37 @@ func TestClientQueueEnqueueCommitBoundary(t *testing.T) {
 		t.Fatal("committed acceptance changed after recovery")
 	}
 }
+func TestClientQueueRestoredNoRunCannotHideUnknownWithNewTurn(t *testing.T) {
+	f, svc, client, sid := queueClientFixture(t)
+	reply, _ := goalCommand(t, f, svc, queueClientEnvelope(t, f, client, sid, "session.send", Object{"text": "future uncertainty", "attachment_artifact_ids": Empty(), "delivery": "STEER"}))
+	if deref(reply.Status) != "COMPLETED" {
+		t.Fatal(string(Bytes(reply)))
+	}
+	var goal, task string
+	f.db.QueryRow(`SELECT goal_id,task_id FROM client_sessions WHERE id=?`, sid).Scan(&goal, &task)
+	reply, _ = goalCommand(t, f, svc, queueClientEnvelope(t, f, client, sid, "session.control", Object{"action": "CANCEL", "target_id": goal, "reason": "noRun cancellation fixture"}))
+	if deref(reply.Status) != "COMPLETED" {
+		t.Fatal(string(Bytes(reply)))
+	}
+	sourceTx(t, f.db, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE client_command_queue SET state='UNKNOWN'`); err != nil {
+			return err
+		}
+		return fenceRestoredClientQueues(tx)
+	})
+	for _, method := range []string{"session.send", "session.control"} {
+		payload := Object{"text": "must retain previous UNKNOWN", "attachment_artifact_ids": Empty(), "delivery": "NORMAL"}
+		if method == "session.control" {
+			payload = Object{"action": "RESUME", "target_id": sid, "reason": "explicit resume is not unknown reconciliation"}
+		}
+		refused, _ := goalCommand(t, f, svc, queueClientEnvelope(t, f, client, sid, method, payload))
+		if deref(refused.ErrorCode) != "SESSION_BUSY" {
+			t.Fatalf("%s hid original queue: %s", method, Bytes(refused))
+		}
+	}
+	var current string
+	f.db.QueryRow(`SELECT task_id FROM client_sessions WHERE id=?`, sid).Scan(&current)
+	if current != task {
+		t.Fatal("restored unknown Task mapping changed")
+	}
+}

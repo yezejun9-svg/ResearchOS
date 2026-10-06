@@ -451,6 +451,15 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
 				var err error
 				if strings.HasPrefix(frame.Type, "command.") {
 					err = c.ingestClientQueueFrame(ctx, route, run, bridge, frame)
+					if err == nil && frame.Type == "command.accepted" {
+						payload, e := Decode(frame.Payload)
+						if e != nil {
+							return e
+						}
+						if payload["initialized"] == true {
+							response = Object{"sequence": frame.Sequence, "key": "command.initialize", "state": "CONFIRMED", "payload": Object{}}
+						}
+					}
 				}
 				if frame.Type == "checkpoint" {
 					mutation.Lock()

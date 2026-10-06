@@ -346,8 +346,8 @@ func (w *Bridge) consume(chunk sandbox.StreamChunk) error {
 			}
 			w.journal.ContextReady = true
 		case "effect.request", "checkpoint":
-			if !w.journal.ContextReady {
-				return errors.New("context acknowledgement required before work")
+			if !w.journal.ContextReady || w.journal.QueueRequired && (w.journal.QueueInitSequence == 0 || w.journal.Acknowledged < w.journal.QueueInitSequence) {
+				return errors.New("context and queue initialization acknowledgement required before work")
 			}
 			if frame.Type == "checkpoint" {
 				w.journal.CheckpointSequence = frame.Sequence
@@ -375,7 +375,7 @@ func (w *Bridge) consume(chunk sandbox.StreamChunk) error {
 					return errors.New("duplicate initialization receipt")
 				}
 				w.journal.QueueInitSequence = frame.Sequence
-			} else if w.journal.QueueInitSequence == 0 {
+			} else if w.journal.QueueInitSequence == 0 || w.journal.Acknowledged < w.journal.QueueInitSequence {
 				return errors.New("command receipt before initialization")
 			}
 			if frame.Type == "command.abort_observed" {

@@ -382,6 +382,17 @@ func (s *ClientService) sendClientMessage(ctx context.Context, tx *sql.Tx, env *
 // Keep that acceptance pending while requiring actual process/effect settlement
 // and durable terminal projection before replacing the session's current Task.
 func clientTurnSettled(tx *sql.Tx, project, sessionID string, task Object) bool {
+	installed, err := clientQueueInstalled(tx)
+	if err != nil {
+		return false
+	}
+	if installed {
+		var pending int
+		if err = tx.QueryRow(`SELECT (SELECT count(*) FROM client_queue_fences f WHERE f.project=? AND f.task_id=? AND (restore_fenced<>0 OR state='RECONCILING' OR EXISTS(SELECT 1 FROM client_command_queue q WHERE q.generation=f.generation AND q.state NOT IN ('CONSUMED','DROPPED'))))+(SELECT count(*) FROM client_control_requests c,json_each(c.task_ids) t WHERE c.project=? AND c.session_id=? AND t.value=? AND c.state<>'CONFIRMED')`, project, task["id"], project, sessionID, task["id"]).Scan(&pending); err != nil || pending != 0 {
+			return false
+		}
+	}
+
 	runID := Str(task, "active_run_id")
 	if runID == "" {
 		return task["status"] == "ACCEPTED" || task["status"] == "CANCELLED" || task["status"] == "FAILED"
