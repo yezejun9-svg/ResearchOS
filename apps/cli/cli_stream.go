@@ -35,6 +35,7 @@ type cliFlow struct {
 	cancelDeadline   time.Time
 	operations       []map[string]any
 	admissionCommand string
+	goalFlow         bool
 }
 
 func (f *cliFlow) interrupt() {
@@ -79,7 +80,7 @@ func (f *cliFlow) call(method string, payload map[string]any, wait bool) (map[st
 	f.ordinal++
 	sent := *f.c
 	sent.commandID = v2FlowCommandID(f.base, method, f.ordinal)
-	if method == "session.send" {
+	if method == "session.send" || method == "goal.start" {
 		f.admissionCommand = sent.commandID
 	}
 	attempted := false
@@ -87,7 +88,7 @@ func (f *cliFlow) call(method string, payload map[string]any, wait bool) (map[st
 		if f.expired() {
 			return nil, "WAIT_FOR_SETTLEMENT", exitNotImplemented
 		}
-		if method == "session.send" && f.cancelRequested && !attempted {
+		if (method == "session.send" || method == "goal.start") && f.cancelRequested && !attempted {
 			return nil, "CANCELLED_BEFORE_ADMISSION", exitInterrupted
 		}
 		attempted = true
@@ -100,7 +101,25 @@ func (f *cliFlow) call(method string, payload map[string]any, wait bool) (map[st
 		}
 		status := statusOf(reply)
 		if status == "COMPLETED" || !wait {
-			adoptV2Snapshot(f.c, reply)
+			if method == "goal.start" {
+				if why := adoptCLIGoal(f.c, reply, payload["start_as_draft"] == true); why != "" {
+					return reply, why, exitNotImplemented
+				}
+			} else if f.goalFlow && method == "session.get" {
+				snap := cliSnapshot(reply)
+				doc, err := cliProtocolDocument()
+				if err != nil || doc.ValidateDef("SessionSnapshot", snap) != nil || snap["session_id"] != f.c.sessionID || snap["project_id"] != f.c.projectID {
+					return reply, "INVALID_GOAL_SESSION_SNAPSHOT", exitNotImplemented
+				}
+				writer := cliObject(snap["writer"])
+				epoch, valid := cliInteger(writer["epoch"])
+				if writer["client_id"] != f.c.clientID || !valid || epoch < 1 {
+					return reply, "GOAL_WRITER_UNRESOLVED", exitNotImplemented
+				}
+				adoptV2Snapshot(f.c, reply)
+			} else {
+				adoptV2Snapshot(f.c, reply)
+			}
 			return reply, "", exitCompleted
 		}
 		// ACKNOWLEDGED/IN_PROGRESS only confirm receipt, not task completion.
@@ -439,7 +458,7 @@ func followCLIExecution(f *cliFlow, snapshot map[string]any, message, explicitRu
 func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options cliFollowOptions) (map[string]any, int) {
 	budget, stop := context.WithTimeout(context.Background(), options.timeout)
 	defer stop()
-	f := &cliFlow{c: c, budget: budget, options: options, base: c.commandID}
+	f := &cliFlow{c: c, budget: budget, options: options, base: c.commandID, goalFlow: name == "goal" || name == "go" || name == "/goal"}
 	steps, reason, detail := verbSteps(name, args, c, cfg)
 	out := map[string]any{"command": name, "client_id": c.clientID, "host_url": c.baseURL}
 	code := 0
@@ -496,6 +515,23 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
 			reason = continuationString(execution, "reason")
 			break
 		}
+		if step.method == "goal.start" {
+			result := cliObject(reply["result"])
+			out["goal"] = map[string]any{"goal_id": result["goal_id"], "goal_revision": result["goal_revision"], "goal_status": result["goal_status"]}
+			if step.payload["start_as_draft"] == true {
+				out["execution"] = map[string]any{"status": "NOT_STARTED", "independent_acceptance": "NOT_EVALUATED"}
+				break
+			}
+			if result["goal_status"] == "DRAFT" {
+				reason, code = "GOAL_NOT_STARTED", exitNotImplemented
+				break
+			}
+			var execution map[string]any
+			execution, code = followCLIExecution(f, cliSnapshot(reply), "", "", after)
+			out["execution"] = execution
+			reason = continuationString(execution, "reason")
+			break
+		}
 	}
 	if reason != "" && len(steps) == 0 {
 		code = exitUsage
@@ -510,6 +546,9 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
 	out["status"], out["exit_code"] = "COMPLETED", code
 	if execution := cliObject(out["execution"]); execution != nil {
 		out["status"] = execution["status"]
+		if execution["status"] == "NOT_STARTED" && code == 0 {
+			out["status"] = "GOAL_DRAFT_CREATED"
+		}
 	} else if code != 0 {
 		out["status"] = "REJECTED"
 	}
