@@ -21,6 +21,9 @@ type Query struct {
 }
 
 type Item struct {
+	ReadLevel string // BODY or INDEX; empty preserves existing full-detail adapters
+	PRState   string // OPEN, CLOSED, MERGED from explicit detail metadata
+
 	SourceID         string
 	CanonicalURL     string
 	UpstreamID       string
@@ -34,6 +37,12 @@ type Item struct {
 }
 
 type Page struct {
+	ObservationMarker string
+	ProviderResult    *ProviderResult
+	AccessScope       string
+	ActualFrom        *time.Time
+	ActualTo          *time.Time
+
 	Items         []Item
 	RequestURLs   []string
 	FinalURLs     []string

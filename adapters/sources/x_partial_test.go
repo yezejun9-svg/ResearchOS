@@ -78,8 +78,8 @@ func TestW0702XGapKeepsPrefixAndResumeCursor(t *testing.T) {
 	if len(p.Items) != 1 || string(p.Items[0].Body) != "Complete public post body" {
 		t.Fatalf("the verified prefix was discarded instead of kept: %d items", len(p.Items))
 	}
-	if p.NextCursor != "observed_tail:2105011808327401000" {
-		t.Fatalf("no resume cursor after a gap, so the window cannot be补齐: %q", p.NextCursor)
+	if p.NextCursor != "" || p.ObservationMarker != "observed_tail:2105011808327401000" {
+		t.Fatalf("observation marker missing or provider cursor invented: %q", p.NextCursor)
 	}
 	if p.ObservedFrom == nil || p.ObservedTo == nil {
 		t.Fatalf("observed span missing on a partial page: %v %v", p.ObservedFrom, p.ObservedTo)
@@ -102,7 +102,7 @@ func TestW0702XGapOnFirstArticleSealsNothingButStillReports(t *testing.T) {
 	if e != nil || p.Failure != "INCOMPLETE_ITEM" || len(p.Items) != 0 || p.Complete {
 		t.Fatalf("an immediately collapsed page produced a usable-looking result: %+v %v", p, e)
 	}
-	if p.NextCursor != "" {
+	if p.NextCursor != "" || p.ObservationMarker != "" {
 		t.Fatalf("a page with nothing complete invented a resume cursor: %q", p.NextCursor)
 	}
 }

@@ -216,11 +216,23 @@ func TestW07HTTPSourceEvidenceAndDurableEmptyWindow(t *testing.T) {
 	if e != nil || len(pending) != eventsBefore+1 {
 		t.Fatal("capture outbox missing", len(pending), e)
 	}
-	if replay, replayErr := f.s.captureSourcePage(context.Background(), token, f.project, current, config, from, to, 20, sourceFixtureAdapter{page}); replayErr != nil || replay.Manifest["id"] != got.Manifest["id"] {
+	if replay, replayErr := f.s.captureSourcePage(context.Background(), token, f.project, current, config, from, to, 20, sourceFixtureAdapter{page}); replayErr != nil || replay.Manifest["id"] != got.Manifest["id"] || replay.HealthArtifact == nil || Hash(Ref(replay.HealthArtifact, "Artifact")) != Hash(Ref(got.HealthArtifact, "Artifact")) {
 		t.Fatal("identical page did not replay its sealed manifest", replayErr)
 	}
-	if countKind(t, f.db, "EventEnvelope") != eventsBefore+1 || countKind(t, f.db, "Artifact") != artifactsBefore+2 {
+	if countKind(t, f.db, "EventEnvelope") != eventsBefore+1 || countKind(t, f.db, "Artifact") != artifactsBefore+3 {
 		t.Fatal("replayed capture duplicated artifacts or events")
+	}
+
+	if got.HealthArtifact == nil || got.HealthArtifact["kind"] != "REPORT" {
+		t.Fatal("sealed health REPORT missing")
+	}
+	var healthBytes []byte
+	if err := f.db.QueryRow("SELECT bytes FROM uploaded_content WHERE project=? AND storage_key=? AND sealed=1", f.project, got.HealthArtifact["storage_key"]).Scan(&healthBytes); err != nil {
+		t.Fatal(err)
+	}
+	healthDoc, err := Decode(healthBytes)
+	if err != nil || Digest(healthBytes) != got.HealthArtifact["content_hash"] || healthDoc["schema"] != sourceHealthSchema || healthDoc["source_id"] != config["source_id"] || healthDoc["query_hash"] != current["query_hash"] || got.Health.Status != "COMPLETE" || got.Health.FullReadCount != 0 {
+		t.Fatal("health identity or empty proof missing", err)
 	}
 	advance["last_success_at"] = Now()
 	var advanced Object

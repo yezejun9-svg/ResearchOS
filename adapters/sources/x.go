@@ -3,6 +3,7 @@ package sources
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os/exec"
@@ -51,7 +52,10 @@ const xPostScript = `JSON.stringify({url:location.href,items:Array.from(document
 // for a complete visible post body. It never inspects account sidebars or XHR
 // authentication headers. UI search cannot certify exhaustive window coverage.
 func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
-	p := Page{RequestedFrom: q.From, RequestedTo: q.To}
+	p := Page{RequestedFrom: q.From, RequestedTo: q.To, AccessScope: "VISIBLE_PUBLIC_POSTS"}
+	actualFrom := time.Date(q.From.UTC().Year(), q.From.UTC().Month(), q.From.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	actualTo := time.Date(q.To.UTC().Year(), q.To.UTC().Month(), q.To.UTC().Day(), 0, 0, 0, 0, time.UTC).Add(24 * time.Hour)
+	p.ActualFrom, p.ActualTo = &actualFrom, &actualTo
 	if !bounded(q) || strings.TrimSpace(q.Text) == "" || len(q.Text) > 120 || a.Runner == nil || a.BrowserID == "" {
 		return p, ErrInvalidQuery
 	}
@@ -59,20 +63,21 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 	searchURL := "https://x.com/search?q=" + url.QueryEscape(query) + "&src=typed_query&f=live"
 	p.RequestURLs = append(p.RequestURLs, searchURL)
 	session := fmt.Sprintf("researchos-w07-%d", time.Now().UnixNano())
-	if _, e := a.Runner.Run(ctx, "--session", session, "browser", "open", a.BrowserID, searchURL); e != nil {
-		p.Failure = "UNAVAILABLE"
-		return p, e
-	}
+
 	defer func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_, _ = a.Runner.Run(cleanup, "session", "close", session)
 	}()
+	if _, e := a.Runner.Run(ctx, "--session", session, "browser", "open", a.BrowserID, searchURL); e != nil {
+		recordBrowserFailure(&p, e)
+		return p, e
+	}
 	// The browser-open acknowledgement can precede X's client-rendered results.
 	_, _ = a.Runner.Run(ctx, "--session", session, "wait", "stable", "--timeout", "15000")
 	search, raw, e := a.eval(ctx, session, xSearchScript)
 	if e != nil {
-		p.Failure = "UNAVAILABLE"
+		recordBrowserFailure(&p, e)
 		return p, e
 	}
 	if search.URL != searchURL {
@@ -120,6 +125,7 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 		// a gap would claim coverage of ground this read never examined.
 		if _, e = a.Runner.Run(ctx, "--session", session, "navigate", candidate.URL); e != nil {
 			p.Failure = "DETAIL_UNAVAILABLE"
+			p.ProviderResult = &ProviderResult{ExitCode: 1, Status: "error", DetailErrors: []string{e.Error()}}
 			break
 		}
 		p.RequestURLs = append(p.RequestURLs, candidate.URL)
@@ -127,6 +133,7 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 		post, _, e := a.eval(ctx, session, xPostScript)
 		if e != nil {
 			p.Failure = "DETAIL_UNAVAILABLE"
+			p.ProviderResult = &ProviderResult{ExitCode: 1, Status: "error", DetailErrors: []string{e.Error()}}
 			break
 		}
 		if post.URL != candidate.URL || len(post.Items) != 1 {
@@ -147,8 +154,9 @@ func (a XBrowser) Fetch(ctx context.Context, q Query) (Page, error) {
 	}
 	p.ObservedFrom, p.ObservedTo = observed(p.Items)
 	if len(p.Items) > 0 {
-		p.NextCursor = "observed_tail:" + p.Items[len(p.Items)-1].UpstreamID
+		p.ObservationMarker = "observed_tail:" + p.Items[len(p.Items)-1].UpstreamID
 	}
+
 	// No complete=true from a visible X UI page: results can be limited or
 	// re-ordered, and there is no durable provider cursor in this channel.
 	return p, nil
@@ -160,6 +168,19 @@ func (a XBrowser) eval(ctx context.Context, session, script string) (xPublicResu
 	if e != nil {
 		return result, nil, e
 	}
+	var envelope struct {
+		ExitCode     int      `json:"exit_code"`
+		Status       string   `json:"status"`
+		DetailError  string   `json:"detail_error"`
+		DetailErrors []string `json:"detail_errors"`
+	}
+	if json.Unmarshal(raw, &envelope) == nil && (envelope.DetailError != "" || len(envelope.DetailErrors) > 0) {
+		details := envelope.DetailErrors
+		if envelope.DetailError != "" {
+			details = append([]string{envelope.DetailError}, details...)
+		}
+		return result, nil, &browserDetailError{ProviderResult{ExitCode: envelope.ExitCode, Status: envelope.Status, DetailErrors: details}}
+	}
 	if len(raw) > 1<<20 {
 		return result, nil, fmt.Errorf("public article extraction too large")
 	}
@@ -167,4 +188,18 @@ func (a XBrowser) eval(ctx context.Context, session, script string) (xPublicResu
 		return result, nil, e
 	}
 	return result, raw, nil
+}
+
+type browserDetailError struct{ result ProviderResult }
+
+func (e *browserDetailError) Error() string { return strings.Join(e.result.DetailErrors, "; ") }
+func recordBrowserFailure(p *Page, err error) {
+	p.Failure = "UNAVAILABLE"
+	var detail *browserDetailError
+	if errors.As(err, &detail) {
+		p.ProviderResult = &detail.result
+		p.Failure = detail.Error()
+	} else if err != nil {
+		p.ProviderResult = &ProviderResult{ExitCode: 1, Status: "error", DetailErrors: []string{err.Error()}}
+	}
 }
