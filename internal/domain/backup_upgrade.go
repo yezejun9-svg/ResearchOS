@@ -243,6 +243,9 @@ func upgradeTemplate(ctx context.Context, sqls [][]byte, contracts *Contracts) (
 }
 
 func upgradeLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (RestoreReport, error) {
+	if opt.Plan == QueueSchemaUpgradePlan {
+		return upgradeQueueLocal(ctx, opt, verifier)
+	}
 	report := RestoreReport{Started: Now(), Status: "FAILED"}
 	targetVersion := 14
 	switch opt.Plan {
