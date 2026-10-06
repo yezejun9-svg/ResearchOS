@@ -5,6 +5,7 @@ import sqlite3
 import hashlib
 import copy
 import os
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
@@ -97,6 +98,81 @@ class ParentGateTests(unittest.TestCase):
             directory = Path(temporary)
             (directory / "fixture.stdout").write_text('{"Action":"pass"}\n', encoding="utf-8")
             self.assertFalse(gate.verify_h07_evidence(directory))
+
+    def test_recorded_h07_relocation_and_forged_paths(self):
+        # Read-only checker replay of retained INJECTED H07 bytes, never a LIVE qualification.
+        relative = Path("execution/v2.4/receipts/W07/W07-99/source_executor_codex/run-8017e0f7e4384703b223c3dbc542a057")
+        recorded = ROOT / relative
+        proof = json.loads((recorded / "proof.json").read_text(encoding="utf-8"))
+        self.assertTrue(gate.verify_h07_evidence(recorded, proof))
+        original_rows = gate.typed_h07_rows(recorded)
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            relocated_root = Path(temporary).resolve()
+            directory = relocated_root / relative
+            directory.mkdir(parents=True)
+            for name in ("fixture.stdout", "fixture.stderr", "h07-assertions.json"):
+                shutil.copyfile(recorded / name, directory / name)
+            shutil.copytree(recorded / "h07-db", directory / "h07-db")
+            with patch.object(gate, "ROOT", relocated_root):
+                opened = []
+                connect = sqlite3.connect
+                def local_only(database, **kwargs):
+                    self.assertIn(directory.as_uri(), database)
+                    self.assertTrue(database.endswith("?mode=ro&immutable=1"))
+                    opened.append(database)
+                    return connect(database, **kwargs)
+                with patch.object(gate.sqlite3, "connect", side_effect=local_only):
+                    self.assertTrue(gate.verify_h07_evidence(directory, proof))
+                self.assertEqual(len(opened), 13)
+                self.assertFalse(gate.verify_h07_evidence(directory))  # No proof means local collection only.
+                for mutation in ("foreign_cwd", "duplicate_invocation", "missing_snapshot", "duplicate_snapshot", "foreign_ref", "changed_digest"):
+                    bad = copy.deepcopy(proof)
+                    inv = bad["h07_invocations"][0]
+                    if mutation == "foreign_cwd": inv["cwd"] = str(relocated_root / "unrelated-root")
+                    elif mutation == "duplicate_invocation": bad["h07_invocations"].append(copy.deepcopy(inv))
+                    elif mutation == "missing_snapshot": inv["db_snapshots"].pop()
+                    elif mutation == "duplicate_snapshot": inv["db_snapshots"].append(copy.deepcopy(inv["db_snapshots"][0]))
+                    elif mutation == "foreign_ref": inv["db_snapshots"][0]["path"] = "../outside.sqlite"
+                    elif mutation == "changed_digest": inv["db_snapshots"][0]["sha256"] = "sha256:" + "0" * 64
+                    with self.subTest(mutation=mutation):
+                        self.assertFalse(gate.verify_h07_evidence(directory, bad))
+
+                # Before a collector writes its proof, only its actual local
+                # snapshot paths are accepted. These remain injected checker inputs.
+                local_rows = copy.deepcopy(original_rows)
+                for row in local_rows:
+                    row["db_snapshot_path"] = str(directory / "h07-db" / Path(row["db_snapshot_path"]).name)
+                (directory / "fixture.stdout").write_text("".join(json.dumps({"Action": "output", "Output": "H07_ASSERTION " + json.dumps(row) + "\n"}) + "\n" for row in local_rows), encoding="utf-8")
+                self.assertTrue(gate.verify_h07_evidence(directory))
+                shutil.copyfile(recorded / "fixture.stdout", directory / "fixture.stdout")
+                snapshot = relocated_root / proof["h07_invocations"][0]["db_snapshots"][0]["path"]
+                original_bytes = snapshot.read_bytes()
+                snapshot.write_bytes(original_bytes + b"tampered checker bytes")
+                self.assertFalse(gate.verify_h07_evidence(directory, proof))
+                snapshot.write_bytes(original_bytes)
+                # Explicit tampered checker inputs with matching hashes exercise the
+                # relocation boundary independently of raw hash mismatch rejection.
+                for mutation in ("outside_row", "row_cwd_override", "duplicate_row", "duplicate_row_path", "unlisted_row", "traversal_row", "unused_snapshot"):
+                    rows = copy.deepcopy(original_rows)
+                    bad = copy.deepcopy(proof)
+                    inv = bad["h07_invocations"][0]
+                    if mutation in {"outside_row", "row_cwd_override"}:
+                        rows[0]["db_snapshot_path"] = str(relocated_root / "foreign" / Path(rows[0]["db_snapshot_path"]).name)
+                        rows[0]["cwd"] = str(relocated_root / "foreign")
+                    elif mutation == "duplicate_row": rows.append(copy.deepcopy(rows[0]))
+                    elif mutation == "duplicate_row_path": rows[0]["db_snapshot_path"] = rows[1]["db_snapshot_path"]
+                    elif mutation == "unlisted_row": rows[0]["db_snapshot_path"] += ".unlisted.sqlite"
+                    elif mutation == "traversal_row": rows[0]["db_snapshot_path"] = str(Path(rows[0]["db_snapshot_path"]).parent / ".." / "h07-db" / Path(rows[0]["db_snapshot_path"]).name)
+                    elif mutation == "unused_snapshot":
+                        extra = directory / "h07-db/extra.sqlite"
+                        shutil.copyfile(directory / Path(inv["db_snapshots"][0]["path"]).relative_to(relative), extra)
+                        inv["db_snapshots"].append(gate.file_ref(extra))
+                    (directory / "fixture.stdout").write_text("".join(json.dumps({"Action": "output", "Output": "H07_ASSERTION " + json.dumps(row) + "\n"}) + "\n" for row in rows), encoding="utf-8")
+                    (directory / "h07-assertions.json").write_text(json.dumps(rows), encoding="utf-8")
+                    inv["stdout_ref"] = gate.file_ref(directory / "fixture.stdout")
+                    inv["assertions_ref"] = gate.file_ref(directory / "h07-assertions.json")
+                    with self.subTest(mutation=mutation):
+                        self.assertFalse(gate.verify_h07_evidence(directory, bad))
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED = {
@@ -412,16 +412,70 @@ def typed_h07_rows(evidence):
     return rows
 
 
-def verify_h07_evidence(evidence):
-    rows={r["id"]:r for r in typed_h07_rows(evidence)}
+def h07_snapshot_paths(evidence, rows, proof):
+    """Map recorded paths using one proof-bound invocation; never open its old cwd."""
+    evidence = evidence.resolve()
+    collection = evidence.relative_to(ROOT.resolve())
+    invocations = proof["h07_invocations"]
+    if len(invocations) != 1 or proof["run_id"] != evidence.name:
+        raise ValueError("one H07 invocation for this collection required")
+    invocation = invocations[0]
+    if invocation.get("measurement_mode") != "INJECTED" or invocation.get("exit_code") != 0 or invocation.get("timed_out") is not False:
+        raise ValueError("successful injected H07 invocation required")
+    for field, name in (("stdout_ref", "fixture.stdout"), ("stderr_ref", "fixture.stderr"), ("assertions_ref", "h07-assertions.json")):
+        if invocation[field] != file_ref(evidence / name):
+            raise ValueError("H07 raw reference differs from this collection")
+    if json.loads((evidence / "h07-assertions.json").read_text(encoding="utf-8")) != rows:
+        raise ValueError("typed assertions differ from original stdout")
+    cwd = invocation["cwd"]
+    flavor = PureWindowsPath if PureWindowsPath(cwd).drive else PurePosixPath
+    original_root = flavor(cwd)
+    if not original_root.is_absolute() or ".." in original_root.parts:
+        raise ValueError("absolute recorded invocation cwd required")
+    original_collection = original_root.joinpath(*collection.parts)
+    snapshots = {}
+    for ref in invocation["db_snapshots"]:
+        relative = PurePosixPath(ref["path"])
+        if relative.is_absolute() or PureWindowsPath(ref["path"]).drive or ".." in relative.parts or "\\" in ref["path"]:
+            raise ValueError("repository-relative snapshot reference required")
+        target = (ROOT / Path(*relative.parts)).resolve()
+        suffix = target.relative_to(evidence)
+        if len(suffix.parts) != 2 or suffix.parts[0] != "h07-db" or target.suffix != ".sqlite" or target in snapshots:
+            raise ValueError("duplicate or foreign H07 snapshot")
+        if ref != file_ref(target):
+            raise ValueError("H07 snapshot bytes changed")
+        snapshots[target] = ref
+    mapped = {}
+    seen = set()
+    for row in rows:
+        recorded = flavor(row["db_snapshot_path"])
+        if not recorded.is_absolute() or ".." in recorded.parts:
+            raise ValueError("absolute captured snapshot path required")
+        suffix = recorded.relative_to(original_collection)
+        target = (evidence / Path(*suffix.parts)).resolve()
+        if target not in snapshots or target in seen:
+            raise ValueError("unlisted or duplicate captured snapshot")
+        seen.add(target)
+        mapped[row["id"]] = target
+    if seen != set(snapshots):
+        raise ValueError("H07 snapshot inventory is not closed")
+    return mapped
+
+
+def verify_h07_evidence(evidence, proof=None):
     expected={"not_configured":"NOT_CONFIGURED","429":"RATE_LIMITED","401_or_revoked":"UNAVAILABLE","timeout":"PARTIAL","empty_valid_result":"COMPLETE","visible_empty":"PARTIAL","index_only":"PARTIAL","pr_open":"COMPLETE","pr_closed_unmerged":"COMPLETE","pr_merged":"COMPLETE"}
-    if not set(expected)|{"cycle_partial","effect_confirmed","effect_unresolved"} <= set(rows): return False
     try:
+        typed_rows = typed_h07_rows(evidence)
+        rows = {r["id"]: r for r in typed_rows}
+        if len(rows) != len(typed_rows) or set(rows) != set(expected)|{"cycle_partial","effect_confirmed","effect_unresolved"}: return False
+        mapped = h07_snapshot_paths(evidence, typed_rows, proof) if proof is not None else None
+        seen = set()
         for name,row in rows.items():
             if row.get("measurement_mode") != "INJECTED" or row.get("db_closed_or_vacuum_snapshot") is not True: return False
-            path=Path(row["db_snapshot_path"]).resolve()
-            if not path.is_relative_to(evidence.resolve()): return False
-            db=sqlite3.connect("file:"+str(path).replace("\\","/")+"?mode=ro",uri=True)
+            path=mapped[name] if mapped is not None else Path(row["db_snapshot_path"]).resolve()
+            if not path.is_relative_to((evidence / "h07-db").resolve()) or path in seen: return False
+            seen.add(path)
+            db=sqlite3.connect(path.as_uri()+"?mode=ro&immutable=1",uri=True)
             try:
                 actual=row["actual"];project=row["project_id"]
                 if name in expected:
@@ -528,7 +582,7 @@ def replay_product_proof(path, task, check, case):
     after=json.loads((ROOT/proof["source_after_ref"]["path"]).read_text(encoding="utf-8"))
     if before!=after or not set(SOURCE_FILES)<=set(before) or any(sha256(ROOT/name)!=digest for name,digest in before.items()): raise ValueError("proof product source drift")
     original=json.loads((path.parent/"report.json").read_text(encoding="utf-8"))
-    if original.get("product_proof_ref")!=file_ref(path) or not fixture_ok(original.get("fixture",{})) or not verify_h07_evidence(path.parent): raise ValueError("missing current fixture and typed H07 evidence")
+    if original.get("product_proof_ref")!=file_ref(path) or not fixture_ok(original.get("fixture",{})) or not verify_h07_evidence(path.parent, proof): raise ValueError("missing current fixture and typed H07 evidence")
     for name,digest in original["raw_hashes"].items():
         if sha256(ROOT/name)!=digest: raise ValueError("raw command output changed")
     vector=json.loads((ROOT/proof["version_vector_ref"]["path"]).read_text(encoding="utf-8"))
