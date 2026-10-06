@@ -98,7 +98,7 @@ func (s *Service) sealSourceHealth(tx *sql.Tx, p Principal, project string, curs
 	if err != nil {
 		return nil, err
 	}
-	return s.seal(tx, p, project, Object{"run_id": nil, "kind": "REPORT", "evidence_kind": "GENERATED", "measurement_mode": "LIVE", "content_hash": u["content_hash"], "storage_key": u["storage_key"], "media_type": "application/vnd.researchos.source-health.v1+json", "byte_size": len(body), "input_refs": []any{Ref(cursor, "SourceCursor"), Ref(profile, "ProjectProfile")}, "source_refs": refs, "produced_by": p.ID, "access_class": "PROJECT"})
+	return s.sealArtifact(tx, p, project, Object{"run_id": nil, "kind": "REPORT", "evidence_kind": "GENERATED", "measurement_mode": "LIVE", "content_hash": u["content_hash"], "storage_key": u["storage_key"], "media_type": "application/vnd.researchos.source-health.v1+json", "byte_size": len(body), "input_refs": []any{Ref(cursor, "SourceCursor"), Ref(profile, "ProjectProfile")}, "source_refs": refs, "produced_by": p.ID, "access_class": "PROJECT"}, true)
 }
 
 func (s *Service) persistSourceHealth(ctx context.Context, token, project string, cursor, config Object, result SourceCapture) (Object, error) {

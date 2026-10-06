@@ -284,6 +284,15 @@ func (s *Service) upload(tx *sql.Tx, p Principal, project string, b []byte) (Obj
 	return Object{"storage_key": key, "content_hash": h, "byte_size": len(b), "expires_at": expiry}, e
 }
 func (s *Service) seal(tx *sql.Tx, p Principal, project string, b Object) (Object, error) {
+	return s.sealArtifact(tx, p, project, b, false)
+}
+
+func (s *Service) sealArtifact(tx *sql.Tx, p Principal, project string, b Object, trustedSourceHealth bool) (Object, error) {
+	// Host capture authority is an internal capability, never a role, producer
+	// name or caller-authored field. Check before upload lookup or artifact reuse.
+	if b["media_type"] == "application/vnd.researchos.source-health.v1+json" && !trustedSourceHealth {
+		return nil, Fail(403, "FORBIDDEN", "source health reports require internal source capture")
+	}
 	if b["produced_by"] != p.ID {
 		return nil, Fail(403, "FORBIDDEN", "producer must be authenticated principal")
 	}
