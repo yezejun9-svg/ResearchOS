@@ -1,0 +1,20 @@
+package evaluation
+import("testing";"fmt";"encoding/json";"os";"path/filepath")
+func independentEvalCheck(t *testing.T,id string,want,got any){t.Helper();fmt.Println("INDEPENDENT_W10 "+string(Bytes(Object{"id":id,"expected":want,"actual":got})));if string(Bytes(want))!=string(Bytes(got)){t.Errorf("%s want%v got%v",id,want,got)}}
+func independentManifest()Manifest{h:=Digest([]byte("frozen"));return Manifest{ProjectID:"p",ExperimentID:"e",RunID:"r",Engine:Object{"name":"NATIVE","version":"review-v1","config_hash":h},DatasetHash:h,CandidateHash:h,BaselineHash:h,RubricHash:h,Expected:[]string{"a","b"}}}
+func TestIndependentEvaluationIntegrity(t *testing.T){
+ m:=independentManifest();yes,no:=true,false;score:=0.99;exit:=0
+ rows:=[]Result{{CaseID:"a",Verdict:"PASS",Hard:&yes,Reason:"completed"},{CaseID:"b",Verdict:"ABSTAIN",Reason:"valid abstention"}}
+ for _,scenario:=range []string{"normal","missing","duplicate","unknown","hard","config","rawhash","rawrows"}{t.Run(scenario,func(t *testing.T){
+  copyRows:=append([]Result{},rows...);observed:=m;observed.Engine=Object{"name":"NATIVE","version":"review-v1","config_hash":m.DatasetHash}
+  want:="COMPLETE"
+  switch scenario{case "missing":copyRows=copyRows[:1];want="INCOMPLETE";case "duplicate":copyRows=append(copyRows,copyRows[0]);want="INVALID";case "unknown":copyRows=append(copyRows,Result{CaseID:"c",Verdict:"PASS",Hard:&yes,Reason:"unexpected"});want="INVALID";case "hard":copyRows[0].Hard=&no;copyRows[0].Score=&score;case "config":observed.Engine["config_hash"]=Digest([]byte("changed"));want="INVALID"}
+  raw:=Bytes(copyRows);hash:=Digest(raw);if scenario=="rawhash"{hash=Digest([]byte("wrong"));want="INVALID"};if scenario=="rawrows"{raw=Bytes([]Result{{CaseID:"a",Verdict:"ERROR",Reason:"provider failure"}});hash=Digest(raw);want="INVALID"}
+  report,e:=Normalize(m,observed,copyRows,raw,hash,&exit,1);if e!=nil{t.Fatal(e)}
+  if dir:=os.Getenv("W10_REVIEW_OUT");dir!=""{os.WriteFile(filepath.Join(dir,"evaluation-"+scenario+".json"),Bytes(Object{"manifest":m,"observed_manifest":observed,"parsed_rows":copyRows,"raw_export":string(raw),"raw_export_hash":hash,"normalized":report}),0600)}
+  independentEvalCheck(t,scenario+"_integrity",want,report["integrity_status"])
+  if scenario=="hard"{independentEvalCheck(t,"high_score_does_not_override_hard_fail","FAIL",report["results"].([]Result)[0].Verdict)}
+  if scenario=="normal"{independentEvalCheck(t,"abstention_denominator_kept",Object{"expected_count":2,"observed_count":2,"pass_count":1,"fail_count":0,"error_count":0,"abstain_count":1,"missing_count":0,"duplicate_count":0},report["counts"]);independentEvalCheck(t,"valid_report_passes",true,Validate(m,report)==nil)}
+  if scenario=="duplicate"||scenario=="unknown"{var changed Object;json.Unmarshal(Bytes(report),&changed);changed["integrity_status"]="COMPLETE";changed["counts"].(map[string]any)["duplicate_count"]=float64(0);e=Validate(m,changed);independentEvalCheck(t,scenario+"_cannot_be_laundered_by_status_and_count_edit",true,e!=nil);if dir:=os.Getenv("W10_REVIEW_OUT");dir!=""{os.WriteFile(filepath.Join(dir,"evaluation-"+scenario+"-laundered.json"),Bytes(Object{"changed_report":changed,"validator_error":fmt.Sprint(e)}),0600)}}
+ })}
+}

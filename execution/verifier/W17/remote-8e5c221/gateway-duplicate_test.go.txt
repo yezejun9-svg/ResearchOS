@@ -1,0 +1,28 @@
+package main
+
+import (
+ "fmt"
+ "net/http"
+ "net/http/httptest"
+ "testing"
+)
+
+func TestIndependentDuplicateTrustHeaders(t *testing.T) {
+ calls := 0
+ upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){calls++; w.WriteHeader(200)}))
+ defer upstream.Close()
+ handler, err := gateway(upstream.URL,"https://reviewed.trycloudflare.com"); if err != nil {t.Fatal(err)}
+ server := httptest.NewServer(handler); defer server.Close()
+ for _, name := range []string{"X-Forwarded-Proto", "Origin"} {
+  request, _ := http.NewRequest("POST",server.URL+"/v1/device-pairings/redeem",nil)
+  request.Host="reviewed.trycloudflare.com"
+  request.Header.Set("X-Forwarded-Proto","https")
+  request.Header.Set("Origin","https://reviewed.trycloudflare.com")
+  request.Header.Set("Content-Type","application/json")
+  if name=="Origin" {request.Header.Add(name,"https://evil.invalid")} else {request.Header.Add(name,"http")}
+  before:=calls
+  response,err:=server.Client().Do(request); if err!=nil {t.Fatal(err)}; response.Body.Close()
+  fmt.Printf("INDEPENDENT_GATEWAY_DUPLICATE header=%s status=%d upstream_calls=%d expected=403/0\n",name,response.StatusCode,calls-before)
+  if response.StatusCode!=403 || calls!=before {t.Errorf("ambiguous %s reached upstream",name)}
+ }
+}

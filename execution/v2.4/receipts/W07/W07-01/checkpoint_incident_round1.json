@@ -1,0 +1,30 @@
+{
+  "artifact": "checkpoint_incident_round1.json",
+  "step_id": "W07-01",
+  "written_by": "qoder-desktop:/root/construction",
+  "written_at": "2026-10-04T13:57:30+00:00",
+  "what_happened": "Registering W07-01 required appending two obligation entries into checkpoint.json's "
+                   "open_obligations_before_next_card array. That array holds 203 mixed entries (dicts and strings) "
+                   "and the file does not round-trip under json.dumps, so the edit had to be text surgery. My insert "
+                   "expression was ',' + join('\\n' + indent + element) - a single leading comma for the whole batch - "
+                   "so the two new entries landed with NO comma between them and checkpoint.json became invalid JSON "
+                   "(Expecting ',' delimiter at the second inserted line) for roughly two minutes.",
+  "how_it_was_repaired": "A textual insert of the missing comma at the exact break, guarded by asserts (the R3 marker "
+                   "occurs exactly once, the character before the newline is a closing quote, the next non-space text "
+                   "begins with the R4 marker), followed by json.loads on the whole file and a re-check that revision "
+                   "140, expected_previous_revision 139 and current_step_id null survived. No restore, no checkout, no "
+                   "reset: nothing that any other writer had done was discarded, and my own intended edits were kept.",
+  "blast_radius": "The broken bytes were never committed - the freeze commit 743bb1ec touched only receipts/W07/W07-01, "
+                   "and the checkpoint's last valid committed state is rev 139 in e745f624. task_packet.py was not run "
+                   "against the broken file before the repair, so no registration decision was made on it.",
+  "rule_this_teaches": "A batch insert needs a separator PER element, not one leading comma. The 旧例 guard for shared "
+                   "append points (assert the key is absent, prove a no-op re-dump reproduces the bytes, compare the "
+                   "untouched remainder) passed here precisely because it refuses to write what it cannot re-parse - "
+                   "the abort happened at the verification read, after both files were on disk, which is the one window "
+                   "the existing guards did not cover. Any future array append must parse the candidate text BEFORE "
+                   "writing it.",
+  "disclosure_why_it_matters": "A concurrent reviewer measures whatever is on disk. Had w0701_verifier_r1 still been "
+                   "running it would have read an unparseable checkpoint, and an unattributed failure would have looked "
+                   "like a product defect. This file exists so the sequence is reconstructable rather than silently "
+                   "corrected."
+}

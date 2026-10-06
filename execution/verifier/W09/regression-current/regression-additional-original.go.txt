@@ -1,0 +1,61 @@
+package domain
+
+import (
+ "context"
+ "fmt"
+ "os"
+ "path/filepath"
+ "strings"
+ "testing"
+ "unicode/utf8"
+ "researchos.local/research-os/internal/store"
+)
+
+// Uses only existing HTTP fixture setup; assertions and scenario are independent.
+func TestVerifierW09OriginChain(t *testing.T){
+ f:=contextFixture(t); base:=verifierW09Base(t)
+ root,err:=f.s.RegisterLocalRoot(context.Background(),f.token,f.project,base);if err!=nil{t.Fatal(err)}
+ capture:=func(rel,body,kind string)(Object,Object){t.Helper();if err:=os.WriteFile(filepath.Join(base,rel),[]byte(body),0600);err!=nil{t.Fatal(err)};return w09LocalEvidence(t,f,root,rel,"The measured rune count is three",kind)}
+ primaryBody:="Original measurement: rune count of A中🙂 is 3"
+ a,primary:=capture("primary.txt",primaryBody,"LOCAL")
+ annotate:=func(ev,a Object,parent,rel string){t.Helper();if err:=f.s.RecordEvidenceOrigin(context.Background(),f.token,f.project,Str(ev,"id"),parent,Str(a,"id"),root,rel);err!=nil{t.Fatal(err)}}
+ annotate(primary,a,"","primary.txt")
+ measurement:=utf8.RuneCountInString("A中🙂");if measurement!=3{t.Fatal(measurement)}
+ exa,experiment:=capture("independent.txt",fmt.Sprintf("Independent execution of Go utf8.RuneCountInString: input A中🙂 result %d",measurement),"EXPERIMENT");annotate(experiment,exa,"","independent.txt")
+ ids:=[]string{Str(primary,"id"),Str(experiment,"id")};var reposts []Object
+ for i:=0;i<4;i++{rel:=fmt.Sprintf("repost%d.txt",i);ra,re:=capture(rel,fmt.Sprintf("Day %d retelling of https://fixture.example/primary.txt; rune count=3",i),"LOCAL");annotate(re,ra,Str(primary,"id"),rel);re=f.read("evidence",Str(re,"id"));if re["origin_evidence_id"]!=primary["id"]||re["independence_key"]!=primary["independence_key"]{t.Fatal("lineage not retained",re)};ids=append(ids,Str(re,"id"));reposts=append(reposts,re)}
+ _,unknown:=capture("unknown.txt",primaryBody,"LOCAL");ids=append(ids,Str(unknown,"id"))
+ simBytes:=[]byte("independent-verifier simulated opinions");su:=f.expect(201,"POST",f.path("/content"),ID(),"",simBytes)
+ sima:=f.expect(201,"POST",f.path("/artifacts"),ID(),f.stateTag(),Object{"run_id":nil,"kind":"SOURCE_SNAPSHOT","evidence_kind":"SIMULATED","measurement_mode":"FIXTURE","content_hash":su["content_hash"],"storage_key":su["storage_key"],"media_type":"text/plain","byte_size":len(simBytes),"input_refs":Empty(),"source_refs":Empty(),"produced_by":f.owner,"access_class":"PROJECT"})
+ for i:=0;i<20;i++{ev:=f.expect(201,"POST",f.path("/evidence"),ID(),f.stateTag(),Object{"claim":"The measured rune count is three","stance":"SUPPORT","evidence_kind":"SIMULATED","source_kind":"SIMULATION","canonical_url":nil,"publisher":nil,"upstream_revision":nil,"published_at":nil,"modified_at":nil,"retrieved_at":Now(),"time_status":"UNKNOWN","snapshot_artifact_ref":Ref(sima,"Artifact"),"locator":fmt.Sprintf("opinion%d",i),"independence_key":Hash(fmt.Sprintf("sim%d",i)),"origin_evidence_id":nil,"discovery_urls":Empty(),"license_status":"UNKNOWN","license_expression":nil});ids=append(ids,Str(ev,"id"))}
+ summary,err:=f.s.EvidenceSupportSummary(context.Background(),f.token,f.project,ids);if err!=nil{t.Fatal(err)}
+ t.Logf("initial=%s",Bytes(summary));if summary["independent_observed_count"]!=2||summary["simulated_count"]!=20||summary["unknown_count"]!=1||len(Arr(summary,"records"))!=27{t.Fatal("independence classification",summary)}
+ leafA,leaf:=capture("second-hop.txt","Second hop quotes https://fixture.example/repost0.txt","LOCAL");annotate(leaf,leafA,Str(reposts[0],"id"),"second-hop.txt")
+ before,err:=f.s.EvidenceSupportSummary(context.Background(),f.token,f.project,[]string{Str(leaf,"id")});if err!=nil||before["independent_observed_count"]!=1{t.Fatal("chain positive control",err,before)}
+ if err=os.Remove(filepath.Join(base,"repost0.txt"));err!=nil{t.Fatal(err)}
+ if _,err=f.s.RefreshLocalSnapshots(context.Background(),f.token,f.project);err!=nil{t.Fatal(err)}
+ after,err:=f.s.EvidenceSupportSummary(context.Background(),f.token,f.project,[]string{Str(leaf,"id")});if err!=nil{t.Fatal(err)}
+ t.Logf("deleted_intermediate=%v leaf_summary=%s",f.read("evidence",Str(reposts[0],"id"))["validity"],Bytes(after))
+ if after["independent_observed_count"]!=0||after["unknown_count"]!=1{t.Error("stale intermediate still certifies derived evidence chain")}
+ if err=os.WriteFile(filepath.Join(base,"primary.txt"),[]byte("primary statement withdrawn"),0600);err!=nil{t.Fatal(err)}
+ after,err=f.s.EvidenceSupportSummary(context.Background(),f.token,f.project,ids);if err!=nil{t.Fatal(err)}
+ t.Logf("primary_changed=%s",Bytes(after));if after["independent_observed_count"]!=1||after["unknown_count"]!=6||len(Arr(after,"records"))!=27{t.Error("primary currentness did not propagate")}
+}
+
+func TestVerifierW09UnicodeFallback(t *testing.T){
+ f:=contextFixture(t);base:=verifierW09Base(t);body:="İ intro\n中文检索 🙂\nthird line needle"
+ if e:=os.WriteFile(filepath.Join(base,"中文.txt"),[]byte(body),0600);e!=nil{t.Fatal(e)}
+ root,e:=f.s.RegisterLocalRoot(context.Background(),f.token,f.project,base);if e!=nil{t.Fatal(e)}
+ a,e:=f.s.CaptureLocalSnapshot(context.Background(),f.token,f.project,root,"中文.txt");if e!=nil{t.Fatal(e)}
+ for _,fallback:=range []bool{false,true}{if fallback{if _,e=f.db.Exec("DROP TABLE retrieval_fts");e!=nil{t.Fatal(e)}};for query,line:=range map[string]string{"中文":"line:2","needle":"line:3"}{q:=Object{"query":query,"snapshot_ids":[]any{a["id"]},"limit":10,"expected_state_revision":f.state()["revision"]};r:=f.expect(200,"POST",f.path("/search"),ID(),"",q);hits:=Arr(r,"hits");if len(hits)!=1{t.Fatal("missing hit",r)};h:=hits[0].(map[string]any);t.Logf("fallback=%v query=%s hit=%s",fallback,query,Bytes(h));if h["locator"]!=line||!strings.Contains(Str(h,"excerpt"),query)||h["artifact_ref"].(map[string]any)["content_hash"]!=a["content_hash"]{t.Fatal("untraceable locator",h)};if fallback&&h["backend"]!="bounded-scan"{t.Fatal("fallback not actual",h)}}}
+}
+
+func TestVerifierW09LegacyIdentityMigration(t *testing.T){
+ db,e:=store.Open(filepath.Join(verifierW09Base(t),"legacy.sqlite"));if e!=nil{t.Fatal(e)};defer db.Close()
+ if e=store.Bootstrap(context.Background(),db,"../../migrations/sqlite/0001_bootstrap.sql");e!=nil{t.Fatal(e)}
+ old,e:=os.ReadFile("../../migrations/sqlite/0007_retrieval.sql");if e!=nil{t.Fatal(e)};if _,e=db.Exec(string(old));e!=nil{t.Fatal(e)}
+ if _,e=db.Exec("INSERT INTO retrieval_roots(project,id,path,revision) VALUES('verifier','root','C:/synthetic-old',4); INSERT INTO schema_migrations(version) VALUES(7)");e!=nil{t.Fatal(e)}
+ if _,e=New(db,"../../spec/v2.0/contracts","../../migrations/sqlite/0002_domain.sql");e!=nil{t.Fatal(e)}
+ var identity string;var revoked,rev int;if e=db.QueryRow("SELECT root_identity,revoked,revision FROM retrieval_roots WHERE project='verifier' AND id='root'").Scan(&identity,&revoked,&rev);e!=nil{t.Fatal(e)}
+ t.Logf("legacy identity=%q revoked=%d revision=%d",identity,revoked,rev);if identity!=""||revoked!=1||rev!=5{t.Fatal("legacy authority survived")}
+}

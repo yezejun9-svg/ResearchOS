@@ -1,0 +1,472 @@
+diff --git "a/D:\\\344\275\234\345\223\201\351\233\206\\ResearchOS\\research-os\\.local\\worktrees\\codex-w0599-command-queue\\execution\\v2.4\\receipts\\W05\\W05-99\\historical_fixture_executor_codex\\w04-transition-candidate-3d1d3c4e-2f7c-493d-b19d-40bd7147543e\\register.py" "b/D:\\\344\275\234\345\223\201\351\233\206\\ResearchOS\\research-os\\.local\\worktrees\\codex-w0599-command-queue\\execution\\v2.4\\receipts\\W05\\W05-99\\historical_fixture_executor_codex\\w04-transition-fix-6a8e4fe3-32d1-4a75-b511-0645edca245a\\register.py"
+index 91f6d9b4..69615482 100644
+--- "a/D:\\\344\275\234\345\223\201\351\233\206\\ResearchOS\\research-os\\.local\\worktrees\\codex-w0599-command-queue\\execution\\v2.4\\receipts\\W05\\W05-99\\historical_fixture_executor_codex\\w04-transition-candidate-3d1d3c4e-2f7c-493d-b19d-40bd7147543e\\register.py"
++++ "b/D:\\\344\275\234\345\223\201\351\233\206\\ResearchOS\\research-os\\.local\\worktrees\\codex-w0599-command-queue\\execution\\v2.4\\receipts\\W05\\W05-99\\historical_fixture_executor_codex\\w04-transition-fix-6a8e4fe3-32d1-4a75-b511-0645edca245a\\register.py"
+@@ -2,8 +2,9 @@
+ 
+ prepare/dry-run audits real existing evidence and writes only immutable plans.
+ apply requires independent authorization bound to that exact plan. Synthetic
+-controls call the pure guards against isolated synthetic documents, never CLI
+-apply or canonical ResearchOS state. Shared validators are loaded unchanged.
++controls exercise guards and registration transactions against isolated synthetic
++documents, never canonical ResearchOS state. Shared validators are
++loaded unchanged; inert provenance providers are explicitly labelled in tests.
+ """
+ import argparse
+ from contextlib import contextmanager
+@@ -16,6 +17,7 @@ import math
+ import os
+ from pathlib import Path, PureWindowsPath
+ import sys
++import subprocess
+ import traceback
+ import uuid
+ 
+@@ -37,6 +39,22 @@ CASES = {"C03": ["C03-01", "C03-02", "C03-03"], "C04": ["C04-01", "C04-02", "C04
+          "A01": ["A01-01", "A01-02", "A01-03", "A01-04"]}
+ GATES = ["W04-G01", "W04-G02", "W04-G03", "W04-H01", "W04-B01"]
+ GROUPS = ("spec_files", "source_files", "input_files", "lock_files", "tool_files")
++HISTORY_SCOPE = {"path": BASE + "integration_codex/historical-purpose-amendment-f996016351e24358973ebd6a8b128e96/scope_amendment.json",
++                 "sha256": "a4a798bd65c082e42def9e434f04627f967a18ee876c7b205d0655b69ee31285"}
++HISTORY_PARENTS_SCOPE = {"path": BASE + "integration_codex/historical-state-second-parent-c378ddf810114a60b314c5f57f5815dd/scope_amendment.json",
++                         "sha256": "3983bd745ace94aaf6f0406fd5e86d14d12f8b5616a832bdd5f68fa25fac1ee6"}
++EXPECTED_OLD = {"path": BASE + "executor_codex/expected.json", "sha256": "075cdf560c9b4e791493218e056325c27010987f6f43242720d25282197f24ce"}
++EXPECTED_MANIFEST = {"path": BASE + "executor_codex/runs/20261005T224949Z-418d17844405/source_snapshot_manifest.json",
++                     "sha256": "98e6c224e47a7a1a9fd28c0a90901aa344f6b79826e45a03a5cca6d9356f2aeb"}
++EXPECTED_COPY = {"path": str(Path(EXPECTED_MANIFEST["path"]).parent / "source_snapshot" / EXPECTED_OLD["path"]).replace("\\", "/"), "sha256": EXPECTED_OLD["sha256"]}
++EXPECTED_VECTOR = {"path": str(Path(EXPECTED_MANIFEST["path"]).parent / "version_vector.json").replace("\\", "/"),
++                   "sha256": "e39862de172e308b0cb5d81d0c6b7b1bb51d6ba19e1f9f2d22e6502fa07120dc"}
++OLD_AUDIT = {"path": BASE + "independent-review-codex-final-20261006-61a0d2e7/audit_result.json", "sha256": "b2ffa00c4f842ba2b1e9f45da5570f86b01970f95a719ebf552b03129baf6e27"}
++OLD_DETAIL = {"path": BASE + "independent-review-codex-round2-20261006-3be14ac9/review_detail.json", "sha256": "f03f6c2fc182e672a64b66c4f86bb61be91b4569a982ae6b6f8bb63f003d4af5"}
++OLD_STATE_SHA = "64ef113e768e530d721977cf10c736d4c285fd9896ba00727871ff449c422760"
++OLD_STATE_COPY = {"path": BASE + "integration_codex/step_state_before_acceptance.json", "sha256": OLD_STATE_SHA}
++OLD_STATE_COMMIT = "f68c83c2918ae25d9811e4e9f703f1a158e143d2"
++COLLECTION_ORDER = "VERIFIED_EXCLUSIVE_RUN_BEFORE_PREPROOF_PREPUBLISH_FINALLY_AFTER_AND_FINAL_EXIT"
+ 
+ 
+ class Refusal(ValueError):
+@@ -141,6 +159,7 @@ class Audit:
+         self.bound_metadata = set()
+         self.external_inputs = {}
+         self.aliases = {}
++        self.historical_observations = []
+ 
+     def bytes(self, ref, historical=False):
+         need(isinstance(ref, dict) and isinstance(ref.get("path"), str) and
+@@ -158,7 +177,10 @@ class Audit:
+             need(historical and key in self.applicability, "HASH_MISMATCH", ref["path"])
+             # Only existing source copies bound by the old immutable graph can
+             # explain an old source version. No raw/JSON/message substitution.
+-            need(source_path(ref["path"]) or ref["path"] == REGISTRY, "OLD_RECEIPT_DRIFT", ref["path"])
++            exact_asset = ref == EXPECTED_OLD and any(
++                item["mapping_ref"] == EXPECTED_MANIFEST and item["snapshot_ref"] == EXPECTED_COPY
++                for item in self.snapshot_bindings.get(key, []))
++            need(source_path(ref["path"]) or ref["path"] == REGISTRY or exact_asset, "OLD_RECEIPT_DRIFT", ref["path"])
+             frozen = self.applicability[key]
+             raw = self.bytes(frozen)
+             need(sha(raw) == ref["sha256"], "HISTORICAL_SOURCE_HASH", ref["path"])
+@@ -181,10 +203,10 @@ class Audit:
+         self.bytes(reference)
+         return strict(raw), reference
+ 
+-    def closure(self, value, historical=False):
++    def closure(self, value, historical=False, parent=None, field=None):
+         if isinstance(value, list):
+             for item in value:
+-                self.closure(item, historical)
++                self.closure(item, historical, parent, field)
+         elif isinstance(value, dict):
+             if isinstance(value.get("path"), str) and isinstance(value.get("sha256"), str):
+                 value = normalized_ref(self.repo, value)
+@@ -199,12 +221,13 @@ class Audit:
+                         self.visited.add(key)
+                         raw = self.bytes(value, historical)
+                         if name.endswith(".json"):
+-                            self.closure(strict(raw), historical)
++                            self.closure(strict(raw), historical, value)
+                 return
+             for ref in mapped_hashes(self.repo, value):
+-                self.closure(ref, historical)
+-            for item in value.values():
+-                self.closure(item, historical)
++                if not (historical and historical_state_observation(self, parent, field, ref)):
++                    self.closure(ref, historical, parent, field)
++            for key, item in value.items():
++                self.closure(item, historical, parent, key)
+ 
+     def finish(self):
+         for name, expected in self.external_inputs.items():
+@@ -244,6 +267,89 @@ def mapped_hashes(repo, value):
+                     yield ref
+ 
+ 
++def historical_state_observation(audit, parent, field, ref):
++    # Exact purpose classification, never a general STATE or JSON fallback.
++    if parent not in (OLD_AUDIT, OLD_DETAIL) or field != "input_hashes" or ref != {"path": STATE, "sha256": OLD_STATE_SHA}:
++        return False
++    parents_scope = audit.doc(HISTORY_PARENTS_SCOPE)
++    independent = audit.doc(parents_scope["independent_scope_ref"])
++    entries = parents_scope["exact_allowed_observation_parents"]
++    need(parents_scope["actor"] == ROOT_ACTOR and parents_scope["prior_root_amendment_ref"] == HISTORY_SCOPE
++         and parents_scope["allowed_source_copy_ref"] == OLD_STATE_COPY
++         and independent["decision"] == "EXACT_PURPOSE_SCOPE_READY"
++         and independent["exact_allowed_observation_parents"] == entries
++         and independent["allowed_source_copy_ref"] == OLD_STATE_COPY
++         and len(entries) == 2 and {object_sha(item["parent_ref"]) for item in entries} == {object_sha(OLD_AUDIT),object_sha(OLD_DETAIL)},
++         "HISTORY_PARENT_SCOPE_BINDING", parents_scope)
++    entry = next(item for item in entries if item["parent_ref"] == parent)
++    need(entry["expected_sha256"] == ref["sha256"] and entry["field_locator"] == "/input_hashes/" + entry["original_path"]
++         and normalized_ref(audit.repo, {"path":entry["original_path"],"sha256":entry["expected_sha256"]}) == ref,
++         "HISTORY_PARENT_TUPLE", entry)
++    ruling = audit.doc(HISTORY_SCOPE)["mutable_state_observation_ruling"]
++    need(ruling["parent_audit_ref"] == OLD_AUDIT and ruling["field"] == field
++         and ruling["historical_sha256"] == ref["sha256"] and ruling["corroboration_ref"] == OLD_STATE_COPY
++         and ruling["first_tracked_commit"] == OLD_STATE_COMMIT, "HISTORY_SCOPE_BINDING", ruling)
++    # Reading the unchanged parent itself is mandatory; no invented old edge.
++    document = audit.doc(parent)
++    input_entries = list(mapped_hashes(audit.repo, document[field]))
++    need(document[field].get(entry["original_path"]) == OLD_STATE_SHA and input_entries.count(ref) == 1
++         and normalized_ref(audit.repo, {"path": ruling["original_path"], "sha256": OLD_STATE_SHA}) == ref,
++         "HISTORY_OBSERVATION_PARENT", parent)
++    raw = audit.bytes(OLD_STATE_COPY)
++    writer = BASE + "integration_codex/accept_parent_codex.py"
++    git_refs = []
++    for name in (OLD_STATE_COPY["path"], writer):
++        argv = ["git", "--no-replace-objects", "-c", "core.longpaths=true", "-C", str(audit.repo), "show", OLD_STATE_COMMIT + ":" + name]
++        git_env = {key:value for key,value in os.environ.items() if not key.upper().startswith("GIT_")}
++        run = subprocess.run(argv, cwd=audit.repo.anchor, env=git_env, capture_output=True, check=False)
++        need(run.returncode == 0, "HISTORY_GIT_PROVENANCE", name)
++        actual = path_in(audit.repo, name).read_bytes()
++        need(actual == run.stdout, "HISTORY_GIT_PROVENANCE", name)
++        audit.bytes({"path": name, "sha256": sha(actual)})
++        git_refs.append({"argv": argv, "exit_code": run.returncode, "blob_sha256": sha(run.stdout), "stderr_sha256": sha(run.stderr)})
++        if name == writer:
++            text = actual.decode("utf-8")
++            need("state_raw, cp_raw = state_path.read_bytes(), cp_path.read_bytes()" in text
++                 and "('step_state_before_acceptance.json',state_raw)" in text
++                 and "with (HERE/name).open('xb') as stream: stream.write(raw_before)" in text,
++                 "HISTORY_WRITER_PROVENANCE", writer)
++    need(sha(raw) == OLD_STATE_SHA, "HISTORY_COPY_HASH", OLD_STATE_COPY)
++    observation = {"classification": "HISTORICAL_READ_OBSERVATION_WITH_NEW_TRANSITION_CORROBORATION",
++        "parent_audit_ref": parent, "field": field, "original_ref": ref,
++        "additional_corroboration_ref": OLD_STATE_COPY, "scope_amendment_ref": HISTORY_SCOPE,
++        "exact_parent_scope_ref": HISTORY_PARENTS_SCOPE, "field_locator": entry["field_locator"],
++        "git_provenance": git_refs, "original_review_bound_copy": False,
++        "current_state_cas_substitute": False}
++    if observation not in audit.historical_observations:
++        audit.historical_observations.append(observation)
++    return True
++
++
++def historical_manifest_vector(audit, manifest, ref):
++    need(manifest.get("unavailable_originals") == [], "OLD_SOURCE_SNAPSHOT", ref)
++    if ref == EXPECTED_MANIFEST:
++        need(manifest.get("schema") == "researchos.failed-source-snapshot.v1"
++             and manifest.get("source_vector_sha256") == EXPECTED_VECTOR["sha256"], "EXACT_EARLIER_SOURCE_VECTOR", ref)
++        vector_ref = EXPECTED_VECTOR
++    else:
++        need(manifest.get("schema") == "researchos.execution-source-snapshot.v1", "OLD_SOURCE_SNAPSHOT", ref)
++        vector_ref = manifest["version_vector_ref"]
++    return audit.doc(vector_ref)
++
++
++def historical_expected_mapping(audit, original, frozen, binding):
++    if original != EXPECTED_OLD or frozen != EXPECTED_COPY or binding != EXPECTED_MANIFEST:
++        return False
++    ruling = audit.doc(HISTORY_SCOPE)["source_asset_ruling"]
++    need(ruling["permitted_exact_original_ref"] == original
++         and ruling["required_exact_old_mapping_manifest_ref"] == binding
++         and ruling["permitted_exact_snapshot_ref"] == frozen, "HISTORY_ASSET_SCOPE", original)
++    vector = historical_manifest_vector(audit, audit.doc(binding), binding)
++    need(original in vector["source_files"], "HISTORY_ASSET_SOURCE_VECTOR", original)
++    audit.bytes(frozen)
++    return True
++
++
+ def discover_historical_snapshots(audit, roots):
+     """First follow immutable JSON only, then validate every source normally.
+ 
+@@ -253,10 +359,10 @@ def discover_historical_snapshots(audit, roots):
+     or differing bytes refuse. The plan records every actual mapping document.
+     """
+     seen, bindings = set(), {}
+-    def walk(value, binding=None):
++    def walk(value, binding=None, field=None):
+         if isinstance(value, list):
+             for item in value:
+-                walk(item, binding)
++                walk(item, binding, field)
+         elif isinstance(value, dict):
+             if value.get("schema") == "researchos.root-registration-integrity-repair.v1":
+                 need(binding == {"path": BASE + "integration_codex/registration_repair_source_codex.json",
+@@ -273,7 +379,8 @@ def discover_historical_snapshots(audit, roots):
+                                                         "kind": "PRE_ACCEPTANCE_SOURCE_REPAIR_HISTORY"})
+             if "original_ref" in value and "snapshot_ref" in value:
+                 original, frozen = value["original_ref"], value["snapshot_ref"]
+-                if source_path(original["path"]):
++                exact_asset = historical_expected_mapping(audit, original, frozen, binding)
++                if source_path(original["path"]) or exact_asset:
+                     need(binding is not None and original["path"] != frozen["path"]
+                          and frozen["path"].startswith(BASE) and original["sha256"] == frozen["sha256"],
+                          "OLD_SOURCE_SNAPSHOT_BINDING", value)
+@@ -288,6 +395,10 @@ def discover_historical_snapshots(audit, roots):
+                 if value is None:
+                     return
+                 name = value["path"]
++                if value == EXPECTED_OLD:
++                    # Source-asset discovery only. Closure later requires the
++                    # exact old bound manifest mapping; this grants no fallback.
++                    return
+                 if name == REGISTRY or not name.startswith(("execution/", ".local/", "spec/")) or not name.endswith(".json"):
+                     return
+                 key = (name, value["sha256"])
+@@ -298,10 +409,14 @@ def discover_historical_snapshots(audit, roots):
+                     walk(document, value)
+                 return
+             for ref in mapped_hashes(audit.repo, value):
+-                walk(ref, binding)
+-            for child in value.values():
+-                walk(child, binding)
++                if not historical_state_observation(audit, binding, field, ref):
++                    walk(ref, binding, field)
++            for key, child in value.items():
++                walk(child, binding, key)
+     walk(roots)
++    if (EXPECTED_OLD["path"], EXPECTED_OLD["sha256"]) in bindings:
++        need((EXPECTED_VECTOR["path"], EXPECTED_VECTOR["sha256"]) in audit.bound_metadata,
++             "OLD_BOUND_SOURCE_VECTOR_MISSING", EXPECTED_VECTOR)
+     for key, entries in bindings.items():
+         # Same path with different spellings/aliases is rejected by path_in;
+         # each selected copy and each corroborating copy has been hash checked.
+@@ -441,10 +556,9 @@ def historical(audit, freeze):
+     need(manifests, "OLD_BOUND_SOURCE_MANIFEST_MISSING", "No new source copies can repair the old chain")
+     for snapshot, snapshot_ref in manifests:
+         run_dir = Path(snapshot_ref["path"]).parent.as_posix()
+-        need(snapshot["schema"] == "researchos.execution-source-snapshot.v1" and snapshot["unavailable_originals"] == [], "OLD_SOURCE_SNAPSHOT", snapshot_ref)
+         # Each historical manifest must cover its own actually bound vector.
+         # The earlier repaired run must never be relabelled the final run.
+-        vector = audit.doc(snapshot["version_vector_ref"])
++        vector = historical_manifest_vector(audit, snapshot, snapshot_ref)
+         manifest_expected = {(r["path"], r["sha256"]) for group in GROUPS for r in vector[group]}
+         mapped = {}
+         for item in snapshot["snapshots"]:
+@@ -479,6 +593,7 @@ def historical(audit, freeze):
+             "product_source_differences": [item for item in audit.drifts if (item["path"], item["old_sha256"]) in expected and not item["path"].startswith("execution/")],
+             "shared_tool_source_differences": [item for item in audit.drifts if item["path"].startswith("execution/") and source_path(item["path"])],
+             "pre_acceptance_repair_history_refs": [{"path": name, "sha256": digest} for name, digest in sorted(audit.bound_metadata) if "registration_repair" in name or "registration-repair" in name],
++            "historical_mutable_observations": deepcopy(audit.historical_observations),
+             "snapshot_ref": manifests[0][1], "all_bound_snapshot_refs": [ref for _, ref in manifests], "registered_pass_ref": OLD_REGISTERED}
+ 
+ 
+@@ -592,6 +707,10 @@ def scope(audit):
+          and assignment["executor_namespace"] == BASE + "executor_revalidation_codex/"
+          and len({assignment[k].casefold() for k in ("executor_id", "reviewer_id", "root_id")}) == 3, "ACTOR_ASSIGNMENT", assignment)
+     amendment = audit.doc(AMENDMENT)
++    history_scope = audit.doc(HISTORY_SCOPE)
++    audit.doc(HISTORY_PARENTS_SCOPE)
++    need(history_scope.get("registered_by") == ROOT_ACTOR and history_scope.get("helper_requires_independent_fix_review") is True,
++         "HISTORY_SCOPE_AUTHORIZATION", history_scope)
+     need(amendment["parent_scope_ref"] == registration["review_ref"]
+          and amendment["decision"] == "PROTOCOL_SCOPE_READY_PENDING_IMPLEMENTATION_REVIEW", "RESOLVER_SCOPE", amendment)
+     return registration, review, assignment
+@@ -699,11 +818,50 @@ def collection_completion(audit, completion_ref, new, assignment):
+     result = strict(stdout)
+     need(result["status"] == "EXECUTED_PENDING_INDEPENDENT_REVIEW" and result["execution_index"] == index_ref
+          and Path(result["run"]).resolve() == audit.repo / run_dir, "COLLECTOR_STDOUT_RUN", result)
+-    need(new["review"].get("collection_completion_ref") == completion_ref
+-         and new["review"].get("collection_source_order_review") == "VERIFIED_EXCLUSIVE_RUN_BEFORE_PREPROOF_PREPUBLISH_FINALLY_AFTER_AND_FINAL_EXIT",
+-         "COLLECTION_INDEPENDENT_REVIEW", new["review"])
++    sidecar_ref = collection_review(audit, completion_ref, completion, new, assignment, outer)
+     audit.closure(completion_ref)
+-    return completion
++    return {"completion": completion, "sidecar_ref": sidecar_ref}
++
++
++def collection_review(audit, completion_ref, completion, new, assignment, outer):
++    review = new["review"]
++    need("collection_completion_ref" not in review and "collection_source_order_review" not in review,
++         "V1_UNKNOWN_FIELD", "Collection attestation belongs in legal semantic raw evidence")
++    sidecars = []
++    rows = review.get("owned_case_verdicts", [])
++    need(len(rows) == 3 and {row["case_id"] for row in rows} == set(CASES), "COLLECTION_SIDECAR_BINDING", "all case verdicts")
++    for row in rows:
++        found = []
++        for raw_ref in row["semantic_review"]["raw_evidence_refs"]:
++            if raw_ref.get("locator") != {"json_pointer": "/collection_source_order_review"}:
++                continue
++            need(set(raw_ref) == {"path", "sha256", "locator"}, "COLLECTION_SIDECAR_BINDING", raw_ref)
++            ref = {key: raw_ref[key] for key in ("path", "sha256")}
++            need(ref["path"].startswith(BASE + "independent_revalidation_codex/"), "COLLECTION_SIDECAR_NAMESPACE", ref)
++            found.append(ref)
++        need(len(found) == 1, "COLLECTION_SIDECAR_BINDING", row["case_id"])
++        sidecars += found
++    need(all(ref == sidecars[0] for ref in sidecars), "COLLECTION_SIDECAR_BINDING", sidecars)
++    ref = sidecars[0]
++    sidecar = audit.doc(ref)
++    fields = {"schema", "scope", "task_id", "step_id", "reviewer_id", "executor_id", "issued_at", "current_context_ref",
++              "execution_index_ref", "collection_completion_ref", "run_id", "capture_refs", "collector_source_refs",
++              "outer_invocation_ref", "collection_source_order_review"}
++    need(set(sidecar) == fields and sidecar["schema"] == "researchos.w04.collection-independent-attestation.v1"
++         and sidecar["scope"] == "INDEPENDENT_COLLECTION_ORDER_AND_COMPLETION" and sidecar["task_id"] == "W04"
++         and sidecar["step_id"] == "W04-99", "COLLECTION_SIDECAR_SHAPE", sidecar)
++    need(sidecar["reviewer_id"] == assignment["reviewer_id"] == review["verifier_id"]
++         and sidecar["executor_id"] == assignment["executor_id"] == review["executor_id"]
++         and sidecar["reviewer_id"] not in {sidecar["executor_id"], ROOT_ACTOR}, "COLLECTION_SIDECAR_ACTOR", sidecar)
++    need(sidecar["current_context_ref"] == review["current_context_ref"]
++         and sidecar["execution_index_ref"] == new["context"]["execution_index"] == review["evidence_index_ref"]
++         and sidecar["collection_completion_ref"] == completion_ref and sidecar["run_id"] == new["index"]["run_id"]
++         and all(sidecar[key] == completion[key] for key in ("capture_refs", "collector_source_refs", "outer_invocation_ref")),
++         "COLLECTION_SIDECAR_TUPLE", sidecar)
++    need(sidecar["collection_source_order_review"] == COLLECTION_ORDER, "COLLECTION_SIDECAR_ORDER", sidecar)
++    need(at(outer["ended_at"]) <= at(sidecar["issued_at"]) <= at(review["issued_at"]), "COLLECTION_SIDECAR_TIME", sidecar)
++    audit.closure(ref)
++    return ref
+ 
+ 
+ def audit_inputs(repo, roots, out, prefix, collection_ref):
+@@ -714,7 +872,7 @@ def audit_inputs(repo, roots, out, prefix, collection_ref):
+     current_raw = path_in(repo, STATE).read_bytes()
+     full_state_cas(current_raw, sha(current_raw), old["owner"])
+     new = delivery_chain(audit, roots, assignment=assignment)
+-    collection_completion(audit, collection_ref, new, assignment)
++    new["collection_review_ref"] = collection_completion(audit, collection_ref, new, assignment)["sidecar_ref"]
+     actual_message(new["message"], assignment["reviewer_id"], [roots["review"]["sha256"]])
+     need(at(new["review"]["issued_at"]) <= at(new["message"]["received_at"]) <= at(new["issuance"]["observed_at"]), "NEW_ACTUAL_DELIVERY_TIME", new["message"])
+     differences = require_changed(old["chain"]["context"], new["context"], old["chain"]["review"], new["review"])
+@@ -734,7 +892,7 @@ def source_approval(audit, review_ref, message_ref, assignment):
+     need(review.get("helper_sha256") == sha(Path(__file__).read_bytes())
+          and review.get("tests_sha256") == sha(Path(__file__).with_name("test_register.py").read_bytes()), "SOURCE_APPROVAL_HASH", review)
+     controls = audit.doc(review["controls_ref"])
+-    need(controls["scope"] == "SYNTHETIC_NOT_PRODUCT" and controls["tests_run"] >= 13
++    need(controls["scope"] == "SYNTHETIC_NOT_PRODUCT" and controls["tests_run"] >= 22
+          and controls["failures"] == controls["errors"] == controls["skipped"] == 0
+          and controls["source_ref"]["sha256"] == review["helper_sha256"]
+          and controls["tests_sha256"] == review["tests_sha256"], "SOURCE_CONTROLS", controls)
+@@ -753,7 +911,7 @@ def prepare(repo, out, roots, source_review_ref, source_message_ref, collection_
+     source_approval(audit, source_review_ref, source_message_ref, assignment)
+     graph = {"schema": "researchos.w04.old-graph-manifest.v1", "historical_files": old["graph_hashes"],
+              "permitted_applicability_differences": old["applicability_observations"], "old_registered_pass_ref": old["registered_pass_ref"],
+-             **{key: old[key] for key in ("snapshot_mapping_refs", "product_source_differences", "shared_tool_source_differences", "pre_acceptance_repair_history_refs")}}
++             **{key: old[key] for key in ("snapshot_mapping_refs", "product_source_differences", "shared_tool_source_differences", "pre_acceptance_repair_history_refs", "historical_mutable_observations")}}
+     save(out / "old_graph_manifest.json", graph)
+     archive = {"schema": "researchos.w04.historical-acceptance-archive.v1", "scope": "HISTORICAL_ONLY_NOT_CURRENT_ROOT",
+                "owner": old["owner"], "roots": old["roots"], "nonroots": old["nonroots"], "original_evidence": old["owner"]["evidence"],
+@@ -774,7 +932,9 @@ def prepare(repo, out, roots, source_review_ref, source_message_ref, collection_
+             "created_at": now(), "actor": ROOT_ACTOR, "resolver": RESOLVER, "invariants": INVARIANTS,
+             "scope_ref": {"path": SCOPE_DIR + "scope_registration.json", "sha256": SCOPE_SHA}, "amendment_ref": AMENDMENT,
+             "source_review_ref": source_review_ref, "source_review_message_ref": source_message_ref,
+-            "collection_completion_ref": collection_ref, "external_compiled_input_hashes": dict(audit.external_inputs),
++            "collection_completion_ref": collection_ref, "collection_review_ref": new["collection_review_ref"],
++            "historical_purpose_scope_ref": HISTORY_SCOPE, "historical_state_parent_scope_ref": HISTORY_PARENTS_SCOPE,
++            "external_compiled_input_hashes": dict(audit.external_inputs),
+             "assignment_ref": {"path": SCOPE_DIR + "actor_assignment.json", "sha256": ASSIGNMENT_SHA},
+             "expected_full_state_sha256": sha(state_raw), "latest_state_ref": reference(repo, out / "latest_state.original.json"),
+             "old_row": old["owner"], "old_row_sha256": object_sha(old["owner"]), "old_roots": old["roots"],
+@@ -790,7 +950,7 @@ def prepare(repo, out, roots, source_review_ref, source_message_ref, collection_
+     return {"status": "PLAN_ONLY_PENDING_INDEPENDENT_REVIEW", "plan_ref": reference(repo, out / "transition_plan.json"), "formal_acceptance_delta": 0}
+ 
+ 
+-def verify_plan_current(audit, plan, old, new, assignment, differences):
++def verify_plan_current(audit, plan, old, new, assignment, differences, committed=None):
+     need(plan["schema"] == "researchos.w04.explicit-applicability-transition-plan.v1" and plan["resolver"] == RESOLVER
+          and plan["invariants"] == INVARIANTS and plan["scope_ref"]["sha256"] == SCOPE_SHA and plan["amendment_ref"] == AMENDMENT,
+          "PLAN_PROTOCOL", plan)
+@@ -804,12 +964,22 @@ def verify_plan_current(audit, plan, old, new, assignment, differences):
+     need(plan["helper_ref"] == reference(audit.repo, Path(__file__).resolve()) and
+          plan["tests_ref"] == reference(audit.repo, Path(__file__).resolve().with_name("test_register.py")), "HELPER_CHANGED", "helper/tests raw SHA")
+     source_approval(audit, plan["source_review_ref"], plan["source_review_message_ref"], assignment)
+-    collection_completion(audit, plan["collection_completion_ref"], new, assignment)
++    collection = collection_completion(audit, plan["collection_completion_ref"], new, assignment)
++    need(collection["sidecar_ref"] == plan["collection_review_ref"] and plan["historical_purpose_scope_ref"] == HISTORY_SCOPE
++         and plan["historical_state_parent_scope_ref"] == HISTORY_PARENTS_SCOPE,
++         "PLAN_COLLECTION_HISTORY_BINDING", plan)
+     need(audit.external_inputs == plan["external_compiled_input_hashes"], "COMPILED_EXTERNAL_DRIFT", "actual external dependencies")
+     need(plan["applicability_differences"] == differences and plan["case_actual_message_ref"] == new["issuance"]["message_ref"]
+          and plan["registry_snapshot_ref"] == new["context"]["registry_snapshot_ref"], "PLAN_GRAPH_CHANGED", plan)
++    own_write = authenticate_committed_state(audit, *committed) if committed is not None else None
++    if own_write is not None:
++        need(own_write["plan"] == plan, "OWN_WRITE_PLAN_BINDING", "signed plan bytes")
+     for name, expected_hash in plan["input_hashes"].items():
+-        audit.bytes({"path": name, "sha256": expected_hash})
++        if name == STATE and own_write is not None:
++            need(expected_hash == own_write["before"] == plan["expected_full_state_sha256"], "OWN_WRITE_INPUT_BINDING", name)
++            audit.bytes({"path": name, "sha256": own_write["after"]})
++        else:
++            audit.bytes({"path": name, "sha256": expected_hash})
+     need(sha((audit.repo / REGISTRY).read_bytes()) == plan["registry_sha256"], "NEEDS_REVALIDATION", "registry binding changed")
+     audit.finish()
+ 
+@@ -867,6 +1037,48 @@ def verify_commit_row(plan, plan_ref, commit, intent, actual_row):
+     need(actual_row["accepted_at"] == intent["actual_apply_time"] == commit["actual_apply_time"], "COMMIT_TIME_BINDING", commit)
+ 
+ 
++def authenticate_intent_state(audit, plan_ref, intent_ref):
++    plan, intent = audit.doc(plan_ref), audit.doc(intent_ref)
++    need(intent.get("schema") == "researchos.w04.transition-pending-intent.v1"
++         and intent.get("target") == STATE and intent.get("project_id") == PROJECT
++         and intent.get("actor") == ROOT_ACTOR and intent.get("plan_ref") == plan_ref
++         and intent.get("resolver") == RESOLVER, "OWN_WRITE_INTENT", intent)
++    directory = Path(intent_ref["path"]).parent
++    for key in ("original_state_ref", "desired_state_ref", "resolved_row_raw_ref"):
++        need(Path(intent[key]["path"]).parent == directory, "OWN_WRITE_BACKUP_SCOPE", key)
++    original, desired = audit.bytes(intent["original_state_ref"]), audit.bytes(intent["desired_state_ref"])
++    original_doc = full_state_cas(original, plan["expected_full_state_sha256"], plan["old_row"])
++    need(audit.bytes(plan["latest_state_ref"]) == original, "OWN_WRITE_ORIGINAL_PLAN", intent)
++    row = intent["resolved_row"]
++    need(object_sha(row) == intent["resolved_row_sha256"] and intent["actual_apply_time"] == row["accepted_at"]
++         and audit.bytes(intent["resolved_row_raw_ref"]) == encoded(row), "OWN_WRITE_ROW_HASH", intent)
++    verify_resolved(plan["stable_row"], row, plan_ref, intent["lower_time_bound"])
++    expected = deepcopy(original_doc)
++    expected["steps"] = [row if item["id"] == "W04-99" else item for item in expected["steps"]]
++    need(desired == encoded(expected), "OWN_WRITE_EXACT_STATE", "only exact resolved row may change; all top-level fields and other owners preserved")
++    need(path_in(audit.repo, STATE).read_bytes() == desired, "OWN_WRITE_CURRENT_STATE", STATE)
++    prior = audit.observed.get(STATE)
++    need(prior in (None, sha(original), sha(desired)), "OWN_WRITE_PRIOR_STATE", prior)
++    # The sole permitted old->new observation update is authenticated above.
++    audit.observed[STATE] = sha(desired)
++    return {"before":sha(original), "after":sha(desired), "plan":plan, "intent":intent, "row":row}
++
++
++def authenticate_committed_state(audit, plan_ref, commit_ref):
++    commit = audit.doc(commit_ref)
++    need(commit.get("schema") == "researchos.w04.explicit-transition-commit.v1"
++         and commit.get("status") == "REGISTERED_PENDING_INDEPENDENT_FINAL_ROW_AUDIT"
++         and commit.get("plan_ref") == plan_ref, "OWN_WRITE_COMMIT", commit)
++    need(Path(commit["intent_ref"]["path"]).parent == Path(commit_ref["path"]).parent, "OWN_WRITE_COMMIT_SCOPE", commit)
++    bound = authenticate_intent_state(audit, plan_ref, commit["intent_ref"])
++    verify_commit_row(bound["plan"], plan_ref, commit, bound["intent"], bound["row"])
++    need(commit["before_state_sha256"] == bound["before"] and commit["after_state_sha256"] == bound["after"], "COMMIT_STATE_HASH", commit)
++    for key in ("transition_review_ref", "transition_message_ref", "case_message_ref"):
++        need(commit[key] == bound["intent"][key], "OWN_WRITE_AUTHORIZATION_BINDING", key)
++    need(commit["case_message_ref"] == bound["plan"]["case_actual_message_ref"], "OWN_WRITE_CASE_MESSAGE", commit)
++    return bound
++
++
+ def apply(repo, out, plan_ref, review_ref, message_ref):
+     audit = Audit(repo)
+     plan = audit.doc(plan_ref)
+@@ -909,9 +1121,7 @@ def apply(repo, out, plan_ref, review_ref, message_ref):
+     recheck = public.recheck_inputs(derived["dependency_snapshot"])
+     save(out / "registered-input-recheck.json", recheck)
+     need(recheck["status"] == "PASS", "NEEDS_REVALIDATION", recheck)
+-    # The old full-state hash was checked at the mutation boundary; after our
+-    # write it is intentionally different. All non-state hashes remain pinned.
+-    checked.observed.pop(STATE, None)
++    authenticate_intent_state(checked, plan_ref, reference(repo, out / "pending_intent.json"))
+     checked.finish()
+     need((repo / STATE).read_bytes() == desired, "POSTCOMMIT_FULL_STATE_CAS", STATE)
+     receipt = {"schema": "researchos.w04.explicit-transition-commit.v1", "status": "REGISTERED_PENDING_INDEPENDENT_FINAL_ROW_AUDIT",
+@@ -951,11 +1161,11 @@ def verify_registered(repo, out, commit_ref):
+     desired = audit.doc(intent["desired_state_ref"])
+     need(sha(audit.bytes(intent["original_state_ref"])) == commit["before_state_sha256"]
+          and sha(audit.bytes(intent["desired_state_ref"])) == commit["after_state_sha256"], "COMMIT_STATE_HASH", commit)
+-    need([r for r in original["steps"] if r["id"] != "W04-99"] == [r for r in desired["steps"] if r["id"] != "W04-99"], "COMMIT_FOREIGN_ROW_CHANGED", commit)
++    authenticate_committed_state(audit, plan_ref, commit_ref)
+     old = historical(audit, audit.doc(assignment["old_owner_ref"]))
+     new = delivery_chain(audit, plan["new_roots"], assignment=assignment)
+     differences = require_changed(old["chain"]["context"], new["context"], old["chain"]["review"], new["review"])
+-    verify_plan_current(audit, plan, old, new, assignment, differences)
++    verify_plan_current(audit, plan, old, new, assignment, differences, committed=(plan_ref, commit_ref))
+     review_ref, message_ref = commit["transition_review_ref"], commit["transition_message_ref"]
+     review, message = audit.doc(review_ref), audit.doc(message_ref)
+     authorization(review, plan_ref, plan, message, review_ref, assignment["reviewer_id"])

@@ -1,0 +1,21 @@
+22:| rename / archive | `session.update` | 修改展示元数据；archive 不代表取消或完成 |
+44:| `native.workspace.choose` | NativeWorkspaceChooseRequest → NativeWorkspaceChooseResult | Desktop 使用系统目录选择器；CLI 的显式 `init <path>` 或交互确认提供路径。宿主解析真实路径、junction/symlink、访问范围，生成 5 分钟有效、绑定本机主体/client 的单次 selection_ref。取消选择不产生授权。 |
+47:凭据原值只能短暂存在于输入控件、受信 IPC 和宿主凭据存储。提交/失败/取消均清空输入；不得进入 CommandEnvelope、command journal、事件、Artifact、会话、遥测或日志。验证错误不回显原值。没有“读取秘密”接口；普通响应只返回引用和 AVAILABLE/MISSING/REVOKED 状态。引用撤销后新调用失败，不能自动从其他项目借密钥。
+76:| session.control | ControlPayload | ControlResult | PAUSE/RESUME/CANCEL；target 必须属于当前 session 的 Goal/Run |
+92:`host.configure` 不携带凭据原值。未提供 session_id 时只更新新会话默认配置，已有会话保留固定 model_config_ref。提供 session_id 时还必须提供 project_id、expected_revision、writer_epoch；宿主只在相关运行已 settled 后更新当前会话配置，忙时返回 SESSION_BUSY。历史 Run 保留原配置/模型版本，下一次运行才用新版本；绝不由失败降级静默换成另一模型。
+116:- ACKNOWLEDGED：请求已持久接收，result 为 PendingResult，后续通过同命令重放、会话事件和快照对账；不能显示完成。
+120:幂等存储键包含主体和 command_id，存规范化完整请求 hash、接收/完成状态及响应。相同键相同请求重放原状态/结果；不同请求返回 COMMAND_ID_CONFLICT。旧 epoch 的已执行命令可以读取原回执，但不能再次执行；未执行的旧 epoch 请求拒绝。transport 断开或客户端超时不能自动把未知结果当失败后新建命令重试。
+124:## 5. 单写入者、取消、恢复和重放
+137:2. 无 writer 且无未决工具时可直接授予；请求者已是当前 writer 时只续租。同主体其他客户端仍持有有效 writer 时，宿主受理显式接管请求，返回 ACKNOWLEDGED，目标客户端继续只读。
+138:3. 若源端正在运行，先暂停新派发，在安全点等待当前工具/子进程 settled 并持久保存检查点。保留原 Goal/Task、工作成果和未消费 follow-up 队列；接管自身不调用业务 CANCEL、不删除队列、不新开一个写入 Agent。
+140:5. 并发输家、过期快照或中途发生影响交接的版本变化返回 WRITER_BUSY 或 VERSION_CONFLICT；不得自动替换 revision 重试。无法确认 settled 时不提交转移，保留可见的待处理/阻塞及原归属，不隐式取消来制造成功。
+141:6. 等待期间用户主动 CANCEL 仍服从原控制权和停止链，其优先级高于接管/自动续跑。后续即使合法转移控制权，也不能复活 CANCELLED Run 或清除 resume_requires_explicit_user。
+145:owner 失联/过期不能证明其工具已停止。若仍有活动运行，显式接管先请求原运行在安全点暂停，并核对工具/队列已 settled；未确认前保留只读、返回 ACKNOWLEDGED 或 CANCEL_UNCONFIRMED，不能给新 owner 启动第二个 Agent。宿主自身崩溃后先按原 Run/checkpoint/副作用账本对账，再递增 epoch。旧工具回报保留审计但不能覆盖新版本。
+151:PAUSE 停止派发新工具并在可中断点保存检查点；有不可中断工具时显示等待，不伪报暂停。CANCEL 清理本任务队列、取消活动工具及子进程，并记录 cancel_requested_at；只有实际确认后填 cancel_confirmed_at/settled_at。无法确认返回可追踪待处理/阻塞，不能把父进程退出当取消成功。
+153:RESUME 只允许当前有效暂停/恢复上下文；显式取消的 Run 不自动复活。用户重新提出继续时，宿主沿原 Goal/Task 和检查点建立有来源的新 attempt/run，原 CANCELLED 记录、预算、失败计数和事件水位保留。`resume_requires_explicit_user=true` 时自动启动、重连、定时器均不得越过。取消一个运行不等于清空项目全部任务。本版不支持任意 command_id 的队列单项撤回；CANCEL 的 target_id 只接受当前 session 关联的 Run/Goal，并清理其所属未消费队列。上游 takeback 单项按钮须移除，不能保留无实现的成功提示。
+155:archive 只调整会话列表展示；活跃运行须先暂停/取消并完成停止确认，否则 SESSION_BUSY。rename/unarchive 使用 expected_revision；不引起模型运行或重放工具，不能把归档视为删除历史或验收通过。
+187:待决定权限来自现有 category=PERMISSION 的 ResourceRequest。SessionSnapshot 和事件投影其原状态 OPEN/ACKNOWLEDGED/RESOLVED/CANCELLED；不新增另一套权限业务状态。`PermissionActionScope` 正文封存为 Artifact，记录 project/task/run、tool、参数 Artifact、允许路径、输入版本、模型配置、issued_at/expires_at、max_uses=1 和 USER_DECIDABLE/POLICY_DENIED 来源；action_digest 对冻结正文计算。
+191:ALLOW_ONCE 仅对原动作的同一 task/run/参数生效，消费写入现有副作用/幂等账本；重放只返回原响应。宿主封存决定 Artifact，并通过原 resolveResourceRequest 流程写入 resolution_evidence_refs。DENY 同样留证，原任务保持适当阻塞/取消，不会因为请求“已处理”就获准继续。未获其他必要资源时 resumption_scheduled=false；解决权限请求不等于任务完成。
+201:| WRITER_BUSY / SESSION_BUSY / CANCEL_UNCONFIRMED | 保留只读和等待/取消状态 | 新起第二个写同一工作区的 Agent |
+208:W02 固定 transport/native bridge 和方法映射；W03 落 Session 映射、typed result/event、幂等/CAS、目录绑定与身份引导；W05 接真实 worker/CLI、provider 配置/探针及安全文件工具；W06 接单 owner、权限动作和独立接受；W13 消费相同接口补齐 Desktop；W17 验证 native/权限边界；W19/W20 用持久宿主和安装包复验。前置 mock/fixture 不能代替后置 live 证据。
+214:- 恢复：两客户端并发抢 owner 只一方成功；写入完成但响应丢失重放只发生一次；handoff 中断不双写；取消子进程未停不报成功；关闭窗口重开先快照；游标过期回补后事件/费用不重复。
