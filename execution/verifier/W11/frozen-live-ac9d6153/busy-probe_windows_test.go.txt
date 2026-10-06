@@ -1,0 +1,24 @@
+package protectedstore
+
+import (
+ "context"
+ "encoding/json"
+ "fmt"
+ "os"
+ "testing"
+ "time"
+ "golang.org/x/sys/windows"
+)
+
+func TestReviewerPublicBusySequence(t *testing.T) {
+ rows:=[]map[string]any{}
+ add:=func(name string,start time.Time,err error,result any){ e:="";if err!=nil{e=err.Error()};rows=append(rows,map[string]any{"operation":name,"elapsed_us":time.Since(start).Microseconds(),"error":e,"result":result}) }
+ start:=time.Now();s,e:=QueryFrozenService("status");state:="";if s.Frozen!=nil{state=s.Frozen.RunState};add("QueryFrozenService(status)",start,e,state)
+ p:=&FrozenProvider{}
+ start=time.Now();e=p.Ready(context.Background(),"LIVE");add("FrozenProvider.Ready(LIVE)",start,e,nil)
+ start=time.Now();b,e:=p.Boundary(context.Background());add("FrozenProvider.Boundary",start,e,b)
+ start=time.Now();h,e:=windows.CreateFile(windows.StringToUTF16Ptr(canaryPipe),pipeClientRights,0,nil,windows.OPEN_EXISTING,windows.FILE_FLAG_OVERLAPPED|windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION,0)
+ if e==nil{windows.CloseHandle(h)}
+ add("native CreateFile public pipe; no bytes read or written",start,e,map[string]any{"is_ERROR_PIPE_BUSY":e==windows.ERROR_PIPE_BUSY})
+ raw,_:=json.MarshalIndent(rows,"","  ");fmt.Println(string(raw));if path:=os.Getenv("RV_BUSY_OUT");path!=""{if e:=os.WriteFile(path,raw,0600);e!=nil{t.Fatal(e)}}
+}
