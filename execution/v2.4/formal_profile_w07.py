@@ -570,6 +570,16 @@ def _compiled_inputs(api, reader, context, proof, source_before, tools, bounds):
             source_name = (relative / name).as_posix()
             api.require(source_name in source_before, "SOURCE_COVERAGE", "missing compiled dependency")
             current = reader.ref({"path": source_name, "sha256": _digest(source_before[source_name])}).read_bytes().decode("utf-8")
+            for directive in re.findall(r"(?m)^//go:embed\s+([^\r\n]+)", current):
+                for literal in re.findall(r'"(?:\\.|[^"\\])*"|`[^`]*`|\S+', directive):
+                    pattern = json.loads(literal) if literal.startswith('"') else literal[1:-1] if literal.startswith('`') else literal
+                    api.require(pattern and not pattern.startswith("all:") and not any(c in pattern for c in "*?[]\\")
+                                and not Path(pattern).is_absolute() and not Path(pattern).drive
+                                and all(part not in {".", ".."} for part in pattern.split("/")),
+                                "SOURCE_COVERAGE", "unqualified embedded input pattern")
+                    embedded = (relative / pattern).as_posix()
+                    api.require(embedded in source_before, "SOURCE_COVERAGE", "missing embedded compilation input")
+                    reader.ref({"path": embedded, "sha256": _digest(source_before[embedded])})
             # Read imports from the pinned Go source, never from receipt code.
             tokens = re.findall(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|`[^`]*`|[A-Za-z_]\w*|[^\s]', current, re.S)
             tokens = [t for t in tokens if not t.startswith(("//", "/*"))]
