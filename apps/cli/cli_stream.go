@@ -36,6 +36,9 @@ type cliFlow struct {
 	operations       []map[string]any
 	admissionCommand string
 	goalFlow         bool
+	inputs           <-chan cliInputLine
+	cancelCommand    *v2Context
+	cancelPayload    map[string]any
 }
 
 func (f *cliFlow) interrupt() {
@@ -80,6 +83,11 @@ func (f *cliFlow) call(method string, payload map[string]any, wait bool) (map[st
 	f.ordinal++
 	sent := *f.c
 	sent.commandID = v2FlowCommandID(f.base, method, f.ordinal)
+	if method == "session.control" && payload["action"] == "CANCEL" {
+		frozen := sent
+		f.cancelCommand = &frozen
+		f.cancelPayload = payload
+	}
 	if method == "session.send" || method == "goal.start" {
 		f.admissionCommand = sent.commandID
 	}
@@ -400,6 +408,15 @@ func followCLIExecution(f *cliFlow, snapshot map[string]any, message, explicitRu
 		if runID != "" {
 			e.run = runID
 		}
+		snap, reason, code := f.snapshot()
+		if code != 0 {
+			return finish(exitNotImplemented, reason)
+		}
+		if snap["goal_id"] != e.goal || snap["core_build_id"] != e.build {
+			return finish(exitNotImplemented, "SESSION_TARGET_CHANGED")
+		}
+		f.consumeActiveInput(snap, e)
+		f.interrupt()
 		// BLOCKED admission is not successful execution. Pending cancellation
 		// continues to observe the original task instead of inventing a Run.
 		if e.run == "" && !f.cancelRequested {
@@ -410,12 +427,29 @@ func followCLIExecution(f *cliFlow, snapshot map[string]any, message, explicitRu
 				return finish(exitFailed, "TASK_FAILED_WITHOUT_RUN")
 			}
 		}
-		snap, reason, code := f.snapshot()
-		if code != 0 {
-			return finish(exitNotImplemented, reason)
+		if f.cancelRequested && e.run == "" && !e.cancelSent {
+			writer := cliObject(snap["writer"])
+			if writer["client_id"] != f.c.clientID {
+				return finish(exitNotImplemented, "CANCEL_AUTHORITY_UNRESOLVED")
+			}
+			reply, why, code := f.call("session.control", map[string]any{"action": "CANCEL", "target_id": e.goal, "reason": "User interrupted before Run admission"}, true)
+			if code != 0 {
+				return finish(exitNotImplemented, why)
+			}
+			result := cliObject(reply["result"])
+			if result["settled"] == true && result["children_stopped"] == true && result["queue_empty"] == true {
+				return finish(exitInterrupted, "HOST_CANCELLATION_SETTLED_WITHOUT_RUN")
+			}
+			e.cancelSent = true
 		}
-		if snap["goal_id"] != e.goal || snap["core_build_id"] != e.build {
-			return finish(exitNotImplemented, "SESSION_TARGET_CHANGED")
+		if e.cancelSent && f.cancelCommand != nil {
+			attempt := *f.cancelCommand
+			attempt.requestLog = nil
+			_, why, code := v2CallContext(f.budget, &attempt, "session.control", f.cancelPayload)
+			f.c.requestLog = append(f.c.requestLog, attempt.requestLog...)
+			if code != 0 {
+				return finish(exitNotImplemented, why)
+			}
 		}
 		if e.run != "" {
 			run, reason := f.object("runs", e.run)
@@ -459,6 +493,9 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
 	budget, stop := context.WithTimeout(context.Background(), options.timeout)
 	defer stop()
 	f := &cliFlow{c: c, budget: budget, options: options, base: c.commandID, goalFlow: name == "goal" || name == "go" || name == "/goal"}
+	if input, ok := cliInputPumps.Load(c); ok {
+		f.inputs = input.(<-chan cliInputLine)
+	}
 	steps, reason, detail := verbSteps(name, args, c, cfg)
 	out := map[string]any{"command": name, "client_id": c.clientID, "host_url": c.baseURL}
 	code := 0
@@ -487,7 +524,11 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
 			f.cancelRequested = true
 			f.cancelDeadline = time.Now().Add(options.cancelTimeout)
 			var result map[string]any
-			result, code = followCLIExecution(f, snapshot, "", continuationString(step.payload, "target_id"), 0)
+			explicit := continuationString(step.payload, "target_id")
+			if explicit == snapshot["goal_id"] {
+				explicit = ""
+			}
+			result, code = followCLIExecution(f, snapshot, "", explicit, 0)
 			out["execution"] = result
 			reason = continuationString(result, "reason")
 			break
@@ -556,6 +597,56 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
 	out["admission_command_id"] = f.admissionCommand
 	out["session_id"], out["reason"], out["detail"] = c.sessionID, reason, detail
 	return out, code
+}
+
+// Called only by the single flow after a canonical snapshot. The stdin pump
+// holds at most 16 intents and never sends a request or mutates writer state.
+func (f *cliFlow) consumeActiveInput(snapshot map[string]any, e *cliExecution) {
+	if f.inputs == nil {
+		return
+	}
+	select {
+	case input, ok := <-f.inputs:
+		if !ok {
+			f.inputs = nil
+			return
+		}
+		name, rest, _ := strings.Cut(input.text, " ")
+		if name == "/cancel" || name == "/stop" {
+			f.cancelRequested = true
+			f.cancelDeadline = time.Now().Add(f.options.cancelTimeout)
+			return
+		}
+		mode := ""
+		if name == "/steer" {
+			mode = "STEER"
+		}
+		if name == "/follow-up" || name == "/followup" {
+			mode = "FOLLOW_UP"
+		}
+		row := map[string]any{"type": "input.rejected", "draft": input.text, "reason": "ACTIVE_INPUT_REQUIRES_STEER_OR_FOLLOW_UP"}
+		if input.err != nil {
+			row["reason"] = "INPUT_READ_FAILED"
+		} else if mode != "" && strings.TrimSpace(rest) != "" && !f.cancelRequested {
+			writer := cliObject(snapshot["writer"])
+			if writer["client_id"] != f.c.clientID {
+				row["reason"] = "WRITER_BUSY"
+			} else {
+				originalAdmission := f.admissionCommand
+				reply, why, code := f.call("session.send", map[string]any{"text": rest, "attachment_artifact_ids": []any{}, "delivery": mode}, true)
+				f.admissionCommand = originalAdmission
+				row["reason"], row["exit_code"], row["response"] = why, code, reply
+				if code == 0 && statusOf(reply) == "COMPLETED" {
+					row["type"] = "input.enqueued"
+					delete(row, "draft")
+				}
+			}
+		}
+		if f.options.emit != nil {
+			f.options.emit(row)
+		}
+	default:
+	}
 }
 
 func saveCLIContext(c *v2Context, cfg *cliConfig) error {

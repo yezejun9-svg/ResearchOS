@@ -68,6 +68,13 @@ type BridgeJournal struct {
 	Artifacts          []Artifact       `json:"artifacts"`
 	StdoutHash         string           `json:"stdout_hash"`
 	StderrHash         string           `json:"stderr_hash"`
+	QueueRequired      bool             `json:"queue_required"`
+	QueueSealed        bool             `json:"queue_sealed"`
+	QueueAbortObserved bool             `json:"queue_abort_observed"`
+	QueueCancelIdle    bool             `json:"queue_cancel_idle"`
+	QueueIdle          bool             `json:"queue_idle"`
+	QueueInitSequence  int64            `json:"queue_init_sequence"`
+	CommandReceipts    []BridgeFrame    `json:"command_receipts,omitempty"`
 }
 
 type Bridge struct {
@@ -85,6 +92,7 @@ type Bridge struct {
 	stdout, stderr *os.File
 	streamOffsets  map[string]int64
 	err            error
+	writeMu        sync.Mutex
 }
 
 func bridgeMap(raw []byte) (map[string]any, error) {
@@ -181,6 +189,8 @@ func StartBridge(ctx context.Context, directory string, request BridgeRequest) (
 	child, cancel := context.WithCancel(ctx)
 	w := &Bridge{directory: directory, lock: lock, cancel: cancel, frames: make(chan BridgeFrame, 32), done: make(chan struct{}), deadline: time.Now().Add(LeaseDuration), wallDeadline: time.Now().UTC().Add(LeaseDuration), streamOffsets: map[string]int64{}}
 	w.journal = BridgeJournal{Version: 1, Manifest: append(json.RawMessage(nil), request.Manifest...), ManifestHash: digest, DispatchKey: bridgeString(manifest, "dispatch_key"), Worker: request.WorkerID, Revision: BridgeRevision, State: "PREPARED", Started: now(), Artifacts: []Artifact{}, InputHash: Hash(request.Inputs["request.json"])}
+	inputRequest, _ := bridgeMap(request.Inputs["request.json"])
+	w.journal.QueueRequired = inputRequest["queue_control"] == true
 	failed := true
 	defer func() {
 		if failed {
@@ -348,14 +358,51 @@ func (w *Bridge) consume(chunk sandbox.StreamChunk) error {
 			}
 			w.journal.Paused, w.journal.ProtocolComplete = true, true
 		case "turn.completed":
-			if !w.journal.ContextReady {
+			if !w.journal.ContextReady || w.journal.QueueRequired && !w.journal.QueueSealed {
 				return errors.New("context acknowledgement required before completion")
 			}
 			w.journal.ProtocolComplete = true
+		case "command.accepted", "command.consumed", "command.cleared", "command.abort_observed", "command.idle", "command.sealed":
+			if !w.journal.ContextReady || !w.journal.QueueRequired || len(w.journal.CommandReceipts) >= 256 {
+				return errors.New("unexpected or excessive command receipt")
+			}
+			payload, err := bridgeMap(frame.Payload)
+			if err != nil || w.validateControlBinding(payload) != nil {
+				return errors.New("unbound command receipt")
+			}
+			if frame.Type == "command.accepted" && payload["initialized"] == true {
+				if w.journal.QueueInitSequence != 0 {
+					return errors.New("duplicate initialization receipt")
+				}
+				w.journal.QueueInitSequence = frame.Sequence
+			} else if w.journal.QueueInitSequence == 0 {
+				return errors.New("command receipt before initialization")
+			}
+			if frame.Type == "command.abort_observed" {
+				w.journal.QueueAbortObserved = payload["sdk_idle"] == true && payload["sdk_queue_empty"] == true
+			}
+			if frame.Type == "command.idle" || frame.Type == "command.sealed" {
+				if payload["sdk_idle"] != true || payload["sdk_queue_empty"] != true {
+					return errors.New("false SDK settlement witness")
+				}
+				w.journal.QueueIdle = true
+				if payload["cancelled"] == true && w.journal.QueueAbortObserved {
+					w.journal.QueueCancelIdle = true
+				}
+			}
+			if frame.Type == "command.sealed" {
+				w.journal.QueueSealed = true
+			}
+			w.journal.CommandReceipts = append(w.journal.CommandReceipts, frame)
 		default:
 			return errors.New("unknown protocol frame")
 		}
 		w.journal.Frames = frame.Sequence
+		if strings.HasPrefix(frame.Type, "command.") {
+			if err := w.persist(); err != nil {
+				return err
+			}
+		}
 		select {
 		case w.frames <- frame:
 		default:
@@ -510,9 +557,55 @@ func (w *Bridge) Acknowledge(ctx context.Context, sequence int64, response any) 
 		if len(raw) > 64*1024 {
 			return errors.New("protocol response exceeds frame limit")
 		}
+		w.writeMu.Lock()
+		defer w.writeMu.Unlock()
 		return w.process.Write(ctx, append(raw, '\n'))
 	}
 	return nil
+}
+
+func (w *Bridge) validateControlBinding(binding map[string]any) error {
+	manifest, err := bridgeMap(w.journal.Manifest)
+	identity := map[string]any{"pid": w.journal.Identity.PID, "process_created_ns": strconv.FormatInt(w.journal.Identity.Created, 10), "job": w.journal.Identity.Job, "appcontainer_sid": w.journal.Identity.SID, "profile": w.journal.Identity.Profile, "staging_directory": w.journal.Identity.StagingDirectory}
+	raw, _ := json.Marshal(identity)
+	expected, _ := canonicalHash(raw)
+	actualRaw, _ := json.Marshal(binding["process_identity"])
+	actual, _ := canonicalHash(actualRaw)
+	if err != nil || binding["task_id"] != manifest["task_id"] || binding["run_id"] != manifest["run_id"] || bridgeNumber(binding, "runtime_epoch") != bridgeNumber(manifest, "epoch") || binding["dispatch_key"] != w.journal.DispatchKey || binding["manifest_hash"] != w.journal.ManifestHash || actual != expected || bridgeString(binding, "queue_generation") == "" {
+		return errors.New("control identity mismatch")
+	}
+	return nil
+}
+
+// Control shares a single process stdin writer with effect acknowledgements.
+func (w *Bridge) Control(ctx context.Context, frame any) error {
+	raw, err := json.Marshal(frame)
+	if err != nil {
+		return err
+	}
+	if len(raw) > 64*1024 {
+		return errors.New("control frame exceeds bound")
+	}
+	value, err := bridgeMap(raw)
+	if err != nil {
+		return err
+	}
+	binding, _ := value["binding"].(map[string]any)
+	w.mu.Lock()
+	err = w.validateControlBinding(binding)
+	if err == nil && (!w.journal.QueueRequired || w.journal.ProtocolComplete) {
+		err = errors.New("control on closed worker")
+	}
+	if err == nil && value["type"] == "command.deliver" && value["initialize"] != true {
+		w.journal.QueueIdle = false
+	}
+	w.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+	return w.process.Write(ctx, append(raw, '\n'))
 }
 func (w *Bridge) Finalize(effectsReconciled bool) (BridgeJournal, error) {
 	select {
@@ -560,7 +653,7 @@ func (j BridgeJournal) Observation() (map[string]any, error) {
 	if j.Cancelled && j.Receipt.Stopped && j.Receipt.StreamsDrained {
 		state = "CANCELLED"
 	}
-	return map[string]any{"spec": spec, "dispatch_key": j.DispatchKey, "manifest_hash": j.ManifestHash, "worker": j.Worker, "identity": map[string]any{"pid": j.Identity.PID, "process_created_ns": strconv.FormatInt(j.Identity.Created, 10), "job": j.Identity.Job, "appcontainer_sid": j.Identity.SID, "profile": j.Identity.Profile, "staging_directory": j.Identity.StagingDirectory}, "observation_sequence": j.Sequence, "state": state, "reason": j.Reason, "children_stopped": j.Receipt.Stopped, "queue_empty": j.Acknowledged == j.Frames, "streams_drained": j.Receipt.StreamsDrained, "cleanup_complete": j.Receipt.CleanupComplete, "exit_code": j.Receipt.ExitCode, "ended": j.Ended, "protocol": map[string]any{"settled": state == "SETTLED" && j.ProtocolComplete && j.Receipt.StreamsDrained, "frames": j.Frames, "acknowledged": j.Acknowledged}, "artifacts": j.Artifacts, "stdout_hash": j.StdoutHash, "stderr_hash": j.StderrHash}, nil
+	return map[string]any{"spec": spec, "dispatch_key": j.DispatchKey, "manifest_hash": j.ManifestHash, "worker": j.Worker, "identity": map[string]any{"pid": j.Identity.PID, "process_created_ns": strconv.FormatInt(j.Identity.Created, 10), "job": j.Identity.Job, "appcontainer_sid": j.Identity.SID, "profile": j.Identity.Profile, "staging_directory": j.Identity.StagingDirectory}, "observation_sequence": j.Sequence, "state": state, "reason": j.Reason, "children_stopped": j.Receipt.Stopped, "queue_empty": j.Acknowledged == j.Frames && (!j.QueueRequired || j.QueueSealed || j.Cancelled && j.QueueCancelIdle), "streams_drained": j.Receipt.StreamsDrained, "cleanup_complete": j.Receipt.CleanupComplete, "exit_code": j.Receipt.ExitCode, "ended": j.Ended, "protocol": map[string]any{"settled": state == "SETTLED" && j.ProtocolComplete && j.Receipt.StreamsDrained, "frames": j.Frames, "acknowledged": j.Acknowledged}, "artifacts": j.Artifacts, "stdout_hash": j.StdoutHash, "stderr_hash": j.StderrHash}, nil
 }
 
 // ReadBridgeTerminal checks the trusted directory and raw hashes. It never

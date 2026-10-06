@@ -296,6 +296,10 @@ func BuildSessionSnapshot(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, proje
 	if err != nil {
 		return nil, err
 	}
+	pending, err := clientPendingCommands(ctx, tx, project, sessionID)
+	if err != nil {
+		return nil, err
+	}
 	snap := map[string]any{
 		"session_id":                    sessionID,
 		"project_id":                    project,
@@ -317,7 +321,7 @@ func BuildSessionSnapshot(ctx context.Context, tx *sql.Tx, doc *SchemaDoc, proje
 		"event_sequence":                wm,
 		"earliest_event_sequence":       earliest,
 		"checkpoint_artifact_ref":       nil,
-		"pending_command_ids":           []any{},
+		"pending_command_ids":           pending,
 		"pending_permissions":           permissions,
 		"resume_requires_explicit_user": resumeExplicit == 1,
 		"messages":                      messages,

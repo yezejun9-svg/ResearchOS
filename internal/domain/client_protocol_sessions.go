@@ -130,6 +130,9 @@ func (s *ClientService) checkClientBinding(ctx context.Context, tx *sql.Tx, prin
 	if s.Domain == nil || s.SessionRuntime == nil {
 		return Fail(503, "MODEL_UNAVAILABLE", "host session runtime binding is unavailable")
 	}
+	if gate, ok := s.SessionRuntime.(interface{ ClientIntakeOpen() bool }); ok && !gate.ClientIntakeOpen() {
+		return Fail(409, "RESOURCE_BLOCKED", "runtime intake fenced for release")
+	}
 	b, err := s.Domain.binding(ctx, tx, workspace)
 	if err != nil {
 		return Fail(404, "NOT_FOUND", "authorized workspace binding unavailable")
@@ -274,9 +277,6 @@ func (s *ClientService) sendClientMessage(ctx context.Context, tx *sql.Tx, env *
 	if err = json.Unmarshal(env.Payload, &payload); err != nil {
 		return nil, err
 	}
-	if payload.Delivery != "NORMAL" {
-		return NewTypedRejection(env, "NOT_IMPLEMENTED", "STEER and FOLLOW_UP require a qualified runtime queue"), nil
-	}
 	if strings.TrimSpace(payload.Text) == "" || utf8.RuneCountInString(payload.Text) > 16384 {
 		return NewTypedRejection(env, "CONTENT_TOO_LARGE", "message must contain 1 to 16384 characters"), nil
 	}
@@ -297,9 +297,18 @@ func (s *ClientService) sendClientMessage(ctx context.Context, tx *sql.Tx, env *
 		if err != nil {
 			return nil, err
 		}
+		if payload.Delivery != "NORMAL" {
+			if err = s.SessionRuntime.AdmitTurn(ctx, tx, sess.project, model, task); err != nil {
+				return clientFault(env, err)
+			}
+			return s.enqueueClientMessage(ctx, tx, env, principal, sess, task, payload.Text, payload.Delivery, payload.Attachments)
+		}
 		if !clientTurnSettled(tx, sess.project, sess.sessionID, task) {
 			return NewTypedRejection(env, "SESSION_BUSY", "the previous turn requires settlement or explicit cancellation"), nil
 		}
+	}
+	if payload.Delivery != "NORMAL" {
+		return NewTypedRejection(env, "SESSION_BUSY", "an original task is required"), nil
 	}
 	refs := Empty()
 	seen := map[string]bool{}

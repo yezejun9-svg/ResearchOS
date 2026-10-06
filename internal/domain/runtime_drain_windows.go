@@ -16,6 +16,7 @@ type RuntimeDrainSnapshot struct {
 	ActiveWorkers        int `json:"active_workers"`
 	Reservations         int `json:"reservations"`
 	CheckpointBusy       int `json:"checkpoint_busy"`
+	UnresolvedCommands   int `json:"unresolved_commands"`
 }
 
 func (c *RuntimeCoordinator) StartupReady() bool {
@@ -32,6 +33,7 @@ func (s *Service) RuntimeDrainSnapshot(ctx context.Context) (RuntimeDrainSnapsho
 		dest  *int
 		query string
 	}{
+		{&snap.UnresolvedCommands, `SELECT (SELECT count(*) FROM client_command_queue WHERE state NOT IN ('CONSUMED','DROPPED'))+(SELECT count(*) FROM client_control_requests WHERE state<>'CONFIRMED')`},
 		{&snap.ActiveRuns, `SELECT count(*) FROM domain_objects WHERE kind='Run' AND coalesce(json_extract(body,'$.status'),'UNKNOWN') NOT IN ('SETTLED','FAILED','CANCELLED')`},
 		{&snap.UnresolvedEffects, `SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')`},
 		{&snap.UnresolvedDispatches, `SELECT count(*) FROM runtime_dispatches WHERE state IN ('PREPARED','STARTED','UNKNOWN')`},
@@ -59,6 +61,7 @@ func (c *RuntimeCoordinator) QuiesceForRelease(ctx context.Context) (RuntimeDrai
 	if c.quiesced {
 		return snap, errors.New("runtime coordinator already quiesced")
 	}
+	c.intakeClosed.Store(true)
 	c.quiesced = true
 	c.mu.Lock()
 	snap.ActiveWorkers = len(c.active)
@@ -66,11 +69,13 @@ func (c *RuntimeCoordinator) QuiesceForRelease(ctx context.Context) (RuntimeDrai
 	observed, e := c.service.RuntimeDrainSnapshot(ctx)
 	if e != nil {
 		c.quiesced = false
+		c.intakeClosed.Store(false)
 		return snap, e
 	}
 	observed.ActiveWorkers = snap.ActiveWorkers
-	if observed.ActiveRuns != 0 || observed.UnresolvedEffects != 0 || observed.UnresolvedDispatches != 0 || observed.ActiveWorkers != 0 || observed.Reservations != 0 {
+	if observed.ActiveRuns != 0 || observed.UnresolvedEffects != 0 || observed.UnresolvedDispatches != 0 || observed.ActiveWorkers != 0 || observed.Reservations != 0 || observed.UnresolvedCommands != 0 {
 		c.quiesced = false
+		c.intakeClosed.Store(false)
 		return observed, errors.New("runtime busy or external effect unresolved")
 	}
 	return observed, nil
@@ -79,5 +84,9 @@ func (c *RuntimeCoordinator) QuiesceForRelease(ctx context.Context) (RuntimeDrai
 func (c *RuntimeCoordinator) ResumeAfterReleaseAbort() {
 	c.scanMu.Lock()
 	c.quiesced = false
+	c.intakeClosed.Store(false)
 	c.scanMu.Unlock()
 }
+
+// Called inside the admission transaction; drain closes intake before reading DB.
+func (c *RuntimeCoordinator) ClientIntakeOpen() bool { return !c.intakeClosed.Load() }

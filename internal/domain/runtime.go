@@ -210,9 +210,15 @@ func (s *Service) runtimeOperationMode(tx *sql.Tx, p Principal, project, id stri
 			r["started_at"] = Now()
 		}
 	case "cancelRun":
+		if e = fenceClientTask(tx, project, Str(r, "task_id")); e != nil {
+			return nil, "", 0, e
+		}
 		r["status"] = "CANCEL_REQUESTED"
 		r["cancel_requested_at"] = Now()
 	case "reportRun":
+		if e = clientQueueSettled(tx, project, id); e != nil {
+			return nil, "", 0, e
+		}
 		if e = s.currentDispatchedRun(tx, project, r, "report"); e != nil {
 			return nil, "", 0, e
 		}
@@ -287,6 +293,9 @@ func (s *Service) runtimeOperationMode(tx *sql.Tx, p Principal, project, id stri
 			return nil, "", 0, e
 		}
 	case "acknowledgeRunCancellation":
+		if e = clientQueueSettled(tx, project, id); e != nil {
+			return nil, "", 0, e
+		}
 		o, err := runtimeObservation(tx, project, r)
 		if err != nil {
 			return nil, "", 0, err

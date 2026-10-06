@@ -723,6 +723,30 @@ func (s *ClientService) Execute(ctx context.Context, tx *sql.Tx, env *Envelope, 
 		if err := json.Unmarshal([]byte(body), &r); err != nil {
 			return nil, false, err
 		}
+		if deref(env.Method) == "session.control" && deref(r.Status) == "ACKNOWLEDGED" {
+			final, err := s.finalizeClientCancel(ctx, tx, env, principal, nil)
+			if err != nil {
+				return nil, false, err
+			}
+			if final != nil {
+				if s.Doc != nil {
+					var generic map[string]any
+					if err = json.Unmarshal(Bytes(final), &generic); err != nil {
+						return nil, false, err
+					}
+					if err = s.Doc.ValidateDef("CommandResponse", generic); err != nil {
+						return nil, false, err
+					}
+					if err = ValidateResultAgainstMethod(*env.Method, final, s.Doc); err != nil {
+						return nil, false, err
+					}
+				}
+				if _, err = tx.ExecContext(ctx, "UPDATE idempotency SET body=? WHERE principal=? AND project=? AND operation=? AND key=? AND request_hash=?", string(Bytes(final)), principal, deref(env.ProjectID), "v2:"+deref(env.Method), deref(env.CommandID), hash); err != nil {
+					return nil, false, err
+				}
+				return final, true, nil
+			}
+		}
 		return &r, true, nil
 	case err != sql.ErrNoRows:
 		return nil, false, err
@@ -763,6 +787,11 @@ func (s *ClientService) Execute(ctx context.Context, tx *sql.Tx, env *Envelope, 
 		}
 	}
 	rb, _ := json.Marshal(res)
+	if deref(env.Method) == "session.control" {
+		if _, err = tx.ExecContext(ctx, "UPDATE client_control_requests SET original_response=coalesce(original_response,?) WHERE principal=? AND project=? AND command_id=?", string(rb), principal, deref(env.ProjectID), deref(env.CommandID)); err != nil {
+			return nil, false, err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
 		principal, deref(env.ProjectID), "v2:"+*env.Method, *env.CommandID, hash, 0, string(rb), "", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return nil, false, err
@@ -1089,6 +1118,17 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		}
 		json.Unmarshal(env.Payload, &p)
 		if deref(p.Action) == "RESUME" && deref(p.TargetID) == sess.sessionID {
+			pending, err := clientPendingCommands(ctx, tx, sess.project, sess.sessionID)
+			if err != nil {
+				return nil, err
+			}
+			var fenced int
+			if err = tx.QueryRow(`SELECT count(*) FROM client_queue_fences WHERE project=? AND session_id=? AND (restore_fenced<>0 OR state='RECONCILING')`, sess.project, sess.sessionID).Scan(&fenced); err != nil {
+				return nil, err
+			}
+			if len(pending) > 0 || fenced > 0 {
+				return reject(sess.revision, sess.epoch, "SESSION_BUSY", "command queue requires reconciliation before resume"), nil
+			}
 			// Resuming a session restores its saved context. A cancelled or failed
 			// Run is never restarted; a later explicit send creates the next turn.
 			if sess.runID != "" {
@@ -1111,59 +1151,7 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		if p.Action == nil || *p.Action != "CANCEL" {
 			return reject(sess.revision, sess.epoch, "NOT_IMPLEMENTED", "only CANCEL run and RESUME session controls are implemented on this host build"), nil
 		}
-		if sess.runID == "" || sess.runID != deref(p.TargetID) {
-			return reject(sess.revision, sess.epoch, "NOT_FOUND", "target is not the current session run"), nil
-		}
-		run, err := loadClientRun(ctx, tx, sess.project, deref(p.TargetID))
-		if err == sql.ErrNoRows {
-			return reject(sess.revision, sess.epoch, "NOT_FOUND", "target run is not in this project"), nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		if run.cancelConfirmed() {
-			if !run.childrenStopped || !run.queueEmpty {
-				return reject(sess.revision, sess.epoch, "CANCEL_UNCONFIRMED", "cancel confirmed but runtime teardown is not settled"), nil
-			}
-			snap, err := BuildSessionSnapshot(ctx, tx, s.Doc, sess.project, sess.sessionID)
-			if err != nil {
-				return nil, err
-			}
-			return complete(sess.revision, map[string]any{"action": *p.Action, "target_id": *p.TargetID,
-				"control_request_id": "ctrl-" + deref(env.CommandID), "settled": true,
-				"children_stopped": true, "queue_empty": true, "snapshot": snap}), nil
-		}
-		if run.terminal() {
-			return reject(sess.revision, sess.epoch, "ALREADY_TERMINAL", "run reached a terminal state without a confirmed cancel"), nil
-		}
-		if s.Domain == nil {
-			return reject(sess.revision, sess.epoch, "HOST_UNAVAILABLE", "canonical runtime service unavailable"), nil
-		}
-		owner, err := clientPrincipal(ctx, tx, principal, sess.project, true)
-		if err != nil {
-			return clientFault(env, err)
-		}
-		canonical, _, _, err := s.Domain.runtimeOperation(tx, owner, sess.project, run.id, Object{"reason": "Authenticated client cancellation"}, "cancelRun", deref(env.CommandID))
-		if err != nil {
-			return clientFault(env, err)
-		}
-		if err = s.Domain.event(tx, sess.project, "Run", canonical, principal, deref(env.CommandID), "RUN_CHANGED"); err != nil {
-			return nil, err
-		}
-		now := Str(canonical, "cancel_requested_at")
-		if err := s.journal(ctx, tx, env, sess, "RUN_STATE", map[string]any{
-			"run_id": run.id, "status": "CANCEL_REQUESTED", "revision": canonical["revision"],
-			"cancel_requested_at": now, "cancel_confirmed_at": nil, "settled_at": nil,
-			"children_stopped": run.childrenStopped, "queue_empty": run.queueEmpty,
-		}); err != nil {
-			return nil, err
-		}
-		// related_resource_ref stays null: a VersionRef must carry the row's published
-		// content_hash, and that digest belongs to the runtime cards, so nothing is invented
-		// here. The journaled RUN_STATE event carries run_id plus the run revision.
-		return ack(sess.revision+1, map[string]any{"accepted_at": now, "operation_id": "op-" + deref(env.CommandID),
-			"after_sequence":       sess.watermark + 1,
-			"related_resource_ref": nil}), nil
+		return s.cancelClientTarget(ctx, tx, env, principal, sess, deref(p.TargetID))
 	default:
 		if sess == nil {
 			return reject(0, nil, "NOT_IMPLEMENTED", "handler belongs to a later card"), nil

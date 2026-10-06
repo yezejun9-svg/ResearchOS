@@ -48,13 +48,14 @@ type BackupManifest struct {
 // Internal policies are available only to the bounded local upgrade coordinator.
 // Public backup/export/restore retain the ordinary format and protection guard.
 type backupPolicy struct {
-	format         string
-	databaseName   string
-	purpose        Object
-	allowProtected func(*sql.DB, Object) error
-	validate       func(*sql.DB) error
-	beforeRecovery func(*sql.DB) error
-	afterRecovery  func(*sql.DB) error
+	format                         string
+	databaseName                   string
+	purpose                        Object
+	allowProtected                 func(*sql.DB, Object) error
+	validate                       func(*sql.DB) error
+	beforeRecovery                 func(*sql.DB) error
+	afterRecovery                  func(*sql.DB) error
+	preserveQueueUpgradeWorkspaces func(*sql.DB) error
 }
 
 func backupFormat(policy *backupPolicy) string {
@@ -259,12 +260,22 @@ func backupInventory(db *sql.DB) (Object, error) {
 		return nil, e
 	}
 	inventory["max_event_sequence"] = seq
+	queue, err := backupQueueState(db)
+	if err != nil {
+		return nil, err
+	}
+	if queue != nil {
+		inventory["command_queue_digest"] = Hash(queue)
+	}
 	return inventory, nil
 }
 func backupIntegrity(db *sql.DB) error {
 	return backupIntegrityPolicy(db, nil)
 }
 func backupIntegrityPolicy(db *sql.DB, policy *backupPolicy) error {
+	if err := validateBackupQueue(db); err != nil {
+		return err
+	}
 	if policy != nil && policy.validate != nil {
 		if e := policy.validate(db); e != nil {
 			return e
@@ -399,6 +410,13 @@ func (s *Service) createBackupPolicy(ctx context.Context, destination string, ke
 		objects, e := backupPortable(db)
 		if e != nil {
 			return m, e
+		}
+		queue, err := backupQueueState(db)
+		if err != nil {
+			return m, err
+		}
+		if queue != nil {
+			files["command-queue.json"] = Bytes(queue)
 		}
 		files["portable.json"] = Bytes(Object{"format": "RESEARCHOS_PORTABLE_V1", "objects": objects, "authority": "state.sqlite; portable objects preserve IDs, revisions, source relationships and receipt hashes"})
 		var source WorkspaceBackupSource
@@ -601,6 +619,18 @@ func restoreBackupPolicy(ctx context.Context, directory, destination string, opt
 	if schema != m.SchemaHash {
 		return r, fmt.Errorf("BACKUP_SCHEMA_HASH_MISMATCH")
 	}
+	if policy == nil {
+		queue, err := backupQueueState(db)
+		if err != nil {
+			return r, err
+		}
+		if queue != nil {
+			var saved Object
+			if json.Unmarshal(files["command-queue.json"], &saved) != nil || Hash(saved) != Hash(queue) {
+				return r, fmt.Errorf("RESTORE_QUEUE_SIDECAR_MISMATCH")
+			}
+		}
+	}
 	// Types are loaded separately so schema evolution cannot silently reinterpret
 	// stored objects under a changed application contract.
 	types, e := db.Query("SELECT kind,body FROM domain_versions")
@@ -635,7 +665,18 @@ func restoreBackupPolicy(ctx context.Context, directory, destination string, opt
 	if Hash(r.Before) != Hash(m.Inventory) {
 		return r, fmt.Errorf("RESTORE_INVENTORY_MISMATCH")
 	}
-	workspaceRequests, e := backupPrepareWorkspaces(ctx, db, files, stage, destination)
+	var workspaceRequests []WorkspaceRestoreRequest
+	if policy != nil && policy.preserveQueueUpgradeWorkspaces != nil {
+		plan, ok := policy.purpose["plan"].(Object)
+		if !ok || policy.format != localUpgradeFormat || plan["id"] != "schema21-to22-client-command-queue-v1" {
+			return r, fmt.Errorf("RESTORE_QUEUE_WORKSPACE_POLICY_MISMATCH")
+		}
+		// Only the fixed same-host upgrade may retain source path identities. Its
+		// callback rechecks the source protection and every original row/path.
+		e = policy.preserveQueueUpgradeWorkspaces(db)
+	} else {
+		workspaceRequests, e = backupPrepareWorkspaces(ctx, db, files, stage, destination)
+	}
 	if e != nil {
 		return r, e
 	}

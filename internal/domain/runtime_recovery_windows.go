@@ -169,6 +169,9 @@ func (c *RuntimeCoordinator) recoverArtifact(tx *sql.Tx, project string, dispatc
 }
 
 func (c *RuntimeCoordinator) recoverTerminal(ctx context.Context, project, runID string, epoch int64, directory string, j rt.BridgeJournal) error {
+	if err := c.recoverClientQueue(ctx, project, runID, epoch, j); err != nil {
+		return err
+	}
 	if e := c.ingestObservation(ctx, project, runID, epoch, j); e != nil {
 		return e
 	}

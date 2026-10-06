@@ -5,6 +5,17 @@ import "database/sql"
 func (s *Service) controlTask(tx *sql.Tx, p Principal, project string, t, b Object, cid string) (Object, error) {
 	action := Str(b, "action")
 	status := Str(t, "status")
+	if action == "CANCEL" {
+		if err := fenceClientTask(tx, project, Str(t, "id")); err != nil {
+			return nil, err
+		}
+	} else {
+		var prior string
+		err := tx.QueryRow("SELECT action FROM orchestration_task_controls WHERE project=? AND task=?", project, t["id"]).Scan(&prior)
+		if err == nil && prior == "CANCEL" {
+			return nil, Fail(409, "STATE_CONFLICT", "cancellation dominates pause")
+		}
+	}
 	if status == "ACCEPTED" || status == "CANCELLED" || status == "NEEDS_REVALIDATION" || status == "DEFERRED_NO_PROGRESS" {
 		return nil, Fail(409, "STATE_CONFLICT", "task cannot be paused or cancelled in this state")
 	}
