@@ -60,15 +60,12 @@ func TestW18FinalSchemaUpgrade(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer db.Close()
-	_, e = New(db, filepath.Join(opt.TargetRoot, "spec/v2.0/contracts"), filepath.Join(opt.TargetRoot, "migrations/sqlite/0002_domain.sql"))
-	if e != nil {
-		t.Fatal(e)
-	}
+	upgradeHistoricalFixtureService(t, db, opt.TargetRoot, 20, true)
 	versions, e := backupMigrations(db)
 	if e != nil {
 		t.Fatal(e)
 	}
-	finalUpgradeAssert(t, "NEW20-NORMAL-STARTUP", upgradeVersions(20), versions)
+	finalUpgradeAssert(t, "HISTORICAL20-SCHEMA-VALIDATED", upgradeVersions(20), versions)
 	after, e := upgradeRows(db)
 	if e != nil {
 		t.Fatal(e)
@@ -123,10 +120,7 @@ func TestW18FinalSchemaUpgrade(t *testing.T) {
 		t.Fatal(e)
 	}
 	finalUpgradeAssert(t, "SOURCE13-LOGICALLY-UNCHANGED", Hash(before), Hash(unchanged))
-	_, e = New(source, filepath.Join(opt.SourceRoot, "spec/v2.0/contracts"), filepath.Join(opt.SourceRoot, "migrations/sqlite/0002_domain.sql"))
-	if e != nil {
-		t.Fatal(e)
-	}
+	upgradeHistoricalFixtureService(t, source, opt.SourceRoot, 13, false)
 	source.Close()
 	manifestBytes, e := os.ReadFile(filepath.Join(opt.Snapshot, "manifest.json"))
 	if e != nil {
@@ -286,14 +280,11 @@ func TestW18FinalSchemaRollback(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer db.Close()
-	_, e = New(db, filepath.Join(opt.SourceRoot, "spec/v2.0/contracts"), filepath.Join(opt.SourceRoot, "migrations/sqlite/0002_domain.sql"))
-	if e != nil {
-		t.Fatal(e)
-	}
+	upgradeHistoricalFixtureService(t, db, opt.SourceRoot, 13, true)
 	versions, e := backupMigrations(db)
 	if e != nil {
 		t.Fatal(e)
 	}
-	finalUpgradeAssert(t, "RETAINED-BACKUP-OLD13-NORMAL-STARTUP", upgradeVersions(13), versions)
+	finalUpgradeAssert(t, "RETAINED-BACKUP-HISTORICAL13-SCHEMA-VALIDATED", upgradeVersions(13), versions)
 	finalUpgradeAssert(t, "ROLLBACK-NO-PRIVATE-READ", 0, fake.reads)
 }

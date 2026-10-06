@@ -23,7 +23,7 @@ async function harness(t, cancel) {
   binding.process_identity={pid:child.pid,process_created_ns:"host-fixture-creation",job:"host-fixture-job",appcontainer_sid:"fixture-sid",profile:"fixture-profile",staging_directory:root};
   t.after(async()=>{child.kill();await exited;await rm(root,{recursive:true,force:true,maxRetries:5,retryDelay:50})});
   let stderr="";child.stderr.on("data",data=>stderr+=data);
-  const frames=[];const requests=[];let sent=false,prepared=false,committed=false,abort=false;
+  const frames=[];const requests=[];let sent=false,prepared=false,committed=false,abort=false,initAck=false,heldFrame;
   const send = (frame)=>child.stdin.write(JSON.stringify({...frame,binding})+"\n");
   const text="同样的原始用户输入 — exact bytes";
   const attachment="原始附件 UTF-8 text";
@@ -38,10 +38,15 @@ async function harness(t, cancel) {
     reader.on("line",line=>{try{
       const frame=JSON.parse(line);frames.push(frame);assert.equal(frame.sequence,frames.length);
       if(frame.type==="context.ready")send({type:"command.deliver",initialize:true,command:null});
-      if(frame.type==="effect.request"){
-        requests.push(frame.payload.body);
-        if(!sent){sent=true;send({type:"command.deliver",command:command("first",1)});send({type:"command.deliver",command:command("second",2)});if(cancel){send({type:"command.clear_abort"});return;}setTimeout(()=>acknowledge(frame),50);}else acknowledge(frame);
+      if(frame.type==="command.accepted" && frame.payload.initialized===true){
+        setTimeout(()=>{try{assert.equal(requests.length,0,"original MODEL must wait for durable initialization ACK");initAck=true;child.stdin.write(JSON.stringify({sequence:frame.sequence,key:"command.initialize",state:"CONFIRMED",payload:{}})+"\n");}catch(error){reject(error);child.kill();}},80);
       }
+      if(frame.type==="effect.request"){
+        assert.ok(initAck,"effect before initialization ACK");
+        requests.push(frame.payload.body);
+        if(!sent){sent=true;heldFrame=frame;send({type:"command.deliver",command:command("first",1)});send({type:"command.deliver",command:command("second",2)});if(cancel){send({type:"command.clear_abort"});return;}setTimeout(()=>acknowledge(frame),50);}else acknowledge(frame);
+      }
+      if(cancel && frame.type==="command.cleared" && frame.payload.command_id==="second") child.stdin.write(JSON.stringify({sequence:heldFrame.sequence,key:heldFrame.key,state:"UNKNOWN",payload:{code:"FIXTURE_CANCELLED_PENDING_EFFECT"}})+"\n");
       if(frame.type==="command.abort_observed")abort=true;
       if(frame.type==="command.idle"){
         if(cancel && abort){child.kill();resolve();return;}
