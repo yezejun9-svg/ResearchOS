@@ -8,8 +8,6 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
 	"os"
 	"strings"
 )
@@ -49,53 +47,7 @@ func main() {
 	case "help", "--help":
 		cliHelpSurface(true)
 	case "doctor":
-		// The same discovery path every other verb honours: RESEARCHOS_CLI_DISCOVERY names the file, so doctor can be
-		// pointed at the host a check actually started instead of only at the repository default.
-		discoveryFile := cliEnv("RESEARCHOS_CLI_DISCOVERY", discoveryPath)
-		b, err := os.ReadFile(discoveryFile)
-		if err != nil {
-			diag("doctor: host discovery NOT_FOUND at %s", discoveryFile)
-			outJSON(map[string]any{"command": "doctor", "status": "REJECTED", "exit_code": 3,
-				"reason": "NOT_FOUND", "detail": discoveryFile + ": " + err.Error(), "discovery_path": discoveryFile})
-			os.Exit(3)
-		}
-		var d discovery
-		if err := json.Unmarshal(b, &d); err != nil {
-			diag("doctor: discovery file INVALID_JSON")
-			outJSON(map[string]any{"command": "doctor", "status": "REJECTED", "exit_code": 3,
-				"reason": "INVALID_JSON", "detail": discoveryFile, "discovery_path": discoveryFile})
-			os.Exit(3)
-		}
-		status := "DOWN"
-		code := 0
-		probe := ""
-		health, body, err := hostGet(d.URL + "/healthz")
-		if err != nil {
-			probe = err.Error()
-		} else {
-			probe = clip(body, 200)
-			if health == 200 {
-				status = "UP"
-			} else {
-				code = health
-			}
-		}
-		out := map[string]any{"command": "doctor", "status": map[string]any{"UP": "COMPLETED", "DOWN": "REJECTED"}[status],
-			"exit_code": map[string]any{"UP": 0, "DOWN": 1}[status], "product": productName, "version": buildVersion,
-			"client_protocol": clientProtocol, "host_url": d.URL, "host_pid": d.PID, "host_data_dir": d.DataDir,
-			"health": status, "discovery_path": discoveryFile, "probe": probe}
-		if status != "UP" {
-			out["http_code"] = code
-			// Exit 4 is the shape the accepted W02-03 launcher shipped for an unhealthy host. It sits outside the
-			// 0/1/2/3/130 vocabulary this card's action names, and it is left as delivered rather than silently
-			// renumbered: the receipt records the deviation with the row that measures it (W0503-DOCTOR-DOWN-EXIT-4).
-			out["exit_code_note"] = "an unhealthy host is 1 (execution_or_check_failed) per contracts/product.contract.json cli.exit_codes; the accepted W02-03 launcher shipped 4 here, and 4 is not in that map"
-		}
-		line, _ := json.Marshal(out)
-		fmt.Println(string(line))
-		if status != "UP" {
-			os.Exit(1)
-		}
+		cliDoctor()
 	case "task":
 		runCodingTask(args[1:])
 	default:
