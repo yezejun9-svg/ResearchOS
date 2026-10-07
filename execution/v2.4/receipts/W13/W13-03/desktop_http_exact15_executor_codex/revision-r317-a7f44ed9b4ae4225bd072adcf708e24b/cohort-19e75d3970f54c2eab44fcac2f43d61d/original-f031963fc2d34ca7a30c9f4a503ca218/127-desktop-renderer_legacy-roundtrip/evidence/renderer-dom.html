@@ -1,0 +1,394 @@
+<html><head><meta charset="utf-8">
+<title>ResearchOS</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; color: #14181f; background: #f6f7f9; }
+  header { padding: 14px 20px; background: #fff; border-bottom: 1px solid #e3e6ea; display: flex; gap: 12px; align-items: baseline; }
+  h1 { font-size: 15px; margin: 0; }
+  #host-health { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #eceff3; }
+  #host-health.UP { background: #e3f4e8; } #host-health.DOWN { background: #fbe7e7; }
+  main { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 14px; padding: 16px 20px; }
+  section { background: #fff; border: 1px solid #e3e6ea; border-radius: 8px; padding: 12px 14px; }
+  h2 { font-size: 13px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; color: #5d6773; }
+  ul { margin: 0 0 8px; padding-left: 18px; } li { font-size: 13px; }
+  button { font: inherit; padding: 5px 11px; border-radius: 6px; border: 1px solid #c9ced6; background: #fff; }
+  button.primary { background: #14508f; border-color: #14508f; color: #fff; }
+  output { display: block; margin-top: 8px; font-size: 12px; white-space: pre-wrap; color: #5d6773; }
+  output.failed { color: #a3261f; }
+  #empty { grid-column: 1 / -1; }
+  #review { grid-column: 1 / -1; }
+  .review-grid { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(360px, 2fr); gap: 14px; }
+  .review-box { min-width: 0; border: 1px solid #e3e6ea; border-radius: 8px; padding: 12px; }
+  .review-box h3 { margin: 0 0 8px; font-size: 13px; }
+  .review-box label { display: block; margin: 8px 0; font-size: 12px; }
+  .review-box input, .review-box textarea { box-sizing: border-box; width: 100%; font: inherit; padding: 7px; border: 1px solid #c9ced6; border-radius: 5px; }
+  .review-box textarea { min-height: 75px; resize: vertical; }
+  .review-box button { margin: 3px 4px 3px 0; }
+  .review-box li { margin: 7px 0; overflow-wrap: anywhere; }
+  .review-box pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; background: #f6f7f9; padding: 8px; }
+  .review-box .muted { color: #5d6773; }
+  .review-box .failed { color: #a3261f; }
+  .review-box .ok { color: #176638; }
+  #review-report { min-height: 20px; }
+  @media (max-width: 820px) { .review-grid { grid-template-columns: 1fr; } main { grid-template-columns: 1fr; } }
+</style>
+
+</head><body><header>
+  <h1>ResearchOS</h1>
+  <span id="host-health" class="UP">本机服务可读</span>
+  <button id="retry">Retry</button>
+</header>
+
+<main>
+  <section id="review">
+    <h2>同一会话审阅与接续</h2>
+    <p class="muted">先读取服务端会话与事件；仅在上一轮结束后接管写入，再发送下一条消息。这里不把执行结果当成独立验收。</p>
+    <div class="review-grid">
+      <div class="review-box">
+        <h3>选择会话</h3>
+        <label>项目 ID<input id="review-project" autocomplete="off" placeholder="当前项目 ID"></label>
+        <button id="review-list">列出会话</button>
+        <label>会话 ID<input id="review-session" autocomplete="off" placeholder="或直接输入同一会话 ID"></label>
+        <button id="review-open">打开指定会话</button>
+        <ul id="review-sessions"></ul>
+        <p id="review-context" class="muted">项目 fixture_project · 会话 fixture_session</p>
+      </div>
+      <div class="review-box">
+        <h3>审阅</h3>
+        <p id="review-state" class="muted">“Fixture coding task” · 修订 9007199254740993 · 运行 无 · 写者 desktop-shell / 纪元 9007199254740993 · 事件水位 9007199254740993</p>
+        <button id="review-refresh">重新读取快照</button>
+        <button id="review-read-attach">只读接入</button>
+        <button id="review-events">读取后续事件</button>
+        <button id="review-more" hidden="">读取下一页事件</button>
+        <h3>消息</h3><ol id="review-messages"><li>USER · 运行已有测试并解释失败</li></ol>
+        <h3>事件与运行状态</h3><ol id="review-event-list"><li>#9007199254740993 USAGE：{"cost_known":false,"input_tokens":"9007199254740993","ledger_entry_id":"public-ledger","money":null,"output_tokens":"9007199254740992","provider_usage_id":null}</li></ol>
+        <h3>封存产物与工具输出</h3><ul id="review-artifacts"><li>完整对话 · fixture_artifact · sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa <button>核对并读取文本</button></li></ul>
+        <p class="muted">当前主机没有可用的 workspace.diff 处理器；此处只展示服务端快照、事件与核对哈希后的封存文本。</p>
+        <pre id="review-artifact-text" hidden=""></pre>
+        <h3>接管后继续</h3>
+        <button id="review-claim" disabled="">上一轮结束后接管写入</button>
+        <label>下一条消息<textarea id="review-message" placeholder="接管成功后发送到这个会话"></textarea></label>
+        <button id="review-send">发送到同一会话</button>
+        <p id="review-report" role="status" aria-live="polite" class="failed">未发送：ACKNOWLEDGED</p>
+      </div>
+    </div>
+  </section>
+  <section id="empty">
+    <h2>First run</h2>
+    <p id="empty-text">Choose a workspace folder and configure a model to start your first session.</p>
+    <button class="primary" data-call="workspacePickDirectory">Choose workspace folder</button>
+    <button data-call="providerConfigure">Configure model</button>
+    <button data-call="sessionCreate">Start first session</button>
+    <output id="out-empty"></output>
+  </section>
+
+  <section><h2>Workspace</h2><ul id="workspace-list"></ul>
+    <output id="out-workspace"></output></section>
+
+  <section><h2>Sessions</h2><ul id="session-list"></ul>
+    <output id="out-session"></output></section>
+
+  <section><h2>Provider</h2><ul id="provider-list"></ul>
+    <output id="out-provider"></output></section>
+
+  <section><h2>Host</h2><ul id="host-list"></ul>
+    <output id="out-status"></output></section>
+</main>
+
+<script>
+const api = window.researchos;
+const clients = ['workspace', 'session', 'provider'];
+
+function show(node, res) {
+  const el = document.getElementById(node);
+  if (!el) return;
+  const ok = !!(res && res.ok);
+  el.className = ok ? '' : 'failed';
+  el.textContent = ok ? (res.summary || 'done') : ('not done — ' + ((res && (res.reason || res.error)) || 'no reply'));
+}
+
+async function call(name, body) {
+  if (typeof api !== 'object' || typeof api[name] !== 'function') {
+    return show('out-' + (clients.find(c => name.toLowerCase().startsWith(c)) || 'status'), { ok: false, reason: 'BRIDGE_UNAVAILABLE' });
+  }
+  const res = await api[name](body || {});
+  show('out-' + (clients.find(c => name.toLowerCase().startsWith(c)) || 'status'), res);
+  if (/^(workspace|session|provider)List$/.test(name)) fill(name, res);
+  return res;
+}
+
+function fill(name, res) {
+  const key = name.replace(/List$/, '').toLowerCase();
+  const ul = document.getElementById(key + '-list');
+  if (!ul) return;
+  const items = (res && (res.items || res.models || res.sessions || res.workspaces)) || [];
+  ul.textContent = '';
+  for (const it of items) {
+    const li = document.createElement('li');
+    li.textContent = typeof it === 'string' ? it : (it.name || it.id || it.model || JSON.stringify(it));
+    ul.appendChild(li);
+  }
+  if (!items.length) {
+    const li = document.createElement('li');
+    li.textContent = 'none yet';
+    ul.appendChild(li);
+  }
+}
+
+document.querySelectorAll('[data-call]').forEach((b) => b.addEventListener('click', () => call(b.dataset.call)));
+document.getElementById('retry').addEventListener('click', refresh);
+
+async function refresh() {
+  const health = await call('statusHealth');
+  const host = await call('statusHost');
+  const el = document.getElementById('host-health');
+  const up = !!(host && host.ok);
+  el.className = up ? 'UP' : 'DOWN';
+  el.textContent = up ? ('local core up · ' + (host.url || '')) : ('local core unreachable · ' + ((host && host.reason) || (health && health.reason) || 'unknown'));
+  for (const c of clients) await call(c[0].toUpperCase() + c.slice(1) + 'List');
+  const empty = await call('sessionList');
+  document.getElementById('empty-text').textContent = (empty && empty.ok && (empty.items || []).length)
+    ? 'Your workbench is set up. Start another session when you need one.'
+    : 'Choose a workspace folder and configure a model to start your first session.';
+}
+
+</script>
+<script>
+// This is the renderer Electron actually loads. The v2 bridge carries the same
+// project/session references as the CLI; all displayed facts come from host replies.
+const review = { projectId: null, snapshot: null, events: [], cursor: 0, hasMore: false };
+const byId = id => document.getElementById(id);
+const exactInt = value => typeof value === 'bigint' || (typeof value === 'number' && Number.isSafeInteger(value));
+const exactCompare = (a, b) => { if (!exactInt(a) || !exactInt(b)) throw Error('EXACT_INTEGER_REQUIRED'); const x = BigInt(a), y = BigInt(b); return x < y ? -1 : x > y ? 1 : 0; };
+const exactPrevious = value => exactCompare(value, 0) > 0 ? BigInt(value) - 1n : 0n;
+const exactDisplay = value => JSON.stringify(value, (_key, item) => typeof item === 'bigint' ? item.toString() : item);
+const settledStatuses = new Set(['SETTLED', 'FAILED', 'CANCELLED']);
+
+function report(message, good = false) {
+  const node = byId('review-report');
+  node.textContent = message;
+  node.className = good ? 'ok' : 'failed';
+}
+function failure(reply) {
+  return reply?.reason || reply?.error_code || reply?.protocol_status || reply?.kind || '主机没有给出可用回执';
+}
+function item(parent, text, tag = 'li') {
+  const node = document.createElement(tag);
+  node.textContent = text;
+  parent.appendChild(node);
+  return node;
+}
+function canContinue() {
+  const snap = review.snapshot;
+  return !!snap && !snap.archived_at && (!snap.active_run_id || settledStatuses.has(snap.run_status));
+}
+function updateControls() {
+  const snap = review.snapshot;
+  const own = snap?.writer?.client_id === 'desktop-shell' && exactInt(snap.writer.epoch) && Date.parse(snap.writer.expires_at) > Date.now();
+  byId('review-refresh').disabled = !snap;
+  byId('review-read-attach').disabled = !snap?.writer?.epoch;
+  byId('review-events').disabled = !snap;
+  byId('review-claim').disabled = !snap || !canContinue() || own;
+  byId('review-send').disabled = !own || !canContinue() || !byId('review-message').value.trim();
+  byId('review-more').hidden = !review.hasMore;
+}
+function renderMessages() {
+  const root = byId('review-messages');
+  root.textContent = '';
+  const messages = review.snapshot?.messages || [];
+  if (!messages.length) { item(root, '服务端快照没有消息。'); return; }
+  for (const message of messages) {
+    const parts = (message.parts || []).slice().sort((a, b) => exactCompare(a.part_index, b.part_index));
+    item(root, `${message.role || 'UNKNOWN'} · ${parts.map(p => p.text || '').join('') || '(空)'}${message.complete ? '' : '（未结束）'}`);
+  }
+}
+function eventSummary(event) {
+  const p = event.payload || {};
+  if (event.kind === 'MESSAGE') return `${p.role || '消息'} ${p.phase || ''} ${p.text || ''}`;
+  if (event.kind === 'RUN_STATE') return `运行 ${p.run_id || ''}：${p.status || '未知'}`;
+  if (event.kind === 'TOOL_RESULT') return `工具 ${p.outcome || '未知'}：${p.summary || ''}`;
+  if (event.kind === 'ARTIFACT') return `产物 ${p.artifact_ref?.id || '未知'}：${p.availability || ''}`;
+  return `${event.kind || '事件'}：${exactDisplay(p).slice(0, 320)}`;
+}
+function renderEvents() {
+  const root = byId('review-event-list');
+  root.textContent = '';
+  if (!review.events.length) { item(root, '尚未读取到事件。'); return; }
+  for (const event of review.events.slice(-100)) item(root, `#${event.sequence} ${eventSummary(event)}`);
+}
+function artifactRefs() {
+  const found = new Map();
+  const add = (ref, label) => {
+    if (ref?.id && /^sha256:[a-f0-9]{64}$/.test(ref.content_hash || '')) found.set(ref.id, { ref, label });
+  };
+  add(review.snapshot?.checkpoint_artifact_ref, '检查点');
+  add(review.snapshot?.transcript_artifact_ref, '完整对话');
+  for (const event of review.events) {
+    const p = event.payload || {};
+    if (event.kind === 'ARTIFACT') add(p.artifact_ref, '产物事件');
+    if (event.kind === 'TOOL_RESULT') {
+      add(p.stdout_artifact_ref, '工具标准输出');
+      add(p.stderr_artifact_ref, '工具错误输出');
+      for (const ref of p.result_artifact_refs || []) add(ref, '工具结果');
+    }
+  }
+  return [...found.values()];
+}
+function renderArtifacts() {
+  const root = byId('review-artifacts');
+  root.textContent = '';
+  const refs = artifactRefs();
+  if (!refs.length) { item(root, '当前快照和已读取事件中没有可预览的封存产物。'); return; }
+  for (const { ref, label } of refs) {
+    const row = document.createElement('li');
+    row.append(`${label} · ${ref.id} · ${ref.content_hash} `);
+    const button = document.createElement('button');
+    button.textContent = '核对并读取文本';
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        const result = await api.desktop.readArtifact(ref);
+        const preview = byId('review-artifact-text');
+        if (!result?.ok) { preview.hidden = true; report(`产物 ${ref.id} 未读取：${failure(result)}`); return; }
+        preview.textContent = `${ref.id} · ${result.media_type} · ${result.content_hash}\n\n${result.text}`;
+        preview.hidden = false;
+        report(`产物 ${ref.id} 的内容哈希已核对。`, true);
+      } finally { button.disabled = false; }
+    });
+    row.appendChild(button);
+    root.appendChild(row);
+  }
+}
+function adoptSnapshot(snapshot) {
+  if (!snapshot?.session_id || !snapshot?.project_id) return false;
+  review.snapshot = snapshot;
+  review.projectId = snapshot.project_id;
+  byId('review-project').value = snapshot.project_id;
+  byId('review-session').value = snapshot.session_id;
+  byId('review-context').textContent = `项目 ${snapshot.project_id} · 会话 ${snapshot.session_id}`;
+  byId('review-state').textContent = `“${snapshot.title || snapshot.session_id}” · 修订 ${snapshot.revision} · 运行 ${snapshot.run_status || '无'} · 写者 ${snapshot.writer?.client_id || '无'} / 纪元 ${snapshot.writer?.epoch ?? '无'} · 事件水位 ${snapshot.event_sequence}${snapshot.resume_requires_explicit_user ? ' · 需要显式继续' : ''}`;
+  renderMessages();
+  renderArtifacts();
+  updateControls();
+  return true;
+}
+async function selectProject() {
+  const id = byId('review-project').value.trim();
+  if (!id) { report('先输入项目 ID。'); return false; }
+  if (id === review.projectId) return true;
+  const result = await api.desktop.selectProject(id);
+  if (!result?.ok) { report(`无法选择项目：${failure(result)}`); return false; }
+  review.projectId = id;
+  review.snapshot = null;
+  review.events = [];
+  review.cursor = 0;
+  review.hasMore = false;
+  byId('review-context').textContent = `项目 ${id} · 尚未选择会话`;
+  byId('review-state').textContent = '等待服务端快照。';
+  renderMessages(); renderEvents(); renderArtifacts(); updateControls();
+  return true;
+}
+async function listSessions() {
+  if (!(await selectProject())) return;
+  const reply = await api.v2['session.list']({ cursor: null, limit: 50 });
+  if (!reply?.completed) { report(`会话列表未读取：${failure(reply)}`); return; }
+  const root = byId('review-sessions');
+  root.textContent = '';
+  const sessions = reply.result?.items || [];
+  for (const session of sessions) {
+    const row = document.createElement('li');
+    const button = document.createElement('button');
+    button.textContent = `${session.title || session.session_id} · ${session.run_status || '无运行'} · ${session.session_id}`;
+    button.addEventListener('click', () => openSession(session.session_id));
+    row.appendChild(button); root.appendChild(row);
+  }
+  if (!sessions.length) item(root, '当前项目没有可读取的会话。');
+  report(`服务端返回 ${sessions.length} 个会话${reply.result?.next_cursor ? '（仍有下一页）' : ''}。`, true);
+}
+async function openSession(id) {
+  if (!(await selectProject())) return;
+  const sessionId = (id || byId('review-session').value).trim();
+  if (!sessionId) { report('先选择或输入会话 ID。'); return; }
+  const reply = await api.desktop.openSession(sessionId);
+  if (!reply?.completed || !adoptSnapshot(reply.result)) { report(`会话未打开：${reply?.ok ? 'SNAPSHOT_MISSING' : failure(reply)}`); return; }
+  review.events = [];
+  review.cursor = exactPrevious(review.snapshot.earliest_event_sequence);
+  review.hasMore = false;
+  renderEvents();
+  await readEvents();
+  report(`已从服务端打开同一会话 ${sessionId}，当前为只读审阅。`, true);
+}
+async function refreshSession() {
+  if (!review.snapshot) return false;
+  const reply = await api.v2['session.get']({});
+  if (!reply?.completed || !adoptSnapshot(reply.result)) { report(`快照未更新：${reply?.ok ? 'SNAPSHOT_MISSING' : failure(reply)}`); return false; }
+  report('已重新读取服务端快照。', true);
+  return true;
+}
+async function readEvents() {
+  if (!review.snapshot) return;
+  const reply = await api.v2['session.events']({ after_sequence: review.cursor, limit: 200 });
+  if (!reply?.completed) { report(`事件未读取：${failure(reply)}`); return; }
+  const page = reply.result || {};
+  const seen = new Set(review.events.map(event => event.event_id));
+  for (const event of page.events || []) {
+    if (event?.event_id && !seen.has(event.event_id)) { review.events.push(event); seen.add(event.event_id); }
+  }
+  if (!exactInt(page.next_sequence)) { report("无效事件游标"); return; }
+  if (exactCompare(page.next_sequence, review.cursor) > 0) review.cursor = page.next_sequence;
+  review.hasMore = page.has_more === true;
+  renderEvents(); renderArtifacts(); updateControls();
+  report(`已读取事件，当前游标 ${review.cursor}${review.hasMore ? '，还有后续页' : ''}。`, true);
+}
+async function readAttach() {
+  if (!review.snapshot?.writer?.epoch) return;
+  const reply = await api.v2['session.attach']({ after_sequence: review.cursor, request_write_owner: false });
+  if (!reply?.completed || !adoptSnapshot(reply.result?.snapshot)) { report(`只读接入未完成：${reply?.ok ? 'SNAPSHOT_MISSING' : failure(reply)}`); return; }
+  report('已按服务端纪元只读接入；没有取得写入权。', true);
+}
+async function claimWriter() {
+  if (!canContinue()) { report('上一轮尚未结束，不能接管写入。'); return; }
+  const reply = await api.v2['session.attach']({ after_sequence: review.cursor, request_write_owner: true });
+  if (!reply?.completed) { report(`写入接管被拒绝：${failure(reply)}`); return; }
+  if (!(await refreshSession())) return;
+  if (review.snapshot?.writer?.client_id !== 'desktop-shell') { report('主机尚未确认本窗口取得写入权。'); return; }
+  report(`主机已确认写入纪元 ${review.snapshot.writer.epoch}；现在可以在同一会话发送下一条消息。`, true);
+}
+async function sendNext() {
+  if (!canContinue() || review.snapshot?.writer?.client_id !== 'desktop-shell') { report('当前不持有已结束会话的写入权。'); return; }
+  const text = byId('review-message').value.trim();
+  if (!text) return;
+  const reply = await api.v2['session.send']({ text, attachment_artifact_ids: [], delivery: 'NORMAL' });
+  if (!reply?.completed) { report(`未发送：${failure(reply)}`); return; }
+  byId('review-message').value = '';
+  if (reply.result?.snapshot) adoptSnapshot(reply.result.snapshot);
+  await refreshSession();
+  await readEvents();
+  report('消息已由服务端受理；执行结果和独立验收仍以后续回执为准。', true);
+}
+async function reviewInit() {
+  if (!api?.v2 || !api?.desktop) { report('Desktop 预加载桥不可用，无法读取会话。'); return; }
+  const context = await api.desktop.context();
+  review.projectId = context?.project_id || null;
+  byId('review-project').value = review.projectId || '';
+  byId('review-session').value = context?.session_id || '';
+  const health = await api.v2['host.status']({});
+  const indicator = byId('host-health');
+  indicator.className = health?.completed ? 'UP' : 'DOWN';
+  indicator.textContent = health?.completed ? '本机服务可读' : `本机服务未就绪 · ${failure(health)}`;
+  if (context?.session_id && context?.project_id) await openSession(context.session_id);
+  else if (context?.project_id) await listSessions();
+}
+
+byId('review-list').addEventListener('click', listSessions);
+byId('review-open').addEventListener('click', () => openSession());
+byId('review-refresh').addEventListener('click', refreshSession);
+byId('review-read-attach').addEventListener('click', readAttach);
+byId('review-events').addEventListener('click', readEvents);
+byId('review-more').addEventListener('click', readEvents);
+byId('review-claim').addEventListener('click', claimWriter);
+byId('review-send').addEventListener('click', sendNext);
+byId('review-message').addEventListener('input', updateControls);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && review.snapshot) readEvents(); });
+reviewInit();
+</script>
+</body></html>
