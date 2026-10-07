@@ -34,14 +34,14 @@ async function chooseWorkspace({ host, native, callV2, deps, contextStore, sessi
     selection_ref: selected.selection_ref, display_name: name, requested_access: 'READ_WRITE',
   });
   const workspaceRef = registered.result?.authorized_workspace_ref;
-  if (!registered.ok || typeof workspaceRef !== 'string' || !workspaceRef) {
+  if (!registered.ok || registered.completed !== true || typeof workspaceRef !== 'string' || !workspaceRef) {
     return { ok: false, reason: registered.reason || registered.error_code || 'WORKSPACE_REGISTER_FAILED', protocol_status: registered.protocol_status };
   }
   const bootstrapped = await callV2(firstUseDeps, 'project.bootstrap', {
     authorized_workspace_ref: workspaceRef, display_name: name,
   });
   const result = bootstrapped.result;
-  if (!bootstrapped.ok || typeof result?.project_id !== 'string' || !result.project_id ||
+  if (!bootstrapped.ok || bootstrapped.completed !== true || typeof result?.project_id !== 'string' || !result.project_id ||
       result.workspace?.project_id !== result.project_id || result.workspace?.status !== 'ACTIVE' ||
       typeof result.workspace?.authorized_workspace_ref !== 'string') {
     return { ok: false, reason: bootstrapped.reason || bootstrapped.error_code || 'PROJECT_BOOTSTRAP_FAILED', protocol_status: bootstrapped.protocol_status };

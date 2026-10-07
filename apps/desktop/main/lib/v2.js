@@ -105,14 +105,16 @@ function envelopeFor(identity, state, method, payload) {
     const claiming = payload.request_write_owner === true;
     if (claiming && env.writer_epoch !== null) return { ok: false, reason: 'ATTACKER_CLAIMED_EPOCH', method };
     if (!claiming && env.writer_epoch === null) return { ok: false, reason: 'MISSING_FIELD:writer_epoch', method };
-  } else if (WRITE_METHODS.indexOf(method) >= 0 && method !== 'project.bootstrap') {
+  } else if (WRITE_METHODS.indexOf(method) >= 0 && method !== 'project.bootstrap' && !(method === 'goal.start' && env.session_id === null)) {
     if (typeof env.project_id !== 'string') return { ok: false, reason: 'MISSING_FIELD:project_id', method };
     if (env.expected_revision === null) return { ok: false, reason: 'MISSING_FIELD:expected_revision', method };
     if (env.writer_epoch === null) return { ok: false, reason: 'MISSING_FIELD:writer_epoch', method };
   }
-  if (method === 'host.configure' && (Object.prototype.hasOwnProperty.call(payload, 'model_id') ||
-    Object.prototype.hasOwnProperty.call(payload, 'provider_id')) && env.writer_epoch === null) {
-    return { ok: false, reason: 'MODEL_CHANGE_WITHOUT_EPOCH', method };
+  if (method === 'host.configure') {
+    const scopes = [env.project_id, env.session_id, env.expected_revision, env.writer_epoch];
+    if (!scopes.every(value => value === null) && scopes.some(value => value === null)) {
+      return { ok: false, reason: 'CONFIGURATION_SCOPE_INCOMPLETE', method };
+    }
   }
   // The published payloads are closed objects, so an unexpected key is a bug in this shell, not a question for the core.
   if (CONTRACT[method].payload === 'EmptyPayload' && Object.keys(payload).length) {

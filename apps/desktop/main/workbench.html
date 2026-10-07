@@ -161,6 +161,10 @@ async function refresh() {
 // project/session references as the CLI; all displayed facts come from host replies.
 const review = { projectId: null, snapshot: null, events: [], cursor: 0, hasMore: false };
 const byId = id => document.getElementById(id);
+const exactInt = value => typeof value === 'bigint' || (typeof value === 'number' && Number.isSafeInteger(value));
+const exactCompare = (a, b) => { if (!exactInt(a) || !exactInt(b)) throw Error('EXACT_INTEGER_REQUIRED'); const x = BigInt(a), y = BigInt(b); return x < y ? -1 : x > y ? 1 : 0; };
+const exactPrevious = value => exactCompare(value, 0) > 0 ? BigInt(value) - 1n : 0n;
+const exactDisplay = value => JSON.stringify(value, (_key, item) => typeof item === 'bigint' ? item.toString() : item);
 const settledStatuses = new Set(['SETTLED', 'FAILED', 'CANCELLED']);
 
 function report(message, good = false) {
@@ -183,7 +187,7 @@ function canContinue() {
 }
 function updateControls() {
   const snap = review.snapshot;
-  const own = snap?.writer?.client_id === 'desktop-shell' && Number.isInteger(snap.writer.epoch);
+  const own = snap?.writer?.client_id === 'desktop-shell' && exactInt(snap.writer.epoch) && Date.parse(snap.writer.expires_at) > Date.now();
   byId('review-refresh').disabled = !snap;
   byId('review-read-attach').disabled = !snap?.writer?.epoch;
   byId('review-events').disabled = !snap;
@@ -197,7 +201,7 @@ function renderMessages() {
   const messages = review.snapshot?.messages || [];
   if (!messages.length) { item(root, '服务端快照没有消息。'); return; }
   for (const message of messages) {
-    const parts = (message.parts || []).slice().sort((a, b) => a.part_index - b.part_index);
+    const parts = (message.parts || []).slice().sort((a, b) => exactCompare(a.part_index, b.part_index));
     item(root, `${message.role || 'UNKNOWN'} · ${parts.map(p => p.text || '').join('') || '(空)'}${message.complete ? '' : '（未结束）'}`);
   }
 }
@@ -207,7 +211,7 @@ function eventSummary(event) {
   if (event.kind === 'RUN_STATE') return `运行 ${p.run_id || ''}：${p.status || '未知'}`;
   if (event.kind === 'TOOL_RESULT') return `工具 ${p.outcome || '未知'}：${p.summary || ''}`;
   if (event.kind === 'ARTIFACT') return `产物 ${p.artifact_ref?.id || '未知'}：${p.availability || ''}`;
-  return `${event.kind || '事件'}：${JSON.stringify(p).slice(0, 320)}`;
+  return `${event.kind || '事件'}：${exactDisplay(p).slice(0, 320)}`;
 }
 function renderEvents() {
   const root = byId('review-event-list');
@@ -290,7 +294,7 @@ async function selectProject() {
 async function listSessions() {
   if (!(await selectProject())) return;
   const reply = await api.v2['session.list']({ cursor: null, limit: 50 });
-  if (!reply?.ok) { report(`会话列表未读取：${failure(reply)}`); return; }
+  if (!reply?.completed) { report(`会话列表未读取：${failure(reply)}`); return; }
   const root = byId('review-sessions');
   root.textContent = '';
   const sessions = reply.result?.items || [];
@@ -309,9 +313,9 @@ async function openSession(id) {
   const sessionId = (id || byId('review-session').value).trim();
   if (!sessionId) { report('先选择或输入会话 ID。'); return; }
   const reply = await api.desktop.openSession(sessionId);
-  if (!reply?.ok || !adoptSnapshot(reply.result)) { report(`会话未打开：${reply?.ok ? 'SNAPSHOT_MISSING' : failure(reply)}`); return; }
+  if (!reply?.completed || !adoptSnapshot(reply.result)) { report(`会话未打开：${reply?.ok ? 'SNAPSHOT_MISSING' : failure(reply)}`); return; }
   review.events = [];
-  review.cursor = Math.max(0, (review.snapshot.earliest_event_sequence || 1) - 1);
+  review.cursor = exactPrevious(review.snapshot.earliest_event_sequence);
   review.hasMore = false;
   renderEvents();
   await readEvents();
@@ -320,20 +324,21 @@ async function openSession(id) {
 async function refreshSession() {
   if (!review.snapshot) return false;
   const reply = await api.v2['session.get']({});
-  if (!reply?.ok || !adoptSnapshot(reply.result)) { report(`快照未更新：${reply?.ok ? 'SNAPSHOT_MISSING' : failure(reply)}`); return false; }
+  if (!reply?.completed || !adoptSnapshot(reply.result)) { report(`快照未更新：${reply?.ok ? 'SNAPSHOT_MISSING' : failure(reply)}`); return false; }
   report('已重新读取服务端快照。', true);
   return true;
 }
 async function readEvents() {
   if (!review.snapshot) return;
   const reply = await api.v2['session.events']({ after_sequence: review.cursor, limit: 200 });
-  if (!reply?.ok) { report(`事件未读取：${failure(reply)}`); return; }
+  if (!reply?.completed) { report(`事件未读取：${failure(reply)}`); return; }
   const page = reply.result || {};
   const seen = new Set(review.events.map(event => event.event_id));
   for (const event of page.events || []) {
     if (event?.event_id && !seen.has(event.event_id)) { review.events.push(event); seen.add(event.event_id); }
   }
-  review.cursor = Math.max(review.cursor, Number(page.next_sequence) || 0);
+  if (!exactInt(page.next_sequence)) { report("无效事件游标"); return; }
+  if (exactCompare(page.next_sequence, review.cursor) > 0) review.cursor = page.next_sequence;
   review.hasMore = page.has_more === true;
   renderEvents(); renderArtifacts(); updateControls();
   report(`已读取事件，当前游标 ${review.cursor}${review.hasMore ? '，还有后续页' : ''}。`, true);
@@ -341,13 +346,13 @@ async function readEvents() {
 async function readAttach() {
   if (!review.snapshot?.writer?.epoch) return;
   const reply = await api.v2['session.attach']({ after_sequence: review.cursor, request_write_owner: false });
-  if (!reply?.ok || !adoptSnapshot(reply.result?.snapshot)) { report(`只读接入未完成：${reply?.ok ? 'SNAPSHOT_MISSING' : failure(reply)}`); return; }
+  if (!reply?.completed || !adoptSnapshot(reply.result?.snapshot)) { report(`只读接入未完成：${reply?.ok ? 'SNAPSHOT_MISSING' : failure(reply)}`); return; }
   report('已按服务端纪元只读接入；没有取得写入权。', true);
 }
 async function claimWriter() {
   if (!canContinue()) { report('上一轮尚未结束，不能接管写入。'); return; }
   const reply = await api.v2['session.attach']({ after_sequence: review.cursor, request_write_owner: true });
-  if (!reply?.ok) { report(`写入接管被拒绝：${failure(reply)}`); return; }
+  if (!reply?.completed) { report(`写入接管被拒绝：${failure(reply)}`); return; }
   if (!(await refreshSession())) return;
   if (review.snapshot?.writer?.client_id !== 'desktop-shell') { report('主机尚未确认本窗口取得写入权。'); return; }
   report(`主机已确认写入纪元 ${review.snapshot.writer.epoch}；现在可以在同一会话发送下一条消息。`, true);
@@ -357,7 +362,7 @@ async function sendNext() {
   const text = byId('review-message').value.trim();
   if (!text) return;
   const reply = await api.v2['session.send']({ text, attachment_artifact_ids: [], delivery: 'NORMAL' });
-  if (!reply?.ok) { report(`未发送：${failure(reply)}`); return; }
+  if (!reply?.completed) { report(`未发送：${failure(reply)}`); return; }
   byId('review-message').value = '';
   if (reply.result?.snapshot) adoptSnapshot(reply.result.snapshot);
   await refreshSession();
@@ -372,8 +377,8 @@ async function reviewInit() {
   byId('review-session').value = context?.session_id || '';
   const health = await api.v2['host.status']({});
   const indicator = byId('host-health');
-  indicator.className = health?.ok ? 'UP' : 'DOWN';
-  indicator.textContent = health?.ok ? '本机服务可读' : `本机服务未就绪 · ${failure(health)}`;
+  indicator.className = health?.completed ? 'UP' : 'DOWN';
+  indicator.textContent = health?.completed ? '本机服务可读' : `本机服务未就绪 · ${failure(health)}`;
   if (context?.session_id && context?.project_id) await openSession(context.session_id);
   else if (context?.project_id) await listSessions();
 }

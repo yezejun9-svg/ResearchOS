@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { integer, previous, display } from '../../desktop/main/lib/wire-values.mjs'
 import { ArtifactPreview } from './preview.jsx'
 import { SessionContinuation } from './session-continuation.jsx'
 
 const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
 const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
-const settled = value => ['COMPLETED', 'ACKNOWLEDGED'].includes(value?.protocol_status || value?.kind)
+const settled = value => value?.completed === true && (value?.protocol_status || value?.kind) === 'COMPLETED'
 function unwrap(reply) {
   if (!reply?.ok || !settled(reply)) {
     const error = new Error(reply?.error_code || reply?.reason || reply?.protocol_status || '主机尚未完成请求')
@@ -65,7 +66,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
   function active(generation) { return current.current.projectId === projectId && current.current.generation === generation }
   function adopt(snapshot) {
     if (!snapshot || snapshot.project_id !== projectId) throw new Error('会话与当前项目不一致')
-    if (current.current.snapshot?.session_id !== snapshot.session_id) current.current.eventSequence = Math.max(0, snapshot.earliest_event_sequence - 1)
+    if (current.current.snapshot?.session_id !== snapshot.session_id) current.current.eventSequence = previous(snapshot.earliest_event_sequence)
     current.current.snapshot = snapshot
     setState(old => ({ ...old, snapshot, error: null }))
   }
@@ -92,7 +93,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
       setWorkspace(old => old || host?.workspaces?.find(item => item.project_id === projectId && item.status === 'ACTIVE')?.authorized_workspace_ref || '')
       if (context.project_id === projectId && context.session_id) {
         const opened = unwrap(await window.researchos.desktop.openSession(context.session_id))
-        if (active(generation)) { adopt(opened); current.current.eventSequence = Math.max(0, opened.earliest_event_sequence - 1) }
+        if (active(generation)) { adopt(opened); current.current.eventSequence = previous(opened.earliest_event_sequence) }
       }
     } catch (error) { if (active(generation)) setState(old => ({ ...old, loading: false, error })) }
   }
@@ -114,7 +115,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
       try {
         const page = unwrap(await window.researchos.v2['session.events']({ after_sequence: current.current.eventSequence ?? snapshot.event_sequence, limit: 200 }))
         if (stopped || !active(generation)) return
-        if (Number.isSafeInteger(page.next_sequence)) current.current.eventSequence = page.next_sequence
+        if (integer(page.next_sequence)) current.current.eventSequence = page.next_sequence
         if (page.events?.length) {
           setState(old => {
             const seen = new Set(old.events.map(item => item.event_id))
@@ -124,7 +125,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
         }
       } catch (error) {
         if (stopped || !active(generation)) return
-        if (['CURSOR_EXPIRED', 'CURSOR_INVALID'].includes(error.code)) { try { const fresh = await readSnapshot(generation); if (active(generation)) current.current.eventSequence = Math.max(0, fresh.earliest_event_sequence - 1) } catch (cause) { if (active(generation)) setState(old => ({ ...old, error: cause })) } }
+        if (['CURSOR_EXPIRED', 'CURSOR_INVALID'].includes(error.code)) { try { const fresh = await readSnapshot(generation); if (active(generation)) current.current.eventSequence = previous(fresh.earliest_event_sequence) } catch (cause) { if (active(generation)) setState(old => ({ ...old, error: cause })) } }
         else setState(old => ({ ...old, error }))
       } finally { polling = false }
     }
@@ -160,7 +161,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
     })
   }
   const snapshot = state.snapshot
-  const writer = snapshot?.writer?.client_id === state.host?.client_id
+  const writer = snapshot?.writer?.client_id === state.host?.client_id && Date.parse(snapshot?.writer?.expires_at) > Date.now()
   const disabled = !!busy || !online
   const tools = state.events.filter(event => ['TOOL_STARTED', 'TOOL_RESULT', 'ERROR', 'USAGE', 'ARTIFACT', 'JUDGE_DECISION'].includes(event.kind))
   return <>
@@ -195,7 +196,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
         <p className="small-muted" role="status" aria-live="polite">{busy ? `${busy}…` : notice}</p>
       </Panel>
       {snapshot?.project_id === projectId && <SessionContinuation key={`${projectId}:${snapshot.session_id}:${snapshot.goal_id || ''}:${snapshot.revision}`} api={api} projectId={projectId} snapshot={snapshot} navigate={navigate}/>}
-      {tools.length > 0 && <Panel title="工具与结果"><ol className="event-list">{tools.map(event => <li key={event.event_id}><strong>{event.kind === 'TOOL_STARTED' ? '开始工具' : event.kind === 'TOOL_RESULT' ? '工具结果' : event.kind}</strong><span>{event.payload?.tool_name || event.payload?.summary || event.payload?.message || ''}</span><details><summary>查看完整回执</summary><pre>{JSON.stringify(event.payload, null, 2)}</pre></details></li>)}</ol></Panel>}
+      {tools.length > 0 && <Panel title="工具与结果"><ol className="event-list">{tools.map(event => <li key={event.event_id}><strong>{event.kind === 'TOOL_STARTED' ? '开始工具' : event.kind === 'TOOL_RESULT' ? '工具结果' : event.kind}</strong><span>{event.payload?.tool_name || event.payload?.summary || event.payload?.message || ''}</span><details><summary>查看完整回执</summary><pre>{display(event.payload)}</pre></details></li>)}</ol></Panel>}
       {(snapshot?.pending_permissions || []).map(prompt => <PermissionDecision key={prompt.request.id} prompt={prompt} api={api} projectId={projectId} disabled={disabled || !writer} respond={decision => command('处理授权', async () => { unwrap(await window.researchos.v2['permission.respond']({ resource_request_id: prompt.request.id, resource_request_revision: prompt.request.revision, action_digest: prompt.action_digest, decision, reason: '用户在桌面明确选择' })); await readSnapshot() })}/>)}
       </div>
     </div>
@@ -228,7 +229,7 @@ function PermissionDecision({ prompt, api, projectId, disabled, respond }) {
     <dl><dt>工具</dt><dd>{scope.tool_name}</dd><dt>工作区</dt><dd className="break-all">{scope.workspace_ref}</dd><dt>允许路径</dt><dd>{scope.allowed_relative_paths.length ? scope.allowed_relative_paths.join('、') : '没有文件路径授权'}</dd><dt>有效期</dt><dd>{new Date(scope.expires_at).toLocaleString()}</dd></dl>
     <p>授权仅对本次动作生效一次。请先预览冻结参数，再决定是否允许。</p>
     <BoundArtifact reference={scope.arguments_artifact_ref} api={api} projectId={projectId} label="查看本次工具参数" onVerified={({ content_hash, text }) => setReviewed(content_hash === scope.arguments_artifact_ref.content_hash && text != null)}/>
-    <details><summary>动作范围与输入版本</summary><pre>{JSON.stringify(scope, null, 2)}</pre></details>
+    <details><summary>动作范围与输入版本</summary><pre>{display(scope)}</pre></details>
     {!prompt.policy_allows_user_decision && <p role="status">当前策略不允许用户授权此动作，请先处理策略限制。</p>}
     {expired && <p role="status">本次授权请求已过期，请刷新原任务状态。</p>}
     {prompt.allowed_responses.filter(decision => decision !== 'ALLOW_ONCE' || prompt.policy_allows_user_decision).map(decision => <button key={decision} disabled={disabled || expired || !prompt.policy_allows_user_decision || (decision === 'ALLOW_ONCE' && !reviewed)} onClick={() => respond(decision)}>{decision === 'DENY' ? '拒绝' : '允许本次'}</button>)}
@@ -258,7 +259,7 @@ function WorkspaceFiles({ snapshot, api, projectId, writer, disabled, command, r
   return <Panel title="工作区文件与差异" aside={<button disabled={disabled} onClick={() => tree('')}>读取文件树</button>}>
     <div className="workspace-layout"><div><p className="small-muted break-all">{directory || '项目根目录'}</p>{directory && <button disabled={disabled} onClick={() => tree(directory.split('/').slice(0, -1).join('/'))}>上级目录</button>}<ul className="file-list">{entries.map(item => <li key={item.relative_path}><button disabled={disabled || !item.readable} onClick={() => item.kind === 'DIRECTORY' ? tree(item.relative_path) : open(item.relative_path)}>{item.name || item.relative_path}{item.kind === 'DIRECTORY' ? ' /' : ''}</button>{!item.readable && <small>{({ CONTENT_TOO_LARGE: '超过读取上限', UNSUPPORTED_CONTENT: '不支持预览', PATH_OUT_OF_SCOPE: '不在授权范围', FORBIDDEN: '无读取权限' })[item.reason_code] || '不可读取'}</small>}</li>)}</ul>{cursor && <button disabled={disabled} onClick={() => tree(directory, true)}>加载更多文件</button>}</div>
     <div><label>差异基线<select value={diffBase} onChange={event => setDiffBase(event.target.value)}><option value="HEAD">Git HEAD</option><option value="INDEX">Git 暂存区</option></select></label><button disabled={disabled} onClick={() => command('读取差异', async () => setDiff(unwrap(await window.researchos.v2['workspace.diff']({ workspace_ref: snapshot.workspace_ref, base: diffBase, relative_path: selectedFile || null, max_bytes: 1048576 }))))}>查看差异</button>
-      {diff && <><p>{diff.base} · {diff.files?.length || 0} / {diff.total_files} 个文件{diff.truncated ? ' · 内容超限，已截断' : ''}</p><pre className="preview-text">{JSON.stringify(diff.files, null, 2)}</pre>{diff.full_diff_artifact_ref && <BoundArtifact reference={diff.full_diff_artifact_ref} api={api} projectId={projectId} label="读取完整差异"/>}</>}
+      {diff && <><p>{diff.base} · {diff.files?.length || 0} / {diff.total_files} 个文件{diff.truncated ? ' · 内容超限，已截断' : ''}</p><pre className="preview-text">{display(diff.files)}</pre>{diff.full_diff_artifact_ref && <BoundArtifact reference={diff.full_diff_artifact_ref} api={api} projectId={projectId} label="读取完整差异"/>}</>}
       {base && <><h3 className="break-all">{base.relative_path}</h3><label>文件草稿<textarea className="file-editor" value={text} onChange={event => setText(event.target.value)} readOnly={!base.editable || !writer}/></label>
         <label>关联任务<select value={task} onChange={event => setTask(event.target.value)}><option value="">选择已有可编辑任务</option>{tasks.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
         <Failure error={taskError} retry={() => setTaskRefresh(value => value + 1)}/>
