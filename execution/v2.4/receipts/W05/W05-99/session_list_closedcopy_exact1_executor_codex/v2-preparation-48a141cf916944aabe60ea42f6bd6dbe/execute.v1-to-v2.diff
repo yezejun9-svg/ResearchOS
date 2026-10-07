@@ -1,0 +1,40 @@
+--- D:\作品集\ResearchOS\research-os\.local\worktrees\codex-w0599-session-list-proof-r312\execution\v2.4\receipts\W05\W05-99\session_list_closedcopy_exact1_executor_codex\907592b8e03d433da7de947435274481\execute.py
++++ D:\作品集\ResearchOS\research-os\.local\worktrees\codex-w0599-session-list-proof-r312\execution\v2.4\receipts\W05\W05-99\session_list_closedcopy_exact1_executor_codex\v2-preparation-48a141cf916944aabe60ea42f6bd6dbe\execute.py
+@@ -7,7 +7,7 @@
+ R=Path(r'D:/作品集/ResearchOS/research-os')
+ W=R/'.local/worktrees/codex-w0599-session-list-proof-r312'
+ OUT=Path(__file__).resolve().parent
+-WORK=W/'.local/closedcopy-907592b8'
++WORK=W/'.local/closedcopy-v2-48a141cf916944aabe60ea42f6bd6dbe'
+ NAMES=['NullContext','OwnedContext','ContextNotResultFilter','ExactReplayAfterCommit','ChangedPayloadConflict','ChangedSIDConflict','CrossProjectContext','ForeignPrincipalContext','ForeignPrincipalNullList','UnknownContext','ProjectGrantDenied','CrossProjectCursor','CrossPrincipalCursor','MalformedRequest']
+ SCOPE=R/'execution/v2.4/receipts/W05/W05-99/integration_codex/session-list-closedcopy-exact1-r312/scope_registration.json'
+ HELPER=R/'execution/v2.4/receipts/W05/W05-99/integration_codex/independent-cli-list-scopes-r308/windows_owned_process.py'
+@@ -73,8 +73,26 @@
+  require(digest(SCOPE)=='31b4e0abaea4355d908050859062206b1a1292407177462acc123313ef8b1f2c','Scope SHA')
+  require(digest(HELPER)=='6a4fa13d7a69bd6dc33b10a667253906193bf105f8370db9f6665cd76837b3ad','Helper SHA')
+  require(digest(PLAN)=='598adac08e7c638bda6b783a78dc8541847b8e48054e196dd6da6eb728319bc2','Publicplan SHA')
+- require(not WORK.exists(),'Work already exists; no automatic retry')
+- WORK.mkdir();[(WORK/x).mkdir() for x in ['cache','gotmp','temp']]
++ # Check the exact worktree and its .local parent without following aliases.
++ require(W.is_absolute() and W.resolve(strict=True)==W.absolute(),'Exact worktree resolved outside its lexical path')
++ worktree_stat=os.lstat(W)
++ require(not W.is_symlink() and not (getattr(worktree_stat,'st_file_attributes',0)&0x400) and W.is_dir(),'Worktree alias or non-directory')
++ parent=WORK.parent
++ require(parent==W/'.local' and parent.is_absolute() and parent.parent.resolve(strict=True)==W.resolve(strict=True),'Invalid owned parent')
++ if os.path.lexists(parent):
++  parent_stat=os.lstat(parent)
++  require(not parent.is_symlink() and not (getattr(parent_stat,'st_file_attributes',0)&0x400) and parent.is_dir(),'Owned parent alias or non-directory')
++  require(parent.resolve(strict=True)==W.resolve(strict=True)/'.local','Owned parent escaped exact worktree')
++ else:
++  require(parent.resolve(strict=False)==W.resolve(strict=True)/'.local','Prospective parent escaped exact worktree')
++  parent.mkdir() # Exclusive creation; a concurrent creator is an error.
++ parent_stat=os.lstat(parent)
++ require(not parent.is_symlink() and not (getattr(parent_stat,'st_file_attributes',0)&0x400) and parent.is_dir() and parent.resolve(strict=True)==W.resolve(strict=True)/'.local','Owned parent changed before leaf creation')
++ require(not os.path.lexists(WORK),'Work already exists; no automatic retry')
++ WORK.mkdir() # Fresh leaf remains exclusive; no exist_ok and no reuse.
++ leaf_stat=os.lstat(WORK)
++ require(not WORK.is_symlink() and not (getattr(leaf_stat,'st_file_attributes',0)&0x400) and WORK.resolve(strict=True).parent==parent.resolve(strict=True),'Fresh work leaf alias or escape')
++ [(WORK/x).mkdir() for x in ['cache','gotmp','temp']]
+  helper=types.ModuleType('owned_helper');helper.__file__=str(HELPER);exec(compile(HELPER.read_bytes(),str(HELPER),'exec'),helper.__dict__)
+  tools=load(LOCK)['tools']
+  for key in ['python','go','git']:require(digest(tools[key]['path'])==tools[key]['sha256'],'Locked '+key)
