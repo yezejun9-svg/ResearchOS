@@ -1,0 +1,397 @@
+package domain
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"researchos.local/research-os/internal/store"
+)
+
+// Native loopback HTTP, real temporary SQLite, reviewer-defined attacks.
+// No provider, installed service, public tunnel or private holdout is involved.
+func reviewRemoteCall(server *httptest.Server, method, path, token, key, tag string, body Object) (int, Object, http.Header, error) {
+	req, e := http.NewRequest(method, server.URL+path, bytes.NewReader(Bytes(body)))
+	if e != nil {
+		return 0, nil, nil, e
+	}
+	if body == nil {
+		req.Body = nil
+		req.ContentLength = 0
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
+	if tag != "" {
+		req.Header.Set("If-Match", tag)
+	}
+	response, e := server.Client().Do(req)
+	if e != nil {
+		return 0, nil, nil, e
+	}
+	defer response.Body.Close()
+	raw, e := io.ReadAll(response.Body)
+	if e != nil {
+		return 0, nil, nil, e
+	}
+	var result Object
+	e = json.Unmarshal(raw, &result)
+	return response.StatusCode, result, response.Header, e
+}
+func reviewRemoteExpect(t *testing.T, server *httptest.Server, want int, method, path, token, key, tag string, body Object) Object {
+	t.Helper()
+	code, result, _, e := reviewRemoteCall(server, method, path, token, key, tag, body)
+	if e != nil || code != want {
+		t.Fatalf("%s %s status=%d want=%d error=%v code=%v", method, path, code, want, e, result["code"])
+	}
+	return result
+}
+func reviewRemoteSetup(t *testing.T) (*fixture, *httptest.Server, string, string) {
+	t.Helper()
+	f := setup(t)
+	f.createProject()
+	a := f.project
+	f.createProject()
+	b := f.project
+	f.project = a
+	server := httptest.NewServer(f.s.Handler())
+	t.Cleanup(server.Close)
+	return f, server, a, b
+}
+func reviewRemotePair(t *testing.T, f *fixture, server *httptest.Server, projects []any) (Object, Object, Object) {
+	t.Helper()
+	challenge := reviewRemoteExpect(t, server, 201, "POST", "/v1/device-pairings", f.token, ID(), "", Object{"label": "reviewer-public-fixture", "project_ids": projects, "expires_in_seconds": 300})
+	body := Object{"challenge_id": challenge["challenge_id"], "pairing_token": challenge["pairing_token"], "device_label": "reviewer-public-fixture"}
+	session := reviewRemoteExpect(t, server, 200, "POST", "/v1/device-pairings/redeem", "", ID(), "", body)
+	return challenge, session, body
+}
+func reviewRemoteAssert(t *testing.T, id string, want, got any) {
+	t.Helper()
+	pass := Hash(want) == Hash(got)
+	fmt.Println("INDEPENDENT_W17_ASSERT " + string(Bytes(Object{"id": id, "expected": want, "actual": got, "pass": pass, "mode": "PUBLIC_FIXTURE_NATIVE_HTTP"})))
+	if !pass {
+		t.Fatal(id)
+	}
+}
+
+func TestIndependentW17ConcurrentConsumption(t *testing.T) {
+	f, server, a, _ := reviewRemoteSetup(t)
+	var seq int
+	var name, path string
+	if e := f.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &path); e != nil {
+		t.Fatal(e)
+	}
+	otherDB, e := store.Open(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer otherDB.Close()
+	otherService, e := New(otherDB, "../../spec/v2.0/contracts", "../../migrations/sqlite/0002_domain.sql")
+	if e != nil {
+		t.Fatal(e)
+	}
+	otherServer := httptest.NewServer(otherService.Handler())
+	defer otherServer.Close()
+	challenge := reviewRemoteExpect(t, server, 201, "POST", "/v1/device-pairings", f.token, ID(), "", Object{"label": "reviewer-concurrent", "project_ids": []any{a}, "expires_in_seconds": 300})
+	body := Object{"challenge_id": challenge["challenge_id"], "pairing_token": challenge["pairing_token"], "device_label": "concurrent-device"}
+	type result struct {
+		code int
+		body Object
+		err  error
+	}
+	results := make(chan result, 12)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			srv := server
+			if i%2 != 0 {
+				srv = otherServer
+			}
+			code, b, _, err := reviewRemoteCall(srv, "POST", "/v1/device-pairings/redeem", "", ID(), "", body)
+			results <- result{code, b, err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	success, denied := 0, 0
+	var session Object
+	for r := range results {
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.code == 200 {
+			success++
+			session = r.body
+		} else if r.code == 401 {
+			denied++
+		} else {
+			t.Fatalf("unexpected race status=%d code=%v", r.code, r.body["code"])
+		}
+	}
+	var devices, consumed int
+	f.db.QueryRow("SELECT count(*) FROM remote_devices").Scan(&devices)
+	f.db.QueryRow("SELECT consumed FROM remote_challenges WHERE id=?", challenge["challenge_id"]).Scan(&consumed)
+	reviewRemoteAssert(t, "concurrent-pair-two-sqlite-connections", []int{1, 11, 1, 1}, []int{success, denied, devices, consumed})
+	token := Str(session, "access_token")
+	reviewRemoteExpect(t, server, 200, "GET", "/v1/projects/"+a+"/state", token, "", "", nil)
+	// A fresh key on a used proof cannot create a second credential/device.
+	reviewRemoteExpect(t, otherServer, 401, "POST", "/v1/device-pairings/redeem", "", ID(), "", body)
+	refreshBody := Object{"refresh_token": session["refresh_token"]}
+	refreshResults := make(chan result, 8)
+	start2 := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start2
+			srv := server
+			if i%2 != 0 {
+				srv = otherServer
+			}
+			code, b, _, err := reviewRemoteCall(srv, "POST", "/v1/device-sessions/refresh", "", ID(), "", refreshBody)
+			refreshResults <- result{code, b, err}
+		}(i)
+	}
+	close(start2)
+	wg.Wait()
+	close(refreshResults)
+	success, denied = 0, 0
+	var renewed Object
+	for r := range refreshResults {
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.code == 200 {
+			success++
+			renewed = r.body
+		} else if r.code == 401 {
+			denied++
+		} else {
+			t.Fatalf("unexpected refresh status=%d", r.code)
+		}
+	}
+	reviewRemoteAssert(t, "concurrent-refresh-single-winner", []int{1, 7}, []int{success, denied})
+	reviewRemoteExpect(t, server, 401, "GET", "/v1/projects/"+a+"/state", token, "", "", nil)
+	reviewRemoteExpect(t, server, 200, "GET", "/v1/projects/"+a+"/state", Str(renewed, "access_token"), "", "", nil)
+	// Scan actual SQLite cells as bytes; []byte is not formatted as a decimal list.
+	secrets := []string{Str(challenge, "pairing_token"), token, Str(session, "refresh_token"), Str(renewed, "access_token"), Str(renewed, "refresh_token")}
+	for _, table := range []string{"remote_challenges", "remote_devices", "remote_refresh", "remote_replays", "remote_audit", "auth_credentials", "domain_objects", "outbox", "idempotency"} {
+		rows, e := f.db.Query("SELECT * FROM " + table)
+		if e != nil {
+			t.Fatal(e)
+		}
+		cols, _ := rows.Columns()
+		for rows.Next() {
+			v := make([]any, len(cols))
+			p := make([]any, len(cols))
+			for i := range v {
+				p[i] = &v[i]
+			}
+			if e = rows.Scan(p...); e != nil {
+				t.Fatal(e)
+			}
+			for _, cell := range v {
+				var raw []byte
+				switch x := cell.(type) {
+				case []byte:
+					raw = x
+				case string:
+					raw = []byte(x)
+				default:
+					continue
+				}
+				for _, secret := range secrets {
+					if len(secret) < 64 {
+						t.Fatal("empty credential in scanner")
+					}
+					if bytes.Contains(raw, []byte(secret)) {
+						t.Fatalf("secret in %s", table)
+					}
+				}
+			}
+		}
+		if e = rows.Err(); e != nil {
+			t.Fatal(e)
+		}
+		rows.Close()
+	}
+	for _, file := range []string{path, path + "-wal"} {
+		raw, e := os.ReadFile(file)
+		if os.IsNotExist(e) {
+			continue
+		}
+		if e != nil {
+			t.Fatal(e)
+		}
+		for _, secret := range secrets {
+			if bytes.Contains(raw, []byte(secret)) {
+				t.Fatal("plaintext credential in SQLite physical bytes")
+			}
+		}
+	}
+	reviewRemoteAssert(t, "logical-and-physical-sqlite-secret-scan", 0, 0)
+}
+
+func TestIndependentW17GrantsAndBoundaries(t *testing.T) {
+	f, server, a, b := reviewRemoteSetup(t)
+	_, session, _ := reviewRemotePair(t, f, server, []any{a, b})
+	token := Str(session, "access_token")
+	d := session["device"].(map[string]any)
+	path := "/v1/devices/" + Str(d, "id")
+	reviewRemoteExpect(t, server, 200, "GET", "/v1/projects/"+a+"/state", token, "", "", nil)
+	reviewRemoteExpect(t, server, 200, "GET", "/v1/projects/"+b+"/state", token, "", "", nil)
+	reviewRemoteExpect(t, server, 403, "POST", "/v1/projects/"+a+"/requirements", token, ID(), f.stateTag(), requirementBody())
+	d = reviewRemoteExpect(t, server, 200, "PUT", path+"/grants", f.token, ID(), testTag(d), Object{"role": "OWNER", "project_ids": []any{a, b}, "reason": "reviewer explicit grant"})
+	created := reviewRemoteExpect(t, server, 201, "POST", "/v1/projects/"+a+"/requirements", token, ID(), f.stateTag(), requirementBody())
+	for _, target := range []string{"/v1/devices", "/v1/policies/run"} {
+		reviewRemoteExpect(t, server, 403, "GET", target, token, "", "", nil)
+	}
+	reviewRemoteExpect(t, server, 403, "POST", "/v1/projects", token, ID(), "", projectBody())
+	reviewRemoteExpect(t, server, 403, "POST", "/v1/device-pairings", token, ID(), "", Object{"label": "no delegation", "project_ids": []any{a}, "expires_in_seconds": 300})
+	oldTag := testTag(d)
+	d = reviewRemoteExpect(t, server, 200, "PUT", path+"/grants", f.token, ID(), oldTag, Object{"role": "READER", "project_ids": []any{a}, "reason": "reviewer scope shrink"})
+	reviewRemoteExpect(t, server, 403, "POST", "/v1/projects/"+a+"/requirements", token, ID(), f.stateTag(), requirementBody())
+	reviewRemoteExpect(t, server, 404, "GET", "/v1/projects/"+b+"/state", token, "", "", nil)
+	reviewRemoteExpect(t, server, 200, "GET", "/v1/projects/"+a+"/requirements/"+Str(created, "id"), token, "", "", nil)
+	reviewRemoteExpect(t, server, 412, "PUT", path+"/grants", f.token, ID(), oldTag, Object{"role": "OWNER", "project_ids": []any{a, b}, "reason": "stale re-expansion"})
+	projects := reviewRemoteExpect(t, server, 200, "GET", "/v1/projects", token, "", "", nil)
+	reviewRemoteAssert(t, "grant-downgrade-and-shrink-live-token", []any{"READER", 1}, []any{d["role"], len(Arr(projects, "items"))})
+	// Even a different local OWNER with the same project cannot manage this device.
+	p := Principal{ID: "reviewer-other-owner", Roles: []string{"OWNER"}, Grants: []Grant{{ProjectID: a}}}
+	if e := f.s.ProvisionPrincipal(context.Background(), p); e != nil {
+		t.Fatal(e)
+	}
+	other, e := f.s.IssueCredential(context.Background(), p.ID, time.Minute)
+	if e != nil {
+		t.Fatal(e)
+	}
+	reviewRemoteExpect(t, server, 404, "POST", path+"/revoke", other, ID(), testTag(d), Object{"reason": "not device issuer"})
+	reviewRemoteAssert(t, "other-owner-cannot-revoke-device", 404, 404)
+	// Owner scope removal immediately constrains existing sessions and refresh.
+	if _, e = f.db.Exec("DELETE FROM auth_grants WHERE principal=? AND project=?", f.owner, a); e != nil {
+		t.Fatal(e)
+	}
+	reviewRemoteExpect(t, server, 404, "GET", "/v1/projects/"+a+"/state", token, "", "", nil)
+	reviewRemoteExpect(t, server, 401, "POST", "/v1/device-sessions/refresh", "", ID(), "", Object{"refresh_token": session["refresh_token"]})
+	reviewRemoteAssert(t, "issuer-scope-intersection-and-refresh", []int{404, 401}, []int{404, 401})
+}
+
+func TestIndependentW17SSEChanges(t *testing.T) {
+	for _, scenario := range []string{"device-revocation", "project-shrink", "refresh-rotation", "owner-revocation"} {
+		t.Run(scenario, func(t *testing.T) {
+			f, server, a, b := reviewRemoteSetup(t)
+			_, session, _ := reviewRemotePair(t, f, server, []any{a, b})
+			token := Str(session, "access_token")
+			d := session["device"].(map[string]any)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			req, e := http.NewRequestWithContext(ctx, "GET", server.URL+"/v1/projects/"+b+"/events/stream", nil)
+			if e != nil {
+				t.Fatal(e)
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			response, e := server.Client().Do(req)
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != 200 {
+				t.Fatal(response.StatusCode)
+			}
+			head := make([]byte, len(": connected\n\n"))
+			if _, e = io.ReadFull(response.Body, head); e != nil {
+				t.Fatal(e)
+			}
+			start := time.Now()
+			want := 401
+			switch scenario {
+			case "device-revocation":
+				reviewRemoteExpect(t, server, 200, "POST", "/v1/devices/"+Str(d, "id")+"/revoke", f.token, ID(), testTag(d), Object{"reason": "reviewer lost device"})
+			case "project-shrink":
+				reviewRemoteExpect(t, server, 200, "PUT", "/v1/devices/"+Str(d, "id")+"/grants", f.token, ID(), testTag(d), Object{"role": "READER", "project_ids": []any{a}, "reason": "reviewer shrink"})
+				want = 404
+			case "refresh-rotation":
+				reviewRemoteExpect(t, server, 200, "POST", "/v1/device-sessions/refresh", "", ID(), "", Object{"refresh_token": session["refresh_token"]})
+			case "owner-revocation":
+				if e = f.s.RevokePrincipal(context.Background(), f.owner); e != nil {
+					t.Fatal(e)
+				}
+			}
+			_, e = io.ReadAll(response.Body)
+			elapsed := time.Since(start)
+			if e != nil || elapsed >= 2*time.Second {
+				t.Fatalf("SSE still active error=%v elapsed=%v", e, elapsed)
+			}
+			reviewRemoteExpect(t, server, want, "GET", "/v1/projects/"+b+"/events?after_sequence=0&limit=100", token, "", "", nil)
+			reviewRemoteAssert(t, "sse-and-poll-"+scenario, []any{true, want}, []any{elapsed < 2*time.Second, want})
+			fmt.Println("INDEPENDENT_W17_SSE_MS", scenario, elapsed.Milliseconds())
+		})
+	}
+}
+
+func TestIndependentW17ProofExpiryReplayAndPrivate(t *testing.T) {
+	f, server, a, b := reviewRemoteSetup(t)
+	for _, ttl := range []int{29, 301} {
+		reviewRemoteExpect(t, server, 400, "POST", "/v1/device-pairings", f.token, ID(), "", Object{"label": "invalid lifetime", "project_ids": []any{a}, "expires_in_seconds": ttl})
+	}
+	ch := reviewRemoteExpect(t, server, 201, "POST", "/v1/device-pairings", f.token, ID(), "", Object{"label": "expired", "project_ids": []any{a}, "expires_in_seconds": 30})
+	if _, e := f.db.Exec("UPDATE remote_challenges SET expires_at=? WHERE id=?", remoteExpiry(-time.Second), ch["challenge_id"]); e != nil {
+		t.Fatal(e)
+	}
+	reviewRemoteExpect(t, server, 401, "POST", "/v1/device-pairings/redeem", "", ID(), "", Object{"challenge_id": ch["challenge_id"], "pairing_token": ch["pairing_token"], "device_label": "expired"})
+	ch = reviewRemoteExpect(t, server, 201, "POST", "/v1/device-pairings", f.token, ID(), "", Object{"label": "one-use", "project_ids": []any{a}, "expires_in_seconds": 300})
+	body := Object{"challenge_id": ch["challenge_id"], "pairing_token": ch["pairing_token"], "device_label": "one-use"}
+	key := ID()
+	s := reviewRemoteExpect(t, server, 200, "POST", "/v1/device-pairings/redeem", "", key, "", body)
+	repeated := reviewRemoteExpect(t, server, 200, "POST", "/v1/device-pairings/redeem", "", key, "", body)
+	reviewRemoteAssert(t, "same-handler-idempotent-credential-reply", true, Hash(s) == Hash(repeated))
+	reconstructed := httptest.NewServer(f.s.Handler())
+	defer reconstructed.Close()
+	reviewRemoteExpect(t, reconstructed, 409, "POST", "/v1/device-pairings/redeem", "", key, "", body)
+	token := Str(s, "access_token")
+	reviewRemoteExpect(t, reconstructed, 200, "GET", "/v1/projects/"+a+"/state", token, "", "", nil)
+	d := s["device"].(map[string]any)
+	reviewRemoteExpect(t, server, 200, "PUT", "/v1/devices/"+Str(d, "id")+"/grants", f.token, ID(), testTag(d), Object{"role": "OWNER", "project_ids": []any{a}, "reason": "private boundary test"})
+	canary := "PUBLIC_REVIEWER_PRIVATE_METADATA_CANARY_W17"
+	private := Merge(Base(a), Object{"run_id": nil, "kind": "REPORT", "evidence_kind": "SIMULATED", "validity": "CURRENT", "measurement_mode": "FIXTURE", "content_hash": Digest([]byte(canary)), "storage_key": canary, "media_type": "text/plain", "byte_size": len(canary), "input_refs": Empty(), "source_refs": Empty(), "produced_by": f.owner, "sealed_at": Now(), "access_class": "VERIFIER_ONLY"})
+	sourceTx(t, f.db, func(tx *sql.Tx) error {
+		if e := f.s.put(tx, "Artifact", private); e != nil {
+			return e
+		}
+		return f.s.event(tx, a, "Artifact", private, f.owner, ID(), "PROJECT_UPDATED")
+	})
+	for _, suffix := range []string{"", "/content"} {
+		reviewRemoteExpect(t, reconstructed, 404, "GET", "/v1/projects/"+a+"/artifacts/"+Str(private, "id")+suffix, token, "", "", nil)
+	}
+	for _, suffix := range []string{"/artifacts", "/events?limit=100&after_sequence=0"} {
+		o := reviewRemoteExpect(t, reconstructed, 200, "GET", "/v1/projects/"+a+suffix, token, "", "", nil)
+		if strings.Contains(string(Bytes(o)), canary) || strings.Contains(string(Bytes(o)), Str(private, "id")) {
+			t.Fatal("private metadata disclosed")
+		}
+	}
+	reviewRemoteExpect(t, reconstructed, 404, "GET", "/v1/projects/"+b+"/artifacts/"+Str(private, "id"), token, "", "", nil)
+	reviewRemoteAssert(t, "reconstructed-handler-private-and-cross-project-boundary", true, true)
+	// A replayed secret response may not revive a rotated access credential.
+	reviewRemoteExpect(t, server, 200, "POST", "/v1/device-sessions/refresh", "", ID(), "", Object{"refresh_token": s["refresh_token"]})
+	reviewRemoteExpect(t, server, 401, "POST", "/v1/device-pairings/redeem", "", key, "", body)
+	reviewRemoteAssert(t, "expired-proof-ttl-and-post-rotation-replay", true, true)
+}

@@ -1,0 +1,60 @@
+internal/domain/backup_host_configuration.go:21:var backupConfigurationProtocol []byte
+internal/domain/backup_host_configuration.go:24:var backupConfigurationDomain []byte
+internal/domain/backup_host_configuration.go:26:var backupConfigurationSchemaOnce sync.Once
+internal/domain/backup_host_configuration.go:27:var backupConfigurationSchemaDoc *SchemaDoc
+internal/domain/backup_host_configuration.go:28:var backupConfigurationSchemaError error
+internal/domain/backup_host_configuration.go:29:var backupConfigurationHash = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+internal/domain/backup_host_configuration.go:31:func loadBackupConfigurationSchema(protocol, external []byte) (*SchemaDoc, error) {
+internal/domain/backup_host_configuration.go:37:func backupConfigurationSchema() (*SchemaDoc, error) {
+internal/domain/backup_host_configuration.go:38:	backupConfigurationSchemaOnce.Do(func() {
+internal/domain/backup_host_configuration.go:39:		backupConfigurationSchemaDoc, backupConfigurationSchemaError = loadBackupConfigurationSchema(backupConfigurationProtocol, backupConfigurationDomain)
+internal/domain/backup_host_configuration.go:41:	return backupConfigurationSchemaDoc, backupConfigurationSchemaError
+internal/domain/backup_host_configuration.go:44:type configurationBackupQuery interface {
+internal/domain/backup_host_configuration.go:48:func configurationBackupRows(db configurationBackupQuery, query string, args ...any) ([]Object, error) {
+internal/domain/backup_host_configuration.go:80:func backupConfigurationPresent(db *sql.DB) (bool, error) {
+internal/domain/backup_host_configuration.go:90:	schema, e := configurationBackupRows(db, `SELECT type,name,tbl_name,sql FROM sqlite_master WHERE (tbl_name IN ('client_command_identities','host_model_configurations','host_model_config_heads') OR name='client_identity_receipt_request') AND sql IS NOT NULL ORDER BY type,name`)
+internal/domain/backup_host_configuration.go:106:func backupHostConfigurationState(db *sql.DB) (Object, error) {
+internal/domain/backup_host_configuration.go:107:	present, e := backupConfigurationPresent(db)
+internal/domain/backup_host_configuration.go:112:	for _, table := range []string{"client_command_identities", "host_model_configurations", "host_model_config_heads"} {
+internal/domain/backup_host_configuration.go:113:		rows, e := configurationBackupRows(db, "SELECT * FROM "+table)
+internal/domain/backup_host_configuration.go:122:	rows, e := configurationBackupRows(db, `SELECT i.* FROM idempotency i JOIN client_command_identities c ON c.principal=i.principal AND c.command_id=i.key WHERE substr(i.operation,1,3)='v2:'`)
+internal/domain/backup_host_configuration.go:131:func validateBackupHostConfiguration(db *sql.DB) error {
+internal/domain/backup_host_configuration.go:132:	present, e := backupConfigurationPresent(db)
+internal/domain/backup_host_configuration.go:136:	doc, e := backupConfigurationSchema()
+internal/domain/backup_host_configuration.go:145:	records, e := configurationBackupRows(tx, `SELECT * FROM host_model_configurations ORDER BY owner_host_ref,principal,config_revision`)
+internal/domain/backup_host_configuration.go:149:	heads := map[string]clientConfigurationHead{}
+internal/domain/backup_host_configuration.go:153:		record, e := readClientConfiguration(context.Background(), tx, doc, owner, principal, ref)
+internal/domain/backup_host_configuration.go:162:		heads[key] = clientConfigurationHead{record.Payload.Revision, record.Ref}
+internal/domain/backup_host_configuration.go:165:	rows, e := configurationBackupRows(tx, `SELECT * FROM host_model_config_heads`)
+internal/domain/backup_host_configuration.go:181:	identities, e := configurationBackupRows(tx, `SELECT * FROM client_command_identities`)
+internal/domain/backup_host_configuration.go:187:		if !clientIdentityLabel(principal) || !clientIdentityLabel(command) || identity["protocol"] != ProtocolV2 || identity["operation"] != "v2:"+method || !backupConfigurationHash.MatchString(Str(identity, "request_hash")) {
+internal/domain/backup_host_configuration.go:207:		journal, e := configurationBackupRows(tx, `SELECT * FROM idempotency WHERE principal=? AND key=? AND substr(operation,1,3)='v2:'`, principal, command)
+internal/domain/backup.go:56:	beforeRecovery                         func(*sql.DB) error
+internal/domain/backup.go:57:	afterRecovery                          func(*sql.DB) error
+internal/domain/backup.go:58:	preserveQueueUpgradeWorkspaces         func(*sql.DB) error
+internal/domain/backup.go:59:	preserveConfigurationUpgradeWorkspaces func(*sql.DB) error
+internal/domain/backup.go:264:	queue, err := backupQueueState(db)
+internal/domain/backup.go:271:	configuration, err := backupHostConfigurationState(db)
+internal/domain/backup.go:275:	if configuration != nil {
+internal/domain/backup.go:276:		inventory["host_configuration_digest"] = Hash(configuration)
+internal/domain/backup.go:284:	if err := validateBackupHostConfiguration(db); err != nil {
+internal/domain/backup.go:287:	if err := validateBackupQueue(db); err != nil {
+internal/domain/backup.go:425:		queue, err := backupQueueState(db)
+internal/domain/backup.go:538:	SupportedMigrations []int
+internal/domain/backup.go:571:	if opt.Contracts == nil || len(opt.SupportedMigrations) == 0 {
+internal/domain/backup.go:587:	if Hash(m.Migrations) != Hash(opt.SupportedMigrations) {
+internal/domain/backup.go:634:		queue, err := backupQueueState(db)
+internal/domain/backup.go:680:	if policy != nil && policy.preserveQueueUpgradeWorkspaces != nil {
+internal/domain/backup.go:687:		e = policy.preserveQueueUpgradeWorkspaces(db)
+internal/domain/backup.go:688:	} else if policy != nil && policy.preserveConfigurationUpgradeWorkspaces != nil {
+internal/domain/backup.go:690:		if !ok || policy.format != localUpgradeFormat || plan["id"] != ConfigurationSchemaUpgradePlan {
+internal/domain/backup.go:693:		e = policy.preserveConfigurationUpgradeWorkspaces(db)
+internal/domain/backup.go:727:	if policy != nil && policy.beforeRecovery != nil {
+internal/domain/backup.go:728:		if e = policy.beforeRecovery(db); e != nil {
+internal/domain/backup.go:755:		if policy.afterRecovery != nil {
+internal/domain/backup.go:756:			if e = policy.afterRecovery(db); e != nil {
+internal/domain/backup_upgrade.go:246:	if opt.Plan == ConfigurationSchemaUpgradePlan {
+internal/domain/backup_upgrade.go:247:		return upgradeConfigurationLocal(ctx, opt, verifier)
+internal/domain/backup_upgrade.go:337:	policy.beforeRecovery = func(restored *sql.DB) error {
+internal/domain/backup_upgrade.go:344:	policy.afterRecovery = func(restored *sql.DB) error {
+internal/domain/backup_upgrade.go:386:		Key: key, SupportedMigrations: versions, Contracts: contracts,

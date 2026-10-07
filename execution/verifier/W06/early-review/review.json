@@ -1,0 +1,177 @@
+{
+  "artifact_kind": "INDEPENDENT_EARLY_APPLICATION_REVIEW",
+  "task_id": "W06",
+  "status": "FINDINGS_CONFIRMED_NOT_ACCEPTED",
+  "stage_accepted": false,
+  "verifier_identity": "codex:/root/route_verifier",
+  "reviewed_revision": "f02a46ba9f3e958eb2b11d2351570b61f6441298",
+  "source_hashes_reference": "execution/verifier/W06/early-review/source-hashes.json",
+  "source_hashes_sha256": "008816f5439c26f119afe8233821a987fb2a765426a304a115489434ae9d3a3e",
+  "scope": "Frozen f02a46b ordinary application scheduler/acceptance/HTTP/SQLite logic only. Trusted development FIXTURE runtime registration and observations are explicitly used; they are not LIVE qualification.",
+  "findings": [
+    {
+      "id": "W06-APP-01",
+      "severity": "P1",
+      "status": "REPRODUCED",
+      "title": "Acceptance does not bind predecessor acceptance/output versions to the successor Run",
+      "locations": [
+        {
+          "path": "internal/domain/acceptance.go",
+          "line": 10
+        },
+        {
+          "path": "internal/domain/acceptance.go",
+          "line": 207
+        },
+        {
+          "path": "internal/domain/orchestration.go",
+          "line": 273
+        },
+        {
+          "path": "internal/domain/context.go",
+          "line": 199
+        }
+      ],
+      "reproduction": [
+        "Create active Goal, current Decision D1, predecessor A with D1 input, and successor B with dependency_task_ids=[A].",
+        "Claim/report/independently accept A through normal HTTP; claim/report B while A is accepted.",
+        "Use normal W04 Decision D2 supersession and independently accepted ChangeProposal apply to replace D1. A becomes NEEDS_REVALIDATION; B remains EXECUTION_REPORTED.",
+        "POST acceptance for B: server returns 201 with PASS and commits B ACCEPTED.",
+        "Second independent test: before accepting B, REVALIDATE A, build fresh ContextBundle, SUBMIT, execute and accept a replacement A Run with a new Artifact and new AcceptanceReceipt. B original Run still returns 201/PASS and becomes ACCEPTED."
+      ],
+      "actual": {
+        "invalidated_predecessor": {
+          "A": "NEEDS_REVALIDATION",
+          "B_before": "EXECUTION_REPORTED",
+          "acceptance_http": 201,
+          "verdict": "PASS",
+          "B_after": "ACCEPTED"
+        },
+        "reaccepted_predecessor": {
+          "A": "ACCEPTED",
+          "acceptance_changed": true,
+          "output_changed": true,
+          "B_before": "EXECUTION_REPORTED",
+          "acceptance_http": 201,
+          "verdict": "PASS",
+          "B_after": "ACCEPTED"
+        }
+      },
+      "expected": "Reject B old execution when a mandatory dependency loses validity or its bound acceptance/output version changes; revalidation/new execution must use current dependency bindings.",
+      "cause": "Claim checks current dependenciesReady but does not freeze predecessor AcceptanceReceipt/output version vector into the Run. ContextBundle records dependency status text only. acceptanceSnapshot neither evaluates dependency readiness nor compares dependency versions, so both preparation and final recheck omit this state.",
+      "impact": "A successor can be accepted from obsolete prerequisites even though all its own frozen JSON checks pass. Checking current ACCEPTED status alone would not close the reproduced replacement/ABA case.",
+      "fix_boundary": "Bind exact dependency acceptance/output versions at admission and revalidate them on report/acceptance/final commit. Preserve immutable historical receipts; do not rewrite W04 accepted history.",
+      "probe_tests": [
+        "TestVerifierW06InvalidatedPredecessor",
+        "TestVerifierW06ReacceptedPredecessor"
+      ]
+    },
+    {
+      "id": "W06-APP-02",
+      "severity": "P2",
+      "status": "REPRODUCED_INTEGRATION_GAP",
+      "title": "Identical output bytes have no current-Run deduplicated provenance path",
+      "locations": [
+        {
+          "path": "migrations/sqlite/0002_domain.sql",
+          "line": 19
+        },
+        {
+          "path": "internal/domain/runtime.go",
+          "line": 228
+        },
+        {
+          "path": "internal/domain/acceptance.go",
+          "line": 126
+        }
+      ],
+      "contract_basis": {
+        "path": "spec/v2.0/03_DATA_CONTRACTS.md",
+        "line": 67,
+        "text": "Artifact UNIQUE(project_id,content_hash,kind); byte-content deduplication; preserve multiple origins by references without replacing provenance."
+      },
+      "reproduction": [
+        "Create two ordinary tasks and distinct executor Runs in one project.",
+        "First Run seals/reports REPORT bytes {\"result\":\"verified\"}.",
+        "Second Run independently uploads the identical bytes and attempts its own REPORT seal: HTTP 409 STATE_CONFLICT, one Artifact remains. This duplicate-identity rejection itself matches the frozen unique constraint.",
+        "Provide trusted current-Run observation of those identical output bytes and report the existing deduplicated Artifact ID from the second Run: HTTP 422 GATE_FAILED because Artifact.run_id/produced_by belong to the first Run."
+      ],
+      "actual": {
+        "distinct_runs": true,
+        "distinct_executors": true,
+        "identical_body_hash": true,
+        "seal_http": 409,
+        "seal_error": "STATE_CONFLICT",
+        "artifact_count": 1,
+        "reuse_report_http": 422,
+        "reuse_error": "GATE_FAILED"
+      },
+      "expected": "Keep the specified content uniqueness while retaining authenticated per-Run production references so repeated identical results can be reported and independently accepted.",
+      "impact": "Routine stable/repeated JSON results cannot complete through either creation or reuse in the current normal runtime lifecycle. This is an integration gap between existing dedup semantics and Run provenance checks, not a claim that duplicate Artifact identities must be allowed.",
+      "fix_boundary": "Do not delete or relax the frozen unique index. Add a contract-consistent deduplicated content/reference lineage path with current-Run observation/provenance binding, including acceptance validation.",
+      "probe_tests": [
+        "TestVerifierW06EqualOutputAcrossRuns"
+      ]
+    }
+  ],
+  "independent_positive_checks": [
+    {
+      "id": "W06-POS-01",
+      "status": "PASS",
+      "test": "TestVerifierW06LateOutboxRollback",
+      "description": "SQLite trigger fails final ACCEPTANCE_RECORDED outbox insert after Task acceptance and successor READY updates were performed inside the transaction.",
+      "actual": {
+        "http": 409,
+        "receipts": 0,
+        "outbox_before": 19,
+        "outbox_after": 19,
+        "first_task": "EXECUTION_REPORTED",
+        "successor": "BLOCKED"
+      }
+    }
+  ],
+  "static_observations": [
+    {
+      "status": "REVIEWED_NO_FINDING_IN_SCOPE",
+      "description": "Server derives check results from frozen contract and sealed JSON; caller PASS cannot override computed FAIL. Trusted FIXTURE registration remains explicit and LIVE acceptance returns 503."
+    },
+    {
+      "status": "REVIEWED_NO_FINDING_IN_SCOPE",
+      "description": "Preparation closes its read transaction before JSON check computation. Commit rebuilds own task/run/context/authority/content snapshot and compares it. The reported hole is the omitted dependency version vector."
+    },
+    {
+      "status": "REVIEWED_NO_FINDING_IN_SCOPE",
+      "description": "Executor/registered child/alias authority-root comparison, lease ownership and current authentication paths reviewed statically. No native execution or identity-isolation claim."
+    }
+  ],
+  "execution": {
+    "mode": "OFFLINE_HTTP_SQLITE_WITH_TRUSTED_RUNTIME_FIXTURE",
+    "command_reference": "execution/verifier/W06/early-review/probe-command.json",
+    "command_sha256": "801ef5fa9c2d16c2b6b051c7e47bc036b38357d9c7e96084cefdfa5c198c5368",
+    "exit_code": 1,
+    "tests": 4,
+    "failed_expected_negative_boundaries": 3,
+    "passed": 1,
+    "probe_source_reference": "execution/verifier/W06/early-review/probe_test.go.txt",
+    "probe_source_sha256": "7ba947524a5cea2fe88fd4dda66e1752a803e2afdff8ba3176ff429edf04f6c5",
+    "raw_stdout_reference": "execution/verifier/W06/early-review/probe.stdout.txt",
+    "raw_stdout_sha256": "9eb247f24d6f0abfa7dad34a16aaeab0a2502771eb4ca3e60f5655e235720f9b",
+    "raw_stderr_reference": "execution/verifier/W06/early-review/probe.stderr.txt",
+    "raw_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "attempt_history": [
+    "Attempt1 encountered duplicate identical REPORT bytes before reaching dependency assertion; preserved raw output.",
+    "Attempt2 changed successor JSON whitespace only to get distinct storage bytes with identical canonical expected semantics; reproduced invalidated predecessor acceptance.",
+    "Attempt3 isolated duplicate-output creation separately.",
+    "Final probe added reaccepted-predecessor variant and existing-Artifact reuse test, respecting the explicit frozen content uniqueness contract. Final stdout corresponds exactly to retained final probe source."
+  ],
+  "limits": [
+    "No W06 stage acceptance and no owned formal case promotion. W05/A04 remains BLOCKED.",
+    "No external model/service/browser calls, native Windows executor APIs or real credentials accessed.",
+    "Only fixed f02a46b reviewed; owner work in progress and later commits not assessed.",
+    "Recovery source at this revision is orchestration_recovery.go, not recovery.go. Missing newer implementation is not reported as a defect.",
+    "Other checked paths are static review only unless listed as executed.",
+    "Isolated snapshot retained as instructed; previously policy-rejected snapshot deletion was not retried."
+  ],
+  "created_at": "2026-09-29T20:27:05.617093+00:00"
+}
