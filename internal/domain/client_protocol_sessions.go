@@ -216,6 +216,17 @@ func (s *ClientService) listClientSessions(ctx context.Context, tx *sql.Tx, env 
 	if _, err := clientPrincipal(ctx, tx, principal, project, false); err != nil {
 		return clientFault(env, err)
 	}
+	// A supplied session is a context binding, never the list selector or a writer claim.
+	if env.SessionID != nil {
+		if _, err := loadClientSession(ctx, tx, *env.SessionID, project); err == sql.ErrNoRows {
+			return NewTypedRejection(env, "NOT_FOUND", "unknown session for this project"), nil
+		} else if err != nil {
+			return nil, err
+		}
+		if err := clientSessionOwner(ctx, tx, project, *env.SessionID, principal); err != nil {
+			return clientFault(env, err)
+		}
+	}
 	var p struct {
 		Cursor *string `json:"cursor"`
 		Limit  int     `json:"limit"`
@@ -276,7 +287,7 @@ func (s *ClientService) listClientSessions(ctx context.Context, tx *sql.Tx, env 
 		}
 		items = append(items, snap)
 	}
-	return &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method, Status: strptr("COMPLETED"), Result: Object{"items": items, "next_cursor": cursor}}, nil
+	return &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method, Status: strptr("COMPLETED"), SessionID: env.SessionID, Result: Object{"items": items, "next_cursor": cursor}}, nil
 }
 
 func clientTurnContract() Object {
