@@ -31,6 +31,8 @@ import (
 	"sync"
 	"time"
 
+	"encoding/json/jsontext"
+
 	"researchos.local/research-os/internal/api"
 )
 
@@ -229,27 +231,34 @@ func v2CallTransport(budget context.Context, ctx *v2Context, method string, payl
 // Only the read-only status flow consumes this private I/O cause. A context
 // cancelled after another failure does not turn that failure into an interrupt.
 func v2CallTransportWithCause(budget context.Context, ctx *v2Context, method string, payload map[string]any, strictIdentity bool) (map[string]any, string, int, bool) {
+	reply, reason, code, cause := v2CallTransportDetailed(budget, ctx, method, payload, strictIdentity)
+	return reply, reason, code, cause.cancelled
+}
+
+type cliTransportCause struct{ cancelled, unreachable bool }
+
+func v2CallTransportDetailed(budget context.Context, ctx *v2Context, method string, payload map[string]any, strictIdentity bool) (map[string]any, string, int, cliTransportCause) {
 	env, refusal := v2EnvelopeFor(ctx, method, payload)
 	if refusal != "" {
 		if refusal == "CREDENTIAL_ABSENT" {
 			// contracts/product.contract.json maps 3 to "blocked_missing_resource_or_authorization"; a CLI with no
 			// bearer is blocked, not given an invalid argument.
-			return nil, refusal, exitNotImplemented, false
+			return nil, refusal, exitNotImplemented, cliTransportCause{}
 		}
-		return nil, refusal, exitUsage, false
+		return nil, refusal, exitUsage, cliTransportCause{}
 	}
 	body, _ := json.Marshal(env)
 	ctx.requestLog = append(ctx.requestLog, method)
 	client := http.Client{Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	req, err := http.NewRequestWithContext(budget, "POST", ctx.baseURL+v2CommandPath, bytes.NewReader(body))
 	if err != nil {
-		return nil, "REQUEST_UNBUILDABLE:" + err.Error(), exitFailed, false
+		return nil, "REQUEST_UNBUILDABLE:" + err.Error(), exitFailed, cliTransportCause{}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+ctx.credential)
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, "HOST_UNREACHABLE:" + err.Error(), exitFailed, errors.Is(err, context.Canceled)
+		return nil, "HOST_UNREACHABLE:" + err.Error(), exitFailed, cliTransportCause{cancelled: errors.Is(err, context.Canceled), unreachable: true}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -257,45 +266,38 @@ func v2CallTransportWithCause(budget context.Context, ctx *v2Context, method str
 		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
 			code = exitFailed
 		}
-		return nil, "HOST_HTTP_" + strconv.Itoa(resp.StatusCode), code, false
+		return nil, "HOST_HTTP_" + strconv.Itoa(resp.StatusCode), code, cliTransportCause{}
 	}
 	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if readErr != nil || len(raw) > 1<<20 {
-		return nil, "INCOMPLETE_OR_OVERSIZE_REPLY", exitFailed, len(raw) <= 1<<20 && errors.Is(readErr, context.Canceled)
+		return nil, "INCOMPLETE_OR_OVERSIZE_REPLY", exitFailed, cliTransportCause{cancelled: len(raw) <= 1<<20 && errors.Is(readErr, context.Canceled)}
 	}
-	var reply map[string]any
-	if e := json.Unmarshal(raw, &reply); e != nil {
-		return nil, "MALFORMED_REPLY", exitFailed, false
-	}
-	if strictIdentity && (reply["protocol_version"] != clientProtocol || reply["command_id"] != ctx.commandID || reply["method"] != method) {
-		return reply, "REPLY_IDENTITY_MISMATCH", exitFailed, false
-	}
-	if sid, ok := reply["session_id"].(string); strictIdentity && ok && ctx.sessionID != "" && sid != ctx.sessionID {
-		return reply, "REPLY_SESSION_MISMATCH", exitFailed, false
+	// Both entry points use the same complete gate. strictIdentity is retained
+	// for caller compatibility, never as permission to trust a weaker response.
+	_ = strictIdentity
+	reply, refusal := validateCLIResponse(raw, env)
+	if refusal != "" {
+		return nil, refusal, exitFailed, cliTransportCause{}
 	}
 	status, _ := reply["status"].(string)
 	switch status {
 	case "COMPLETED", "ACKNOWLEDGED":
-		if method != "goal.start" {
+		if status == "COMPLETED" && method != "goal.start" {
 			adoptV2Snapshot(ctx, reply)
 		}
-		return reply, "", exitCompleted, false
-	case "IN_PROGRESS":
-		return reply, "", exitCompleted, false
+		return reply, "", exitCompleted, cliTransportCause{}
 	case "REJECTED":
 		code, _ := reply["error_code"].(string)
 		exit := exitFailed
 		switch code {
-		case "RESOURCE_BLOCKED", "RESOURCE_UNAVAILABLE", "MODEL_UNAVAILABLE", "HOST_UNAVAILABLE", "UNAUTHENTICATED", "FORBIDDEN", "LEASE_EXPIRED", "WRITER_BUSY", "STALE_WRITER_EPOCH", "CANCEL_UNCONFIRMED":
+		case "NOT_IMPLEMENTED", "COMMAND_PENDING", "CREDENTIAL_MISSING", "CREDENTIAL_REVOKED", "RESOURCE_BLOCKED", "RESOURCE_UNAVAILABLE", "MODEL_UNAVAILABLE", "HOST_UNAVAILABLE", "UNAUTHENTICATED", "FORBIDDEN", "LEASE_EXPIRED", "WRITER_BUSY", "STALE_WRITER_EPOCH", "CANCEL_UNCONFIRMED":
 			exit = exitNotImplemented
 		case "INVALID_REQUEST", "UNSUPPORTED_PROTOCOL", "UNSUPPORTED_METHOD":
 			exit = exitUsage
 		}
-		return reply, "HOST_REJECTED:" + orDefault(code, "UNSPECIFIED"), exit, false
-	case "NOT_IMPLEMENTED":
-		return reply, "HOST_NOT_IMPLEMENTED:" + method, exitNotImplemented, false
+		return reply, "HOST_REJECTED:" + orDefault(code, "UNSPECIFIED"), exit, cliTransportCause{}
 	default:
-		return reply, "UNKNOWN_STATUS:" + orDefault(status, "<absent>"), exitFailed, false
+		return reply, "UNKNOWN_STATUS:" + orDefault(status, "<absent>"), exitFailed, cliTransportCause{}
 	}
 }
 
@@ -331,39 +333,133 @@ func adoptCLIGoal(ctx *v2Context, reply map[string]any, draft bool) string {
 // A successful response supplies the next revision/epoch. Never infer either
 // from the request, and never replace an explicitly selected session.
 func adoptV2Snapshot(ctx *v2Context, reply map[string]any) {
-	result, _ := reply["result"].(map[string]any)
-	snapshot := result
-	if nested, ok := result["snapshot"].(map[string]any); ok {
-		snapshot = nested
-	}
-	replySession, _ := reply["session_id"].(string)
-	if ctx.sessionID != "" && replySession != "" && replySession != ctx.sessionID {
+	if statusOf(reply) != "COMPLETED" {
 		return
 	}
-	if replySession != "" && replySession == ctx.sessionID {
-		if revision, ok := reply["revision"].(float64); ok && revision >= 1 {
-			ctx.revision = int64(revision)
+	next := *ctx
+	snapshot := cliSnapshot(reply)
+	sid, hasSnapshot := snapshot["session_id"].(string)
+	if hasSnapshot {
+		if ctx.sessionID != "" && ctx.sessionID != sid || snapshot["project_id"] != ctx.projectID {
+			return
+		}
+		if ctx.sessionID == "" && reply["method"] != "session.create" {
+			return
+		}
+		revision, ok := cliInteger(snapshot["revision"])
+		if !ok || revision < 1 {
+			return
+		}
+		next.sessionID, next.revision, next.epoch = sid, revision, 0
+		writer := cliObject(snapshot["writer"])
+		if writer["client_id"] == ctx.clientID {
+			epoch, valid := cliInteger(writer["epoch"])
+			expires, err := time.Parse(time.RFC3339Nano, continuationString(writer, "expires_at"))
+			if valid && epoch > 0 && err == nil && time.Now().Before(expires) {
+				next.epoch = epoch
+			}
+		}
+	} else if ctx.sessionID != "" && reply["session_id"] == ctx.sessionID && reply["revision"] != nil {
+		revision, ok := cliInteger(reply["revision"])
+		if !ok || revision < 1 {
+			return
+		}
+		next.revision = revision
+	}
+	ctx.sessionID, ctx.revision, ctx.epoch = next.sessionID, next.revision, next.epoch
+}
+
+// Keep the original numeric lexeme until the frozen schema and exact range
+// checks have completed. Small integers retain the historical map representation.
+func cliResponseNumbers(value any) (any, bool) {
+	switch v := value.(type) {
+	case json.Number:
+		n, ok := configureExactInteger(v)
+		if ok && n < 1<<53 {
+			return float64(n), true
+		}
+		return v, true
+	case map[string]any:
+		for k, item := range v {
+			switch k {
+			case "revision", "expected_revision", "writer_epoch", "epoch", "goal_revision", "config_revision", "current_revision", "current_writer_epoch", "sequence", "event_sequence", "earliest_event_sequence", "next_sequence", "high_watermark", "after_sequence":
+				if item != nil {
+					if _, ok := configureExactInteger(item); !ok {
+						return nil, false
+					}
+				}
+			}
+			converted, ok := cliResponseNumbers(item)
+			if !ok {
+				return nil, false
+			}
+			v[k] = converted
+		}
+	case []any:
+		for i, item := range v {
+			converted, ok := cliResponseNumbers(item)
+			if !ok {
+				return nil, false
+			}
+			v[i] = converted
 		}
 	}
-	if sid, ok := snapshot["session_id"].(string); ok && sid != "" {
-		if ctx.sessionID != "" && ctx.sessionID != sid {
-			return
+	return value, true
+}
+
+func validateCLIResponse(raw []byte, env *v2Envelope) (map[string]any, string) {
+	if !jsontext.Value(raw).IsValid() {
+		return nil, "MALFORMED_REPLY"
+	}
+	var reply map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if decoder.Decode(&reply) != nil {
+		return nil, "MALFORMED_REPLY"
+	}
+	if reply["protocol_version"] != clientProtocol || reply["command_id"] != env.CommandID || reply["method"] != env.Method {
+		return nil, "REPLY_IDENTITY_MISMATCH"
+	}
+	doc, err := cliProtocolDocument()
+	if err != nil || doc.ValidateDef("CommandResponse", reply) != nil {
+		return nil, "INVALID_REPLY_SCHEMA"
+	}
+	var expectedSID any
+	if env.SessionID != nil {
+		expectedSID = *env.SessionID
+	}
+	completed := reply["status"] == "COMPLETED"
+	if !(env.Method == "session.create" && completed) && reply["session_id"] != expectedSID {
+		return nil, "REPLY_SESSION_MISMATCH"
+	}
+	if _, ok := cliResponseNumbers(reply); !ok {
+		return nil, "REPLY_INTEGER_OUT_OF_RANGE"
+	}
+	result := cliObject(reply["result"])
+	if completed && env.Method == "host.status" && result["client_id"] != env.ClientID {
+		return nil, "REPLY_CLIENT_MISMATCH"
+	}
+	if completed {
+		snapshot := cliObject(result["snapshot"])
+		switch env.Method {
+		case "session.create", "session.get", "session.update":
+			snapshot = result
 		}
-		if ctx.sessionID == "" && reply["method"] == "session.create" {
-			ctx.sessionID = sid
-		}
-		if ctx.sessionID != sid {
-			return
-		}
-		if revision, ok := snapshot["revision"].(float64); ok && revision >= 1 {
-			ctx.revision = int64(revision)
-		}
-		if writer, ok := snapshot["writer"].(map[string]any); ok && writer["client_id"] == ctx.clientID {
-			if epoch, ok := writer["epoch"].(float64); ok && epoch >= 1 {
-				ctx.epoch = int64(epoch)
+		if snapshot != nil {
+			sid := snapshot["session_id"]
+			if env.ProjectID == nil || snapshot["project_id"] != *env.ProjectID || expectedSID != nil && sid != expectedSID || env.Method != "goal.start" && sid != reply["session_id"] {
+				return nil, "REPLY_SNAPSHOT_SCOPE_MISMATCH"
+			}
+			if env.Method != "goal.start" {
+				top, topOK := cliInteger(reply["revision"])
+				nested, nestedOK := cliInteger(snapshot["revision"])
+				if !topOK || !nestedOK || top != nested {
+					return nil, "REPLY_SNAPSHOT_REVISION_MISMATCH"
+				}
 			}
 		}
 	}
+	return reply, ""
 }
 
 func v2FlowCommandID(base, method string, ordinal int) string {

@@ -94,20 +94,22 @@ func defaultCLIFollowOptions(signals <-chan os.Signal) cliFollowOptions {
 }
 
 type cliFlow struct {
-	c                *v2Context
-	budget           context.Context
-	options          cliFollowOptions
-	base             string
-	ordinal          int
-	cancelRequested  bool
-	cancelDeadline   time.Time
-	operations       []map[string]any
-	admissionCommand string
-	goalFlow         bool
-	inputs           <-chan cliInputLine
-	cancelCommand    *v2Context
-	cancelPayload    map[string]any
-	readInterrupt    *cliReadInterrupt
+	c                    *v2Context
+	budget               context.Context
+	options              cliFollowOptions
+	base                 string
+	ordinal              int
+	cancelRequested      bool
+	cancelDeadline       time.Time
+	operations           []map[string]any
+	admissionCommand     string
+	goalFlow             bool
+	inputs               <-chan cliInputLine
+	cancelCommand        *v2Context
+	cancelPayload        map[string]any
+	readInterrupt        *cliReadInterrupt
+	responseExit         int
+	transportUnreachable bool
 }
 
 func (f *cliFlow) interrupt() {
@@ -157,8 +159,12 @@ func (f *cliFlow) pause() {
 // a revision learned while waiting must not change an idempotent write body.
 func (f *cliFlow) call(method string, payload map[string]any, wait bool) (map[string]any, string, int) {
 	f.ordinal++
+	f.transportUnreachable = false
 	sent := *f.c
 	sent.commandID = v2FlowCommandID(f.base, method, f.ordinal)
+	if method == "session.attach" && payload["request_write_owner"] == true {
+		sent.epoch = 0
+	}
 	if method == "session.control" && payload["action"] == "CANCEL" {
 		frozen := sent
 		f.cancelCommand = &frozen
@@ -184,12 +190,10 @@ func (f *cliFlow) call(method string, payload map[string]any, wait bool) (map[st
 		var reply map[string]any
 		var reason string
 		var code int
-		cancelledIO := false
-		if f.readInterrupt != nil {
-			reply, reason, code, cancelledIO = v2CallTransportWithCause(f.budget, &attempt, method, payload, true)
-		} else {
-			reply, reason, code = v2CallContext(f.budget, &attempt, method, payload)
-		}
+		var cause cliTransportCause
+		reply, reason, code, cause = v2CallTransportDetailed(f.budget, &attempt, method, payload, true)
+		cancelledIO := cause.cancelled
+		f.transportUnreachable = cause.unreachable
 		f.c.requestLog = append(f.c.requestLog, attempt.requestLog...)
 		if cancelledIO && f.readInterrupt != nil && f.budget.Err() == context.Canceled && f.readInterrupt.observed() {
 			return nil, "READ_INTERRUPTED", exitInterrupted
@@ -198,7 +202,16 @@ func (f *cliFlow) call(method string, payload map[string]any, wait bool) (map[st
 			return reply, reason, code
 		}
 		status := statusOf(reply)
-		if status == "COMPLETED" || !wait {
+		if status == "COMPLETED" {
+			if method == "session.attach" && payload["request_write_owner"] == true {
+				snap := cliSnapshot(reply)
+				writer := cliObject(snap["writer"])
+				expires, err := time.Parse(time.RFC3339Nano, continuationString(writer, "expires_at"))
+				epoch, ok := cliInteger(writer["epoch"])
+				if cliObject(reply["result"])["write_owner_acquired"] != true || writer["client_id"] != f.c.clientID || !ok || epoch < 1 || err != nil || !time.Now().Before(expires) {
+					return reply, "ATTACH_WRITER_UNRESOLVED", exitNotImplemented
+				}
+			}
 			if method == "goal.start" {
 				if why := adoptCLIGoal(f.c, reply, payload["start_as_draft"] == true); why != "" {
 					return reply, why, exitNotImplemented
@@ -220,7 +233,13 @@ func (f *cliFlow) call(method string, payload map[string]any, wait bool) (map[st
 			}
 			return reply, "", exitCompleted
 		}
-		// ACKNOWLEDGED/IN_PROGRESS only confirm receipt, not task completion.
+		if !wait {
+			// The active cancellation follower owns reconciliation of this
+			// accepted request. This return does not adopt a pending snapshot
+			// or establish a terminal execution result. Attach callers wait.
+			return reply, "", exitCompleted
+		}
+		// ACKNOWLEDGED confirms receipt only; replay the same original envelope.
 		f.pause()
 	}
 }
@@ -239,6 +258,9 @@ func cliSnapshot(reply map[string]any) map[string]any {
 }
 
 func cliInteger(value any) (int64, bool) {
+	if n, ok := value.(json.Number); ok {
+		return configureExactInteger(n)
+	}
 	v, ok := value.(float64)
 	return int64(v), ok && v >= 0 && v < 1<<53 && math.Trunc(v) == v
 }
@@ -394,11 +416,22 @@ func (e *cliExecution) pages(f *cliFlow) string {
 	for !f.expired() {
 		reply, reason, code := f.call("session.events", map[string]any{"after_sequence": e.cursor, "limit": 200}, true)
 		if code != 0 {
-			if reason == "HOST_REJECTED:CURSOR_INVALID" {
+			f.responseExit = code
+			if code == exitFailed && f.transportUnreachable && f.admissionCommand != "" && e.task != "" {
+				// A completed admission and its original Task already exist.
+				// A failed HTTP exchange cannot establish their settlement.
+				// The typed cause is set only by client.Do, never a reply string.
+				f.responseExit = exitNotImplemented
+			}
+			if statusOf(reply) == "REJECTED" && reply["error_code"] == "CURSOR_INVALID" && f.admissionCommand != "" && e.task != "" {
 				// A real snapshot is the recovery vehicle. It does not contain
 				// all tool events, so missing execution reporting cannot pass.
-				if snap, _, snapshotCode := f.snapshot(); snapshotCode == 0 {
+				if snap, snapshotReason, snapshotCode := f.snapshot(); snapshotCode == 0 {
 					f.options.emit(map[string]any{"type": "session.snapshot", "snapshot": snap, "reason": "EVENT_RESYNC_REQUIRED"})
+					f.responseExit = exitNotImplemented
+				} else {
+					f.responseExit = exitFailed
+					return snapshotReason
 				}
 			}
 			return reason
@@ -482,6 +515,9 @@ func followCLIExecution(f *cliFlow, snapshot map[string]any, message, explicitRu
 	}
 	for !f.expired() {
 		if reason := e.pages(f); reason != "" {
+			if f.responseExit != 0 {
+				return finish(f.responseExit, reason)
+			}
 			return finish(exitNotImplemented, reason)
 		}
 		task, reason := f.object("tasks", e.task)
@@ -500,7 +536,10 @@ func followCLIExecution(f *cliFlow, snapshot map[string]any, message, explicitRu
 		}
 		snap, reason, code := f.snapshot()
 		if code != 0 {
-			return finish(exitNotImplemented, reason)
+			if code == exitFailed && f.transportUnreachable && f.admissionCommand != "" && e.task != "" {
+				return finish(exitNotImplemented, reason)
+			}
+			return finish(code, reason)
 		}
 		if snap["goal_id"] != e.goal || snap["core_build_id"] != e.build {
 			return finish(exitNotImplemented, "SESSION_TARGET_CHANGED")
@@ -580,6 +619,13 @@ func followCLIExecution(f *cliFlow, snapshot map[string]any, message, explicitRu
 }
 
 func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options cliFollowOptions) (map[string]any, int) {
+	originalContext := c
+	readOnly := name == "status" || name == "/status"
+	if readOnly {
+		pending := *c
+		pending.requestLog = append([]string(nil), c.requestLog...)
+		c = &pending
+	}
 	budget, stop := context.WithTimeout(context.Background(), options.timeout)
 	defer stop()
 	f := &cliFlow{c: c, budget: budget, options: options, base: c.commandID, goalFlow: name == "goal" || name == "go" || name == "/goal"}
@@ -606,9 +652,6 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
 			f.operations = append(f.operations, map[string]any{"method": step.method, "status": "SKIPPED", "reason": step.skipped})
 			continue
 		}
-		if step.method == "session.attach" && step.payload["request_write_owner"] == true {
-			c.epoch = 0
-		}
 		if step.method == "session.events" && (name == "run" || name == "/run") {
 			continue // The admitted task is followed below, not by one page.
 		}
@@ -633,7 +676,7 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
 			reason = continuationString(result, "reason")
 			break
 		}
-		reply, why, currentCode := f.call(step.method, step.payload, step.method != "session.attach")
+		reply, why, currentCode := f.call(step.method, step.payload, true)
 		f.operations = append(f.operations, map[string]any{"method": step.method, "status": statusOf(reply), "exit_code": currentCode, "reason": why, "result": reply["result"]})
 		if currentCode != 0 {
 			reason, code = why, currentCode
@@ -688,6 +731,13 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
 		}
 	}
 	code, reason = f.finishReadResult(code, reason)
+	if readOnly {
+		if code == 0 {
+			*originalContext = *c
+		} else {
+			originalContext.requestLog = c.requestLog
+		}
+	}
 	out["status"], out["exit_code"] = "COMPLETED", code
 	if execution := cliObject(out["execution"]); execution != nil {
 		out["status"] = execution["status"]
@@ -760,12 +810,21 @@ func saveCLIContext(c *v2Context, cfg *cliConfig) error {
 	if c.sessionID == "" || c.projectID == "" || c.revision < 1 {
 		return nil
 	}
+	if cfg.ProjectID == c.projectID && cfg.SessionID == c.sessionID && cfg.Revision == c.revision && cfg.WriterEpoch == c.epoch {
+		return nil
+	}
 	cfg.ProjectID, cfg.SessionID = c.projectID, c.sessionID
 	cfg.Revision, cfg.WriterEpoch, cfg.UpdatedBy = c.revision, c.epoch, c.clientID
 	return writeConfig(*cfg)
 }
 
 func cliFlowSummary(out map[string]any, code int, c *v2Context, cfg *cliConfig) int {
+	if out["command"] == "status" || out["command"] == "/status" {
+		// A read report can display a freshly validated snapshot without
+		// replacing the persisted recovery or writer context.
+		outJSON(out)
+		return code
+	}
 	// Even a blocked/interrupted admission must retain its recovery identity.
 	if err := saveCLIContext(c, cfg); err != nil {
 		diag("session context could not be saved: %s", err)
