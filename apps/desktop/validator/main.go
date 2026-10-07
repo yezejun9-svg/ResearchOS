@@ -348,14 +348,42 @@ func validate(raw []byte) verdict {
 	if !jsontext.Value(raw).IsValid() {
 		return out
 	}
-	var p packet
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if dec.Decode(&p) != nil || p.Schema != protocol || !uuid(p.Nonce) || (p.Phase != "REQUEST" && p.Phase != "RESPONSE") {
-		return out
-	}
+	// Check exact decoded member names and non-null types before encoding/json's
+	// struct projection can accept case aliases or silently zero a null string.
 	var keys map[string]json.RawMessage
 	if json.Unmarshal(raw, &keys) != nil || len(keys) != 6 {
+		return out
+	}
+	for _, key := range []string{"schema", "phase", "nonce", "request_raw_base64", "response_raw_base64"} {
+		value, exists := keys[key]
+		var text string
+		if !exists || len(value) == 0 || value[0] != '"' || json.Unmarshal(value, &text) != nil {
+			return out
+		}
+	}
+	if _, exists := keys["http_status"]; !exists {
+		return out
+	}
+	var p packet
+	for key, target := range map[string]*string{"schema": &p.Schema, "phase": &p.Phase, "nonce": &p.Nonce, "request_raw_base64": &p.Request, "response_raw_base64": &p.Response} {
+		if json.Unmarshal(keys[key], target) != nil {
+			return out
+		}
+	}
+	if !bytes.Equal(keys["http_status"], []byte("null")) {
+		value, err := decode(keys["http_status"], &budget{})
+		number, ok := value.(json.Number)
+		if err != nil || !ok {
+			return out
+		}
+		rational, ok := new(big.Rat).SetString(string(number))
+		if !ok || !rational.IsInt() || !rational.Num().IsInt64() || rational.Num().Int64() < 100 || rational.Num().Int64() > 599 {
+			return out
+		}
+		status := int(rational.Num().Int64())
+		p.Status = &status
+	}
+	if p.Schema != protocol || !uuid(p.Nonce) || (p.Phase != "REQUEST" && p.Phase != "RESPONSE") {
 		return out
 	}
 	out.Nonce = p.Nonce

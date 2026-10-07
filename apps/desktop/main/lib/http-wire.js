@@ -53,7 +53,10 @@ function resource(appRoot) {
 // duplicates, invalid Unicode, trailing values or unsafe framing numbers.
 function privateJSON(text) {
   let i = 0, nodes = 0;
-  const space = () => { while (/\s/.test(text[i] || '') && i < text.length) i++; };
+  const space = () => {
+    while (i < text.length && ' \t\n\r'.includes(text[i])) i++;
+    if (i < text.length && /\s/.test(text[i])) throw Object.assign(error('PRIVATE_JSON'),{invalidWhitespace:true});
+  };
   const string = () => {
     const start = i++;
     while (i < text.length) { if (text[i] === '\\') { i += 2; continue; } if (text[i++] === '"') {
@@ -98,12 +101,12 @@ function child(resource, packet, record, lane) {
       record({ kind: 'child', input, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr), facts: { ...facts } });
       if (facts.cleanupUnconfirmed || fault || facts.exitCode !== 0 || !facts.exited) return reject(fault || error('VALIDATOR_EXIT'));
       try {
-        const value = privateJSON(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(stdout)));
+        const value = privateJSON(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(stdout)));
         if (value.schema !== PROTOCOL || value.phase !== packet.phase || value.nonce !== packet.nonce || value.http_status !== packet.http_status ||
             value.request_sha256 !== sha(Buffer.from(packet.request_raw_base64,'base64')) || value.response_sha256 !== sha(Buffer.from(packet.response_raw_base64,'base64')) ||
             JSON.stringify(value.schema_sha256_pair) !== JSON.stringify(schemas) || value.build_input_digest !== resource.descriptor.build_input_digest) throw error('PRIVATE_CORRELATION');
         resolve(value);
-      } catch { reject(error('PRIVATE_CORRELATION')); }
+      } catch (cause) { reject(error(cause?.invalidWhitespace ? 'PRIVATE_JSON' : 'PRIVATE_CORRELATION')); }
     };
     const deadline = setTimeout(() => terminate('VALIDATOR_TIMEOUT'), 5000);
     proc.on('spawn', () => { facts.spawned = true; });
