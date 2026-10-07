@@ -1,0 +1,29 @@
+//go:build windows
+package protectedstore
+
+import("context";"encoding/json";"fmt";"os";"path/filepath";"strings";"testing";"time";"unsafe";"golang.org/x/sys/windows")
+
+func rvCheck(t *testing.T,id string,want,got any){t.Helper();a,_:=json.Marshal(want);b,_:=json.Marshal(got);status:="PASS";if string(a)!=string(b){status="FAIL";t.Errorf("%s expected=%s actual=%s",id,a,b)};raw,_:=json.Marshal(map[string]any{"id":id,"status":status,"expected":want,"actual":got,"scope":"PREINSTALL_SAME_USER_NATIVE_ONLY"});fmt.Println("RV_BROKER_ASSERTION "+string(raw))}
+func rvPipe(t *testing.T,mutate string)(*os.File,func()){
+ t.Helper();s,e:=NewCanary(filepath.Join(t.TempDir(),"private"));if e!=nil{t.Fatal(e)}
+ for _,name:=range brokerFiles{if e=s.createFile(name,[]byte("SYNTHETIC_SERVICE_CANARY_"+name));e!=nil{t.Fatal(e)}}
+ if mutate=="body"{if e=os.WriteFile(filepath.Join(s.root,"label.canary"),[]byte("PRIVATE_DO_NOT_PUBLISH"),0600);e!=nil{t.Fatal(e)}}
+ if mutate=="acl"{sd,e:=windows.SecurityDescriptorFromString("D:P(A;;FA;;;"+s.sid+")(A;;GR;;;WD)");if e!=nil{t.Fatal(e)};acl,_,_:=sd.DACL();if e=windows.SetNamedSecurityInfo(filepath.Join(s.root,"input.canary"),windows.SE_FILE_OBJECT,windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,nil,nil,acl,nil);e!=nil{t.Fatal(e)}}
+ sd,_:=windows.SecurityDescriptorFromString("D:P(A;;FA;;;"+s.sid+")");sa:=windows.SecurityAttributes{Length:uint32(unsafe.Sizeof(windows.SecurityAttributes{})),SecurityDescriptor:sd}
+ name:=fmt.Sprintf(`\\.\pipe\ResearchOS-RV-broker-%d-%d`,os.Getpid(),time.Now().UnixNano())
+ h,e:=windows.CreateNamedPipe(windows.StringToUTF16Ptr(name),windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_FIRST_PIPE_INSTANCE,windows.PIPE_TYPE_MESSAGE|windows.PIPE_READMODE_MESSAGE|windows.PIPE_NOWAIT|windows.PIPE_REJECT_REMOTE_CLIENTS,1,4096,64,0,&sa);if e!=nil{t.Fatal(e)}
+ ctx,cancel:=context.WithCancel(context.Background());done:=make(chan struct{});go func(){defer close(done);serveCanaryPipe(ctx,h,SafeSummary{Schema:"researchos.protected-summary.v1",Status:"EXECUTION_REPORTED",Total:4,Correct:4,MaximumMode:"ADVISORY"},s)}()
+ client,e:=windows.CreateFile(windows.StringToUTF16Ptr(name),pipeClientRights,0,nil,windows.OPEN_EXISTING,windows.FILE_FLAG_OVERLAPPED|windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION,0);if e!=nil{t.Fatal(e)}
+ var pid uint32;rvCheck(t,"LOCAL-PIPE-SERVER-PID",true,windows.GetNamedPipeServerProcessId(client,&pid)==nil&&pid==uint32(os.Getpid()))
+ file:=os.NewFile(uintptr(client),"rv-protocol");return file,func(){file.Close();started:=time.Now();cancel();select{case <-done:rvCheck(t,"CANCEL-BOUNDED",true,time.Since(started)<time.Second);case <-time.After(time.Second):t.Error("server cancellation timeout")};windows.CloseHandle(h);s.Close()}
+}
+func TestRVBrokerNativeFrames(t *testing.T){
+ for _,scenario:=range []string{"positive","body","acl","path","command","network","oversized","prefix","nul","idle"}{t.Run(scenario,func(t *testing.T){file,close:=rvPipe(t,scenario);defer close();deadline:=time.Now().Add(400*time.Millisecond)
+ if scenario=="positive"||scenario=="body"||scenario=="acl"{s,e:=requestCanarySummary(file,deadline);rvCheck(t,"SUMMARY-ERROR-"+scenario,true,e==nil);expected:=[]any{"EXECUTION_REPORTED",int64(4),int64(4)};if scenario!="positive"{expected=[]any{"BLOCKED",int64(0),int64(0)}};rvCheck(t,"SUMMARY-FIELDS-"+scenario,expected,[]any{s.Status,s.Total,s.Correct});raw,_:=json.Marshal(s);rvCheck(t,"SUMMARY-NO-PRIVATE-"+scenario,false,strings.Contains(string(raw),"CANARY")||strings.Contains(string(raw),"PRIVATE"));return}
+ requests:=map[string]string{"path":`C:\ProgramData\ResearchOSVerifierCanary\data\private\input.canary`,"command":"cmd.exe /c whoami","network":"https://example.invalid","oversized":strings.Repeat("x",100),"prefix":"summary-v1 read-private","nul":"summary-v1\x00"}
+ if e:=file.SetDeadline(deadline);e!=nil{t.Fatal(e)};if scenario!="idle"{if _,e:=file.Write([]byte(requests[scenario]));e!=nil{t.Fatal(e)}}
+ b:=make([]byte,4096);n,e:=file.Read(b);rvCheck(t,"INVALID-NO-RESPONSE-"+scenario,[]any{0,true},[]any{n,e!=nil})
+ })}
+}
+func TestRVBrokerSummaryParsing(t *testing.T){for _,s:=range []string{`{"schema":"researchos.protected-summary.v1","status":"EXECUTION_REPORTED","total":1,"correct":1,"maximum_mode":"ADVISORY","private":"leak"}`,`{"schema":"researchos.protected-summary.v1","status":"BLOCKED","status":"EXECUTION_REPORTED","maximum_mode":"ADVISORY"}`,`{"schema":"researchos.protected-summary.v1","status":"PRIVATE_LABEL","maximum_mode":"ADVISORY"}`,`{"schema":"researchos.protected-summary.v1","status":"BLOCKED","maximum_mode":"BOUNDED_AUTO"}`}{_,e:=ParseSafeSummary([]byte(s));rvCheck(t,"UNSAFE-SUMMARY-REFUSED",true,e!=nil)}}
+func TestRVBrokerNoInstalledService(t *testing.T){started:=time.Now();_,e:=ProbeCanaryService();rvCheck(t,"UNINSTALLED-PROBE-REFUSED",true,e!=nil);rvCheck(t,"PROBE-OVERALL-BOUND",true,time.Since(started)<4*time.Second);rvCheck(t,"INTERACTIVE-SERVICE-REFUSED",true,RunCanaryService("S-1-5-21-1-2-3-1001")!=nil)}

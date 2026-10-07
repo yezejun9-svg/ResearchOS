@@ -1,0 +1,67 @@
+{
+  "schema": "researchos.w05.cli-read-interrupt-independent-precheck.v1",
+  "reviewer": "codex:/root/w05_merge_review",
+  "issued_at": "2026-10-06T15:06:07.266930+00:00",
+  "decision": "NEEDS_FIX_PRECHECK_SCOPE_AMENDMENT_REQUIRED",
+  "final_source_acceptance": false,
+  "scope_checkpoint": "CP266/O94",
+  "registered_scope_sha256": "d30d3c6c68d57d677883d421d13b18afb266a28561bec4112da7630a6f1d5ac3",
+  "read_audit": {
+    "path": "execution/v2.4/receipts/W05/W05-99/cli_read_interrupt_source_precheck_codex/fbc5e37c-b117-4717-b249-0e9e44309775/read_audit.json",
+    "sha256": "9e0c73417e8a620dcf4d858f797c08d4cbc986c79cf104af908aaca001c7b29a"
+  },
+  "counterexample": {
+    "kind": "SYNTHETIC deterministic transport reader; no provider or actual HTTP network",
+    "invocation": {
+      "path": "execution/v2.4/receipts/W05/W05-99/cli_read_interrupt_source_precheck_codex/fbc5e37c-b117-4717-b249-0e9e44309775/invocation.json",
+      "sha256": "df06931569a4f2e5b9c9af9f0ffe628d29f1e8b5311a409a66f5c3ef95608223"
+    },
+    "raw": {
+      "path": "execution/v2.4/receipts/W05/W05-99/cli_read_interrupt_source_precheck_codex/fbc5e37c-b117-4717-b249-0e9e44309775/stdout.raw",
+      "sha256": "53ef0263a04f514fa38aea9dd9a4fefc703bcdd57bcf00c6411b725949edbe3b"
+    },
+    "test": {
+      "path": "execution/v2.4/receipts/W05/W05-99/cli_read_interrupt_source_precheck_codex/fbc5e37c-b117-4717-b249-0e9e44309775/probe_test.go",
+      "sha256": "be6c87b5777f89fab6bda267979cbc1c68a40790776ddb36d36934b1c6731157"
+    },
+    "actual_exit": 1,
+    "fact": "1048577 bytes all returned with nil read error; last Read synchronously observes signal before returning bytes. Actual f.call returns READ_INTERRUPTED/130 instead of original size violation/1. There is no context.Canceled transport error to attribute."
+  },
+  "findings": [
+    {
+      "id": "L02-PRECHECK-01",
+      "severity": "P1",
+      "location": "apps/cli/cli_stream.go:179; apps/cli/cli_v2.go:240-254",
+      "fact": "A late canceled context and a broad reason string erase the original failure cause. INCOMPLETE_OR_OVERSIZE_REPLY includes size violation with nil read error; HOST_UNREACHABLE includes unrelated failures. Both may be incorrectly reported as user interrupt.",
+      "minimum_fix": "Register cli_v2.go as fourth path. Preserve existing public/private three-tuple callers, reason strings, exits and L01 HTTP behavior; add narrowly scoped private actual failure-cause result used by read-only status. Only errors.Is(actual Do/Read error,context.Canceled) plus this observer fact permits conversion; size violation, timeout, HTTP, schema and identity failures remain errors. No string matching or final context state as causal evidence."
+    },
+    {
+      "id": "L02-PRECHECK-02",
+      "severity": "P1",
+      "location": "apps/cli/cli_continuation.go get + cli_stream.go status continuation error mapping",
+      "fact": "CONTINUATION_READ_FAILED similarly conflates non-cancel transport/read errors; same causal ambiguity exists by source inspection, not separately executed.",
+      "minimum_fix": "Within already-owned continuation path preserve compatibility wrapper and expose the actual cancellation cause to status. Retain original bounds, ordering, authorization, no-redirect and projection."
+    },
+    {
+      "id": "L02-PRECHECK-03",
+      "severity": "MANDATORY_TEST_GAP",
+      "location": "apps/cli/cli_read_interrupt_test.go:486",
+      "fact": "ProtocolFaultRetainsOutcome finalizes before sending signal; it does not cover protocol failure accepted then signal observed before finalization. No synchronized valid-read-success then observed signal before finalization test is present.",
+      "minimum_fix": "Add explicit synchronization tests for both windows, oversize+late signal, unrelated transport/body error+late signal, actual cancellation, timeout without signal. Do not use sleeps as success evidence. Keep existing actual Windows signal and active settlement assertions."
+    }
+  ],
+  "recommended_exact_four_paths": [
+    "apps/cli/cli_stream.go",
+    "apps/cli/cli_continuation.go",
+    "apps/cli/cli_read_interrupt_test.go",
+    "apps/cli/cli_v2.go"
+  ],
+  "alternative_exact3": "A status-only duplicate transport could preserve cause within cli_stream.go, but duplicates envelope/identity/status/body policy and is larger; fourth-path private cause propagation is recommended. This receipt does not itself authorize edits.",
+  "ordering_acceptance": "Single finalization with stop/join remains sound under defined observed-signal linearization. A queued signal not yet observed is not asserted to precede finalization. Existing accepted protocol/HTTP errors survive later signal; success before finalization can become interrupted when observer actually accepted signal.",
+  "limits": [
+    "Root closure-v2 is not final input; no final SOURCE_READY",
+    "No full209 repeat; one independent red test only",
+    "No W05/A04/parent/LIVE qualification"
+  ],
+  "formal_acceptance_delta": 0
+}

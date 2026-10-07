@@ -1,0 +1,395 @@
+//go:build windows
+
+package domain
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"golang.org/x/sys/windows"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"researchos.local/research-os/adapters/protectedstore"
+	sandbox "researchos.local/research-os/ops/experiment_sandbox"
+	"strings"
+	"testing"
+	"time"
+	"unsafe"
+)
+
+func rvProtectedCheck(t *testing.T, id string, want, got, proof any) {
+	t.Helper()
+	status := "PASS"
+	if Hash(want) != Hash(got) {
+		status = "FAIL"
+	}
+	fmt.Println("RV11_PROTECTED_ASSERTION " + string(Bytes(Object{"id": id, "status": status, "expected": want, "actual": got, "evidence": proof, "scope": "SYNTHETIC_CANARY_ONLY", "formal_isolation": "BLOCKED"})))
+	if status != "PASS" {
+		t.Errorf("%s mismatch", id)
+	}
+}
+func rvProtectedSetup(t *testing.T) (*fixture, *protectedstore.CanaryStore, string) {
+	f := contextFixture(t)
+	root := filepath.Join(t.TempDir(), "rv-private")
+	store, e := protectedstore.NewCanary(root)
+	if e != nil {
+		t.Fatal(e)
+	}
+	t.Cleanup(func() { store.Close() })
+	f.s.Protected = store
+	p := Principal{ID: "rv-restricted-owner", Roles: []string{"OWNER", "PLANNER", "VERIFIER"}, Grants: []Grant{{ProjectID: f.project, Restricted: true}}}
+	if e = f.s.ProvisionPrincipal(context.Background(), p); e != nil {
+		t.Fatal(e)
+	}
+	f.owner = p.ID
+	f.token, e = f.s.IssueCredential(context.Background(), p.ID, time.Minute)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return f, store, root
+}
+func rvProtectedCounts(f *fixture) []any {
+	var a, u, events int
+	f.db.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='Artifact'", f.project).Scan(&a)
+	f.db.QueryRow("SELECT count(*) FROM uploaded_content WHERE project=?", f.project).Scan(&u)
+	f.db.QueryRow("SELECT count(*) FROM outbox WHERE project=?", f.project).Scan(&events)
+	return []any{a, u, events}
+}
+
+type rvProtectedProvider struct {
+	protectedstore.Provider
+	after  func()
+	tamper bool
+	reads  int
+}
+
+func (s *rvProtectedProvider) Read(ctx context.Context, b protectedstore.Blob) ([]byte, error) {
+	raw, e := s.Provider.Read(ctx, b)
+	s.reads++
+	if s.after != nil {
+		s.after()
+	}
+	if s.tamper && e == nil {
+		raw = append(raw, '!')
+	}
+	return raw, e
+}
+
+func TestRVProtectedRegistration(t *testing.T) {
+	for _, variant := range []string{"positive", "cross-project-ticket", "invalid-ticket", "live", "unknown-field", "executor-run", "grant-race", "credential-race", "role-race", "source-stale-race", "tamper"} {
+		t.Run(variant, func(t *testing.T) {
+			f, store, _ := rvProtectedSetup(t)
+			source := f.artifact(Object{"public": "independent lineage evidence"}, Empty())
+			b := protectedMetadata()
+			b["input_refs"] = []any{Ref(source, "Artifact")}
+			blobProject := f.project
+			if variant == "cross-project-ticket" {
+				blobProject = "other-project"
+			}
+			blob, e := store.CreateCanary(context.Background(), blobProject, "text/plain", []byte("RV_PRIVATE_BODY_synthetic_only"))
+			if e != nil {
+				t.Fatal(e)
+			}
+			provider := &rvProtectedProvider{Provider: store}
+			f.s.Protected = provider
+			provider.after = func() {
+				var e error
+				switch variant {
+				case "grant-race":
+					_, e = f.db.Exec("DELETE FROM auth_grants WHERE principal=? AND project=?", f.owner, f.project)
+				case "credential-race":
+					_, e = f.db.Exec("UPDATE auth_credentials SET revoked=1 WHERE token_hash=?", Digest([]byte(f.token)))
+				case "role-race":
+					_, e = f.db.Exec("UPDATE auth_principals SET roles='[\"PLANNER\"]' WHERE id=?", f.owner)
+				case "source-stale-race":
+					_, e = f.db.Exec("UPDATE domain_objects SET body=json_set(body,'$.validity','STALE') WHERE project=? AND kind='Artifact' AND id=?", f.project, source["id"])
+				}
+				if e != nil {
+					t.Error(e)
+				}
+			}
+			switch variant {
+			case "invalid-ticket":
+				blob.Ticket = "ps1:../escape"
+			case "live":
+				b["measurement_mode"] = "LIVE"
+			case "unknown-field":
+				b["private_payload"] = "forbidden body metadata"
+			case "executor-run":
+				b["run_id"] = ID()
+			case "tamper":
+				provider.tamper = true
+			}
+			before := rvProtectedCounts(f)
+			a, e := f.s.RegisterProtectedArtifact(context.Background(), f.token, f.project, blob.Ticket, b)
+			want := variant == "positive"
+			rvProtectedCheck(t, "REGISTER-"+variant+"-RESULT", want, e == nil, Object{"error": errorString(e), "provider_reads": provider.reads})
+			if !want {
+				rvProtectedCheck(t, "REGISTER-"+variant+"-NO-PUBLISH", before, rvProtectedCounts(f), nil)
+			} else {
+				var hits int
+				f.db.QueryRow("SELECT count(*) FROM uploaded_content WHERE bytes LIKE '%RV_PRIVATE_BODY%' ").Scan(&hits)
+				rvProtectedCheck(t, "REGISTER-PRIVATE-METADATA", []any{"VERIFIER_ONLY", f.owner, blob.Ticket, 0, before[1]}, []any{a["access_class"], a["produced_by"], a["storage_key"], hits, rvProtectedCounts(f)[1]}, nil)
+				code, raw, headers := protectedGET(f, "/artifacts/"+Str(a, "id")+"/content")
+				rvProtectedCheck(t, "REGISTER-HTTP-POSITIVE", []any{200, true, "no-store", "attachment"}, []any{code, string(raw) == "RV_PRIVATE_BODY_synthetic_only", headers.Get("Cache-Control"), headers.Get("Content-Disposition")}, nil)
+			}
+		})
+	}
+}
+
+func TestRVProtectedDedupAndLineage(t *testing.T) {
+	f, store, _ := rvProtectedSetup(t)
+	source := f.artifact(Object{"public": "parent"}, Empty())
+	b := protectedMetadata()
+	b["input_refs"] = []any{Ref(source, "Artifact")}
+	blob, e := store.CreateCanary(context.Background(), f.project, "text/plain", []byte("rv-dedup-private"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	a, e := f.s.RegisterProtectedArtifact(context.Background(), f.token, f.project, blob.Ticket, b)
+	if e != nil {
+		t.Fatal(e)
+	}
+	before := rvProtectedCounts(f)
+	second, e := f.s.RegisterProtectedArtifact(context.Background(), f.token, f.project, blob.Ticket, b)
+	rvProtectedCheck(t, "DEDUP-SAME-CANONICAL", []any{true, a["id"], before}, []any{e == nil, second["id"], rvProtectedCounts(f)}, nil)
+	otherBlob, e := store.CreateCanary(context.Background(), f.project, "text/plain", []byte("rv-dedup-private"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, e = f.s.RegisterProtectedArtifact(context.Background(), f.token, f.project, otherBlob.Ticket, b)
+	rvProtectedCheck(t, "DEDUP-DIFFERENT-TICKET", true, e != nil, errorString(e))
+	altered := protectedMetadata()
+	_, e = f.s.RegisterProtectedArtifact(context.Background(), f.token, f.project, blob.Ticket, altered)
+	rvProtectedCheck(t, "DEDUP-DIFFERENT-PROVENANCE", true, e != nil, errorString(e))
+	var links int
+	f.db.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='ImpactLink' AND json_extract(body,'$.from_ref.id')=? AND json_extract(body,'$.to_ref.id')=?", f.project, a["id"], source["id"]).Scan(&links)
+	rvProtectedCheck(t, "REGISTER-CANONICAL-DERIVATION-LINK", 1, links, Object{"child_artifact": a["id"], "parent_artifact": source["id"]})
+	if _, e = f.db.Exec("UPDATE domain_objects SET body=json_set(body,'$.validity','STALE') WHERE project=? AND kind='Artifact' AND id=?", f.project, source["id"]); e != nil {
+		t.Fatal(e)
+	}
+	_, raw, e := f.s.ReadProtectedArtifact(context.Background(), f.token, f.project, Str(a, "id"))
+	rvProtectedCheck(t, "DERIVED-READ-RECURSIVE-FRESHNESS", []any{true, 0}, []any{e != nil, len(raw)}, errorString(e))
+}
+
+func TestRVProtectedChangeImpact(t *testing.T) {
+	f, store, _ := rvProtectedSetup(t)
+	req := f.requirement()
+	public := f.artifact(Object{"control":"ordinary derivation"}, []any{Ref(req, "Requirement")})
+	meta := protectedMetadata()
+	meta["input_refs"] = []any{Ref(req, "Requirement")}
+	private := protectedRegister(t, f, store, "rv-private-impact", meta)
+	value := f.artifact("independently revised requirement", Empty())
+	state := f.state()
+	p := f.expect(201,"POST",f.path("/change-proposals"),ID(),testTag(state),Object{"title":"independent requirement change", "reason":"check canonical impact closure", "base_state_revision":state["revision"], "edits":[]any{Object{"target_ref":Ref(req,"Requirement"),"field":"text","proposed_value_artifact_ref":Ref(value,"Artifact"),"reason":"synthetic canary"}},"migration_steps":Empty(),"test_check_ids":changeChecks,"rollback_steps":[]any{"independent reversal"}})
+	found := map[string]bool{}
+	for _, v := range Arr(p,"impacted_refs") { found[Str(v.(map[string]any),"id")] = true }
+	rvProtectedCheck(t,"CHANGE-IMPACT-PUBLIC-CONTROL",true,found[Str(public,"id")],p["impacted_refs"])
+	rvProtectedCheck(t,"CHANGE-IMPACT-PROTECTED-INCLUDED",true,found[Str(private,"id")],Object{"impacted_refs":p["impacted_refs"],"private_ref":Ref(private,"Artifact")})
+}
+
+func TestRVProtectedHTTPRevalidation(t *testing.T) {
+	for _, variant := range []string{"grant", "credential", "role", "parent-stale", "tamper"} {
+		t.Run(variant, func(t *testing.T) {
+			f, store, _ := rvProtectedSetup(t)
+			parent := protectedRegister(t, f, store, "rv-parent-canary", protectedMetadata())
+			meta := protectedMetadata()
+			meta["source_refs"] = []any{Ref(parent, "Artifact")}
+			a := protectedRegister(t, f, store, "RV_HTTP_PRIVATE_CANARY", meta)
+			p := &rvProtectedProvider{Provider: store}
+			f.s.Protected = p
+			p.tamper = variant == "tamper"
+			p.after = func() {
+				var e error
+				switch variant {
+				case "grant":
+					_, e = f.db.Exec("UPDATE auth_grants SET restricted=0 WHERE principal=?", f.owner)
+				case "credential":
+					_, e = f.db.Exec("UPDATE auth_credentials SET revoked=1 WHERE token_hash=?", Digest([]byte(f.token)))
+				case "role":
+					_, e = f.db.Exec("UPDATE auth_principals SET roles='[\"EXECUTOR\"]' WHERE id=?", f.owner)
+				case "parent-stale":
+					_, e = f.db.Exec("UPDATE domain_objects SET body=json_set(body,'$.validity','STALE') WHERE project=? AND id=?", f.project, parent["id"])
+				}
+				if e != nil {
+					t.Error(e)
+				}
+			}
+			code, raw, _ := protectedGET(f, "/artifacts/"+Str(a, "id")+"/content")
+			rvProtectedCheck(t, "HTTP-POSTIO-"+variant, []any{true, false, 1}, []any{code >= 400, bytes.Contains(raw, []byte("RV_HTTP_PRIVATE_CANARY")), p.reads}, Object{"status": code})
+		})
+	}
+}
+
+func TestRVProtectedPublicViews(t *testing.T) {
+	f, store, _ := rvProtectedSetup(t)
+	a := protectedRegister(t, f, store, "RV_UNIQUE_PRIVATE_MARKER", protectedMetadata())
+	meta := protectedMetadata()
+	meta["input_refs"] = []any{Ref(a, "Artifact")}
+	child := protectedRegister(t, f, store, "RV_DERIVED_PRIVATE_MARKER", meta)
+	for _, role := range []string{"OWNER", "VERIFIER", "EXECUTOR", "PLANNER", "READER"} {
+		t.Run(role, func(t *testing.T) {
+			f.switchPrincipal("rv-unrestricted-"+strings.ToLower(role), []string{role})
+			for _, suffix := range []string{"", "/content"} {
+				code, raw, _ := protectedGET(f, "/artifacts/"+Str(child, "id")+suffix)
+				rvProtectedCheck(t, "PUBLIC-"+role+suffix, []any{404, false, false}, []any{code, bytes.Contains(raw, []byte("PRIVATE_MARKER")), bytes.Contains(raw, []byte(Str(child, "storage_key")))}, nil)
+			}
+			for _, path := range []string{"/artifacts", "/events"} {
+				code, raw, _ := protectedGET(f, path)
+				rvProtectedCheck(t, "PUBLIC-"+role+path, []any{200, false, false, false}, []any{code, bytes.Contains(raw, []byte("PRIVATE_MARKER")), bytes.Contains(raw, []byte(Str(a, "storage_key"))), bytes.Contains(raw, []byte(Str(child, "id")))}, nil)
+			}
+		})
+	}
+}
+
+func TestRVProtectedNativeVariants(t *testing.T) {
+	for _, variant := range []string{"file-acl", "body-tamper", "metadata-tamper", "hardlink", "root-rename", "existing-root", "closed", "cancelled"} {
+		t.Run(variant, func(t *testing.T) {
+			_, s, root := rvProtectedSetup(t)
+			ctx := context.Background()
+			blob, e := s.CreateCanary(ctx, "native-project", "text/plain", []byte("rv-native-private-body"))
+			if e != nil {
+				t.Fatal(e)
+			}
+			bodyPath := filepath.Join(root, strings.TrimPrefix(blob.Ticket, "ps1:")+".bin")
+			boundary, e := s.Boundary(ctx)
+			if e != nil {
+				t.Fatal(e)
+			}
+			switch variant {
+			case "file-acl":
+				sd, e := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + boundary.OwnerSID + ")(A;;GR;;;WD)")
+				if e != nil {
+					t.Fatal(e)
+				}
+				acl, _, _ := sd.DACL()
+				if e = windows.SetNamedSecurityInfo(bodyPath, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); e != nil {
+					t.Fatal(e)
+				}
+			case "body-tamper":
+				if e = os.WriteFile(bodyPath, []byte("rv-native-private-FAKE"), 0600); e != nil {
+					t.Fatal(e)
+				}
+			case "metadata-tamper":
+				path := strings.TrimSuffix(bodyPath, ".bin") + ".json"
+				raw, e := os.ReadFile(path)
+				if e != nil {
+					t.Fatal(e)
+				}
+				raw = append(raw[:len(raw)-1], []byte(`,"project":"injected"}`)...)
+				if e = os.WriteFile(path, raw, 0600); e != nil {
+					t.Fatal(e)
+				}
+			case "hardlink":
+				if e = os.Link(bodyPath, filepath.Join(root, "alias.bin")); e != nil {
+					t.Fatal(e)
+				}
+			case "root-rename":
+				if e = os.Rename(root, root+"-relocated"); e != nil {
+					rvProtectedCheck(t, "NATIVE-root-rename", true, true, "OS blocked rename")
+					return
+				}
+			case "existing-root":
+				_, e = protectedstore.NewCanary(root)
+				rvProtectedCheck(t, "NATIVE-existing-root", true, e != nil, nil)
+				return
+			case "closed":
+				s.Close()
+			case "cancelled":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			raw, e := s.Read(ctx, blob)
+			rvProtectedCheck(t, "NATIVE-"+variant, []any{true, 0}, []any{e != nil, len(raw)}, errorString(e))
+		})
+	}
+}
+
+func TestRVProtectedChild(t *testing.T) {
+	pos := -1
+	for i, v := range os.Args {
+		if v == "--rv-protected-child" {
+			pos = i
+			break
+		}
+	}
+	if pos < 0 {
+		return
+	}
+	if pos+3 >= len(os.Args) {
+		os.Exit(93)
+	}
+	privatePath, inputPath, outputPath := os.Args[pos+1], os.Args[pos+2], os.Args[pos+3]
+	_, readError := os.ReadFile(privatePath)
+	writeError := os.WriteFile(privatePath, []byte("unexpected overwrite"), 0600)
+	input, inputError := os.ReadFile(inputPath)
+	inputWrite := os.WriteFile(inputPath, []byte("overwrite input"), 0600)
+	outputError := os.WriteFile(outputPath, []byte("candidate output"), 0600)
+	var isContainer, needed uint32
+	var token windows.Token
+	if e := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token); e != nil {
+		fmt.Println(string(Bytes(Object{"token_open_error": e.Error()})))
+		os.Exit(94)
+	}
+	defer token.Close()
+	tokenError := windows.GetTokenInformation(token, uint32(29), (*byte)(unsafe.Pointer(&isContainer)), 4, &needed)
+	caps := make([]uintptr, 512)
+	capError := windows.GetTokenInformation(token, uint32(30), (*byte)(unsafe.Pointer(&caps[0])), uint32(len(caps))*uint32(unsafe.Sizeof(caps[0])), &needed)
+	count := *(*uint32)(unsafe.Pointer(&caps[0]))
+	fmt.Println(string(Bytes(Object{"pid": os.Getpid(), "is_appcontainer": isContainer, "token_ok": tokenError == nil, "capabilities": count, "capabilities_query_ok": capError == nil, "capabilities_error": errorString(capError), "private_read_denied": os.IsPermission(readError), "private_write_denied": os.IsPermission(writeError), "current_input_read": inputError == nil && string(input) == "current synthetic request", "current_input_write_denied": os.IsPermission(inputWrite), "output_write": outputError == nil})))
+	os.Exit(0)
+}
+
+func TestRVProtectedNativeCandidate(t *testing.T) {
+	_, store, root := rvProtectedSetup(t)
+	blob, e := store.CreateCanary(context.Background(), "native-project", "text/plain", []byte("rv-native-private-label"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	path := filepath.Join(root, strings.TrimPrefix(blob.Ticket, "ps1:")+".bin")
+	hostRaw, e := os.ReadFile(path)
+	rvProtectedCheck(t, "SAME-USER-POSITIVE-CONTROL", []any{true, true}, []any{e == nil, string(hostRaw) == "rv-native-private-label"}, "CANARY_ONLY; developer identity is not isolated")
+	staging := t.TempDir()
+	input, output := filepath.Join(staging, "input"), filepath.Join(staging, "output")
+	if e = os.Mkdir(input, 0700); e != nil {
+		t.Fatal(e)
+	}
+	if e = os.Mkdir(output, 0700); e != nil {
+		t.Fatal(e)
+	}
+	exe, e := os.Executable()
+	if e != nil {
+		t.Fatal(e)
+	}
+	binary, e := os.ReadFile(exe)
+	if e != nil {
+		t.Fatal(e)
+	}
+	child := filepath.Join(input, "review-candidate.exe")
+	if e = os.WriteFile(child, binary, 0700); e != nil {
+		t.Fatal(e)
+	}
+	request := filepath.Join(input, "request.txt")
+	if e = os.WriteFile(request, []byte("current synthetic request"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	r, e := sandbox.Run(context.Background(), sandbox.Command{Executable: child, Args: []string{"-test.run=^TestRVProtectedChild$", "--", "--rv-protected-child", path, request, filepath.Join(output, "result.txt")}, InputDirectory: input, OutputDirectory: output, Timeout: 15 * time.Second})
+	if e != nil {
+		t.Fatal(e)
+	}
+	var result Object
+	if e = json.Unmarshal(r.Stdout, &result); e != nil {
+		t.Fatalf("child output %q: %v", r.Stdout, e)
+	}
+	rvProtectedCheck(t, "NATIVE-CHILD-TOKEN", []any{0, true, true, true, 1, 0, true}, []any{r.ExitCode, r.Stopped, result["token_ok"], result["capabilities_query_ok"], result["is_appcontainer"], result["capabilities"], int(result["pid"].(float64)) != os.Getpid()}, Object{"receipt_pid": r.PID, "child": result, "sid": r.SID})
+	rvProtectedCheck(t, "NATIVE-CHILD-ACCESS", []any{true, true, true, true, true}, []any{result["private_read_denied"], result["private_write_denied"], result["current_input_read"], result["current_input_write_denied"], result["output_write"]}, nil)
+	raw, e := store.Read(context.Background(), blob)
+	rvProtectedCheck(t, "NATIVE-PRIVATE-UNMODIFIED", []any{true, "rv-native-private-label"}, []any{e == nil, string(raw)}, nil)
+}
+
+var _ = http.MethodGet
+var _ = httptest.NewRecorder

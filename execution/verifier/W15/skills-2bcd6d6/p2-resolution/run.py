@@ -1,0 +1,8 @@
+import pathlib,json,hashlib,subprocess,os,datetime
+r=pathlib.Path('.').resolve();out=r/'execution/verifier/W15/skills-2bcd6d6/p2-resolution';wt=r/'.local/worktrees/skills-lifecycle'
+replace={str(wt/'internal/domain/independent_skills_test.go'):str(r/'execution/verifier/W15/skills-2bcd6d6/fix-22cb749/independent_skills_test.go'),str(wt/'internal/domain/independent_resolution_test.go'):str(out/'independent_resolution_test.go')}
+(out/'overlay.json').write_text(json.dumps({'Replace':replace},indent=2),encoding='utf-8')
+go=r/'.local/tools/go1.27.1/go/bin/go.exe';env=dict(os.environ,RESEARCHOS_GO=str(go),GOROOT=str(go.parents[1]));argv=[str(go),'test','-json','-count=1','-timeout=3m','-overlay',str(out/'overlay.json'),'-run','^(TestIndependentResolution.*|TestW15SourceConflictFormalResolution|TestW04C04|TestIndependentSkillRegressionSuiteShrink|TestIndependentSkillNegativeRelabel|TestIndependentSkillConflictOmission)$','./internal/domain']
+(out/'command.json').write_text(json.dumps({'argv':argv,'cwd':str(wt),'source':'751dfc7e84a2370f5daf9f7c7034e3e6fdadb6f8','HEAD':subprocess.check_output(['git','rev-parse','HEAD'],cwd=wt,text=True).strip(),'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'mode':'FIXTURE','limits':['trusted fixture provisioning and W10 observation seams','source withdrawal negative uses local trusted service put transition; no real product data']},indent=2),encoding='utf-8')
+with (out/'stdout.jsonl').open('wb') as stdout,(out/'stderr.txt').open('wb') as stderr: p=subprocess.run(argv,cwd=wt,env=env,stdout=stdout,stderr=stderr)
+(out/'exit-code.json').write_text(json.dumps({'exit_code':p.returncode}),encoding='utf-8');print({'exit_code':p.returncode})
