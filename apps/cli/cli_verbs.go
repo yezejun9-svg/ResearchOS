@@ -10,6 +10,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -238,7 +239,15 @@ func cliInteractive(args []string) {
 	// input. Never adopt a session identity merely echoed by this listing.
 	reply, reason, code := v2Call(c, "session.list", map[string]any{"cursor": nil, "limit": 20})
 	if code != 0 || statusOf(reply) != "COMPLETED" {
-		fail("interactive", exitNotImplemented, orDefault(reason, "SESSION_LIST_PENDING"))
+		if code == 0 {
+			code = exitNotImplemented
+		}
+		fail("interactive", code, orDefault(reason, "SESSION_LIST_PENDING"))
+	}
+	if c.sessionID != "" {
+		if reason, code := cliInteractivePrepare(c, cfg, "", options, true); code != 0 {
+			fail("interactive", code, reason)
+		}
 	}
 	lines := make(chan cliInputLine, 16)
 	cliInputPumps.Store(c, (<-chan cliInputLine)(lines))
@@ -311,6 +320,14 @@ func cliInteractive(args []string) {
 					fail("interactive", exitUsage, "UNKNOWN_SLASH_COMMAND", name)
 				}
 			}
+			if name == "run" || name == "/run" {
+				prompt, _ := firstPositional(commandArgs)
+				if reason, code := cliInteractivePrepare(c, cfg, prompt, options, false); code != 0 {
+					out := map[string]any{"command": "interactive", "status": "REJECTED", "reason": reason, "exit_code": code, "requests_sent": c.requestLog}
+					code = cliFlowSummary(out, code, c, &cfg)
+					os.Exit(code)
+				}
+			}
 			out, code := runCLIVerb(name, commandArgs, c, cfg, options)
 			code = cliFlowSummary(out, code, c, &cfg)
 			if code != 0 {
@@ -318,6 +335,48 @@ func cliInteractive(args []string) {
 			}
 		}
 	}
+}
+
+// Opening a session is read-only. An explicit ordinary message may acquire an
+// unowned session, but never takes a foreign or expired writer lease implicitly.
+func cliInteractivePrepare(c *v2Context, cfg cliConfig, prompt string, options cliFollowOptions, opening bool) (string, int) {
+	budget, stop := context.WithTimeout(context.Background(), options.timeout)
+	defer stop()
+	f := &cliFlow{c: c, budget: budget, options: options, base: v2FlowCommandID(c.commandID, "interactive.prepare", -1)}
+	if opening {
+		_, reason, code := f.call("session.attach", map[string]any{"after_sequence": 0, "request_write_owner": false}, true)
+		return reason, code
+	}
+	created := c.sessionID == ""
+	method, payload := "session.get", map[string]any{}
+	if created {
+		method = "session.create"
+		payload = map[string]any{"workspace_ref": cfg.WorkspaceRef, "model_config_ref": cfg.Model, "title": clip(prompt, 60)}
+	}
+	reply, reason, code := f.call(method, payload, true)
+	if code != 0 {
+		return reason, code
+	}
+	snapshot := cliSnapshot(reply)
+	writer := cliObject(snapshot["writer"])
+	if writer != nil {
+		if writer["client_id"] != c.clientID {
+			return "HOST_REJECTED:WRITER_BUSY", exitNotImplemented
+		}
+		expires, err := time.Parse(time.RFC3339Nano, continuationString(writer, "expires_at"))
+		if err != nil || !time.Now().Before(expires) {
+			return "HOST_REJECTED:LEASE_EXPIRED", exitNotImplemented
+		}
+		epoch, ok := cliInteger(writer["epoch"])
+		if !ok || epoch < 1 {
+			return "ATTACH_WRITER_UNRESOLVED", exitNotImplemented
+		}
+		// A completed create already granted this exact writer lease. It is
+		// subject to the same fresh expiry check as an existing own writer.
+		return "", exitCompleted
+	}
+	_, reason, code = f.call("session.attach", map[string]any{"after_sequence": 0, "request_write_owner": true}, true)
+	return reason, code
 }
 
 func statusOf(reply map[string]any) string {
