@@ -1,0 +1,199 @@
+
+// G2 controls are fixture evidence, never provider qualification.
+func providerG2BeforeTaskBudget(t *testing.T) func(*fixture, Object) Object {
+ return func(f *fixture, goal Object) Object {
+  t.Helper()
+  token := f.token
+  defer func() { f.token = token }()
+  id := Str(goal,"id")
+  if goal["status"] != "ACTIVE" { t.Fatal("budget callback before Goal activation") }
+  var tasks, runs int
+  if e:=f.db.QueryRow(`SELECT count(*) FROM domain_objects WHERE project=? AND kind='Task' AND json_extract(body,'$.goal_id')=?`,f.project,id).Scan(&tasks); e!=nil {t.Fatal(e)}
+  if e:=f.db.QueryRow(`SELECT count(*) FROM domain_objects WHERE project=? AND kind='Run'`,f.project).Scan(&runs); e!=nil {t.Fatal(e)}
+  if tasks!=0 || runs!=0 {t.Fatal("budget callback after Task/Run creation",tasks,runs)}
+  policyPath:=f.path("/goals/"+id+"/budget-policy")
+  policy:=f.expect(200,"GET",policyPath,"","",nil)
+  policy=f.expect(200,"PUT",policyPath,ID(),testTag(policy),capBody("10"))
+  fresh:=f.read("goals",id)
+  if fresh["id"]!=goal["id"] || fresh["status"]!="ACTIVE" {t.Fatal("budget changed original Goal identity")}
+  providerEvidence(t,"before-task-budget.json",Object{"goal_before":goal,"goal_after":fresh,"policy":policy,"task_count":tasks,"run_count":runs,"token_restored_on_return":true})
+  return fresh
+ }
+}
+
+func providerG2TypedFaultMatches(err error, status int, code,message string) bool {
+ var fault *Fault
+ return errors.As(err,&fault) && fault.Status==status && fault.Code==code && fault.Message==message
+}
+func TestProviderBindingG2TypedFaultMatcher(t *testing.T) {
+ for _,mode:=range []string{"exact","nil","wrong-status","wrong-code","wrong-message"} {t.Run(mode,func(t *testing.T){
+  var err error=Fail(422,"GATE_FAILED","budget exhausted")
+  switch mode {case "nil":err=nil;case "wrong-status":err=Fail(409,"GATE_FAILED","budget exhausted");case "wrong-code":err=Fail(422,"STATE_CONFLICT","budget exhausted");case "wrong-message":err=Fail(422,"GATE_FAILED","context stale")}
+  got:=providerG2TypedFaultMatches(err,422,"GATE_FAILED","budget exhausted")
+  providerEvidence(t,"component.json",Object{"mode":"SYNTHETIC_ASSERTION_CONTROL","case":mode,"actual":got,"expected":mode=="exact"})
+  if got!=(mode=="exact") {t.Fatal("typed fault matcher",mode,got)}
+ })}
+}
+
+type providerG2Trace struct {mu sync.Mutex; facts []Object}
+func providerG2Observe(c *RuntimeCoordinator) *providerG2Trace {
+ trace:=&providerG2Trace{facts:[]Object{}}
+ previous:=c.boundaryHook
+ c.boundaryHook=func(name string,fact Object){
+  if previous!=nil {previous(name,fact)}
+  copy,_:=Decode(Bytes(fact));trace.mu.Lock();defer trace.mu.Unlock()
+  trace.facts=append(trace.facts,Object{"stage":name,"fact":copy})
+ }
+ return trace
+}
+
+func providerG2OriginalModelCauseMatches(actual,expected Object) bool {
+ for _,key:=range []string{"project_id","task_id","run_id","epoch","dispatch_key","manifest_hash","profile_hash","transport_hash","model_key"} {
+  if actual[key]==nil || expected[key]==nil || Hash(actual[key])!=Hash(expected[key]) {return false}
+ }
+ effects:=Arr(actual,"effects");ledger:=Arr(actual,"ledger")
+ if len(effects)!=3 || len(ledger)!=1 {return false}
+ var requestHash,reservation any
+ for i,state:=range []string{"PREPARED","STARTED","UNKNOWN"} {
+  e,ok:=effects[i].(map[string]any);if !ok || e["state"]!=state || e["project_id"]!=expected["project_id"] || e["task_id"]!=expected["task_id"] || e["run_id"]!=expected["run_id"] || Hash(e["epoch"])!=Hash(expected["epoch"]) || e["key"]!=expected["model_key"] {return false}
+  if i==0 {requestHash,reservation=e["request_hash"],e["reservation_id"];if requestHash==nil || reservation==nil{return false}}
+  if e["request_hash"]!=requestHash || e["reservation_id"]!=reservation{return false}
+  if i==2 {r,ok:=e["receipt"].(map[string]any);if !ok || r["reason"]!=expected["unknown_reason"] || r["actual_cost"]!=nil{return false}}
+ }
+ l,ok:=ledger[0].(map[string]any)
+ return ok && l["id"]==reservation && l["run_id"]==expected["run_id"] && l["provider_request_id"]==expected["model_key"] && l["provider_event_id"]=="prepare/"+Str(expected,"model_key") && l["operation"]=="RESERVE" && l["cost_basis"]=="UPPER_BOUND" && l["reservation_id"]==nil
+}
+func TestProviderBindingG2OriginalModelCauseMatcher(t *testing.T) {
+ for _,mode:=range []string{"exact","wrong-original-key","wrong-unknown-reason"} {t.Run(mode,func(t *testing.T){
+  expected:=Object{"project_id":"synthetic-project","task_id":"synthetic-task","run_id":"synthetic-run","epoch":1,"dispatch_key":"synthetic-dispatch","manifest_hash":"synthetic-manifest","profile_hash":"synthetic-profile","transport_hash":"synthetic-transport","model_key":"synthetic-model-key","unknown_reason":"synthetic original reason"}
+  actual,_:=Decode(Bytes(expected));effects:=Empty()
+  for _,state:=range []string{"PREPARED","STARTED","UNKNOWN"} {effects=append(effects,Object{"project_id":expected["project_id"],"task_id":expected["task_id"],"run_id":expected["run_id"],"epoch":1,"key":expected["model_key"],"state":state,"request_hash":"synthetic-request","reservation_id":"synthetic-reservation","receipt":Object{"reason":expected["unknown_reason"],"actual_cost":nil}})}
+  actual["effects"]=effects;actual["ledger"]=[]any{Object{"id":"synthetic-reservation","run_id":expected["run_id"],"provider_request_id":expected["model_key"],"provider_event_id":"prepare/"+Str(expected,"model_key"),"operation":"RESERVE","cost_basis":"UPPER_BOUND","reservation_id":nil}}
+  if mode=="wrong-original-key" {actual["model_key"]="copied-other-key"}
+  if mode=="wrong-unknown-reason" {effects[2].(map[string]any)["receipt"].(map[string]any)["reason"]="protocol not reconciled"}
+  got:=providerG2OriginalModelCauseMatches(actual,expected)
+  providerEvidence(t,"component.json",Object{"classification":"SYNTHETIC_ASSERTION_CONTROL_NOT_EFFECT","case":mode,"actual_input":actual,"expected_input":expected,"matches":got})
+  if got!=(mode=="exact") {t.Fatal("original MODEL predicate",mode,got)}
+ })}
+}
+
+func providerG2Rows(t *testing.T, db *sql.DB) Object {
+ t.Helper()
+ rows,e:=db.Query(`SELECT name,type,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name`);if e!=nil{t.Fatal(e)}
+ schema:=Empty();tables:=[]string{}
+ for rows.Next(){var name,kind string;var ddl sql.NullString;if e=rows.Scan(&name,&kind,&ddl);e!=nil{t.Fatal(e)};schema=append(schema,Object{"name":name,"type":kind,"sql":ddl.String});if kind=="table"{tables=append(tables,name)}}
+ if e=rows.Err();e!=nil{t.Fatal(e)};rows.Close()
+ all:=Object{"schema":schema}
+ for _,table:=range tables {
+  rows,e=db.Query(`SELECT * FROM "`+strings.ReplaceAll(table,`"`,`""`)+`"`);if e!=nil{t.Fatal(e)}
+  cols,e:=rows.Columns();if e!=nil{t.Fatal(e)};values:=[]string{}
+  for rows.Next(){v:=make([]any,len(cols));ptr:=make([]any,len(cols));for i:=range v{ptr[i]=&v[i]};if e=rows.Scan(ptr...);e!=nil{t.Fatal(e)};values=append(values,string(Bytes(v)))}
+  if e=rows.Err();e!=nil{t.Fatal(e)};rows.Close();sort.Strings(values);all[table]=Object{"columns":cols,"row_multiset":values}
+ }
+ return all
+}
+func TestProviderBindingG2RollbackAdmissionComponents(t *testing.T) {
+ for _,mode:=range []string{"legal-small-cap","exhausted-cap"} {t.Run(mode,func(t *testing.T){
+  bound:="1";if mode=="exhausted-cap"{bound="1000000"}
+  c,route,r,calls:=providerBrokerFixtureWithBeforeTask(t,nil,func(_ Object,p Object){Arr(p,"effect_routes")[0].(map[string]any)["upper_bound"]=dollars(bound)},providerG2BeforeTaskBudget(t))
+  c.config.Providers[0].UpperBound=dollars(bound)
+  before:=providerG2Rows(t,r.f.db);providerEvidence(t,"rows-before.json",before)
+  epoch,e:=Num(r.run,"lease_epoch");if e!=nil{t.Fatal(e)}
+  tx,run,dispatch,e:=c.dispatchGate(context.Background(),route,Str(r.run,"id"),r.lease,epoch);if e!=nil{t.Fatal(e)}
+  defer tx.Rollback()
+  if e=r.f.s.taskContextForRun(tx,r.f.project,run);e!=nil{t.Fatal(e)}
+  config:=c.config.Providers[0].ModelConfig
+  payload:=Object{"body":Object{"model":config["model"],"messages":[]any{Object{"role":"user","content":"explicit synthetic rollback component"}},"stream":true,"tools":config["tools"],"thinking":Object{"type":"enabled"},"reasoning_effort":"high","max_tokens":config["max_output_tokens"]}}
+  frame:=rt.BridgeFrame{Sequence:2,Type:"effect.request",Key:"synthetic-g2-rollback-key",Route:Str(config,"route"),Capability:"MODEL",Payload:Bytes(payload)}
+  provider,e:=c.providerRoute(tx,route,run,dispatch,frame);if e!=nil{t.Fatal(e)}
+  if _,e=validateRuntimeModelRequest(config,payload);e!=nil{t.Fatal(e)}
+  if e=runtimeModelCallGate(tx,route.ProjectID,Str(run,"id"),frame.Key,config);e!=nil{t.Fatal(e)}
+  transport,e:=providerTransport(tx,route.ProjectID,run,dispatch);if e!=nil{t.Fatal(e)}
+  task,e:=load(tx,route.ProjectID,"Task",Str(run,"task_id"));if e!=nil{t.Fatal(e)}
+  goal,e:=load(tx,route.ProjectID,"Goal",Str(task,"goal_id"));if e!=nil{t.Fatal(e)}
+  request:=Object{"route":provider.ID,"capability":"MODEL","credential_revision":provider.CredentialRevision,"payload":payload,"provider_transport":transport}
+  cost:=Object{"policy_id":goal["budget_policy_id"],"run_id":run["id"],"operation":"RESERVE","money":provider.UpperBound,"provider_request_id":frame.Key,"provider_event_id":"prepare/"+frame.Key,"reservation_id":nil,"cost_basis":"UPPER_BOUND","occurred_at":run["created_at"]}
+  actual,e:=c.service.prepareEffectTx(tx,c.config.SchedulerToken,route.ProjectID,Str(run,"id"),frame.Key,request,cost)
+  evidence:=Object{"classification":"REAL_COMPONENT_ROLLBACK_SYNTHETIC_BRIDGE_FRAME","frame":frame,"run":run,"dispatch":dispatch,"transport":transport,"request":request,"cost":cost,"result":actual,"error":fmt.Sprint(e)}
+  if mode=="legal-small-cap" {
+   if e!=nil || actual["state"]!="PREPARED"{t.Fatal("legal reservation",e,actual)}
+   var raw string;if e=tx.QueryRow(`SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND id=?`,route.ProjectID,actual["reservation_id"]).Scan(&raw);e!=nil{t.Fatal(e)}
+   l,e:=Decode([]byte(raw));if e!=nil || l["operation"]!="RESERVE" || l["provider_request_id"]!=frame.Key{t.Fatal("transaction reservation",e,l)};evidence["reserved_ledger"]=l
+  } else if !providerG2TypedFaultMatches(e,422,"GATE_FAILED","budget exhausted"){t.Fatal("not causal budget refusal",e)}
+  providerEvidence(t,"component.json",evidence)
+  if e=tx.Rollback();e!=nil{t.Fatal(e)}
+  after:=providerG2Rows(t,r.f.db);providerEvidence(t,"rows-after.json",after)
+  if Hash(before)!=Hash(after) || calls.Load()!=0 {t.Fatal("rollback changed rows or called provider")}
+ })}
+}
+
+func TestProviderBindingG2QuarantineLayerControls(t *testing.T) {
+ for _,kind:=range []string{"selected-alias","escaped-tool","unsupported-detail","early-eof"} {for _,variant:=range []string{"original","benign"}{t.Run(kind+"-"+variant,func(t *testing.T){
+  raw:=providerG2QuarantinePayload(kind)
+  if variant=="benign" {
+   switch kind {case "selected-alias","escaped-tool":raw=strings.ReplaceAll(raw,"host-only-model-","benign-");case "unsupported-detail":raw=strings.ReplaceAll(raw,`"reasoning_details":[{"type":"reasoning.text","text":"safe but unsupported"}],`,"");case "early-eof":raw+="data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"}
+  }
+  layer:="PASS";detail:="";complete:=completeRuntimeModelSSE([]byte(raw))
+  if !complete{layer="COMPLETE_SSE"}else{
+   q,e:=newModelSSEQuarantine("host-only-model-fixture");if e!=nil{t.Fatal(e)}
+   if _,e=q.Feed([]byte(raw));e!=nil{layer="FEED";detail=e.Error()}else if _,_,e=q.Finish();e!=nil{layer="FINISH";detail=e.Error()}else if e=providerSSEPolicy([]byte(raw));e!=nil{layer="POLICY";detail=e.Error()}
+  }
+  expected:="PASS";if variant=="original"{expected=map[string]string{"selected-alias":"FEED","escaped-tool":"FEED","unsupported-detail":"POLICY","early-eof":"COMPLETE_SSE"}[kind]}
+  providerEvidence(t,"component.json",Object{"classification":"PRODUCTION_EVALUATORS_SYNTHETIC_INPUT","raw":raw,"digest":Digest([]byte(raw)),"complete_sse":complete,"actual_layer":layer,"expected_layer":expected,"error":detail})
+  if layer!=expected{t.Fatal("quarantine causal layer",kind,variant,layer,expected,detail)}
+ })}}
+}
+
+func providerG2AssertNative(t *testing.T,c *RuntimeCoordinator,route RuntimeCoordinatorRoute,r *runtimeFixture,trace *providerG2Trace,mode string,actualError error,quarantine bool) {
+ t.Helper()
+ status,code,message:=403,"FORBIDDEN","provider differs from frozen route permission"
+ if mode=="route-not-fixture"{message="effect route not permitted for this purpose"}
+ if mode=="wrong-endpoint"{message="model route differs from frozen profile"}
+ if mode=="missing-qualification-plan"{status,code,message=422,"GATE_FAILED","trusted host qualification plan required"}
+ if mode=="insufficient-budget"{status,code,message=422,"GATE_FAILED","budget exhausted"}
+ if quarantine{status,code,message=409,"STATE_CONFLICT","model outcome UNKNOWN; automatic retry prohibited"}
+ trace.mu.Lock();facts:=append([]Object(nil),trace.facts...);trace.mu.Unlock()
+ counts:=map[string]int{};for _,v:=range facts{counts[Str(v,"stage")]++}
+ var fault *Fault;errors.As(actualError,&fault)
+ providerEvidence(t,"native-stages-and-fault.json",Object{"classification":"LOCAL_SDK_FIXTURE_NOT_LIVE","stages":facts,"stage_counts":counts,"actual_fault":fault,"actual_error":fmt.Sprint(actualError),"expected_fault":Object{"Status":status,"Code":code,"Message":message}})
+ if !providerG2TypedFaultMatches(actualError,status,code,message){t.Fatal("unexpected typed fault",actualError,status,code,message)}
+ for _,name:=range []string{"before_launch_fence","dispatch_started","suspended_identity","native_started","effect_prepared"}{
+  want:=1;if name=="effect_prepared"&&!quarantine || mode=="missing-qualification-plan"&&name!="before_launch_fence"{want=0}
+  if counts[name]!=want{t.Fatalf("stage %s actual=%d expected=%d",name,counts[name],want)}
+ }
+ epoch,e:=Num(r.run,"lease_epoch");if e!=nil{t.Fatal(e)}
+ tx,e:=r.f.db.Begin();if e!=nil{t.Fatal(e)}
+ dispatch,e:=runtimeDispatch(tx,route.ProjectID,Str(r.run,"id"),epoch);tx.Rollback();if e!=nil{t.Fatal(e)}
+ manifest:=dispatch["manifest"].(map[string]any);admission:=manifest["admission"].(map[string]any)
+ if admission["qualification_bootstrap"]!=true || manifest["run_id"]!=r.run["id"] || manifest["task_id"]!=r.task["id"] || Hash(manifest)!=dispatch["manifest_hash"]{t.Fatal("original bootstrap tuple mismatch")}
+ providerEvidence(t,"original-dispatch.json",dispatch)
+ if mode=="missing-qualification-plan"{return}
+ directory:=filepath.Join(c.config.DataRoot,"runtime-dispatches",Str(dispatch,"dispatch_key"))
+ journal,e:=rt.ReadBridgeTerminal(directory,Str(dispatch,"manifest_hash"));if e!=nil{t.Fatal("original closed bridge",e)}
+ if journal.QueueRequired || journal.DispatchKey!=dispatch["dispatch_key"]{t.Fatal("G2 is not nonstream bootstrap")}
+ providerEvidence(t,"bridge-terminal.json",journal)
+ raw,e:=os.ReadFile(filepath.Join(directory,"stdout.raw"));if e!=nil{t.Fatal(e)}
+ providerEvidence(t,"bridge-stdout.json",Object{"raw":raw,"digest":Digest(raw)})
+ scanner:=bufio.NewScanner(bytes.NewReader(raw));scanner.Buffer(make([]byte,4096),2*1024*1024)
+ models:=[]rt.BridgeFrame{}
+ for scanner.Scan(){var f rt.BridgeFrame;if json.Unmarshal(scanner.Bytes(),&f)==nil&&f.Type=="effect.request"&&f.Capability=="MODEL"{models=append(models,f)}}
+ if e=scanner.Err();e!=nil{t.Fatal(e)}
+ if len(models)!=1{t.Fatal("original MODEL frame count",len(models))}
+ model:=models[0]
+ if journal.Acknowledged>=model.Sequence{t.Fatal("refused MODEL received successful ordinary ACK")}
+ providerEvidence(t,"original-model-frame.json",model)
+ if !quarantine{return}
+ reason:=map[string]string{"selected-alias":"provider response rejected by quarantine","escaped-tool":"provider response rejected by quarantine","unsupported-detail":"provider reasoning alternative unsupported","early-eof":"model returned no complete bounded SSE response"}[mode]
+ expected:=Object{"project_id":route.ProjectID,"task_id":r.task["id"],"run_id":r.run["id"],"epoch":epoch,"dispatch_key":dispatch["dispatch_key"],"manifest_hash":dispatch["manifest_hash"],"profile_hash":admission["profile_hash"],"model_key":model.Key,"unknown_reason":reason}
+ tx,e=r.f.db.Begin();if e!=nil{t.Fatal(e)}
+ transport,e:=providerTransport(tx,route.ProjectID,r.run,dispatch);tx.Rollback();if e!=nil{t.Fatal(e)};expected["transport_hash"]=Hash(transport)
+ actual,_:=Decode(Bytes(expected));effects:=Empty();rows,e:=r.f.db.Query(`SELECT body FROM resource_effects WHERE project=? AND run=? AND effect_key=? ORDER BY sequence`,route.ProjectID,r.run["id"],model.Key);if e!=nil{t.Fatal(e)}
+ for rows.Next(){var raw string;if e=rows.Scan(&raw);e!=nil{t.Fatal(e)};o,e:=Decode([]byte(raw));if e!=nil{t.Fatal(e)};effects=append(effects,o)};if e=rows.Err();e!=nil{t.Fatal(e)};rows.Close()
+ ledger:=Empty();rows,e=r.f.db.Query(`SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.provider_request_id')=? ORDER BY id`,route.ProjectID,r.run["id"],model.Key);if e!=nil{t.Fatal(e)}
+ for rows.Next(){var raw string;if e=rows.Scan(&raw);e!=nil{t.Fatal(e)};o,e:=Decode([]byte(raw));if e!=nil{t.Fatal(e)};ledger=append(ledger,o)};if e=rows.Err();e!=nil{t.Fatal(e)};rows.Close()
+ actual["effects"],actual["ledger"]=effects,ledger
+ if len(effects)>0{p:=effects[0].(map[string]any)["payload"].(map[string]any);actual["transport_hash"]=Hash(p["provider_transport"]);if Hash(p["payload"])!=Hash(json.RawMessage(model.Payload)){var body Object;if json.Unmarshal(model.Payload,&body)!=nil || Hash(p["payload"])!=Hash(body){t.Fatal("original MODEL payload changed")}}}
+ providerEvidence(t,"original-model-cause.json",Object{"actual":actual,"expected":expected,"matches":providerG2OriginalModelCauseMatches(actual,expected),"model_success_ack":0})
+ if !providerG2OriginalModelCauseMatches(actual,expected){t.Fatal("original MODEL cause/reservation mismatch")}
+ providerEvidence(t,"all-public-rows.json",providerG2Rows(t,r.f.db))
+}
