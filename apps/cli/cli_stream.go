@@ -110,6 +110,7 @@ type cliFlow struct {
 	readInterrupt        *cliReadInterrupt
 	responseExit         int
 	transportUnreachable bool
+	lastVerifiedSessionSnapshot map[string]any
 }
 
 func (f *cliFlow) interrupt() {
@@ -274,6 +275,7 @@ func (f *cliFlow) snapshot() (map[string]any, string, int) {
 	if snap["project_id"] != f.c.projectID || snap["session_id"] != f.c.sessionID || snap["protocol_version"] != clientProtocol {
 		return nil, "SNAPSHOT_SCOPE_MISMATCH", exitNotImplemented
 	}
+	f.lastVerifiedSessionSnapshot = snap
 	return snap, "", 0
 }
 
@@ -753,6 +755,9 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
 	out["operations"], out["requests_sent"] = f.operations, c.requestLog
 	out["admission_command_id"] = f.admissionCommand
 	out["session_id"], out["reason"], out["detail"] = c.sessionID, reason, detail
+	if f.lastVerifiedSessionSnapshot != nil && !readOnly {
+		out["last_verified_session_snapshot"] = f.lastVerifiedSessionSnapshot
+	}
 	return out, code
 }
 
@@ -832,6 +837,13 @@ func cliFlowSummary(out map[string]any, code int, c *v2Context, cfg *cliConfig) 
 		if code == 0 {
 			code = exitFailed
 			out["status"], out["exit_code"] = "REJECTED", code
+		}
+	} else if c.sessionID != "" && c.projectID != "" && c.revision >= 1 {
+		// Original JSONL reports the exact persisted context after a successful save.
+		out["saved_context"] = map[string]any{
+			"project_id": cfg.ProjectID, "session_id": cfg.SessionID,
+			"session_revision": cfg.Revision, "writer_epoch": cfg.WriterEpoch,
+			"updated_by": cfg.UpdatedBy,
 		}
 	}
 	outJSON(out)
