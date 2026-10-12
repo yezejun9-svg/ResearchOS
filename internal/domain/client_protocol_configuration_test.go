@@ -317,13 +317,28 @@ func TestHandlerOriginalHeaderExactBytesAndCorruption(t *testing.T) {
 
 func TestHandlerEndpointLexicalMapping(t *testing.T) {
 	for _, base := range []string{"https://fixture.invalid", "https://Fixture.INVALID/", "https://fixture.invalid/v1/", "https://fixture.invalid:00443/v1", "https://127.0.0.1:8443/v1", "https://[::1]:8443/v1", "https://xn--bcher-kva.example/v1"} {
-		if got, e := clientConfigurationEndpoint(base); e != nil || got != strings.TrimSuffix(base, "/")+"/chat/completions" {
+		if got, e := clientConfigurationEndpoint(base, nil); e != nil || got != strings.TrimSuffix(base, "/")+"/chat/completions" {
 			t.Errorf("%s: %s %v", base, got, e)
 		}
 	}
 	for _, base := range []string{"HTTPS://fixture.invalid", "http://fixture.invalid", "https://fixture.invalid:", "https://fixture.invalid:0", "https://fixture.invalid:65536", "https://fixture.invalid:+443", "https://::1/v1", "https://[fe80::1%25eth0]/v1", "https://书.example/v1", "https://user@fixture.invalid/v1", "https://fixture.invalid/v1?", "https://fixture.invalid/v1#", "https://fixture.invalid/v1//", "https://fixture.invalid/%76%31", "https://fixture.invalid/a/../v1", "https://fixture.invalid/CHAT/Completions/"} {
-		if _, e := clientConfigurationEndpoint(base); e == nil {
+		if _, e := clientConfigurationEndpoint(base, nil); e == nil {
 			t.Errorf("accepted %s", base)
+		}
+	}
+	for _, base := range []string{"http://127.0.0.1:11434/v1", "http://[::1]:11434/v1"} {
+		got, e := clientConfigurationEndpoint(base, nil)
+		if e != nil || got != base+"/chat/completions" || !clientConfigurationLoopbackModelEndpoint(got) {
+			t.Errorf("local %s: %s %v", base, got, e)
+		}
+		credential := "cred-fixture-api_key-1234567890-12345678-12345678"
+		if _, e := clientConfigurationEndpoint(base, &credential); e == nil {
+			t.Errorf("local credential accepted: %s", base)
+		}
+	}
+	for _, base := range []string{"http://localhost:11434/v1", "http://127.1:11434/v1", "http://127.000.0.1:11434/v1", "http://2130706433:11434/v1", "http://0.0.0.0:11434/v1", "http://192.168.1.1:11434/v1", "http://[::ffff:127.0.0.1]:11434/v1", "http://[::1%25eth0]:11434/v1", "http://user@127.0.0.1:11434/v1", "http://127.0.0.1:11434/%76%31", "http://127.0.0.1:11434/v1?x=1"} {
+		if _, e := clientConfigurationEndpoint(base, nil); e == nil {
+			t.Errorf("unsafe local URL accepted: %s", base)
 		}
 	}
 }

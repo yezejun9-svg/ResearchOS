@@ -40,6 +40,34 @@ type RuntimeProviderRoute struct {
 	CredentialRef      string `json:"credential_ref,omitempty"`
 }
 
+func (c *RuntimeCoordinator) liveModelCredentialBound(provider RuntimeProviderRoute, profile Object) bool {
+	if provider.MeasurementMode != "LIVE" {
+		return true
+	}
+	if clientConfigurationLoopbackModelEndpoint(provider.Endpoint) {
+		return provider.CredentialRef == "" && provider.CredentialRevision == "none" && profile["credential_revision"] == "none" && provider.BearerToken == ""
+	}
+	return provider.CredentialRef != "" && provider.CredentialRef == provider.CredentialRevision && c.config.ModelCredential != nil && provider.BearerToken == ""
+}
+
+func providerEndpointAllowed(provider RuntimeProviderRoute) bool {
+	u, err := url.Parse(provider.Endpoint)
+	if err != nil || u.User != nil || u.Fragment != "" || u.Hostname() == "" {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	if u.Scheme != "http" {
+		return false
+	}
+	if provider.Capability == "MODEL" && provider.MeasurementMode == "LIVE" {
+		return clientConfigurationLoopbackModelEndpoint(provider.Endpoint)
+	}
+	ip := net.ParseIP(u.Hostname())
+	return provider.MeasurementMode == "FIXTURE" && ip != nil && ip.IsLoopback()
+}
+
 func (c *RuntimeCoordinator) providerRoute(tx *sql.Tx, route RuntimeCoordinatorRoute, run, dispatch Object, frame rt.BridgeFrame) (RuntimeProviderRoute, error) {
 	manifest := dispatch["manifest"].(map[string]any)
 	admission := manifest["admission"].(map[string]any)
@@ -78,8 +106,8 @@ func (c *RuntimeCoordinator) providerRoute(tx *sql.Tx, route RuntimeCoordinatorR
 			if profile["backend"] != runtimeMuBackend || Hash(provider.ModelConfig) != Hash(profile["model_config"]) || provider.Endpoint != Str(provider.ModelConfig, "endpoint") || provider.ID != Str(provider.ModelConfig, "route") {
 				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "model route differs from frozen profile")
 			}
-			if provider.MeasurementMode == "LIVE" && (provider.CredentialRef == "" || provider.CredentialRef != provider.CredentialRevision || c.config.ModelCredential == nil || provider.BearerToken != "") {
-				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "LIVE model requires a current protected credential reference")
+			if !c.liveModelCredentialBound(provider, profile) {
+				return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "LIVE model credential differs from bound endpoint")
 			}
 		}
 		if provider.Capability == "TOOL" {
@@ -101,9 +129,8 @@ func (c *RuntimeCoordinator) providerRoute(tx *sql.Tx, route RuntimeCoordinatorR
 		if provider.Capability == "EXPERIMENT" {
 			return provider, nil
 		}
-		u, e := url.Parse(provider.Endpoint)
-		if e != nil || u.User != nil || u.Fragment != "" || u.Hostname() == "" || (u.Scheme != "https" && !(u.Scheme == "http" && net.ParseIP(u.Hostname()) != nil && net.ParseIP(u.Hostname()).IsLoopback() && provider.MeasurementMode == "FIXTURE")) {
-			return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "provider endpoint requires bound TLS or local fixture")
+		if !providerEndpointAllowed(provider) {
+			return RuntimeProviderRoute{}, Fail(403, "FORBIDDEN", "provider endpoint requires bound TLS or permitted local loopback")
 		}
 		return provider, nil
 	}
