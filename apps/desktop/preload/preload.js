@@ -35,6 +35,10 @@ api.desktop = Object.freeze({
   openSession: (sessionId) => ipcRenderer.invoke('ros:desktop:openSession', { session_id: sessionId }),
   readArtifact: (ref) => ipcRenderer.invoke('ros:desktop:readArtifact', ref),
   chooseWorkspace: (body) => ipcRenderer.invoke('ros:desktop:chooseWorkspace', body),
+  qualificationCurrent: () => ipcRenderer.invoke('ros:desktop:qualification:current'),
+  qualificationPrepare: () => ipcRenderer.invoke('ros:desktop:qualification:prepare'),
+  qualificationConfirm: () => ipcRenderer.invoke('ros:desktop:qualification:confirm'),
+  qualificationStatus: () => ipcRenderer.invoke('ros:desktop:qualification:status'),
 });
 
 contextBridge.exposeInMainWorld('researchos', Object.freeze(api));

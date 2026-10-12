@@ -180,6 +180,64 @@ export function NativeProjectEntry({ navigate, onRefresh }) {
   </Panel>
 }
 
+export function DesktopQualification({ projectId, sessionId }) {
+  const [state, setState] = useState(null)
+  const [busy, setBusy] = useState('')
+  const [error, setError] = useState(null)
+  const [notice, setNotice] = useState('')
+  const lifetime = useRef(0)
+  useEffect(() => {
+    const generation = ++lifetime.current
+    setState(null); setError(null); setNotice('')
+    const bridge = window.researchos?.desktop
+    if (!bridge?.qualificationCurrent) return
+    bridge.qualificationCurrent().then(reply => {
+      if (lifetime.current !== generation) return
+      if (reply?.ok) setState(reply)
+      else setError(new Error(reply?.reason || '托管资格状态不可用'))
+    }).catch(cause => { if (lifetime.current === generation) setError(cause) })
+    return () => { lifetime.current++ }
+  }, [projectId, sessionId])
+  if (!window.researchos?.desktop?.qualificationCurrent) return null
+  async function action(label, method) {
+    if (busy) return
+    const generation = lifetime.current
+    setBusy(label); setError(null); setNotice('')
+    try {
+      const reply = await window.researchos.desktop[method]()
+      if (generation !== lifetime.current) return
+      if (!reply?.ok) throw new Error(reply?.reason || '托管资格操作失败')
+      setState(reply)
+      setNotice(method === 'qualificationPrepare' ? '准备完成；模型调用尚未开始。请核对后明确确认。' :
+        method === 'qualificationConfirm' ? '确认调用已结束；下方状态来自原请求的当前复核。' : '已复核原请求的当前状态。')
+    } catch (cause) { if (generation === lifetime.current) setError(cause) }
+    finally { if (generation === lifetime.current) setBusy('') }
+  }
+  const pending = state?.state === 'AWAITING_CONFIRMATION' && !state?.consumed &&
+    Date.parse(state?.expires_at) > Date.now()
+  return <Panel title="本地模型运行资格">
+    <p>先打开会话并取得写入权，再准备当前会话的模型资格确认。准备阶段不会调用模型。</p>
+    <p className="small-muted">确认后最多调用模型 1 次，工具 0 个，用途仅为 mu_turn（600 秒）；费用依据 UNKNOWN，金额无法预估。确认可能消耗一次性请求，失败或超时后请用“复核原请求”查询，不要重复确认。</p>
+    {state?.model && <p>当前待确认模型：{state.model.provider_id} · {state.model.model_id}</p>}
+    {state?.request_id && <p className="break-all">原请求：{state.request_id}；有效至 {state.expires_at || '未知'}</p>}
+    <p role="status">{state?.state === 'QUALIFIED_PURPOSE_AUTHORIZED' ?
+      '最近一次复核显示用途授权；实际使用时服务端再次检查，请按需复核原请求。' :
+      state?.state === 'CONTEXT_CHANGED_PENDING' ? '项目或会话已变更，原请求保留，当前不可确认。' :
+      state?.state || '正在读取托管状态'}{state?.reason ? ` · ${state.reason}` : ''}</p>
+    <div className="button-row">
+      <button disabled={!!busy || !state?.available || !sessionId ||
+        (!!state?.request_id && !(state?.state === 'EXPIRED' && !state?.consumed))}
+        onClick={() => action('准备', 'qualificationPrepare')}>准备当前会话</button>
+      <button className="primary" disabled={!!busy || !state?.available || !pending} onClick={() => {
+        if (window.confirm('确认进行最多 1 次本地模型资格调用？费用依据 UNKNOWN，金额无法预估；此请求只能确认一次。')) action('确认', 'qualificationConfirm')
+      }}>明确确认一次调用</button>
+      <button disabled={!!busy || !state?.available || !state?.request_id} onClick={() => action('复核', 'qualificationStatus')}>复核原请求</button>
+    </div>
+    {busy && <p role="status">{busy}中…</p>}{notice && <p role="status">{notice}</p>}
+    <Failure error={error} />
+  </Panel>
+}
+
 export function NativeWorkbench({ projectId, profile, api, navigate, shared, onRefresh }) {
   const [state, setState] = useState({ loading: true, sessions: [], host: null, snapshot: null, events: [], error: null })
   const [busy, setBusy] = useState('')
@@ -303,6 +361,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
     {!online && <p className="connection-banner" role="status">已离线，显示最后读取的会话；重新连接后核对最新状态。</p>}
     {state.loading && <div className="loading-state" role="status" aria-busy="true">正在读取本机会话…</div>}
     {!state.loading && state.host && !state.host.model_configurations?.length && <NativeModelConfiguration projectId={projectId} initialHost={state.host} onConfigured={(host, configured) => { setState(old => ({ ...old, host })); setModel(configured.model_config_ref); setNotice(`配置已保存（修订 ${configured.config_revision}）；运行时资格仍待验证。`) }} />}
+    <DesktopQualification key={`${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId} sessionId={state.snapshot?.session_id || null}/>
     <div className="session-layout">
       <Panel title="项目会话"><ul className="session-picker">{state.sessions.map(item => <li key={item.session_id}><button aria-current={snapshot?.session_id === item.session_id ? 'page' : undefined} disabled={disabled} onClick={() => open(item.session_id)}>{item.title || '未命名会话'}<small>{item.run_status || (item.archived_at ? '已归档' : '等待消息')}</small></button></li>)}</ul>
         {state.nextCursor && <button disabled={disabled} onClick={moreSessions}>加载更多会话</button>}
