@@ -17,7 +17,7 @@ async function chooseWorkspace({ host, native, callV2, deps, contextStore, sessi
     const instance = native.hostInstanceId(deps.fsImpl, started.discovery);
     choice = await native.dialNative('\\\\.\\pipe\\ResearchOSHost-v1-' + instance.slice(5), {
       kind: 'NATIVE_WORKSPACE_CHOOSE_REQUEST', client_id: deps.clientId || 'desktop-shell',
-      payload: { requested_access: 'READ_WRITE' },
+      payload: { requested_path: null, requested_access: 'READ_WRITE' },
     }, 5 * 60 * 1000);
   } catch (error) { return { ok: false, reason: String(error.message || error) }; }
   if (choice?.kind === 'NATIVE_ERROR') return { ok: false, reason: 'NATIVE_' + String(choice.error?.code || 'ERROR') };

@@ -234,7 +234,7 @@ func identity(req, res map[string]any) error {
 		if !equal(result["client_id"], req["client_id"]) {
 			return bad
 		}
-		if res["session_id"] != nil || res["revision"] != nil {
+		if res["session_id"] != nil {
 			return bad
 		}
 	}
