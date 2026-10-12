@@ -22,6 +22,17 @@ function canonical(value) {
   if (object(value)) return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
   return value;
 }
+function frozenCopy(value) {
+  const copy = structuredClone(value);
+  const freeze = item => {
+    if (item && typeof item === 'object') {
+      for (const child of Object.values(item)) freeze(child);
+      Object.freeze(item);
+    }
+    return item;
+  };
+  return freeze(copy);
+}
 function sameValue(a, b) { return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b)); }
 function keys(value, required, optional = []) {
   if (!object(value)) throw failure('PRIVATE_FRAME_INVALID');
@@ -181,7 +192,8 @@ class DesktopManagement {
     this.spawn = options.spawn || childProcess.spawn;
     this.state = 'NOT_STARTED';
     this.child = null; this.hostId = null; this.identity = null;
-    this.parentIdentity = null; this.pending = null; this.intent = null; this.codingIntent = null;
+    this.parentIdentity = null; this.pending = null; this.consentPending = false;
+    this.intent = null; this.codingIntent = null;
     this.retiredIntents = []; this.retiredCodingIntents = [];
     this.buffer = Buffer.alloc(0); this.ready = null; this.failure = null;
     this.exitPromise = null; this.resolveExit = null; this.shutdownAccepted = false; this.childExited = true;
@@ -192,7 +204,11 @@ class DesktopManagement {
     const base = this.summary();
     if (!intent) return { available: base.available, state: base.state, reason: base.reason || null };
     const selected = this.sameSelection(intent.projectId, intent.sessionId);
-    return { available: base.available && selected, state: !selected ? 'CONTEXT_CHANGED_PENDING' :
+    const sameGeneration = this.sameCodingGeneration(intent);
+    if (!intent.requestId) return { available: false, state: 'CODING_PREPARE_UNRESOLVED',
+      reason: base.reason || 'CODING_ORIGINAL_PREPARE_UNRESOLVED' };
+    return { available: base.available && selected && sameGeneration,
+      state: !selected || !sameGeneration ? 'CONTEXT_CHANGED_PENDING' :
       !base.available ? base.state : intent.state,
       reason: base.reason || null,
       expires_at: intent.expiresAt, consumed: intent.confirmSent,
@@ -210,11 +226,19 @@ class DesktopManagement {
         build_hash: check.build_hash, vendor_hash: check.vendor_hash })), model_calls: 0,
       normal_max_model_calls: 8, qualification_model_calls: 1, qualification_tool_calls: 0,
       model_config_ref: intent.newModelRef || null, runtime_status: intent.runtimeStatus || null,
-      profile_ref: intent.profileRef || null, config_revision: intent.configRevision || null };
+      profile_ref: intent.profileRef || null, config_revision: intent.configRevision || null,
+      commit_key: intent.state === 'CODING_CONFIGURED' ? intent.commitKey : null };
   }
   sameSelection(projectId, sessionId) {
     try { const context = JSON.parse(this.options.context()); return context[0] === projectId && context[1] === sessionId; }
     catch { return false; }
+  }
+  sameCodingGeneration(intent) {
+    try {
+      const before = JSON.parse(intent.context), now = JSON.parse(this.options.context());
+      return Array.isArray(before) && Array.isArray(now) &&
+        before[0] === now[0] && before[1] === now[1] && before[6] === now[6];
+    } catch { return false; }
   }
   summary() {
     const intent = this.intent;
@@ -224,11 +248,11 @@ class DesktopManagement {
       catch (error) { hostFailure = error.code || 'HOST_IDENTITY_UNAVAILABLE'; }
     }
     if (hostFailure && intent) intent.needsRecheck = true;
-    const available = this.state === 'READY' && !hostFailure && !this.pending;
+    const available = this.state === 'READY' && !hostFailure && !this.pending && !this.consentPending;
     const pendingState = this.pending?.timedOut ? 'PRIVATE_COMMAND_UNCERTAIN' :
-      this.pending ? 'PRIVATE_COMMAND_PENDING' : null;
+      this.pending ? 'PRIVATE_COMMAND_PENDING' : this.consentPending ? 'PRIVILEGED_CONFIRM_PENDING' : null;
     const reason = hostFailure || (this.pending?.timedOut ? 'MANAGEMENT_REPLY_UNCERTAIN' :
-      this.pending ? 'MANAGEMENT_COMMAND_PENDING' : this.failure);
+      this.pending ? 'MANAGEMENT_COMMAND_PENDING' : this.consentPending ? 'PRIVILEGED_CONFIRM_PENDING' : this.failure);
     const previous = this.retiredIntents.at(-1);
     const history = previous ? { previous_request_id: previous.requestId,
       previous_expires_at: previous.expiresAt, previous_retired_at: previous.retiredAt } : {};
@@ -249,7 +273,7 @@ class DesktopManagement {
       ...history };
   }
   canRetireExpiredIntent(intent) {
-    return !!intent?.validated && !intent.confirmSent && !this.pending &&
+    return !!intent?.validated && !intent.confirmSent && !this.pending && !this.consentPending &&
       ['AWAITING_CONFIRMATION', 'EXPIRED'].includes(intent.state) &&
       Number.isFinite(Date.parse(intent.expiresAt)) && Date.parse(intent.expiresAt) <= Date.now();
   }
@@ -266,6 +290,10 @@ class DesktopManagement {
   sameContext(expected) {
     try { return this.options.context() === expected; }
     catch { return false; }
+  }
+  commandIdle() {
+    if (this.pending) throw failure('MANAGEMENT_COMMAND_PENDING');
+    if (this.consentPending) throw failure('PRIVILEGED_CONFIRM_PENDING');
   }
   currentHost() {
     if (!this.child || !this.identity || this.state !== 'READY') throw failure('MANAGEMENT_LINK_UNAVAILABLE');
@@ -394,9 +422,9 @@ class DesktopManagement {
       return this.summary();
     }
   }
-  async exchange(operation, scope, timeoutMs) {
+  async exchange(operation, scope, timeoutMs, postflight = true) {
     this.currentHost();
-    if (this.pending) throw failure('MANAGEMENT_COMMAND_PENDING');
+    this.commandIdle();
     const messageId = crypto.randomUUID();
     const request = { protocol: PROTOCOL, message_id: messageId, operation, host_id: this.hostId, ...scope };
     const bytes = Buffer.from(JSON.stringify(request) + '\n');
@@ -411,9 +439,10 @@ class DesktopManagement {
       }, timeoutMs);
       try { this.child.stdin.write(bytes, error => { if (error) this.broken('MANAGEMENT_PIPE_ERROR'); }); }
       catch { this.broken('MANAGEMENT_PIPE_ERROR'); }
-    }).then(reply => { if (operation !== 'SHUTDOWN') this.currentHost(); return reply; });
+    }).then(reply => { if (postflight && operation !== 'SHUTDOWN') this.currentHost(); return reply; });
   }
   async prepare(scope, context) {
+    this.commandIdle();
     if (this.codingIntent && this.codingIntent.state !== 'CODING_CONFIGURED') throw failure('CODING_INTENT_PENDING');
     if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
     const { projectId, sessionId, modelRef, model } = scope;
@@ -442,6 +471,7 @@ class DesktopManagement {
     return this.summary();
   }
   async confirm() {
+    this.commandIdle();
     const intent = this.intent;
     if (!intent || intent.confirmSent || intent.state !== 'AWAITING_CONFIRMATION') throw failure('CONFIRM_NOT_AVAILABLE');
     if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
@@ -458,6 +488,7 @@ class DesktopManagement {
     } catch (error) { if (intent.state === 'CONFIRM_SENT') intent.state = 'UNRESOLVED'; throw error; }
   }
   async status() {
+    this.commandIdle();
     const intent = this.intent;
     if (!intent) throw failure('STATUS_ORIGINAL_REQUEST_REQUIRED');
     if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
@@ -473,12 +504,14 @@ class DesktopManagement {
     if (value.consumed) intent.confirmSent = true;
     return this.summary();
   }
-  async prepareCoding(scope, context) {
+  async prepareCoding(scope, context, review) {
+    this.commandIdle();
     if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
     if (this.codingIntent) {
       const old = this.codingIntent;
-      if (old.state !== 'EXPIRED' || old.confirmSent || !old.statusCheckedAt ||
-          Date.parse(old.expiresAt) > Date.now()) throw failure('CODING_ORIGINAL_REQUEST_PENDING');
+      if (old.state !== 'CODING_CONFIGURED' &&
+          (old.state !== 'EXPIRED' || old.confirmSent || !old.statusCheckedAt ||
+            Date.parse(old.expiresAt) > Date.now())) throw failure('CODING_ORIGINAL_REQUEST_PENDING');
       this.currentHost();
       this.retiredCodingIntents.push(Object.freeze({ ...old, retiredAt: new Date().toISOString() }));
       this.codingIntent = null;
@@ -489,12 +522,21 @@ class DesktopManagement {
         !this.intent.needsRecheck && Date.now() - this.intent.checkedAt < 10000))
         throw failure('QUALIFICATION_ORIGINAL_REQUEST_PENDING');
     }
-    const { projectId, sessionId, modelRef, coding } = scope;
+    const { projectId, sessionId, modelRef, model, coding } = scope;
     if (![projectId, sessionId, modelRef].every(v => typeof v === 'string' && ID.test(v)) || !object(coding))
       throw failure('CODING_SCOPE_INVALID');
+    // Retain the original operation before sending. A changed UI selection or
+    // a missing reply cannot make another PREPARE appear safe.
+    const originHost = this.currentHost();
+    const operation = { state: 'PREPARE_UNRESOLVED', context, projectId, sessionId, modelRef,
+      model: model ? frozenCopy(model) : null,
+      scope: frozenCopy(coding), review: review ? frozenCopy(review) : null,
+      hostId: this.hostId, dataRoot: originHost.data_dir,
+      controlIdentity: structuredClone(this.identity), parentIdentity: structuredClone(this.parentIdentity),
+      confirmSent: false };
+    this.codingIntent = operation;
     const reply = await this.exchange('PREPARE_CODING', { project_id: projectId, session_id: sessionId,
-      model_config_ref: modelRef, coding }, 45000);
-    if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
+      model_config_ref: modelRef, coding }, 45000, false);
     if (reply.kind !== 'RESULT') throw failure('CODING_PREPARE_REJECTED');
     const value = reply.result;
     if (!object(value) || value.state !== 'AWAITING_CODING_CONFIRMATION' ||
@@ -518,19 +560,30 @@ class DesktopManagement {
     const expires = Date.parse(value.expires_at);
     if (!Number.isFinite(expires) || expires <= Date.now() || expires - Date.now() > 60000)
       throw failure('CODING_PREPARE_EXPIRED');
-    this.codingIntent = { state: value.state, context, projectId, sessionId, modelRef,
-      requestId: value.request_id, requestHash: value.request_hash, expiresAt: value.expires_at,
-      scope: value.scope, frozenChecks: value.frozen_checks, confirmSent: false };
+    Object.assign(operation, { state: value.state, requestId: value.request_id,
+      requestHash: value.request_hash, expiresAt: value.expires_at,
+      scope: frozenCopy(value.scope), frozenChecks: frozenCopy(value.frozen_checks) });
+    this.currentHost();
     return this.codingSummary();
   }
-  async confirmCoding() {
+  async confirmCoding(askConsent, recheckScope) {
     const intent = this.codingIntent;
     if (!intent || intent.confirmSent || intent.state !== 'AWAITING_CODING_CONFIRMATION')
       throw failure('CODING_CONFIRM_NOT_AVAILABLE');
+    this.commandIdle();
     if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
     if (Date.parse(intent.expiresAt) <= Date.now()) { intent.state = 'EXPIRED'; throw failure('CODING_CONFIRM_EXPIRED'); }
     this.currentHost();
-    if (this.pending) throw failure('MANAGEMENT_COMMAND_PENDING');
+    if (typeof askConsent !== 'function' || typeof recheckScope !== 'function' || !intent.review)
+      throw failure('PRIVILEGED_CONFIRM_UNAVAILABLE');
+    this.consentPending = true;
+    try {
+      await this.recheckCodingConsent(intent, recheckScope);
+      const accepted = await askConsent(this.codingReview(intent));
+      if (accepted !== true) throw failure('PRIVILEGED_CONFIRM_CANCELLED');
+      await this.recheckCodingConsent(intent, recheckScope);
+    } finally { this.consentPending = false; }
+    // No await between the final guard and the consumed write.
     intent.confirmSent = true; intent.state = 'CONFIRM_SENT';
     try {
       const reply = await this.exchange('CONFIRM_CODING', { project_id: intent.projectId,
@@ -540,6 +593,37 @@ class DesktopManagement {
       this.retireQualificationAfterCodingCommit();
       return this.codingSummary();
     } catch (error) { if (intent.state === 'CONFIRM_SENT') intent.state = 'UNRESOLVED'; throw error; }
+  }
+  codingReview(intent) {
+    if (!intent.review?.workspace?.display_name || !intent.review.workspace.display_path)
+      throw failure('CODING_WORKSPACE_DESCRIPTION_UNAVAILABLE');
+    return frozenCopy({ host_id: intent.hostId, data_root: intent.dataRoot,
+      control_process: intent.controlIdentity, parent_process: intent.parentIdentity,
+      project_id: intent.projectId,
+      session_id: intent.sessionId, current_model_ref: intent.modelRef,
+      workspace: intent.review.workspace, scope: intent.scope,
+      frozen_checks: intent.frozenChecks, expires_at: intent.expiresAt });
+  }
+  async recheckCodingConsent(intent, recheckScope) {
+    if (this.codingIntent !== intent || this.pending || !this.consentPending ||
+        !this.sameContext(intent.context)) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
+    const current = this.currentHost();
+    if (this.hostId !== intent.hostId || current.data_dir !== intent.dataRoot ||
+        !sameIdentity(this.identity, intent.controlIdentity) ||
+        !sameIdentity(this.parentIdentity, intent.parentIdentity) ||
+        !(Date.parse(intent.expiresAt) > Date.now())) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
+    const refreshed = await recheckScope();
+    if (this.codingIntent !== intent || this.pending || !this.consentPending ||
+        !this.sameContext(intent.context) ||
+        refreshed?.context !== intent.context ||
+        !sameValue(refreshed?.scope, { projectId: intent.projectId, sessionId: intent.sessionId,
+          modelRef: intent.modelRef, model: intent.model, coding: intent.scope }) ||
+        !sameValue(refreshed?.review, intent.review)) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
+    const after = this.currentHost();
+    if (this.hostId !== intent.hostId || after.data_dir !== intent.dataRoot ||
+        !sameIdentity(this.identity, intent.controlIdentity) ||
+        !sameIdentity(this.parentIdentity, intent.parentIdentity) ||
+        !(Date.parse(intent.expiresAt) > Date.now())) throw failure('CODING_CONSENT_CONTEXT_CHANGED');
   }
   acceptCodingResult(intent, value) {
     if (!object(value) || value.state !== 'CODING_CONFIGURED' || value.request_id !== intent.requestId ||
@@ -556,6 +640,8 @@ class DesktopManagement {
     intent.state = value.state; intent.newModelRef = value.model_config_ref;
     intent.runtimeStatus = value.runtime_status; intent.profileRef = value.profile_ref;
     intent.configRevision = value.config_revision;
+    intent.commitKey = digest(Buffer.from(JSON.stringify([intent.hostId, intent.projectId,
+      intent.sessionId, intent.requestId, value.model_config_ref, value.revision, value.config_revision])));
   }
   retireQualificationAfterCodingCommit() {
     if (this.intent?.confirmSent && ['EXECUTION_SETTLED', 'QUALIFIED_PURPOSE_AUTHORIZED'].includes(this.intent.state)) {
@@ -565,8 +651,10 @@ class DesktopManagement {
     }
   }
   async statusCoding() {
+    this.commandIdle();
     const intent = this.codingIntent;
     if (!intent) throw failure('CODING_ORIGINAL_REQUEST_REQUIRED');
+    if (!intent.requestId) throw failure('CODING_PREPARE_ORIGINAL_UNRESOLVED');
     if (!this.sameSelection(intent.projectId, intent.sessionId)) throw failure('CONTEXT_CHANGED');
     const reply = await this.exchange('STATUS_CODING', { project_id: intent.projectId,
       request_id: intent.requestId, request_hash: intent.requestHash }, 30000);

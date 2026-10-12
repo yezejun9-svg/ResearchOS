@@ -12,6 +12,9 @@ const sameConfiguration = (value, request) => !!value?.model_config_ref &&
 // only the public payload and terminal result across route unmounts.
 const modelConfigurationPending = new Map()
 const modelConfigurationListeners = new Map()
+// A committed private result can arrive through CONFIRM or original STATUS.
+// Successful V2 adoption survives a component remount; failed reads remain retryable.
+const codingReconciliations = new Map()
 const modelPending = projectId => modelConfigurationPending.get(projectId) || null
 function updateModelPending(projectId, value) {
   if (value) modelConfigurationPending.set(projectId, value)
@@ -279,6 +282,20 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured 
   }, [projectId, sessionId])
   if (!window.researchos?.desktop?.codingCurrent) return null
   const lines = value => value.split(/\r?\n/).map(item => item.trim()).filter(Boolean)
+  async function reconcile(reply, generation) {
+    if (reply.state !== 'CODING_CONFIGURED' || !reply.available ||
+        !reply.commit_key || !reply.model_config_ref || !onConfigured) return
+    const key = reply.commit_key
+    const existing = codingReconciliations.get(key)
+    if (existing) { await existing; return }
+    const work = (async () => {
+      if (generation !== lifetime.current) throw new Error('编码配置会话已切换，请复核原请求')
+      await onConfigured(reply)
+    })()
+    codingReconciliations.set(key, work)
+    try { await work }
+    catch (cause) { if (codingReconciliations.get(key) === work) codingReconciliations.delete(key); throw cause }
+  }
   async function action(label, method, body) {
     if (busy) return
     const generation = lifetime.current
@@ -288,9 +305,9 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured 
       if (generation !== lifetime.current) return
       if (!reply?.ok) throw new Error(reply?.reason || '编码授权操作失败')
       setState(reply)
-      if (method === 'codingConfirm' && reply.state === 'CODING_CONFIGURED') {
+      if (reply.state === 'CODING_CONFIGURED') {
+        await reconcile(reply, generation)
         setNotice('编码配置已保存；运行时仍是 REGISTERED，模型资格与代码检查均尚未执行。')
-        await onConfigured?.()
       } else setNotice(method === 'codingPrepare' ? '冻结完成；配置尚未写入，也未调用模型。请核对摘要后明确确认。' :
         method === 'codingStatus' ? '已复核原请求；复核不会重试确认。' : '')
     } catch (cause) {
@@ -354,9 +371,8 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured 
     <div className="button-row"><button disabled={!!busy || !state?.available || !sessionId || !toolchain ||
       (!!state?.scope && !(state?.state === 'EXPIRED' && !state?.consumed))}
       onClick={() => action('准备', 'codingPrepare', intent())}>准备并冻结</button>
-      <button className="primary" disabled={!!busy || !state?.available || !prepared} onClick={() => {
-        if (window.confirm('确认写入上述冻结的编码配置？此操作不会调用模型或执行检查，确认请求只能使用一次。')) action('确认', 'codingConfirm')
-      }}>明确确认配置</button>
+      <button className="primary" disabled={!!busy || !state?.available || !prepared}
+        onClick={() => action('确认', 'codingConfirm')}>明确确认配置</button>
       <button disabled={!!busy || !state?.available || !state?.scope} onClick={() => action('复核', 'codingStatus')}>复核原请求</button></div>
     {busy && <p role="status">{busy}中…</p>}{notice && <p role="status">{notice}</p>}<Failure error={error}/>
   </Panel>
@@ -388,6 +404,29 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
     const value = unwrap(await window.researchos.v2['session.get']({}))
     if (active(generation)) adopt(value)
     return value
+  }
+  async function reconcileCodingCommit(commit) {
+    const generation = current.current.generation
+    const originalSession = current.current.snapshot?.session_id
+    if (!originalSession || commit.runtime_status !== 'REGISTERED') throw new Error('原会话不可用，请复核编码配置')
+    const before = await window.researchos.desktop.context()
+    if (!active(generation) || before.project_id !== projectId || before.session_id !== originalSession)
+      throw new Error('编码配置会话已切换，请复核原请求')
+    const host = unwrap(await window.researchos.v2['host.status']({}))
+    const snapshot = unwrap(await window.researchos.v2['session.get']({}))
+    const after = await window.researchos.desktop.context()
+    const currentCoding = await window.researchos.desktop.codingCurrent()
+    if (!active(generation) || current.current.snapshot?.session_id !== originalSession ||
+        after.project_id !== projectId || after.session_id !== originalSession ||
+        snapshot.project_id !== projectId || snapshot.session_id !== originalSession ||
+        !currentCoding?.ok || !currentCoding.available || currentCoding.commit_key !== commit.commit_key ||
+        !host.model_configurations?.some(item => item.model_config_ref === commit.model_config_ref &&
+          item.config_revision === commit.config_revision))
+      throw new Error('编码配置已保存，但原会话读取尚未核对；请复核原请求')
+    setState(old => ({ ...old, host, snapshot, error: null }))
+    current.current.snapshot = snapshot
+    setModel(commit.model_config_ref)
+    setNotice(`编码配置已保存（修订 ${commit.config_revision}）；运行时资格仍待验证。`)
   }
   async function load() {
     const generation = ++current.current.generation
@@ -487,7 +526,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
     {!state.loading && state.host && !state.host.model_configurations?.length && <NativeModelConfiguration projectId={projectId} initialHost={state.host} onConfigured={(host, configured) => { setState(old => ({ ...old, host })); setModel(configured.model_config_ref); setNotice(`配置已保存（修订 ${configured.config_revision}）；运行时资格仍待验证。`) }} />}
     <DesktopQualification key={`${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId} sessionId={state.snapshot?.session_id || null}/>
     <DesktopCodingAuthorization key={`coding:${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId}
-      sessionId={state.snapshot?.session_id || null} onConfigured={load}/>
+      sessionId={state.snapshot?.session_id || null} onConfigured={reconcileCodingCommit}/>
     <div className="session-layout">
       <Panel title="项目会话"><ul className="session-picker">{state.sessions.map(item => <li key={item.session_id}><button aria-current={snapshot?.session_id === item.session_id ? 'page' : undefined} disabled={disabled} onClick={() => open(item.session_id)}>{item.title || '未命名会话'}<small>{item.run_status || (item.archived_at ? '已归档' : '等待消息')}</small></button></li>)}</ul>
         {state.nextCursor && <button disabled={disabled} onClick={moreSessions}>加载更多会话</button>}

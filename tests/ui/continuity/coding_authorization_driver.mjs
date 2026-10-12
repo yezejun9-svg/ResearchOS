@@ -26,7 +26,9 @@ const frozen = { ok: true, available: true, state: 'AWAITING_CODING_CONFIRMATION
       vendor_selected: false, timeout_seconds: 90, process_limit: 32, memory_mib: 1024,
       max_text_bytes: 4096 }] },
   frozen_checks: [{ id: 'go-check' }] }
-let state = { ok: true, available: true, state: 'READY' }, confirms = 0, prepares = 0, refreshes = 0
+let state = { ok: true, available: true, state: 'READY' }, confirms = 0, prepares = 0, refreshes = 0, refreshAttempts = 0
+const statusRecovery = process.env.ROS_STATUS_RECOVERY === '1'
+const refreshFailOnce = process.env.ROS_REFRESH_FAIL_ONCE === '1'
 let server, browser, page
 try {
   fs.writeFileSync(html, `<div id="root"></div><script type="module" src="/${path.basename(entry)}"></script>`, 'utf8')
@@ -49,7 +51,11 @@ try {
   browser = await chromium.launch({ headless: true })
   page = await browser.newPage(); page.setDefaultTimeout(12000)
   const errors = []; page.on('pageerror', error => errors.push(error.message))
-  await page.exposeFunction('codingRefresh', () => { refreshes++ })
+  await page.exposeFunction('codingRefresh', () => {
+    refreshAttempts++
+    if (refreshFailOnce && refreshAttempts === 1) throw new Error('V2_READ_FAILED')
+    refreshes++
+  })
   await page.exposeFunction('codingBridge', async (method, args) => {
     record.push({ method, args })
     if (method === 'codingCurrent') return state
@@ -57,7 +63,9 @@ try {
     if (method === 'codingPickVendor') return { ok: true, selected: true, name: 'vendor', ...state }
     if (method === 'codingPrepare') { prepares++; state = frozen; return state }
     if (method === 'codingConfirm') { confirms++; state = { ...frozen, state: 'CODING_CONFIGURED',
-      consumed: true, model_config_ref: 'model-2', runtime_status: 'REGISTERED' }; return state }
+      consumed: true, model_config_ref: 'model-2', runtime_status: 'REGISTERED',
+      config_revision: 2, commit_key: 'original-commit-1' };
+      return statusRecovery ? { ok: false, reason: 'MANAGEMENT_REPLY_UNCERTAIN' } : state }
     if (method === 'codingStatus') return state
     throw new Error(`unexpected ${method}`)
   })
@@ -81,17 +89,32 @@ try {
   await page.getByText('读取 8192 字节/文件', { exact: false }).waitFor()
   await page.getByText('最多 32 个进程、1024 MiB 内存', { exact: false }).waitFor()
   assert.equal(await page.getByRole('button', { name: '准备并冻结' }).isDisabled(), true)
-  page.on('dialog', dialog => dialog.accept())
   await page.getByRole('button', { name: '明确确认配置' }).click()
+  if (statusRecovery) {
+    await page.getByRole('alert').getByText('MANAGEMENT_REPLY_UNCERTAIN', { exact: false }).waitFor()
+    assert.equal(confirms, 1); assert.equal(refreshes, 0)
+    await page.getByRole('button', { name: '复核原请求' }).click()
+  }
+  if (refreshFailOnce) {
+    await page.getByRole('alert').getByText('V2_READ_FAILED', { exact: false }).waitFor()
+    assert.equal(refreshes, 0)
+    await page.getByRole('button', { name: '复核原请求' }).click()
+  }
   await page.getByText('编码配置已保存', { exact: false }).waitFor()
   assert.equal(confirms, 1); assert.equal(refreshes, 1)
   assert.equal(await page.getByRole('button', { name: '明确确认配置' }).isDisabled(), true)
   await page.getByRole('button', { name: '复核原请求' }).click()
   assert.equal(confirms, 1)
+  assert.equal(refreshes, 1)
+  await page.evaluate(() => window.remount())
+  await page.getByText('编码配置已保存', { exact: false }).waitFor({ state: 'hidden' }).catch(() => {})
+  await page.getByRole('button', { name: '复核原请求' }).click()
+  assert.equal(refreshes, 1)
   assert.equal(await page.getByText('C:/trusted-go').count(), 0)
   assert.deepEqual(errors, [])
-  console.log(JSON.stringify({ status: 'SYNTHETIC_CODING_DOM_PASS', prepares, confirms,
-    refreshes, actual_model_calls: 0, page_errors: errors }))
+  console.log(JSON.stringify({ status: refreshFailOnce ? 'SYNTHETIC_CODING_REFRESH_RETRY_PASS' :
+    statusRecovery ? 'SYNTHETIC_CODING_STATUS_RECOVERY_PASS' : 'SYNTHETIC_CODING_DOM_PASS',
+    prepares, confirms, refreshes, refresh_attempts: refreshAttempts, actual_model_calls: 0, page_errors: errors }))
 } finally {
   await page?.close(); await browser?.close(); await server?.close()
   for (const file of [html, entry]) if (fs.existsSync(file)) fs.unlinkSync(file)
