@@ -18,6 +18,10 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 	if ref["entity_type"] == "Goal" {
 		return s.goalAcceptanceSnapshot(tx, p, project, b)
 	}
+	root, e := currentAuthorityRoot(tx, p.ID)
+	if e != nil {
+		return nil, e
+	}
 	t, e := load(tx, project, "Task", Str(ref, "id"))
 	if e != nil {
 		return nil, e
@@ -69,11 +73,7 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 			return nil, e
 		}
 	}
-	root, e := authorityRoot(tx, p.ID)
-	if e != nil {
-		return nil, e
-	}
-	executorRoot, e := authorityRoot(tx, Str(r, "executor_principal_id"))
+	executorRoot, e := currentAuthorityRoot(tx, Str(r, "executor_principal_id"))
 	if e != nil {
 		return nil, e
 	}
@@ -96,6 +96,17 @@ func (s *Service) acceptanceSnapshot(tx *sql.Tx, p Principal, project string, b 
 		}
 		if root == authorRoot {
 			return nil, Fail(403, "FORBIDDEN", "host author cannot independently accept qualification")
+		}
+		var author string
+		if err = tx.QueryRow(`SELECT author FROM runtime_qualification_plans WHERE project=? AND task=?`, project, t["id"]).Scan(&author); err != nil {
+			return nil, err
+		}
+		currentAuthor, err := currentAuthorityRoot(tx, author)
+		if err != nil {
+			return nil, err
+		}
+		if currentAuthor != authorRoot {
+			return nil, Fail(403, "FORBIDDEN", "qualification author lineage changed")
 		}
 		var epoch int64
 		var storedPlan, storedProfile, storedContract, storedInputs, storedContext, storedRoot string

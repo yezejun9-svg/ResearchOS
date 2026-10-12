@@ -21,6 +21,9 @@ func (s *Service) AuthorizeRuntimePurpose(ctx context.Context, token, project, r
 	if e != nil {
 		return e
 	}
+	if _, e = currentAuthorityRoot(tx, p.ID); e != nil {
+		return e
+	}
 	runtime, e := load(tx, project, "RuntimeRegistration", runtimeID)
 	if e != nil {
 		return e
@@ -59,6 +62,9 @@ func (s *Service) currentRuntimePurpose(tx *sql.Tx, project string, task, runtim
 	}
 	if !runtimeRoleAndGrant(tx, Str(grant, "authorized_by"), project, "OWNER") {
 		return nil, Fail(403, "FORBIDDEN", "purpose owner role or project grant revoked")
+	}
+	if _, e = currentAuthorityRoot(tx, Str(grant, "authorized_by")); e != nil {
+		return nil, e
 	}
 	return grant, nil
 }

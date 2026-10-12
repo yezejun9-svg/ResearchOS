@@ -293,8 +293,10 @@ func (s *Service) EnsureRuntimeSetupPrincipal(ctx context.Context, ownerToken, p
 	err = tx.QueryRow("SELECT count(*) FROM auth_principals WHERE id=?", id).Scan(&count)
 	if err == nil && count != 0 {
 		current, e := clientAuthenticatedPrincipal(ctx, tx, id)
-		if e != nil || len(current.Roles) != 1 || !current.HasRole(role) || len(current.Grants) != 1 || current.Grants[0] != (Grant{ProjectID: project}) || current.CanCreateProject {
+		if e != nil || len(current.Roles) != 1 || !current.HasRole(role) || current.CanCreateProject {
 			err = Fail(403, "FORBIDDEN", "host runtime principal is revoked or changed")
+		} else if e = runtimeSetupGrants(tx, current, project, role); e != nil {
+			err = e
 		}
 	}
 	tx.Rollback()
@@ -317,4 +319,76 @@ func (s *Service) EnsureRuntimeSetupPrincipal(ctx context.Context, ownerToken, p
 		return "", err
 	}
 	return id, nil
+}
+
+// createRuntimeRun adds a narrow executor grant in its claim transaction. Only
+// those exact current or historical Run bindings may accompany the base grant.
+func runtimeSetupGrants(tx *sql.Tx, p Principal, project, role string) error {
+	base := 0
+	for _, grant := range p.Grants {
+		if grant == (Grant{ProjectID: project}) {
+			base++
+			continue
+		}
+		if role != "EXECUTOR" || grant.ProjectID != project || grant.Restricted || grant.TaskID == "" || grant.RunID == "" {
+			return Fail(403, "FORBIDDEN", "host runtime principal has an unrelated grant")
+		}
+		run, e := load(tx, project, "Run", grant.RunID)
+		if e != nil || run["task_id"] != grant.TaskID || run["executor_principal_id"] != p.ID {
+			return Fail(403, "FORBIDDEN", "host runtime grant has no matching executor Run")
+		}
+		task, e := load(tx, project, "Task", grant.TaskID)
+		if e != nil {
+			return e
+		}
+		var runtime, taskID string
+		if e = tx.QueryRow(`SELECT runtime,task FROM runtime_qualification_plans WHERE project=? AND runtime=?`, project, run["runtime_id"]).Scan(&runtime, &taskID); e != nil {
+			return Fail(403, "FORBIDDEN", "host runtime grant lacks its prepared runtime plan")
+		}
+		reg, e := load(tx, project, "RuntimeRegistration", runtime)
+		if e != nil {
+			return e
+		}
+		var raw string
+		if e = tx.QueryRow(`SELECT profile_ref FROM runtime_bindings WHERE project=? AND runtime=?`, project, runtime).Scan(&raw); e != nil {
+			return e
+		}
+		ref, e := Decode([]byte(raw))
+		if e != nil {
+			return e
+		}
+		artifact, e := version(tx, project, ref)
+		if e != nil {
+			return e
+		}
+		profile, e := runtimeProfileBody(tx, project, artifact)
+		setup, _ := profile["host_setup"].(map[string]any)
+		owner := Str(setup, "principal")
+		expected := "local-executor-" + strings.TrimPrefix(Hash([]any{owner, project, "EXECUTOR"}), "sha256:")[:32]
+		root, rootErr := authorityRoot(tx, owner)
+		actualRoot, lineageErr := authorityRoot(tx, p.ID)
+		if e != nil || owner == "" || expected != p.ID || rootErr != nil || lineageErr != nil || root != actualRoot || profile["technical_hash"] != runtimeTechnicalHash(reg) {
+			return Fail(403, "FORBIDDEN", "host runtime grant is not from this prepared Owner lineage")
+		}
+		if task["task_type"] == "runtime_qualification" {
+			var count int
+			if taskID != grant.TaskID || tx.QueryRow(`SELECT count(*) FROM runtime_qualification_runs WHERE project=? AND task=? AND run=? AND runtime=? AND epoch=?`, project, grant.TaskID, grant.RunID, runtime, run["lease_epoch"]).Scan(&count) != nil || count != 1 {
+				return Fail(403, "FORBIDDEN", "qualification grant differs from its original claim")
+			}
+		} else if task["task_type"] == "mu_turn" {
+			dispatch, e := runtimeDispatch(tx, project, grant.RunID, run["lease_epoch"])
+			manifest, _ := dispatch["manifest"].(map[string]any)
+			admission, _ := manifest["admission"].(map[string]any)
+			permission, _ := admission["permission"].(map[string]any)
+			if e != nil || manifest["task_id"] != grant.TaskID || manifest["executor_principal_id"] != p.ID || manifest["runtime_id"] != runtime || admission["profile_hash"] != Hash(ref) || permission["purpose"] != "mu_turn" || permission["authorized_by"] != owner {
+				return Fail(403, "FORBIDDEN", "normal turn grant lacks its original qualified dispatch binding")
+			}
+		} else {
+			return Fail(403, "FORBIDDEN", "host runtime grant has an unsupported task purpose")
+		}
+	}
+	if base != 1 {
+		return Fail(403, "FORBIDDEN", "host runtime principal requires its exact base project grant")
+	}
+	return nil
 }
