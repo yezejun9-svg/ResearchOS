@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -904,6 +905,12 @@ func (s *ClientService) dispatch(ctx context.Context, tx *sql.Tx, env *Envelope,
 		}
 	}
 	if deref(env.SessionID) != "" {
+		if *env.Method == "session.attach" && isTruePayloadAttach(env.Payload) {
+			owner, err := clientPrincipal(ctx, tx, principal, deref(env.ProjectID), true)
+			if err != nil || owner.DeviceID != "" {
+				return reject(0, nil, "FORBIDDEN", "local project Owner required for writer attach"), nil
+			}
+		}
 		if err := clientSessionOwner(ctx, tx, deref(env.ProjectID), deref(env.SessionID), principal); err != nil {
 			return reject(0, nil, "FORBIDDEN", "session belongs to another principal"), nil
 		}
@@ -969,6 +976,13 @@ func (s *ClientService) dispatch(ctx context.Context, tx *sql.Tx, env *Envelope,
 		}
 	}
 	return s.handleWrite(ctx, tx, env, principal, sess, reject)
+}
+
+func isTruePayloadAttach(raw json.RawMessage) bool {
+	var p struct {
+		RequestWriteOwner bool `json:"request_write_owner"`
+	}
+	return json.Unmarshal(raw, &p) == nil && p.RequestWriteOwner
 }
 
 func loadClientSession(ctx context.Context, tx *sql.Tx, sessionID, project string) (*clientSessionRow, error) {
@@ -1107,13 +1121,6 @@ func (s *ClientService) handleRead(ctx context.Context, tx *sql.Tx, env *Envelop
 }
 
 func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelope, principal string, sess *clientSessionRow, reject func(int64, any, string, string) *Response) (*Response, error) {
-	// ack reports the session revision *after* every write this command performed, so a
-	// client that journals one event and a client that transfers ownership both learn the
-	// exact revision to refresh against.
-	ack := func(revision int64, result map[string]any) *Response {
-		return &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method,
-			Status: strptr("ACKNOWLEDGED"), SessionID: env.SessionID, Revision: revPtr(revision), Result: result}
-	}
 	complete := func(rev int64, result map[string]any) *Response {
 		return &Response{ProtocolVersion: strptr(ProtocolV2), CommandID: env.CommandID, Method: env.Method,
 			Status: strptr("COMPLETED"), SessionID: env.SessionID, Revision: revPtr(rev), Result: result}
@@ -1135,22 +1142,69 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		return s.respondClientPermission(ctx, tx, env, principal, sess)
 	case "session.attach":
 		var p struct {
-			RequestWriteOwner bool `json:"request_write_owner"`
+			RequestWriteOwner bool  `json:"request_write_owner"`
+			AfterSequence     int64 `json:"after_sequence"`
 		}
-		json.Unmarshal(env.Payload, &p)
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return nil, err
+		}
 		if !p.RequestWriteOwner {
 			return reject(sess.revision, sess.epoch, "INVALID_REQUEST", "attach without write ownership is a read path"), nil
 		}
-		// Reacquisition by the current client renews the writer lease through the
-		// same CAS and epoch rotation as a handoff. Any queued old claim expires.
-		if sess.runID != "" {
-			status, settled, err := runState(ctx, tx, sess.project, sess.runID)
+		if p.AfterSequence < 0 || p.AfterSequence > sess.watermark {
+			return reject(sess.revision, sess.epoch, "CURSOR_INVALID", "after_sequence exceeds the session watermark; recover from snapshot"), nil
+		}
+		if s.Host.LeaseTTL <= 0 || s.Host.LeaseTTL > 15*time.Minute {
+			return nil, fmt.Errorf("HOST_LEASE_POLICY_INVALID")
+		}
+		creator, err := s.attachCreationAuthority(ctx, tx, principal, sess)
+		if err != nil {
+			return clientFault(env, err)
+		}
+		if creator != principal {
+			return reject(sess.revision, sess.epoch, "FORBIDDEN", "session belongs to another principal"), nil
+		}
+		var oldLease sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT lease_expires_at FROM client_sessions WHERE id=? AND project_id=?`, sess.sessionID, sess.project).Scan(&oldLease); err != nil {
+			return nil, err
+		}
+		nowT := time.Now().UTC()
+		var until time.Time
+		if oldLease.Valid {
+			until, err = time.Parse(time.RFC3339Nano, oldLease.String)
+			if err != nil {
+				return reject(sess.revision, sess.epoch, "WRITER_BUSY", "writer lease state is invalid"), nil
+			}
+		}
+		if oldLease.Valid && sess.writerClientID == deref(env.ClientID) {
+			// An ordinary renewal does not invalidate the current writer's claims.
+			if err := s.attachRenewalSafe(ctx, tx, principal, sess); err != nil {
+				return clientFault(env, err)
+			}
+			res, err := tx.ExecContext(ctx, `UPDATE client_sessions SET lease_expires_at=?,updated_at=? WHERE id=? AND project_id=? AND writer_client_id=? AND revision=? AND writer_epoch=? AND lease_expires_at=? AND sealed_at IS NULL AND archived_at IS NULL`, nowT.Add(s.Host.LeaseTTL).Format(time.RFC3339Nano), nowT.Format(time.RFC3339Nano), sess.sessionID, sess.project, sess.writerClientID, sess.revision, sess.epoch, oldLease.String)
 			if err != nil {
 				return nil, err
 			}
-			if liveRunStatuses[status] && !settled {
-				return reject(sess.revision, sess.epoch, "SESSION_BUSY", "previous runtime must settle before writer takeover"), nil
+			if n, err := res.RowsAffected(); err != nil || n != 1 {
+				return nil, fmt.Errorf("ATTACH_RENEWAL_CAS: %v", err)
 			}
+			snap, err := BuildSessionSnapshot(ctx, tx, s.Doc, sess.project, sess.sessionID)
+			if err != nil {
+				return nil, err
+			}
+			return complete(sess.revision, map[string]any{"snapshot": snap, "write_owner_acquired": true}), nil
+		}
+		if oldLease.Valid && until.After(nowT) {
+			return reject(sess.revision, sess.epoch, "WRITER_BUSY", "another client holds the writer lease"), nil
+		}
+		if err := s.attachRenewalSafe(ctx, tx, principal, sess); err != nil {
+			return clientFault(env, err)
+		}
+		if err := s.attachSettlement(ctx, tx, principal, sess); err != nil {
+			return clientFault(env, err)
+		}
+		if sess.epoch == math.MaxInt64 || sess.revision > math.MaxInt64-2 || sess.watermark == math.MaxInt64 {
+			return nil, fmt.Errorf("ATTACH_SEQUENCE_OVERFLOW")
 		}
 		prevEpoch, prevClient := sess.epoch, sess.writerClientID
 		newEpoch, err := HandoffEpoch(ctx, tx, sess.sessionID, sess.epoch, sess.revision)
@@ -1161,17 +1215,15 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 			}
 			return reject(sess.revision, sess.epoch, code, err.Error()), nil
 		}
-		nowT := time.Now().UTC()
-		if s.Host.LeaseTTL <= 0 {
-			// A handoff must publish a real writer lease; the TTL comes from host config,
-			// and the service refuses to invent one.
-			return nil, fmt.Errorf("HOST_LEASE_POLICY_MISSING")
-		}
 		// Writer attribution moves with the epoch inside this same transaction, so the old
 		// client cannot slip a command in between the transfer and the journal row.
-		if _, err := tx.ExecContext(ctx, `UPDATE client_sessions SET writer_client_id=?,lease_expires_at=? WHERE id=? AND writer_epoch=?`,
-			deref(env.ClientID), nowT.Add(s.Host.LeaseTTL).Format(time.RFC3339Nano), sess.sessionID, newEpoch); err != nil {
+		res, err := tx.ExecContext(ctx, `UPDATE client_sessions SET writer_client_id=?,lease_expires_at=?,updated_at=? WHERE id=? AND project_id=? AND writer_epoch=? AND revision=? AND writer_client_id=? AND lease_expires_at IS ? AND sealed_at IS NULL AND archived_at IS NULL`,
+			deref(env.ClientID), nowT.Add(s.Host.LeaseTTL).Format(time.RFC3339Nano), nowT.Format(time.RFC3339Nano), sess.sessionID, sess.project, newEpoch, sess.revision+1, prevClient, oldLease)
+		if err != nil {
 			return nil, err
+		}
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			return nil, fmt.Errorf("ATTACH_GRANT_CAS: %v", err)
 		}
 		sess.writerClientID = deref(env.ClientID)
 		now := nowT.Format(time.RFC3339Nano)
@@ -1192,8 +1244,11 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		}); err != nil {
 			return nil, err
 		}
-		return ack(sess.revision+1, map[string]any{"accepted_at": now, "operation_id": "op-" + deref(env.CommandID),
-			"after_sequence": sess.watermark + 1, "related_resource_ref": nil}), nil
+		snap, err := BuildSessionSnapshot(ctx, tx, s.Doc, sess.project, sess.sessionID)
+		if err != nil {
+			return nil, err
+		}
+		return complete(sess.revision+1, map[string]any{"snapshot": snap, "write_owner_acquired": true}), nil
 	case "session.control":
 		var p struct {
 			Action   *string `json:"action"`
@@ -1241,6 +1296,201 @@ func (s *ClientService) handleWrite(ctx context.Context, tx *sql.Tx, env *Envelo
 		}
 		return reject(sess.revision, sess.epoch, "NOT_IMPLEMENTED", "handler belongs to a later card"), nil
 	}
+}
+
+// attachCreationAuthority requires one original, immutable creation receipt and its
+// command identity. A mapped session with no such proof remains readable only.
+func (s *ClientService) attachCreationAuthority(ctx context.Context, tx *sql.Tx, principal string, sess *clientSessionRow) (string, error) {
+	creator, err := clientSessionCreationPrincipal(ctx, tx, sess.project, sess.sessionID)
+	if err != nil || creator != principal {
+		return "", Fail(403, "FORBIDDEN", "original session creation attribution unavailable")
+	}
+	var key, operation, hash, headers, body string
+	err = tx.QueryRowContext(ctx, `SELECT key,operation,request_hash,headers,body FROM idempotency WHERE principal=? AND project=? AND ((operation='v2:session.create' AND json_extract(body,'$.status')='COMPLETED' AND json_extract(body,'$.result.session_id')=?) OR (operation='v2:goal.start' AND json_extract(body,'$.status')='COMPLETED' AND json_extract(body,'$.session_id') IS NULL AND json_extract(body,'$.result.snapshot.session_id')=?))`, principal, sess.project, sess.sessionID, sess.sessionID).Scan(&key, &operation, &hash, &headers, &body)
+	if err != nil {
+		return "", Fail(403, "FORBIDDEN", "original session creation receipt unavailable")
+	}
+	req, known, err := readClientCommandEnvelope(s.Doc, headers)
+	if err != nil {
+		return "", err
+	}
+	if err := requireClientOriginalHeader(ctx, tx, principal, key, known); err != nil {
+		return "", err
+	}
+	if !known || req.hash != hash || deref(req.env.CommandID) != key || deref(req.env.ProjectID) != sess.project || "v2:"+deref(req.env.Method) != operation {
+		return "", Fail(403, "FORBIDDEN", "original session request identity unavailable")
+	}
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM client_command_identities WHERE principal=? AND command_id=? AND request_hash=? AND project=? AND method=?`, principal, key, hash, sess.project, deref(req.env.Method)).Scan(&n); err != nil {
+		return "", err
+	}
+	if n != 1 {
+		return "", Fail(403, "FORBIDDEN", "original session command identity unavailable")
+	}
+	if _, err := decodeClientIdentityResponse(s.Doc, req, []byte(body)); err != nil {
+		return "", err
+	}
+	return creator, nil
+}
+
+func (s *ClientService) attachRenewalSafe(ctx context.Context, tx *sql.Tx, principal string, sess *clientSessionRow) error {
+	var restore, fences int
+	var workspace string
+	err := tx.QueryRowContext(ctx, `SELECT resume_requires_explicit_user,COALESCE(workspace_ref,'') FROM client_sessions WHERE id=? AND project_id=?`, sess.sessionID, sess.project).Scan(&restore, &workspace)
+	if err != nil {
+		return err
+	}
+	if restore != 0 {
+		return Fail(409, "SESSION_BUSY", "session restore requires explicit recovery")
+	}
+	err = tx.QueryRowContext(ctx, `SELECT count(*) FROM client_queue_fences WHERE project=? AND session_id=? AND (restore_fenced<>0 OR state='RECONCILING')`, sess.project, sess.sessionID).Scan(&fences)
+	if err != nil {
+		return err
+	}
+	if fences != 0 {
+		return Fail(409, "SESSION_BUSY", "session recovery fence is active")
+	}
+	if sess.runID != "" {
+		status, _, err := runState(ctx, tx, sess.project, sess.runID)
+		if err != nil {
+			return err
+		}
+		if status == "RECONCILING" || status == "LOST" {
+			return Fail(409, "SESSION_BUSY", "session run requires recovery")
+		}
+	}
+	if s.Domain == nil {
+		return Fail(503, "HOST_UNAVAILABLE", "workspace authority unavailable")
+	}
+	b, err := s.Domain.binding(ctx, tx, workspace)
+	if err != nil || b.ProjectID == nil || *b.ProjectID != sess.project || b.PrincipalID != principal || b.Status != WorkspaceActive {
+		return Fail(403, "WORKSPACE_REVOKED", "session workspace is unavailable")
+	}
+	return nil
+}
+
+// attachSettlement is the lease-independent, read-only settlement predicate used
+// only for a new writer grant. The configuration predicate remains unchanged.
+func (s *ClientService) attachSettlement(ctx context.Context, tx *sql.Tx, principal string, sess *clientSessionRow) error {
+	if sess.runID != "" {
+		run, err := load(tx, sess.project, "Run", sess.runID)
+		if err != nil || !runTerminal(run) || run["children_stopped"] != true || run["queue_empty"] != true || effectsReconciled(tx, sess.project, sess.runID) != nil {
+			return Fail(409, "SESSION_BUSY", "current session run is not settled")
+		}
+	}
+	originalTasks, e := s.originalSessionTasks(ctx, tx, principal, sess.project, sess.sessionID)
+	if e != nil {
+		return e
+	}
+	rows, e := tx.QueryContext(ctx, `SELECT DISTINCT t.body FROM domain_objects t WHERE t.project=? AND t.kind='Task' AND (t.id=(SELECT task_id FROM client_sessions WHERE id=?) OR json_extract(t.body,'$.goal_id') IN(SELECT COALESCE(json_extract(body,'$.result.goal_id'),json_extract(body,'$.result.snapshot.goal_id')) FROM idempotency WHERE project=? AND operation IN('v2:goal.start','v2:session.send') AND json_extract(body,'$.status')='COMPLETED' AND (json_extract(body,'$.session_id')=? OR json_extract(body,'$.result.snapshot.session_id')=?)) OR t.id IN(SELECT task_id FROM client_queue_fences WHERE project=? AND session_id=?))`, sess.project, sess.sessionID, sess.project, sess.sessionID, sess.sessionID, sess.project, sess.sessionID)
+	if e != nil {
+		return e
+	}
+	tasks := originalTasks
+	for rows.Next() {
+		var raw string
+		if e = rows.Scan(&raw); e != nil {
+			rows.Close()
+			return e
+		}
+		task, e := Decode([]byte(raw))
+		if e != nil {
+			rows.Close()
+			return e
+		}
+		tasks = append(tasks, task)
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return e
+	}
+	for _, task := range tasks {
+		if !clientTurnSettled(tx, sess.project, sess.sessionID, task) {
+			return Fail(409, "SESSION_BUSY", "session task is not settled")
+		}
+		// A later active_run_id cannot hide an older generation's unresolved
+		// effects or child process. Reuse the actual settlement predicate for
+		// each canonical Run belonging to the original Task, without writes.
+		runs, err := tx.QueryContext(ctx, `SELECT id FROM domain_objects WHERE project=? AND kind='Run' AND json_extract(body,'$.task_id')=?`, sess.project, Str(task, "id"))
+		if err != nil {
+			return err
+		}
+		ids := []string{}
+		for runs.Next() {
+			var id string
+			if err = runs.Scan(&id); err != nil {
+				runs.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		err = runs.Err()
+		runs.Close()
+		if err != nil {
+			return err
+		}
+		for _, id := range ids {
+			historical := Object{}
+			for k, v := range task {
+				historical[k] = v
+			}
+			historical["active_run_id"] = id
+			if !clientTurnSettled(tx, sess.project, sess.sessionID, historical) {
+				return Fail(409, "SESSION_BUSY", "earlier session run is not settled")
+			}
+		}
+	}
+	var pending int
+	e = tx.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM client_command_queue WHERE project=? AND session_id=? AND state NOT IN('CONSUMED','DROPPED'))+(SELECT count(*) FROM client_control_requests WHERE project=? AND session_id=? AND state<>'CONFIRMED')+(SELECT count(*) FROM client_queue_fences WHERE project=? AND session_id=? AND (restore_fenced<>0 OR state='RECONCILING'))`, sess.project, sess.sessionID, sess.project, sess.sessionID, sess.project, sess.sessionID).Scan(&pending)
+	if e != nil {
+		return e
+	}
+	if pending != 0 {
+		return Fail(409, "SESSION_BUSY", "session controls remain unresolved")
+	}
+	rows, e = tx.QueryContext(ctx, `SELECT q.state,q.command_id,q.generation,COALESCE(r.kind,''),COALESCE(r.body,''),COALESCE(r.body_hash,'') FROM client_command_queue q LEFT JOIN client_control_receipts r ON r.receipt_id=q.last_receipt_id AND r.project=q.project AND r.generation=q.generation AND r.command_id=q.command_id WHERE q.project=? AND q.session_id=?`, sess.project, sess.sessionID)
+	if e != nil {
+		return e
+	}
+	type terminalReceipt struct{ state, command, generation, kind, body, hash string }
+	receipts := []terminalReceipt{}
+	for rows.Next() {
+		var r terminalReceipt
+		if e = rows.Scan(&r.state, &r.command, &r.generation, &r.kind, &r.body, &r.hash); e != nil {
+			rows.Close()
+			return e
+		}
+		receipts = append(receipts, r)
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return e
+	}
+	for _, r := range receipts {
+		if Digest([]byte(r.body)) != r.hash {
+			return Fail(409, "SESSION_BUSY", "queue settlement receipt unavailable")
+		}
+		if r.state == "DROPPED" && r.kind == "CANCEL_FENCE" {
+			if e = s.validatePreSDKConfigurationDrop(ctx, tx, principal, sess, r.command, r.generation, r.body); e != nil {
+				return e
+			}
+		} else if (r.state == "CONSUMED" && r.kind != "command.consumed") || (r.state == "DROPPED" && r.kind != "command.cleared") {
+			return Fail(409, "SESSION_BUSY", "queue settlement receipt unavailable")
+		}
+	}
+
+	// Permission facts are related to the original Session even after its head
+	// Task/Run has advanced; inspect the complete relation, not just the head.
+	e = tx.QueryRowContext(ctx, `SELECT count(*) FROM resource_effects x JOIN domain_objects r ON r.project=x.project AND r.kind='ResourceRequest' AND r.id=json_extract(x.body,'$.permission.request_id') WHERE x.project=? AND json_extract(x.body,'$.permission.session_id')=? AND json_extract(r.body,'$.status') IN('OPEN','ACKNOWLEDGED')`, sess.project, sess.sessionID).Scan(&pending)
+	if e != nil {
+		return e
+	}
+	if pending > 0 {
+		return Fail(409, "SESSION_BUSY", "session permission remains unresolved")
+	}
+	return nil
 }
 
 // journal appends one typed event for the command's session inside the same transaction as
