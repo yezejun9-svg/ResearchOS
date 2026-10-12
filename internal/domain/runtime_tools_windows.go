@@ -201,7 +201,7 @@ func (c *RuntimeCoordinator) brokerTool(ctx context.Context, route RuntimeCoordi
 	if len(Bytes(reply)) > 64*1024 {
 		return unknown("tool reply exceeds bridge frame limit")
 	}
-	for _, secret := range []string{c.config.SchedulerToken, route.ExecutorToken} {
+	for _, secret := range []string{c.schedulerCredential(route.ProjectID), route.ExecutorToken} {
 		if secret != "" && strings.Contains(string(raw), secret) {
 			return unknown("tool result contained host credential material")
 		}

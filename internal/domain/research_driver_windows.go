@@ -35,7 +35,7 @@ func (c *RuntimeCoordinator) advanceResearchCycles(ctx context.Context) error {
 			continue
 		}
 		if err = resourceWriteLock(tx); err == nil {
-			p, e := resourcePrincipal(tx, c.config.SchedulerToken, project, "SCHEDULER")
+			p, e := resourcePrincipal(tx, c.schedulerCredential(project), project, "SCHEDULER")
 			if e != nil {
 				err = e
 			} else {
