@@ -420,13 +420,16 @@ func validateClientConfigurationScope(env *Envelope) error {
 	return nil
 }
 
-func clientConfigurationEndpoint(base string) (string, error) {
+// clientConfigurationEndpoint keeps the stored base URL and the actual model
+// request destination under one lexical rule. Plain HTTP is accepted only for
+// a credential-free, numeric loopback address.
+func clientConfigurationEndpoint(base string, credential *string) (string, error) {
 	bad := func() (string, error) { return "", fmt.Errorf("CONFIGURATION_ENDPOINT") }
-	if !strings.HasPrefix(base, "https://") || strings.ContainsAny(base, "?#\\") || strings.ContainsFunc(base, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) {
+	if !(strings.HasPrefix(base, "https://") || strings.HasPrefix(base, "http://")) || strings.ContainsAny(base, "?#\\") || strings.ContainsFunc(base, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) {
 		return bad()
 	}
 	u, e := url.Parse(base)
-	if e != nil || !u.IsAbs() || u.Scheme != "https" || u.Opaque != "" || u.Host == "" || u.Hostname() == "" || u.User != nil || u.RawPath != "" || strings.Contains(u.Path, "%") || strings.Contains(u.Host, "%") {
+	if e != nil || !u.IsAbs() || (u.Scheme != "https" && u.Scheme != "http") || u.Opaque != "" || u.Host == "" || u.Hostname() == "" || u.User != nil || u.RawPath != "" || strings.Contains(u.Path, "%") || strings.Contains(u.Host, "%") {
 		return bad()
 	}
 	for _, r := range u.Host {
@@ -460,6 +463,9 @@ func clientConfigurationEndpoint(base string) (string, error) {
 			return bad()
 		}
 	}
+	if u.Scheme == "http" && (credential != nil || !clientConfigurationNumericLoopback(u)) {
+		return bad()
+	}
 	if strings.Contains(u.Path, "//") {
 		return bad()
 	}
@@ -472,6 +478,29 @@ func clientConfigurationEndpoint(base string) (string, error) {
 		return bad()
 	}
 	return strings.TrimSuffix(base, "/") + "/chat/completions", nil
+}
+
+func clientConfigurationNumericLoopback(u *url.URL) bool {
+	if u == nil || u.Scheme != "http" {
+		return false
+	}
+	switch u.Hostname() {
+	case "127.0.0.1":
+		return u.Host == "127.0.0.1" || strings.HasPrefix(u.Host, "127.0.0.1:")
+	case "::1":
+		return u.Host == "[::1]" || strings.HasPrefix(u.Host, "[::1]:")
+	default:
+		return false
+	}
+}
+
+func clientConfigurationLoopbackModelEndpoint(endpoint string) bool {
+	if !strings.HasPrefix(endpoint, "http://") || !strings.HasSuffix(endpoint, "/chat/completions") {
+		return false
+	}
+	base := strings.TrimSuffix(endpoint, "/chat/completions")
+	actual, err := clientConfigurationEndpoint(base, nil)
+	return err == nil && actual == endpoint
 }
 
 func (s *ClientService) configurationOwner(ctx context.Context, tx *sql.Tx, principal string) (string, error) {
@@ -507,7 +536,7 @@ func (s *ClientService) configureClientHost(ctx context.Context, tx *sql.Tx, env
 	if e != nil {
 		return NewTypedRejection(env, "INVALID_REQUEST", "invalid configuration payload"), nil
 	}
-	if _, e = clientConfigurationEndpoint(p.BaseURL); e != nil {
+	if _, e = clientConfigurationEndpoint(p.BaseURL, p.Credential); e != nil {
 		return NewTypedRejection(env, "INVALID_REQUEST", "invalid provider base URL"), nil
 	}
 	if p.Credential != nil {

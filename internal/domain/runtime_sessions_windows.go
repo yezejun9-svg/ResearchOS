@@ -71,13 +71,17 @@ func (c *RuntimeCoordinator) matchStoredClientConfiguration(tx *sql.Tx, project,
 	if err != nil {
 		return err
 	}
-	endpoint, err := clientConfigurationEndpoint(record.Payload.BaseURL)
+	endpoint, err := clientConfigurationEndpoint(record.Payload.BaseURL, record.Payload.Credential)
 	if err != nil {
 		return Fail(503, "MODEL_UNAVAILABLE", "configuration endpoint unavailable")
 	}
 	config, _ := profile["model_config"].(map[string]any)
-	if record.Owner != owner || config["api"] != "openai-completions" || config["provider"] != record.Payload.Provider || config["model"] != record.Payload.Model || config["endpoint"] != endpoint || record.Payload.Credential == nil {
+	if record.Owner != owner || config["api"] != "openai-completions" || config["provider"] != record.Payload.Provider || config["model"] != record.Payload.Model || config["endpoint"] != endpoint {
 		return Fail(503, "MODEL_UNAVAILABLE", "runtime profile differs from stored configuration")
+	}
+	local := clientConfigurationLoopbackModelEndpoint(endpoint)
+	if record.Payload.Credential == nil && (!local || profile["credential_revision"] != "none") {
+		return Fail(503, "MODEL_UNAVAILABLE", "credential-free route is not the frozen local model")
 	}
 	matched := false
 	purposes := map[string]bool{}
@@ -85,8 +89,15 @@ func (c *RuntimeCoordinator) matchStoredClientConfiguration(tx *sql.Tx, project,
 		if route.ProjectID != project || route.RuntimeID != Str(runtime, "id") || route.Capability != "MODEL" || route.ID != Str(config, "route") {
 			continue
 		}
-		if route.Endpoint != endpoint || route.CredentialRef != *record.Payload.Credential || route.CredentialRevision != *record.Payload.Credential || Hash(route.ModelConfig) != Hash(config) {
+		if route.Endpoint != endpoint || Hash(route.ModelConfig) != Hash(config) {
 			return Fail(503, "MODEL_UNAVAILABLE", "runtime route differs from stored configuration")
+		}
+		if record.Payload.Credential == nil {
+			if !local || route.CredentialRef != "" || route.CredentialRevision != "none" || route.BearerToken != "" {
+				return Fail(503, "MODEL_UNAVAILABLE", "local route carries credential material")
+			}
+		} else if route.CredentialRef != *record.Payload.Credential || route.CredentialRevision != *record.Payload.Credential {
+			return Fail(503, "MODEL_UNAVAILABLE", "runtime credential differs from stored configuration")
 		}
 		if purposes[route.Purpose] {
 			return Fail(503, "MODEL_UNAVAILABLE", "stored configuration has duplicate model routes")

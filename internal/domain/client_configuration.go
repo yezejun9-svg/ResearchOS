@@ -12,9 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"regexp"
-	"strings"
 	"time"
 
 	"researchos.local/research-os/internal/canonical"
@@ -66,8 +64,7 @@ func parseClientConfiguration(doc *SchemaDoc, raw []byte) (clientConfigurationPa
 	if p.Revision < 1 || p.Revision > clientConfigurationMaxRevision || !clientIdentityLabel(p.Provider) || !clientIdentityLabel(p.Model) {
 		return p, nil, fmt.Errorf("CONFIGURATION_VALUES")
 	}
-	u, err := url.Parse(p.BaseURL)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.ContainsAny(p.BaseURL, "#\r\n\t ") {
+	if _, err = clientConfigurationEndpoint(p.BaseURL, p.Credential); err != nil {
 		return p, nil, fmt.Errorf("CONFIGURATION_ENDPOINT")
 	}
 	if p.Credential != nil && !clientConfigurationCredential.MatchString(*p.Credential) {

@@ -67,6 +67,9 @@ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoord
 		// known absent provider operation, unlike a transport failure after send.
 		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "CREDENTIAL_MISSING", "protected model credential unavailable; no provider request was sent")
 	}
+	if provider.MeasurementMode == "LIVE" && clientConfigurationLoopbackModelEndpoint(provider.Endpoint) && (provider.CredentialRef != "" || provider.CredentialRevision != "none" || provider.BearerToken != "") {
+		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "INVALID_REQUEST", "local model route contains credential material; no provider request was sent")
+	}
 	if provider.CredentialRef != "" {
 		if c.config.ModelCredential == nil {
 			return notDispatched()
