@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { integer, previous, display } from '../../desktop/main/lib/wire-values.mjs'
 import { ArtifactPreview } from './preview.jsx'
 import { SessionContinuation } from './session-continuation.jsx'
@@ -6,9 +6,29 @@ import { SessionContinuation } from './session-continuation.jsx'
 const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
 const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
 const settled = value => value?.completed === true && (value?.protocol_status || value?.kind) === 'COMPLETED'
+const sameConfiguration = (value, request) => !!value?.model_config_ref &&
+  ['config_revision', 'provider_id', 'base_url', 'model_id', 'credential_ref'].every(key => value[key] === request[key])
+// The shell owns the command lifetime. This observable renderer snapshot holds
+// only the public payload and terminal result across route unmounts.
+const modelConfigurationPending = new Map()
+const modelConfigurationListeners = new Map()
+const modelPending = projectId => modelConfigurationPending.get(projectId) || null
+function updateModelPending(projectId, value) {
+  if (value) modelConfigurationPending.set(projectId, value)
+  else modelConfigurationPending.delete(projectId)
+  for (const listener of modelConfigurationListeners.get(projectId) || []) listener()
+}
+function subscribeModelPending(projectId, listener) {
+  let listeners = modelConfigurationListeners.get(projectId)
+  if (!listeners) { listeners = new Set(); modelConfigurationListeners.set(projectId, listeners) }
+  listeners.add(listener)
+  return () => { listeners.delete(listener); if (!listeners.size) modelConfigurationListeners.delete(projectId) }
+}
 function unwrap(reply) {
   if (!reply?.ok || !settled(reply)) {
-    const error = new Error(reply?.error_code || reply?.reason || reply?.protocol_status || '主机尚未完成请求')
+    const code = reply?.error_code || reply?.reason || reply?.protocol_status || '主机尚未完成请求'
+    const detail = typeof reply?.error === 'string' ? reply.error : reply?.error?.message
+    const error = new Error(detail ? `${code}：${detail}` : code)
     error.code = reply?.error_code || reply?.reason || reply?.protocol_status
     error.reply = reply
     throw error
@@ -17,6 +37,118 @@ function unwrap(reply) {
 }
 function Panel({ title, children, aside }) { return <section className="panel"><div className="section-heading"><h2>{title}</h2>{aside}</div>{children}</section> }
 function Failure({ error, retry }) { return error && <div className="state-notice" role="alert"><p>{error.message}。输入仍保留，请核对当前状态。</p>{retry && <button onClick={retry}>重新读取</button>}</div> }
+
+export function NativeModelConfiguration({ projectId, initialHost, onConfigured }) {
+  const pending = useSyncExternalStore(listener => subscribeModelPending(projectId, listener), () => modelPending(projectId), () => null)
+  const [host, setHost] = useState(initialHost || null)
+  const [form, setForm] = useState(() => modelPending(projectId)?.form || { provider_id: '', base_url: '', model_id: '', credential_ref: '' })
+  const [busy, setBusy] = useState(false), [error, setError] = useState(null), [notice, setNotice] = useState('')
+  const live = useRef(true)
+  useEffect(() => { live.current = true; return () => { live.current = false } }, [])
+  useEffect(() => { if (initialHost) setHost(initialHost) }, [initialHost])
+  async function readHost() {
+    if (!live.current) throw new Error('页面已切换')
+    const selected = await window.researchos.desktop.selectProject(projectId)
+    if (!selected?.ok) throw new Error(selected?.reason || '项目选择失败')
+    if (!live.current) throw new Error('页面已切换')
+    const reply = await window.researchos.v2['host.status']({})
+    const value = { ...unwrap(reply), localHostOrigin: reply?.local_host_origin }
+    if (!Number.isSafeInteger(value?.config_revision) || value.config_revision < 0) throw new Error('主机未返回有效的配置修订')
+    if (!/^[a-f0-9]{64}$/.test(value.localHostOrigin || '')) throw new Error('主机未返回可信的本地身份')
+    if (!live.current) throw new Error('页面已切换')
+    setHost(value)
+    return value
+  }
+  useEffect(() => { readHost().catch(setError) }, [projectId])
+  async function reconcile(entry) {
+    if (!entry?.outcome) return
+    if (entry.reconciling) return entry.reconciling
+    entry.reconciling = (async () => {
+      if (!live.current || modelPending(projectId) !== entry) return
+      const reply = entry.outcome
+      if (reply?.dispatch_state === 'NOT_SENT') {
+        // This attempt never reached HTTP. It has no original-host effect to
+        // reconcile, even if another project's command owns the shell barrier.
+        updateModelPending(projectId, null)
+        setError((() => { try { unwrap(reply) } catch (cause) { return cause } })() || new Error(reply?.reason || '本地请求未发送'))
+        return
+      }
+      const refreshed = await readHost()
+      if (!entry.origin || refreshed.localHostOrigin !== entry.origin || reply?.local_host_origin !== entry.origin) {
+        throw new Error('主机已切换；原配置只能在原主机核对，当前主机不可证明保存结果')
+      }
+      if ((reply?.ok && settled(reply)) || reply?.reason === 'STALE_RESPONSE') {
+        const saved = reply?.reason === 'STALE_RESPONSE' ? reply.local_terminal_result : unwrap(reply)
+        if (!sameConfiguration(saved, entry.payload)) throw new Error('原配置回执缺少完整的配置身份；请核对原主机状态')
+        if (!refreshed.model_configurations?.some(item => sameConfiguration(item, entry.payload) && item.model_config_ref === saved.model_config_ref)) {
+          throw new Error('原主机状态尚未列出同一配置；请刷新核对')
+        }
+        if (!live.current || modelPending(projectId) !== entry) return
+        updateModelPending(projectId, null)
+        onConfigured?.(refreshed, saved)
+        setNotice(`配置已保存（修订 ${saved.config_revision}）。运行时资格尚未确认，创建会话或发送消息仍以服务端检查为准。`)
+      } else {
+        const reason = reply?.reason || reply?.error_code
+        if (!live.current || modelPending(projectId) !== entry) return
+        updateModelPending(projectId, null)
+        setError((() => { try { unwrap(reply) } catch (cause) { return cause } })() || new Error(reason || '主机拒绝配置'))
+      }
+    })()
+    try { await entry.reconciling }
+    finally { entry.reconciling = null }
+  }
+  useEffect(() => { if (pending?.outcome) reconcile(pending).catch(setError) }, [pending, projectId])
+  async function submit(event) {
+    event.preventDefault(); if (busy) return
+    setBusy(true); setError(null); setNotice('')
+    try {
+      const remembered = modelPending(projectId)
+      if (remembered?.outcome) { await reconcile(remembered); return }
+      if (!remembered && (!form.provider_id.trim() || !form.model_id.trim() || !form.base_url.trim())) {
+        throw new Error('提供方 ID、模型 ID 和 API 基础地址不能为空')
+      }
+      const current = remembered ? null : await readHost()
+      const request = remembered?.payload || {
+        config_revision: current.config_revision + 1,
+        provider_id: form.provider_id.trim(), base_url: form.base_url.trim(), model_id: form.model_id.trim(),
+        credential_ref: form.credential_ref.trim() || null,
+      }
+      if (!live.current) return
+      if (!remembered) updateModelPending(projectId, { payload: request, form: { ...form }, origin: current.localHostOrigin, outcome: null })
+      const reply = await window.researchos.v2['host.configure'](request)
+      const entry = modelPending(projectId)
+      if (entry?.payload !== request) return
+      if (reply?.ok && !settled(reply)) {
+        if (reply.local_host_origin && reply.local_host_origin !== entry.origin) updateModelPending(projectId, { ...entry, origin: reply.local_host_origin })
+        if (live.current) setNotice('主机已接收配置命令，尚未确认保存。请用同一请求继续查询结果。')
+        return
+      }
+      // Only a trusted shell terminal response or pre-HTTP fact ends this
+      // intent. Every other failure remains an uncertain replay.
+      if (settled(reply) || reply?.protocol_status === 'REJECTED' || reply?.reason === 'STALE_RESPONSE' || reply?.dispatch_state === 'NOT_SENT' || (!remembered && reply?.reason === 'COMMAND_PENDING')) {
+        const terminal = { ...entry, origin: reply?.local_host_origin || null, outcome: reply }
+        updateModelPending(projectId, terminal)
+        if (live.current) await reconcile(terminal)
+      } else if (live.current) unwrap(reply)
+    } catch (cause) {
+      if (live.current) { setError(cause); if (modelPending(projectId)?.outcome?.ok) setNotice('主机已返回配置成功；状态刷新尚未确认，请重新读取。') }
+    } finally { if (live.current) setBusy(false) }
+  }
+  return <Panel title="模型配置" aside={<button type="button" disabled={busy} onClick={() => readHost().then(() => setError(null)).catch(setError)}>刷新主机状态</button>}>
+    <p>配置保存到本地主机。空凭据引用适用于无凭据的本地模型；远程服务须使用主机已有的受保护凭据引用。</p>
+    {host && <p className="small-muted">当前配置修订 {host.config_revision} · 已保存 {host.model_configurations?.length || 0} 条配置</p>}
+    <Failure error={error}/>
+    <form className="form-grid" onSubmit={submit}>
+      <label>提供方 ID<input value={form.provider_id} disabled={busy || !!pending} onChange={event => setForm({ ...form, provider_id: event.target.value })} placeholder="例如 ollama" required/></label>
+      <label>模型 ID<input value={form.model_id} disabled={busy || !!pending} onChange={event => setForm({ ...form, model_id: event.target.value })} placeholder="例如 qwen3:4b-instruct" required/></label>
+      <label className="full-row">API 基础地址<input type="url" value={form.base_url} disabled={busy || !!pending} onChange={event => setForm({ ...form, base_url: event.target.value })} placeholder="http://127.0.0.1:11434/v1" required/></label>
+      <label className="full-row">受保护凭据引用（本地模型留空）<input value={form.credential_ref} disabled={busy || !!pending} onChange={event => setForm({ ...form, credential_ref: event.target.value })} autoComplete="off" placeholder="留空时提交 null"/></label>
+      <button className="primary" type="submit" disabled={busy}>{busy ? '正在核对主机修订…' : pending?.outcome ? '核对原配置结果' : pending ? '继续同一配置命令' : '保存模型配置'}</button>
+    </form>
+    {notice && <p role="status">{notice}</p>}
+    {!!host?.model_configurations?.length && <div className="record-list">{host.model_configurations.map(item => <div className="record-row" key={item.model_config_ref}><strong>{item.provider_id} · {item.model_id}</strong><small>配置修订 {item.config_revision} · {item.verified_at ? '提供方已探测' : '提供方未探测'} · 运行时资格未由此确认</small></div>)}</div>}
+  </Panel>
+}
 
 export function NativeProjectEntry({ navigate, onRefresh }) {
   const [name, setName] = useState('')
@@ -44,7 +176,7 @@ export function NativeProjectEntry({ navigate, onRefresh }) {
     <Failure error={hostError} retry={checkHost}/>{host && <p className="small-muted">本地主机已连接 · {host.workspaces?.length || 0} 个已登记工作区</p>}
     <label>项目显示名称<input value={name} onChange={event => setName(event.target.value)} placeholder="留空时使用目录名称"/></label>
     <div className="button-row"><button className="primary" disabled={busy} onClick={choose}>{busy ? '等待目录选择与本地盘点…' : '选择本地项目目录'}</button></div>
-    <Failure error={error}/>{result && <div role="status"><p>本地盘点已保存。后续调研和复用以任务回执为准。</p><p className="break-all">{result.workspace.display_path}</p><button onClick={() => navigate(`/p/${result.project_id}`)}>打开会话工作台</button></div>}
+    <Failure error={error}/>{result && <div role="status"><p>本地盘点已保存。接下来可在项目工作台配置模型；配置保存后仍须由服务端验证运行资格。</p><p className="break-all">{result.workspace.display_path}</p><button onClick={() => navigate(`/p/${result.project_id}`)}>配置模型并打开工作台</button></div>}
   </Panel>
 }
 
@@ -170,14 +302,15 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
     {Object.values(shared?.errors || {}).map((error, index) => <Failure key={index} error={new Error(`部分项目资料尚未读取：${error.message}`)} retry={() => { onRefresh(); load() }}/>) }
     {!online && <p className="connection-banner" role="status">已离线，显示最后读取的会话；重新连接后核对最新状态。</p>}
     {state.loading && <div className="loading-state" role="status" aria-busy="true">正在读取本机会话…</div>}
+    {!state.loading && state.host && !state.host.model_configurations?.length && <NativeModelConfiguration projectId={projectId} initialHost={state.host} onConfigured={(host, configured) => { setState(old => ({ ...old, host })); setModel(configured.model_config_ref); setNotice(`配置已保存（修订 ${configured.config_revision}）；运行时资格仍待验证。`) }} />}
     <div className="session-layout">
       <Panel title="项目会话"><ul className="session-picker">{state.sessions.map(item => <li key={item.session_id}><button aria-current={snapshot?.session_id === item.session_id ? 'page' : undefined} disabled={disabled} onClick={() => open(item.session_id)}>{item.title || '未命名会话'}<small>{item.run_status || (item.archived_at ? '已归档' : '等待消息')}</small></button></li>)}</ul>
         {state.nextCursor && <button disabled={disabled} onClick={moreSessions}>加载更多会话</button>}
         {!state.sessions.length && !state.loading && <p className="empty-state">{state.error ? '会话列表尚未读取，请恢复连接或权限后重试。' : '还没有会话，选择已配置模型后开始。'}</p>}
         <details><summary>新建会话</summary><label>名称<input value={title} onChange={event => setTitle(event.target.value)}/></label>
           <label>工作区<select value={workspace} onChange={event => setWorkspace(event.target.value)}><option value="">选择已授权目录</option>{(state.host?.workspaces || []).filter(item => item.project_id === projectId && item.status === 'ACTIVE').map(item => <option key={item.authorized_workspace_ref} value={item.authorized_workspace_ref}>{item.display_name}</option>)}</select></label>
-          <label>模型<select value={model} onChange={event => setModel(event.target.value)}><option value="">选择已配置模型</option>{(state.host?.model_configurations || []).map(item => <option key={item.model_config_ref} value={item.model_config_ref}>{item.provider_id} · {item.model_id}</option>)}</select></label>
-          {!state.host?.model_configurations?.length && <p>没有可用模型配置，请在设置中查看配置状态。</p>}<button disabled={disabled || !workspace || !model} onClick={create}>创建会话</button></details>
+          <label>模型<select value={model} onChange={event => setModel(event.target.value)}><option value="">选择配置记录（资格未确认）</option>{(state.host?.model_configurations || []).map(item => <option key={item.model_config_ref} value={item.model_config_ref}>{item.provider_id} · {item.model_id}</option>)}</select></label>
+          {!state.host?.model_configurations?.length ? <p>还没有模型配置，请先使用上方表单或项目设置保存。</p> : <p className="small-muted">配置记录不代表运行时已具备资格；创建会话时由服务端检查。</p>}<button disabled={disabled || !workspace || !model} onClick={create}>创建会话</button></details>
       </Panel>
       <div className="session-center"><Panel title={snapshot?.title || '开始协作'} aside={snapshot && <span className="tag">{snapshot.run_status || '等待消息'}</span>}>
         {snapshot ? <><div className="button-row"><button disabled={disabled || writer} onClick={() => command('接管写入', async () => { unwrap(await window.researchos.v2['session.attach']({ after_sequence: snapshot.event_sequence, request_write_owner: true })); await readSnapshot(); composer.current?.focus() })}>{writer ? '当前可写' : '在此继续'}</button>

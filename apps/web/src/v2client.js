@@ -15,7 +15,7 @@
 // The rules themselves are transcribed from internal/domain/client_protocol.go's DecodeEnvelope:
 //   * write-class methods carry project_id + expected_revision + writer_epoch
 //   * session.attach claiming write ownership must NOT carry a writer epoch (ATTACKER_CLAIMED_EPOCH); a read attach must
-//   * host.configure naming model_id or provider_id without a writer epoch is MODEL_CHANGE_WITHOUT_EPOCH
+//   * host.configure uses either the all-null first-use scope or the full session writer/CAS scope
 //   * a present-but-empty project_id or session_id is refused: an empty string is never a valid reference
 //   * each payload is a closed object (schema additionalProperties:false), so an extra key is refused locally
 
@@ -112,9 +112,11 @@ export function envelopeFor(identity, state, method, payload) {
     if (env.expected_revision === null) return { ok: false, reason: 'MISSING_FIELD:expected_revision', method };
     if (env.writer_epoch === null) return { ok: false, reason: 'MISSING_FIELD:writer_epoch', method };
   }
-  if (method === 'host.configure' && (Object.prototype.hasOwnProperty.call(payload, 'model_id') ||
-    Object.prototype.hasOwnProperty.call(payload, 'provider_id')) && env.writer_epoch === null) {
-    return { ok: false, reason: 'MODEL_CHANGE_WITHOUT_EPOCH', method };
+  if (method === 'host.configure') {
+    const scopes = [env.project_id, env.session_id, env.expected_revision, env.writer_epoch];
+    if (!scopes.every(value => value === null) && scopes.some(value => value === null)) {
+      return { ok: false, reason: 'CONFIGURATION_SCOPE_INCOMPLETE', method };
+    }
   }
   if (CONTRACT[method].payload === 'EmptyPayload' && Object.keys(payload).length) {
     return { ok: false, reason: 'UNEXPECTED_PAYLOAD_KEYS:' + Object.keys(payload).join(','), method };

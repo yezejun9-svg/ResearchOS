@@ -159,10 +159,12 @@ function createTransport({ appRoot, record = () => {} }) {
   const lane = { blocked:false, handles:new Set(), pending:0, bytes:0, tail:Promise.resolve() };
   return async function transport(verb,url,envelope,headers) {
     let raw;
-    try { boundLocalInput(envelope); const captured = structuredClone(envelope); headers = {...headers}; raw=Buffer.from((await values()).stringify(captured)); } catch(e) { return {ok:false,reason:e.reason||e.message}; }
-    if (verb !== 'POST' || raw.length > LIMIT.request || lane.pending >= 9 || lane.bytes + raw.length + LIMIT.response > LIMIT.queued || lane.blocked) return {ok:false,reason:'LOCAL_RESOURCE_LIMIT'};
+    try { boundLocalInput(envelope); const captured = structuredClone(envelope); headers = {...headers}; raw=Buffer.from((await values()).stringify(captured)); } catch(e) { return {ok:false,reason:e.reason||e.message,dispatch_state:'NOT_SENT'}; }
+    if (verb !== 'POST' || raw.length > LIMIT.request || lane.pending >= 9 || lane.bytes + raw.length + LIMIT.response > LIMIT.queued || lane.blocked) return {ok:false,reason:'LOCAL_RESOURCE_LIMIT',dispatch_state:'NOT_SENT'};
     lane.pending++;lane.bytes+=raw.length+LIMIT.response;
     const queuedAt=Date.now();
+    // This local fact is set before calling HTTP; validator output cannot claim it.
+    let dispatchAttempted=false;
     const run=async()=>{
       if (lane.blocked || Date.now()-queuedAt>30000) throw error('VALIDATOR_LANE_UNAVAILABLE');
       const fixed=resource(appRoot);
@@ -173,6 +175,7 @@ function createTransport({ appRoot, record = () => {} }) {
       if (!Buffer.from((await values()).stringify(envelope)).equals(raw)) throw error('REQUEST_CHANGED_AFTER_PREFLIGHT');
       // Validate bytes/modules again after child reaping, before exposing any request.
       if(resource(appRoot).descriptorHash!==fixed.descriptorHash) throw error('VALIDATOR_RESOURCE_CHANGED');
+      dispatchAttempted=true;
       const reply=await post(url,raw,headers,record); const after=packet('RESPONSE');after.http_status=reply.status;after.response_raw_base64=reply.raw.toString('base64');
       const result=await child(fixed,after,record,lane);
       if(resource(appRoot).descriptorHash!==fixed.descriptorHash) throw error('VALIDATOR_RESOURCE_CHANGED');
@@ -181,7 +184,7 @@ function createTransport({ appRoot, record = () => {} }) {
       return {ok:true,http_status:reply.status,validated:true,body:(await values()).reify(result.value)};
     };
     const promise=lane.tail.then(run);lane.tail=promise.catch(()=>{});
-    try{return await promise;}catch(e){return {ok:false,reason:e.reason||'VALIDATOR_FAILURE'};}
+    try{return await promise;}catch(e){return {ok:false,reason:e.reason||'VALIDATOR_FAILURE',...(dispatchAttempted?{}:{dispatch_state:'NOT_SENT'})};}
     finally{lane.pending--;lane.bytes-=raw.length+LIMIT.response;}
   };
 }
