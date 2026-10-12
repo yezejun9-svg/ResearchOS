@@ -102,8 +102,42 @@ func processImageDigest(h windows.Handle) (string, error) {
 	if e := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); e != nil {
 		return "", e
 	}
-	_, digest, e := exactImage(windows.UTF16ToString(buf[:size]))
-	return digest, e
+	return observedProcessImageDigest(windows.UTF16ToString(buf[:size]))
+}
+
+// Identity observation includes the actual Electron parent (larger than the
+// release fixture limit). It grants no launch or release authority: exactImage
+// retains its separate 128 MiB gate. Read at most the observation bound plus a
+// single overflow byte even if the file grows after its initial stat.
+const observedProcessImageMaxBytes int64 = 256 * 1024 * 1024
+
+func observedProcessImageDigest(path string) (string, error) {
+	if !filepath.IsAbs(path) || !strings.EqualFold(filepath.Ext(path), ".exe") {
+		return "", errors.New("absolute observed executable required")
+	}
+	actual, err := filepath.EvalSymlinks(path)
+	if err != nil || !strings.EqualFold(filepath.Clean(path), filepath.Clean(actual)) {
+		return "", errors.New("observed executable reparse rejected")
+	}
+	f, err := os.Open(actual)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	before, err := f.Stat()
+	if err != nil || !before.Mode().IsRegular() || before.Size() > observedProcessImageMaxBytes {
+		return "", errors.New("bounded regular observed executable required")
+	}
+	hash := sha256.New()
+	n, err := io.Copy(hash, io.LimitReader(f, observedProcessImageMaxBytes+1))
+	if err != nil {
+		return "", err
+	}
+	after, err := f.Stat()
+	if err != nil || n > observedProcessImageMaxBytes || n != before.Size() || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+		return "", errors.New("observed executable changed or exceeded byte bound")
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func (d NativeFixtureDriver) Start(image, token, data string) (ProcessIdentity, error) {
