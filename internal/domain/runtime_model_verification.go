@@ -3,6 +3,7 @@ package domain
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -119,6 +120,20 @@ func (s *Service) muTurnSnapshot(tx *sql.Tx, project string, task, run, contract
 		return nil, err
 	}
 	snapshot := Object{"dispatch": dispatch, "profile": profile, "request": request, "prompt": prompt, "effects": history, "ledger": ledger}
+	// UNKNOWN has no reserve bound to verify. Carry the real current run scopes
+	// into both acceptance snapshots; policy changes invalidate their hash.
+	if profile["max_cost"] == nil {
+		policies, leaves, e := runBudgetScopes(tx, project, Str(run, "id"))
+		if e != nil {
+			return nil, e
+		}
+		sort.Slice(policies, func(i, j int) bool { return Str(policies[i], "id") < Str(policies[j], "id") })
+		values := Empty()
+		for _, policy := range policies {
+			values = append(values, policy)
+		}
+		snapshot["unknown_budget"] = Object{"goal": goal, "policies": values, "leaves": leaves}
+	}
 	stream, err := s.modelStreamAcceptanceSnapshot(tx, project, run)
 	if err != nil {
 		return nil, err
@@ -460,12 +475,18 @@ func verifyMuTurn(snapshot Object) (string, string) {
 				return fail("Unknown model money was settled or released.")
 			}
 		}
-		if reservation == nil || reservation["run_id"] != run["id"] || reservation["provider_request_id"] != key || reservation["operation"] != "RESERVE" || reservation["cost_basis"] != "UPPER_BOUND" {
-			return fail("Bounded durable effect reservation missing.")
-		}
-		cost := Object{"policy_id": reservation["policy_id"], "run_id": run["id"], "operation": "RESERVE", "money": reservation["money"], "provider_request_id": key, "provider_event_id": "prepare/" + key, "reservation_id": nil, "cost_basis": "UPPER_BOUND", "occurred_at": run["created_at"]}
-		if Hash(reservation["money"]) != Hash(routeBound) || e["request_hash"] != Hash([]any{request, cost}) {
-			return fail("Effect request or reserved bound differs from immutable admission.")
+		if routeBound == nil {
+			if reason := verifyMuUnknownBudget(mu, task, run, request, e, reservation); reason != "" {
+				return fail(reason)
+			}
+		} else {
+			if reservation == nil || reservation["run_id"] != run["id"] || reservation["provider_request_id"] != key || reservation["operation"] != "RESERVE" || reservation["cost_basis"] != "UPPER_BOUND" {
+				return fail("Bounded durable effect reservation missing.")
+			}
+			cost := Object{"policy_id": reservation["policy_id"], "run_id": run["id"], "operation": "RESERVE", "money": reservation["money"], "provider_request_id": key, "provider_event_id": "prepare/" + key, "reservation_id": nil, "cost_basis": "UPPER_BOUND", "occurred_at": run["created_at"]}
+			if Hash(reservation["money"]) != Hash(routeBound) || e["request_hash"] != Hash([]any{request, cost}) {
+				return fail("Effect request or reserved bound differs from immutable admission.")
+			}
 		}
 		switch capability {
 		case "MODEL":
