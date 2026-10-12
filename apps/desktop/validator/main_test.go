@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -16,6 +17,61 @@ func TestWireParserPreservesAdjacentIntegers(t *testing.T) {
 			t.Fatalf("numeric lexeme lost: %v", err)
 		}
 	}
+}
+
+func TestWireFirstUseHostStatusAcceptsCoreRevisionAndKeepsIdentity(t *testing.T) {
+	const request = `{"protocol_version":"researchos-client/2","command_id":"private-unit","client_id":"desktop-shell","method":"host.status","project_id":null,"session_id":null,"expected_revision":null,"writer_epoch":null,"payload":{}}`
+	raw, err := os.ReadFile("../../../tests/contracts/fixtures/client_protocol_v2_fixtures.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog struct {
+		Fixtures []struct {
+			Name  string         `json:"name"`
+			Value map[string]any `json:"value"`
+		} `json:"fixtures"`
+	}
+	if err := json.Unmarshal(raw, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	var template map[string]any
+	for _, row := range catalog.Fixtures {
+		if row.Name == "valid_response_host_status" {
+			template = row.Value
+			break
+		}
+	}
+	if template == nil {
+		t.Fatal("published host.status response fixture missing")
+	}
+	check := func(name, expected, reason string, mutate func(map[string]any)) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			var response map[string]any
+			if err := json.Unmarshal(mustWireJSON(template), &response); err != nil {
+				t.Fatal(err)
+			}
+			response["command_id"] = "private-unit"
+			response["session_id"] = nil
+			response["revision"] = float64(1) // Core's actual complete(1, result) projection.
+			response["result"].(map[string]any)["client_id"] = "desktop-shell"
+			mutate(response)
+			packet := map[string]any{"schema": protocol, "phase": "RESPONSE",
+				"nonce": "12345678-1234-1234-1234-123456789abc", "http_status": 200,
+				"request_raw_base64":  base64.StdEncoding.EncodeToString([]byte(request)),
+				"response_raw_base64": base64.StdEncoding.EncodeToString(mustWireJSON(response))}
+			got := validate(mustWireJSON(packet))
+			if got.Outcome != expected || got.Reason != reason {
+				t.Fatalf("host.status %s: %+v", name, got)
+			}
+		})
+	}
+	check("revision-one", "VALID", "", func(map[string]any) {})
+	check("revision-null-schema-valid", "VALID", "", func(r map[string]any) { r["revision"] = nil })
+	check("foreign-client", "REFUSED", "RESPONSE_IDENTITY", func(r map[string]any) { r["result"].(map[string]any)["client_id"] = "other-client" })
+	check("foreign-session", "REFUSED", "RESPONSE_IDENTITY", func(r map[string]any) { r["session_id"] = "other-session" })
+	check("foreign-command", "REFUSED", "RESPONSE_IDENTITY", func(r map[string]any) { r["command_id"] = "other-command" })
+	check("schema-invalid-revision", "REFUSED", "INVALID_RESPONSE_SCHEMA", func(r map[string]any) { r["revision"] = float64(0) })
 }
 
 func TestWirePrivatePacketExactKeysAndTypes(t *testing.T) {

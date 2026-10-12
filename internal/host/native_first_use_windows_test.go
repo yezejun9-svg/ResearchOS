@@ -124,6 +124,58 @@ func TestNativeWorkspaceChooseNeedsConfirmedHostSelection(t *testing.T) {
 	}
 }
 
+func TestNativeWorkspaceChooseRequiresExplicitNullablePath(t *testing.T) {
+	h := firstUseHost(t)
+	selected := filepath.Join(t.TempDir(), "actual-choice")
+	if err := os.Mkdir(selected, 0700); err != nil {
+		t.Fatal(err)
+	}
+	called := 0
+	chooser := func(initial string) (string, error) {
+		called++
+		if initial != "" {
+			t.Fatalf("null requested_path should produce empty chooser hint, got %q", initial)
+		}
+		return selected, nil
+	}
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+	}{
+		{"missing-required-path", map[string]any{"requested_access": AccessReadWrite}},
+		{"invalid-access", map[string]any{"requested_path": nil, "requested_access": "INVALID"}},
+		{"unknown-field", map[string]any{"requested_path": nil, "requested_access": AccessReadWrite, "extra": true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			frame := nativeFirstUseFrame(t, KindWorkspaceChooseRequest, tc.payload)
+			if _, err := h.HandleNative(frame, true, chooser); !errors.Is(err, ErrFrameShape) {
+				t.Fatalf("invalid request reached chooser: %v", err)
+			}
+			if called != 0 {
+				t.Fatalf("chooser invoked for invalid request: %d", called)
+			}
+		})
+	}
+	frame := nativeFirstUseFrame(t, KindWorkspaceChooseRequest,
+		map[string]any{"requested_path": nil, "requested_access": AccessReadWrite})
+	reply, err := h.HandleNative(frame, true, chooser)
+	if err != nil || called != 1 {
+		t.Fatalf("explicit null failed to invoke actual chooser once: called=%d err=%v", called, err)
+	}
+	var parsed struct {
+		Payload struct {
+			Ref string `json:"selection_ref"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(reply, &parsed); err != nil || parsed.Payload.Ref == "" {
+		t.Fatalf("chooser selection reply invalid: %v", err)
+	}
+	rec, err := h.ConsumeSelection(parsed.Payload.Ref, "local-cli")
+	if err != nil || rec.RealPath != selected || rec.Access != AccessReadWrite {
+		t.Fatalf("actual chosen path not bound: %+v %v", rec, err)
+	}
+}
+
 func TestNativeWindowsFolderChooserAPIsPresent(t *testing.T) {
 	for _, proc := range []*windows.LazyProc{shell32Browse, shell32Path, ole32Free, user32Send} {
 		if err := proc.Find(); err != nil {
