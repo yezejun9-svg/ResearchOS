@@ -77,6 +77,8 @@ def main():
         paths.update(p for p in base.rglob('*') if p.is_file())
     paths.add(pathlib.Path(__file__).resolve())
     paths.add(ROOT/'spec/v2.0/ui/design-tokens.json')
+    # main.js resolves the published route table at runtime in the bound tree.
+    paths.add(ROOT/'spec/v2.0/contracts/openapi.json')
     paths.add(ROOT/'tests/contracts/fixtures/client_protocol_v2_fixtures.json')
     paths.add(ROOT/'tests/ui/desktop/w13-react.test.js')
     paths.update(p for p in (ROOT/'apps/web').glob('*') if p.is_file())
@@ -112,6 +114,8 @@ def main():
     shutil.copy2(ROOT/'apps/desktop/package.json',app/'package.json')
     (output/'spec/v2.0/ui').mkdir(parents=True)
     shutil.copy2(ROOT/'spec/v2.0/ui/design-tokens.json',output/'spec/v2.0/ui/design-tokens.json')
+    (output/'spec/v2.0/contracts').mkdir(parents=True)
+    shutil.copy2(ROOT/'spec/v2.0/contracts/openapi.json',output/'spec/v2.0/contracts/openapi.json')
     web=output/'apps/web';shutil.copytree(ROOT/'apps/web/src',web/'src')
     for name in ['index.html','package.json','package-lock.json']:
         if (ROOT/'apps/web'/name).is_file():shutil.copy2(ROOT/'apps/web'/name,web/name)
@@ -130,6 +134,7 @@ def main():
     for key,name in [('compile_invocation_ref','go-build.invocation.json'),('full_input_manifest_ref','inputs.before.json'),('compiler_generated_importcfg_archives_ref','compiler-work-archive.json')]:
         p=receipts/name;descriptor[key]={'path':str(p),'sha256':digest(p),'bytes':p.stat().st_size}
     descriptor['legacy_HTML_sha256']=digest(app/'main/workbench.html')
+    descriptor['public_openapi_sha256']=digest(output/'spec/v2.0/contracts/openapi.json')
     put(resource/'descriptor.json',descriptor)
     after=[{**row,'current_sha256':digest(pathlib.Path(row['path']))} for row in inputs]
     drift=[x for x in after if x['sha256']!=x['current_sha256']]
