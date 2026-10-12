@@ -6,6 +6,9 @@ import { SessionContinuation } from './session-continuation.jsx'
 const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
 const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
 const settled = value => value?.completed === true && (value?.protocol_status || value?.kind) === 'COMPLETED'
+// The shell owns the command lifetime. Retain only its public configuration
+// payload across route unmounts so the renderer can request the same replay.
+const modelConfigurationPending = new Map()
 function unwrap(reply) {
   if (!reply?.ok || !settled(reply)) {
     const code = reply?.error_code || reply?.reason || reply?.protocol_status || '主机尚未完成请求'
@@ -22,13 +25,14 @@ function Failure({ error, retry }) { return error && <div className="state-notic
 
 export function NativeModelConfiguration({ projectId, initialHost, onConfigured }) {
   const [host, setHost] = useState(initialHost || null)
-  const [form, setForm] = useState({ provider_id: '', base_url: '', model_id: '', credential_ref: '' })
+  const [form, setForm] = useState(() => modelConfigurationPending.get(projectId)?.form || { provider_id: '', base_url: '', model_id: '', credential_ref: '' })
   const [busy, setBusy] = useState(false), [error, setError] = useState(null), [notice, setNotice] = useState('')
-  const pendingPayload = useRef(null)
+  const pendingPayload = useRef(modelConfigurationPending.get(projectId)?.payload || null)
   const live = useRef(true)
   useEffect(() => { live.current = true; return () => { live.current = false } }, [])
   useEffect(() => { if (initialHost) setHost(initialHost) }, [initialHost])
   async function readHost() {
+    if (!live.current) throw new Error('页面已切换')
     const selected = await window.researchos.desktop.selectProject(projectId)
     if (!selected?.ok) throw new Error(selected?.reason || '项目选择失败')
     if (!live.current) throw new Error('页面已切换')
@@ -44,26 +48,35 @@ export function NativeModelConfiguration({ projectId, initialHost, onConfigured 
     setBusy(true); setError(null); setNotice('')
     let saved = null
     try {
-      const payload = pendingPayload.current
-      const current = payload ? null : await readHost()
-      const request = payload || {
+      const remembered = modelConfigurationPending.get(projectId)
+      if (!remembered && (!form.provider_id.trim() || !form.model_id.trim() || !form.base_url.trim())) {
+        throw new Error('提供方 ID、模型 ID 和 API 基础地址不能为空')
+      }
+      const current = remembered ? null : await readHost()
+      const request = remembered?.payload || {
         config_revision: current.config_revision + 1,
         provider_id: form.provider_id.trim(), base_url: form.base_url.trim(), model_id: form.model_id.trim(),
         credential_ref: form.credential_ref.trim() || null,
       }
       if (!live.current) return
       pendingPayload.current = request
+      if (!remembered) modelConfigurationPending.set(projectId, { payload: request, form: { ...form } })
       const reply = await window.researchos.v2['host.configure'](request)
       if (reply?.ok && !settled(reply)) {
         setNotice('主机已接收配置命令，尚未确认保存。请用同一请求继续查询结果。')
         return
       }
-      // An uncertain transport result can still be an acknowledged command. Keep
-      // its exact bytes for the shell's same-command replay; only rejection ends it.
-      if (reply?.protocol_status === 'REJECTED') pendingPayload.current = null
+      // Only the trusted shell can prove a request never reached HTTP. An
+      // acknowledged or uncertain request keeps its original replay payload.
+      if (reply?.protocol_status === 'REJECTED' || reply?.reason === 'STALE_RESPONSE' || reply?.dispatch_state === 'NOT_SENT' || (reply?.reason === 'COMMAND_PENDING' && !remembered)) {
+        pendingPayload.current = null
+        if (modelConfigurationPending.get(projectId)?.payload === request) modelConfigurationPending.delete(projectId)
+      }
       saved = unwrap(reply)
       pendingPayload.current = null
+      if (modelConfigurationPending.get(projectId)?.payload === request) modelConfigurationPending.delete(projectId)
       if (saved?.config_revision !== request.config_revision || !saved?.model_config_ref) throw new Error('主机配置回执缺少修订或模型引用')
+      if (!live.current) return
       const refreshed = await readHost()
       if (!refreshed.model_configurations?.some(item => item.model_config_ref === saved.model_config_ref)) throw new Error('配置已返回成功，但主机状态尚未列出该模型，请刷新核对')
       onConfigured?.(refreshed, saved)
