@@ -106,11 +106,11 @@ func TestManagedLocalQualificationRequestConsumptionAndDrift(t *testing.T) {
 	if localSetupCensus(t, f) != before {
 		t.Fatal("read-only preflight mutated activity")
 	}
-	run, lease, e := f.s.beginManagedLocalQualification(ctx, f.token, request, executor)
+	run, lease, e := c.beginManagedLocalQualification(ctx, f.token, request, executor)
 	if e != nil {
 		t.Fatal(e)
 	}
-	if _, _, e = f.s.beginManagedLocalQualification(ctx, f.token, request, executor); e == nil {
+	if _, _, e = c.beginManagedLocalQualification(ctx, f.token, request, executor); e == nil {
 		t.Fatal("consumed managed request repeated")
 	}
 	var body string

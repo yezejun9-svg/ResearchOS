@@ -7,21 +7,29 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"errors"
+	"time"
 )
 
 // LocalRuntimeQualificationRequest is a trusted managed-host request, never a
 // new public client method. Every field is frozen before any model dispatch.
 type LocalRuntimeQualificationRequest struct {
-	RequestID        string `json:"request_id"`
-	ProjectID        string `json:"project_id"`
-	SessionID        string `json:"session_id"`
-	ModelRef         string `json:"model_config_ref"`
-	RuntimeID        string `json:"runtime_id"`
-	TaskID           string `json:"task_id"`
-	PlanHash         string `json:"plan_hash"`
-	ProfileHash      string `json:"profile_hash"`
-	AuthorizePurpose string `json:"authorize_purpose"`
-	PurposeSeconds   int    `json:"purpose_seconds"`
+	RequestID         string `json:"request_id"`
+	ProjectID         string `json:"project_id"`
+	SessionID         string `json:"session_id"`
+	ModelRef          string `json:"model_config_ref"`
+	RuntimeID         string `json:"runtime_id"`
+	TaskID            string `json:"task_id"`
+	PlanHash          string `json:"plan_hash"`
+	ProfileHash       string `json:"profile_hash"`
+	AuthorizePurpose  string `json:"authorize_purpose"`
+	PurposeSeconds    int    `json:"purpose_seconds"`
+	OwnerHost         string `json:"owner_host"`
+	OwnerPrincipal    string `json:"owner_principal"`
+	OwnerRoot         string `json:"owner_root"`
+	SessionHash       string `json:"session_hash"`
+	ConfigurationHash string `json:"configuration_hash"`
+	IssuedAt          string `json:"issued_at"`
+	ExpiresAt         string `json:"expires_at"`
 }
 
 func (c *RuntimeCoordinator) localQualification(tx *sql.Tx, p Principal, request LocalRuntimeQualificationRequest) (Object, Object, error) {
@@ -37,7 +45,7 @@ func (c *RuntimeCoordinator) localQualification(tx *sql.Tx, p Principal, request
 		return nil, nil, Fail(412, "STALE_INPUT", "configured runtime differs from managed qualification request")
 	}
 	plan, digest, root, e := qualificationPlan(tx, request.ProjectID, request.TaskID, request.RuntimeID)
-	ownerRoot, rootErr := authorityRoot(tx, p.ID)
+	ownerRoot, rootErr := currentAuthorityRoot(tx, p.ID)
 	if e != nil || rootErr != nil || root != ownerRoot || digest != request.PlanHash || Hash(plan["profile_ref"]) != request.ProfileHash {
 		return nil, nil, Fail(412, "STALE_INPUT", "managed qualification plan, profile or Owner changed")
 	}
@@ -68,6 +76,9 @@ func (c *RuntimeCoordinator) ValidateLocalQualification(ctx context.Context, own
 		return e
 	}
 	_, task, e := c.localQualification(tx, p, request)
+	if e == nil {
+		e = c.validateLocalConfirmation(ctx, tx, p, request)
+	}
 	if e == nil && task["status"] != "DRAFT" {
 		return Fail(409, "STATE_CONFLICT", "qualification request was already consumed; no automatic retry")
 	}
@@ -85,7 +96,7 @@ func (c *RuntimeCoordinator) ExecuteLocalQualification(ctx context.Context, owne
 			c.scanMu.Unlock()
 		}
 	}()
-	if c.quiesced || c.intakeClosed.Load() {
+	if c.quiesced || !c.qualificationActive || c.qualificationRequest != request.RequestID {
 		return nil, Fail(409, "RESOURCE_BLOCKED", "runtime intake is fenced")
 	}
 	if !c.startupComplete {
@@ -142,7 +153,7 @@ func (c *RuntimeCoordinator) ExecuteLocalQualification(ctx context.Context, owne
 	if e = c.authority(ctx, route); e != nil {
 		return nil, e
 	}
-	run, lease, e := c.service.beginManagedLocalQualification(ctx, ownerToken, request, route.ExecutorID)
+	run, lease, e := c.beginManagedLocalQualification(ctx, ownerToken, request, route.ExecutorID)
 	if e != nil {
 		return nil, e
 	}
@@ -157,7 +168,8 @@ func (c *RuntimeCoordinator) ExecuteLocalQualification(ctx context.Context, owne
 	return run, c.RunAdmitted(ctx, route, run, lease)
 }
 
-func (s *Service) beginManagedLocalQualification(ctx context.Context, token string, request LocalRuntimeQualificationRequest, executor string) (Object, string, error) {
+func (c *RuntimeCoordinator) beginManagedLocalQualification(ctx context.Context, token string, request LocalRuntimeQualificationRequest, executor string) (Object, string, error) {
+	s := c.service
 	if e := s.Contracts.Validate("Id", request.RequestID); e != nil {
 		return nil, "", e
 	}
@@ -168,6 +180,15 @@ func (s *Service) beginManagedLocalQualification(ctx context.Context, token stri
 	defer tx.Rollback()
 	p, e := resourcePrincipal(tx, token, request.ProjectID, "OWNER")
 	if e != nil {
+		return nil, "", e
+	}
+	if _, _, e = c.localQualification(tx, p, request); e != nil {
+		return nil, "", e
+	}
+	if e = c.validateLocalConfirmation(ctx, tx, p, request); e != nil {
+		return nil, "", e
+	}
+	if e = localQualificationIdle(tx); e != nil {
 		return nil, "", e
 	}
 	var prior string
@@ -185,6 +206,11 @@ func (s *Service) beginManagedLocalQualification(ctx context.Context, token stri
 	if e != nil {
 		return nil, "", e
 	}
+	// Recheck the wall-clock deadline after all claim gates; an expired claim is
+	// rolled back together with consumption, even if earlier checks were slow.
+	if e = validateLocalConfirmationTime(request); e != nil {
+		return nil, "", e
+	}
 	_, e = tx.Exec(`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,'host:managed-runtime-qualification',?,?,201,?,'{}',?)`, p.ID, request.ProjectID, request.RequestID, Hash(request), Bytes(Object{"request_hash": Hash(request), "run_ref": Ref(run, "Run"), "task_id": request.TaskID, "runtime_id": request.RuntimeID}), Now())
 	if e != nil {
 		return nil, "", e
@@ -193,7 +219,8 @@ func (s *Service) beginManagedLocalQualification(ctx context.Context, token stri
 }
 
 // PreparedLocalQualification is for the privileged managed producer. It emits
-// the current immutable identifiers without starting work or granting authority.
+// the current immutable identifiers and a short-lived private confirmation
+// record without starting work or granting authority.
 func (c *RuntimeCoordinator) PreparedLocalQualification(ctx context.Context, ownerToken string, candidate RuntimeSetupCandidate, seconds int) (LocalRuntimeQualificationRequest, error) {
 	var request LocalRuntimeQualificationRequest
 	tx, e := c.service.DB.BeginTx(ctx, nil)
@@ -205,7 +232,8 @@ func (c *RuntimeCoordinator) PreparedLocalQualification(ctx context.Context, own
 	if e != nil {
 		return request, e
 	}
-	if _, e = c.service.runtimeSetupConfiguration(ctx, tx, p, candidate, c.config.ClientSchema, c.config.ConfigurationAuthority); e != nil {
+	record, e := c.service.runtimeSetupConfiguration(ctx, tx, p, candidate, c.config.ClientSchema, c.config.ConfigurationAuthority)
+	if e != nil {
 		return request, e
 	}
 	runtime, _, e := c.sessionModel(tx, candidate.ProjectID, candidate.ModelRef)
@@ -221,8 +249,29 @@ func (c *RuntimeCoordinator) PreparedLocalQualification(ctx context.Context, own
 		return request, e
 	}
 	request = LocalRuntimeQualificationRequest{RequestID: ID(), ProjectID: candidate.ProjectID, SessionID: candidate.SessionID, ModelRef: candidate.ModelRef, RuntimeID: Str(runtime, "id"), TaskID: taskID, PlanHash: hash, ProfileHash: Hash(plan["profile_ref"]), AuthorizePurpose: "mu_turn", PurposeSeconds: seconds}
-	_, _, e = c.localQualification(tx, p, request)
-	return request, e
+	request.OwnerHost, request.OwnerPrincipal, request.ConfigurationHash = record.Owner, p.ID, record.ConfigHash
+	request.OwnerRoot, e = currentAuthorityRoot(tx, p.ID)
+	if e != nil {
+		return request, e
+	}
+	request.SessionHash, e = localConfirmationSessionHash(ctx, tx, request)
+	if e != nil {
+		return request, e
+	}
+	issued := time.Now().UTC()
+	request.IssuedAt, request.ExpiresAt = issued.Format(time.RFC3339Nano), issued.Add(time.Minute).Format(time.RFC3339Nano)
+	_, task, e := c.localQualification(tx, p, request)
+	if e != nil {
+		return request, e
+	}
+	if task["status"] != "DRAFT" {
+		return request, Fail(409, "STATE_CONFLICT", "qualification already consumed; no automatic retry")
+	}
+	_, e = tx.Exec(`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,'host:qualification-confirmation',?,?,200,?,'{}',?)`, p.ID, request.ProjectID, request.RequestID, Hash(request), Bytes(request), Now())
+	if e != nil {
+		return request, e
+	}
+	return request, tx.Commit()
 }
 
 // RecordLocalRuntimeAdministration seals provenance of a trusted local action;
