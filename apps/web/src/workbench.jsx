@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { integer, previous, display } from '../../desktop/main/lib/wire-values.mjs'
 import { ArtifactPreview } from './preview.jsx'
 import { SessionContinuation } from './session-continuation.jsx'
@@ -6,9 +6,22 @@ import { SessionContinuation } from './session-continuation.jsx'
 const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
 const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
 const settled = value => value?.completed === true && (value?.protocol_status || value?.kind) === 'COMPLETED'
-// The shell owns the command lifetime. Retain only its public configuration
-// payload across route unmounts so the renderer can request the same replay.
+// The shell owns the command lifetime. This observable renderer snapshot holds
+// only the public payload and terminal result across route unmounts.
 const modelConfigurationPending = new Map()
+const modelConfigurationListeners = new Map()
+const modelPending = projectId => modelConfigurationPending.get(projectId) || null
+function updateModelPending(projectId, value) {
+  if (value) modelConfigurationPending.set(projectId, value)
+  else modelConfigurationPending.delete(projectId)
+  for (const listener of modelConfigurationListeners.get(projectId) || []) listener()
+}
+function subscribeModelPending(projectId, listener) {
+  let listeners = modelConfigurationListeners.get(projectId)
+  if (!listeners) { listeners = new Set(); modelConfigurationListeners.set(projectId, listeners) }
+  listeners.add(listener)
+  return () => { listeners.delete(listener); if (!listeners.size) modelConfigurationListeners.delete(projectId) }
+}
 function unwrap(reply) {
   if (!reply?.ok || !settled(reply)) {
     const code = reply?.error_code || reply?.reason || reply?.protocol_status || '主机尚未完成请求'
@@ -24,10 +37,10 @@ function Panel({ title, children, aside }) { return <section className="panel"><
 function Failure({ error, retry }) { return error && <div className="state-notice" role="alert"><p>{error.message}。输入仍保留，请核对当前状态。</p>{retry && <button onClick={retry}>重新读取</button>}</div> }
 
 export function NativeModelConfiguration({ projectId, initialHost, onConfigured }) {
+  const pending = useSyncExternalStore(listener => subscribeModelPending(projectId, listener), () => modelPending(projectId), () => null)
   const [host, setHost] = useState(initialHost || null)
-  const [form, setForm] = useState(() => modelConfigurationPending.get(projectId)?.form || { provider_id: '', base_url: '', model_id: '', credential_ref: '' })
+  const [form, setForm] = useState(() => modelPending(projectId)?.form || { provider_id: '', base_url: '', model_id: '', credential_ref: '' })
   const [busy, setBusy] = useState(false), [error, setError] = useState(null), [notice, setNotice] = useState('')
-  const pendingPayload = useRef(modelConfigurationPending.get(projectId)?.payload || null)
   const live = useRef(true)
   useEffect(() => { live.current = true; return () => { live.current = false } }, [])
   useEffect(() => { if (initialHost) setHost(initialHost) }, [initialHost])
@@ -43,12 +56,53 @@ export function NativeModelConfiguration({ projectId, initialHost, onConfigured 
     return value
   }
   useEffect(() => { readHost().catch(setError) }, [projectId])
+  async function reconcile(entry) {
+    if (!entry?.outcome) return
+    if (entry.reconciling) return entry.reconciling
+    entry.reconciling = (async () => {
+      if (!live.current || modelPending(projectId) !== entry) return
+      const reply = entry.outcome
+      if (reply?.ok && settled(reply)) {
+        const saved = unwrap(reply)
+        if (saved?.config_revision !== entry.payload.config_revision || !saved?.model_config_ref) throw new Error('主机配置回执缺少修订或模型引用')
+        const refreshed = await readHost()
+        if (!refreshed.model_configurations?.some(item => item.model_config_ref === saved.model_config_ref)) throw new Error('配置已返回成功，但主机状态尚未列出该模型，请刷新核对')
+        if (!live.current || modelPending(projectId) !== entry) return
+        updateModelPending(projectId, null)
+        onConfigured?.(refreshed, saved)
+        setNotice(`配置已保存（修订 ${saved.config_revision}）。运行时资格尚未确认，创建会话或发送消息仍以服务端检查为准。`)
+      } else {
+        const reason = reply?.reason || reply?.error_code
+        if (reason === 'STALE_RESPONSE') {
+          // The shell completed the original command but discarded the old
+          // component's presentation ticket. Only an exact host record proves
+          // that this configuration was saved; ambiguity remains locked.
+          const refreshed = await readHost()
+          const saved = refreshed.model_configurations?.find(item => item.config_revision === entry.payload.config_revision &&
+            item.provider_id === entry.payload.provider_id && item.base_url === entry.payload.base_url &&
+            item.model_id === entry.payload.model_id && item.credential_ref === entry.payload.credential_ref && item.model_config_ref)
+          if (!saved) throw new Error('原配置命令已结束，但主机状态未能证明保存结果；请核对主机状态')
+          if (!live.current || modelPending(projectId) !== entry) return
+          updateModelPending(projectId, null)
+          onConfigured?.(refreshed, saved)
+          setNotice(`配置已保存（修订 ${saved.config_revision}）。运行时资格尚未确认，创建会话或发送消息仍以服务端检查为准。`)
+          return
+        }
+        if (!live.current || modelPending(projectId) !== entry) return
+        updateModelPending(projectId, null)
+        setError((() => { try { unwrap(reply) } catch (cause) { return cause } })() || new Error(reason || '主机拒绝配置'))
+      }
+    })()
+    try { await entry.reconciling }
+    finally { entry.reconciling = null }
+  }
+  useEffect(() => { if (pending?.outcome) reconcile(pending).catch(setError) }, [pending, projectId])
   async function submit(event) {
     event.preventDefault(); if (busy) return
     setBusy(true); setError(null); setNotice('')
-    let saved = null
     try {
-      const remembered = modelConfigurationPending.get(projectId)
+      const remembered = modelPending(projectId)
+      if (remembered?.outcome) { await reconcile(remembered); return }
       if (!remembered && (!form.provider_id.trim() || !form.model_id.trim() || !form.base_url.trim())) {
         throw new Error('提供方 ID、模型 ID 和 API 基础地址不能为空')
       }
@@ -59,44 +113,35 @@ export function NativeModelConfiguration({ projectId, initialHost, onConfigured 
         credential_ref: form.credential_ref.trim() || null,
       }
       if (!live.current) return
-      pendingPayload.current = request
-      if (!remembered) modelConfigurationPending.set(projectId, { payload: request, form: { ...form } })
+      if (!remembered) updateModelPending(projectId, { payload: request, form: { ...form }, outcome: null })
       const reply = await window.researchos.v2['host.configure'](request)
+      const entry = modelPending(projectId)
+      if (entry?.payload !== request) return
       if (reply?.ok && !settled(reply)) {
-        setNotice('主机已接收配置命令，尚未确认保存。请用同一请求继续查询结果。')
+        if (live.current) setNotice('主机已接收配置命令，尚未确认保存。请用同一请求继续查询结果。')
         return
       }
-      // Only the trusted shell can prove a request never reached HTTP. An
-      // acknowledged or uncertain request keeps its original replay payload.
-      if (reply?.protocol_status === 'REJECTED' || reply?.reason === 'STALE_RESPONSE' || reply?.dispatch_state === 'NOT_SENT' || (reply?.reason === 'COMMAND_PENDING' && !remembered)) {
-        pendingPayload.current = null
-        if (modelConfigurationPending.get(projectId)?.payload === request) modelConfigurationPending.delete(projectId)
-      }
-      saved = unwrap(reply)
-      pendingPayload.current = null
-      if (modelConfigurationPending.get(projectId)?.payload === request) modelConfigurationPending.delete(projectId)
-      if (saved?.config_revision !== request.config_revision || !saved?.model_config_ref) throw new Error('主机配置回执缺少修订或模型引用')
-      if (!live.current) return
-      const refreshed = await readHost()
-      if (!refreshed.model_configurations?.some(item => item.model_config_ref === saved.model_config_ref)) throw new Error('配置已返回成功，但主机状态尚未列出该模型，请刷新核对')
-      onConfigured?.(refreshed, saved)
-      setNotice(`配置已保存（修订 ${saved.config_revision}）。运行时资格尚未确认，创建会话或发送消息仍以服务端检查为准。`)
+      // Only a trusted shell terminal response or pre-HTTP fact ends this
+      // intent. Every other failure remains an uncertain replay.
+      if (settled(reply) || reply?.protocol_status === 'REJECTED' || reply?.reason === 'STALE_RESPONSE' || reply?.dispatch_state === 'NOT_SENT' || (!remembered && reply?.reason === 'COMMAND_PENDING')) {
+        const terminal = { ...entry, outcome: reply }
+        updateModelPending(projectId, terminal)
+        if (live.current) await reconcile(terminal)
+      } else if (live.current) unwrap(reply)
     } catch (cause) {
-      setError(cause)
-      if (saved) setNotice('主机已返回配置成功；状态刷新尚未确认，请重新读取。')
-      else if (cause?.code === 'VERSION_CONFLICT') readHost().catch(() => {})
-    } finally { setBusy(false) }
+      if (live.current) { setError(cause); if (modelPending(projectId)?.outcome?.ok) setNotice('主机已返回配置成功；状态刷新尚未确认，请重新读取。') }
+    } finally { if (live.current) setBusy(false) }
   }
   return <Panel title="模型配置" aside={<button type="button" disabled={busy} onClick={() => readHost().then(() => setError(null)).catch(setError)}>刷新主机状态</button>}>
     <p>配置保存到本地主机。空凭据引用适用于无凭据的本地模型；远程服务须使用主机已有的受保护凭据引用。</p>
     {host && <p className="small-muted">当前配置修订 {host.config_revision} · 已保存 {host.model_configurations?.length || 0} 条配置</p>}
     <Failure error={error}/>
     <form className="form-grid" onSubmit={submit}>
-      <label>提供方 ID<input value={form.provider_id} disabled={busy || !!pendingPayload.current} onChange={event => setForm({ ...form, provider_id: event.target.value })} placeholder="例如 ollama" required/></label>
-      <label>模型 ID<input value={form.model_id} disabled={busy || !!pendingPayload.current} onChange={event => setForm({ ...form, model_id: event.target.value })} placeholder="例如 qwen3:4b-instruct" required/></label>
-      <label className="full-row">API 基础地址<input type="url" value={form.base_url} disabled={busy || !!pendingPayload.current} onChange={event => setForm({ ...form, base_url: event.target.value })} placeholder="http://127.0.0.1:11434/v1" required/></label>
-      <label className="full-row">受保护凭据引用（本地模型留空）<input value={form.credential_ref} disabled={busy || !!pendingPayload.current} onChange={event => setForm({ ...form, credential_ref: event.target.value })} autoComplete="off" placeholder="留空时提交 null"/></label>
-      <button className="primary" type="submit" disabled={busy}>{busy ? '正在核对主机修订…' : pendingPayload.current ? '继续同一配置命令' : '保存模型配置'}</button>
+      <label>提供方 ID<input value={form.provider_id} disabled={busy || !!pending} onChange={event => setForm({ ...form, provider_id: event.target.value })} placeholder="例如 ollama" required/></label>
+      <label>模型 ID<input value={form.model_id} disabled={busy || !!pending} onChange={event => setForm({ ...form, model_id: event.target.value })} placeholder="例如 qwen3:4b-instruct" required/></label>
+      <label className="full-row">API 基础地址<input type="url" value={form.base_url} disabled={busy || !!pending} onChange={event => setForm({ ...form, base_url: event.target.value })} placeholder="http://127.0.0.1:11434/v1" required/></label>
+      <label className="full-row">受保护凭据引用（本地模型留空）<input value={form.credential_ref} disabled={busy || !!pending} onChange={event => setForm({ ...form, credential_ref: event.target.value })} autoComplete="off" placeholder="留空时提交 null"/></label>
+      <button className="primary" type="submit" disabled={busy}>{busy ? '正在核对主机修订…' : pending?.outcome ? '核对原配置结果' : pending ? '继续同一配置命令' : '保存模型配置'}</button>
     </form>
     {notice && <p role="status">{notice}</p>}
     {!!host?.model_configurations?.length && <div className="record-list">{host.model_configurations.map(item => <div className="record-row" key={item.model_config_ref}><strong>{item.provider_id} · {item.model_id}</strong><small>配置修订 {item.config_revision} · {item.verified_at ? '提供方已探测' : '提供方未探测'} · 运行时资格未由此确认</small></div>)}</div>}
