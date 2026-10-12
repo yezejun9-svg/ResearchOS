@@ -50,11 +50,20 @@ func (c *RuntimeCoordinator) localQualification(tx *sql.Tx, p Principal, request
 		return nil, nil, Fail(412, "STALE_INPUT", "managed qualification plan, profile or Owner changed")
 	}
 	config, _ := profile["model_config"].(map[string]any)
-	if profile["backend"] != runtimeMuBackend || config["ref"] != request.ModelRef || len(Arr(config, "tools")) != 0 {
-		return nil, nil, Fail(422, "GATE_FAILED", "bounded tool-free local Mu profile required")
+	if config["ref"] != request.ModelRef {
+		return nil, nil, Fail(422, "GATE_FAILED", "exact configured local Mu profile required")
 	}
-	if calls, e := Num(config, "max_calls"); e != nil || calls != 1 {
-		return nil, nil, Fail(422, "GATE_FAILED", "exactly one model call must be frozen")
+	if e = validateLocalQualificationProfile(profile); e != nil {
+		return nil, nil, e
+	}
+	if profile["coding_authorization"] != nil {
+		var workspace string
+		if e = tx.QueryRow(`SELECT workspace_ref FROM client_sessions WHERE id=? AND project_id=?`, request.SessionID, request.ProjectID).Scan(&workspace); e != nil {
+			return nil, nil, e
+		}
+		if e = c.validateCodingWorkspace(context.Background(), tx, p.ID, request.ProjectID, request.SessionID, workspace, profile); e != nil {
+			return nil, nil, e
+		}
 	}
 	task, e := load(tx, request.ProjectID, "Task", request.TaskID)
 	if e != nil || qualificationTaskHash(task) != plan["task_hash"] {

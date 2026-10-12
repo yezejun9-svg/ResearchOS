@@ -167,6 +167,12 @@ func runSandbox(ctx context.Context, c Command, options StartOptions, process *P
 			return r, e
 		}
 	}
+	// Windows redirects GetTempPath in an AppContainer beneath LOCALAPPDATA.
+	// Create that exact per-profile directory after installing the output ACL;
+	// descendants inherit only the current sandbox SID and low-integrity policy.
+	if e = os.MkdirAll(filepath.Join(c.OutputDirectory, "Packages", strings.ToLower(name), "AC", "Temp"), 0700); e != nil {
+		return r, e
+	}
 	setupCtx, cancelSetup := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancelSetup()
 	if e = copyTree(setupCtx, originalInput, c.InputDirectory); e != nil {

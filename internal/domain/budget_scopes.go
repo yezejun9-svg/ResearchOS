@@ -2,6 +2,64 @@ package domain
 
 import "database/sql"
 
+// Called only by the server's report/cancellation transaction after terminal
+// native evidence is accepted. Local launch has its own explicit zero charge;
+// no provider effect or MODEL UNKNOWN entry is reconciled here.
+func (s *Service) releaseCompletedRuntimeLocalLaunch(tx *sql.Tx, project string, run Object) error {
+	if !runTerminal(run) || run["children_stopped"] != true || run["queue_empty"] != true || Str(run, "ended_at") == "" {
+		return nil
+	}
+	request := "runtime-local-launch/" + Str(run, "id") + "/" + string(Bytes(run["lease_epoch"]))
+	var raw string
+	e := tx.QueryRow(`SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.provider_request_id')=? ORDER BY rowid DESC LIMIT 1`, project, run["id"], request).Scan(&raw)
+	if e == sql.ErrNoRows {
+		return nil
+	}
+	if e != nil {
+		return e
+	}
+	hold, e := Decode([]byte(raw))
+	if e != nil {
+		return e
+	}
+	money, _ := hold["money"].(map[string]any)
+	amount, moneyErr := moneyAmount(money)
+	if hold["operation"] != "RESERVE" || hold["project_id"] != project || hold["run_id"] != run["id"] || hold["provider_request_id"] != request || hold["provider_event_id"] != request || hold["reservation_id"] != nil || hold["cost_basis"] != "UPPER_BOUND" || hold["receipt_hash"] != Receipt(hold) || moneyErr != nil || amount.Sign() != 0 {
+		return nil
+	}
+	observation, e := runtimeObservation(tx, project, run)
+	if e != nil {
+		return nil
+	}
+	dispatch, e := nativeDispatchProof(tx, project, run, observation)
+	if e != nil || observation["children_stopped"] != true || observation["queue_empty"] != true || Str(observation, "ended") == "" {
+		return nil
+	}
+	if observation["state"] != "SETTLED" && observation["state"] != "FAILED" && observation["state"] != "CANCELLED" {
+		return nil
+	}
+	manifest, _ := dispatch["manifest"].(map[string]any)
+	identity, _ := dispatch["identity"].(map[string]any)
+	admission, _ := manifest["admission"].(map[string]any)
+	profile, _ := admission["profile"].(map[string]any)
+	if len(identity) == 0 || Str(dispatch, "worker") == "" || dispatch["journal_locator"] != dispatch["dispatch_key"] || manifest["task_id"] != run["task_id"] || manifest["run_id"] != run["id"] || Hash(manifest["epoch"]) != Hash(run["lease_epoch"]) || validateRuntimeDispatchProfile(profile) != nil {
+		return nil
+	}
+	task, e := load(tx, project, "Task", Str(run, "task_id"))
+	if e != nil {
+		return e
+	}
+	goal, e := load(tx, project, "Goal", Str(task, "goal_id"))
+	if e != nil {
+		return e
+	}
+	if hold["policy_id"] != goal["budget_policy_id"] {
+		return nil
+	}
+	_, e = s.appendBudget(tx, project, Object{"policy_id": hold["policy_id"], "run_id": run["id"], "operation": "RELEASE", "money": money, "provider_request_id": request, "provider_event_id": request + "/released", "reservation_id": hold["id"], "cost_basis": "ACTUAL", "occurred_at": Now()})
+	return e
+}
+
 // Every call is constrained by its Goal and every preregistered Experiment.
 // The W10 binding is optional only while that migration is absent; query errors
 // after integration fail closed. A ledger caller cannot choose its own scope.

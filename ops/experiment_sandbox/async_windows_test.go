@@ -91,6 +91,36 @@ func TestRuntimeSandboxChild(t *testing.T) {
 		return
 	}
 	mode := os.Args[idx+1]
+	if mode == "empty" || mode == "stdout-only" || mode == "stderr-only" {
+		if mode == "stdout-only" {
+			fmt.Print("captured stdout")
+		}
+		if mode == "stderr-only" {
+			fmt.Fprint(os.Stderr, "captured stderr")
+		}
+		os.Exit(0)
+	}
+	if mode == "default-temp" {
+		f, err := os.CreateTemp("", "args")
+		if err != nil {
+			fmt.Fprint(os.Stderr, err)
+			os.Exit(61)
+		}
+		name := f.Name()
+		if _, err = f.WriteString("actual temp bytes"); err != nil {
+			os.Exit(62)
+		}
+		f.Close()
+		raw, err := os.ReadFile(name)
+		if err != nil || string(raw) != "actual temp bytes" {
+			os.Exit(63)
+		}
+		if err = os.Remove(name); err != nil {
+			os.Exit(64)
+		}
+		fmt.Print(name)
+		os.Exit(0)
+	}
 	if mode == "overflow" {
 		fmt.Print(strings.Repeat("x", MaxStreamBytes+1))
 		os.Exit(0)
@@ -294,4 +324,33 @@ func TestRuntimeSandboxQueuedWriteDeadline(t *testing.T) {
 		t.Fatalf("cancel cleanup: %+v %v", r, err)
 	}
 	t.Logf("RUNTIME_QUEUED_WRITE deadline_ms=40 elapsed_ms=%d stopped=%v", elapsed.Milliseconds(), r.Stopped)
+}
+
+func TestRuntimeSandboxDefaultTempAndEmptyStreams(t *testing.T) {
+	for _, mode := range []string{"default-temp", "empty", "stdout-only", "stderr-only"} {
+		t.Run(mode, func(t *testing.T) {
+			receipt, err := Run(context.Background(), runtimeSandboxCommand(t, mode))
+			if err != nil || receipt.ExitCode != 0 || !receipt.Stopped || !receipt.StreamsDrained || !receipt.CleanupComplete {
+				t.Fatalf("native %s: %+v %v", mode, receipt, err)
+			}
+			if receipt.Stdout == nil || receipt.Stderr == nil {
+				t.Fatal("captured EOF serialized as null")
+			}
+			var decoded Receipt
+			encoded, err := json.Marshal(receipt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = json.Unmarshal(encoded, &decoded); err != nil || decoded.Stdout == nil || decoded.Stderr == nil || !bytes.Equal(decoded.Stdout, receipt.Stdout) || !bytes.Equal(decoded.Stderr, receipt.Stderr) {
+				t.Fatal("empty byte witness lost through JSON", err)
+			}
+			if mode == "default-temp" {
+				rel, err := filepath.Rel(receipt.Directory, string(receipt.Stdout))
+				want := filepath.Join("Packages", strings.ToLower(receipt.Profile), "AC", "Temp") + string(os.PathSeparator)
+				if err != nil || !strings.HasPrefix(strings.ToLower(rel), strings.ToLower(want)) || !strings.HasPrefix(filepath.Base(rel), "args") {
+					t.Fatalf("temp escaped exact profile/output: %s %v", rel, err)
+				}
+			}
+		})
+	}
 }

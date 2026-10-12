@@ -292,6 +292,9 @@ func (s *Service) runtimeOperationMode(tx *sql.Tx, p Principal, project, id stri
 		if e = s.releaseQualificationReservation(tx, project, r); e != nil {
 			return nil, "", 0, e
 		}
+		if e = s.releaseCompletedRuntimeLocalLaunch(tx, project, r); e != nil {
+			return nil, "", 0, e
+		}
 	case "acknowledgeRunCancellation":
 		if e = clientQueueSettled(tx, project, id); e != nil {
 			return nil, "", 0, e
@@ -308,6 +311,9 @@ func (s *Service) runtimeOperationMode(tx *sql.Tx, p Principal, project, id stri
 		}
 		Merge(r, Object{"status": "CANCELLED", "children_stopped": true, "queue_empty": true, "cancel_confirmed_at": Now(), "ended_at": Now()})
 		if e = s.releaseQualificationReservation(tx, project, r); e != nil {
+			return nil, "", 0, e
+		}
+		if e = s.releaseCompletedRuntimeLocalLaunch(tx, project, r); e != nil {
 			return nil, "", 0, e
 		}
 	case "reconcileRun":

@@ -200,12 +200,16 @@ func collectStream(reader *os.File, name string, callback func(StreamChunk) erro
 			}
 		}
 		if err != nil {
+			capturedBytes := captured.Bytes()
 			if errors.Is(err, io.EOF) {
 				err = nil
+				if capturedBytes == nil {
+					capturedBytes = []byte{}
+				}
 			} else {
 				cancel()
 			}
-			result <- streamResult{captured.Bytes(), err}
+			result <- streamResult{capturedBytes, err}
 			return
 		}
 	}

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -557,7 +558,7 @@ func (h *Host) executeRuntimeCheck(ctx context.Context, request domain.RuntimeTo
 	}
 	details := domain.Object{"check_id": check.id, "exit_code": receipt.ExitCode, "timed_out": receipt.TimedOut, "stdout_hash": domain.Digest(receipt.Stdout), "stderr_hash": domain.Digest(receipt.Stderr), "source_manifest_hash": domain.Hash(sourceManifest), "source_count": len(sourceManifest), "frozen_policy_hash": domain.Hash(request.Policy), "toolchain_hash": toolchainHash, "vendor_hash": check.vendorHash, "job_total_processes": receipt.JobProcesses, "children_stopped": receipt.Stopped, "streams_drained": receipt.StreamsDrained, "cleanup_complete": receipt.CleanupComplete}
 	full := domain.Object{"check_id": check.id, "workspace_path": request.WorkspacePath, "frozen_policy_hash": domain.Hash(request.Policy), "argv_template": check.argv, "source_manifest": sourceManifest, "source_manifest_hash": domain.Hash(sourceManifest), "toolchain_manifest": toolchainManifest, "toolchain_hash": toolchainHash, "build_hash": buildHash, "vendor_manifest": vendorManifest, "vendor_hash": check.vendorHash,
-		"sandbox_receipt": domain.Object{"pid": receipt.PID, "process_created_ns": receipt.Created, "job": receipt.Job, "profile": receipt.Profile, "appcontainer_sid": receipt.SID, "capabilities": receipt.Capabilities, "exit_code": receipt.ExitCode, "timed_out": receipt.TimedOut, "job_total_processes": receipt.JobProcesses, "children_stopped": receipt.Stopped, "streams_drained": receipt.StreamsDrained, "cleanup_complete": receipt.CleanupComplete, "output_copied": receipt.OutputCopied, "stdout_hash": domain.Digest(receipt.Stdout), "stderr_hash": domain.Digest(receipt.Stderr), "stdout_raw_bytes": len(receipt.Stdout), "stderr_raw_bytes": len(receipt.Stderr), "stdout_raw": receipt.Stdout, "stderr_raw": receipt.Stderr}}
+		"sandbox_receipt": domain.Object{"pid": receipt.PID, "process_created_ns": strconv.FormatInt(receipt.Created, 10), "job": receipt.Job, "profile": receipt.Profile, "appcontainer_sid": receipt.SID, "capabilities": receipt.Capabilities, "exit_code": receipt.ExitCode, "timed_out": receipt.TimedOut, "job_total_processes": receipt.JobProcesses, "children_stopped": receipt.Stopped, "streams_drained": receipt.StreamsDrained, "cleanup_complete": receipt.CleanupComplete, "output_copied": receipt.OutputCopied, "stdout_hash": domain.Digest(receipt.Stdout), "stderr_hash": domain.Digest(receipt.Stderr), "stdout_raw_bytes": len(receipt.Stdout), "stderr_raw_bytes": len(receipt.Stderr), "stdout_raw": receipt.Stdout, "stderr_raw": receipt.Stderr}}
 	if err := runtimeCheckEvidenceBound(full); err != nil {
 		return nil, err
 	}
