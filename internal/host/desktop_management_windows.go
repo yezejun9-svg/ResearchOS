@@ -23,15 +23,16 @@ const DesktopManagementMaxFrame = 64 << 10
 // This channel exists only when the privileged parent launched control with
 // dedicated inherited pipes. It is never served on HTTP or the Native3 pipe.
 type DesktopManagementFrame struct {
-	Protocol    string `json:"protocol"`
-	MessageID   string `json:"message_id"`
-	Operation   string `json:"operation"`
-	HostID      string `json:"host_id"`
-	ProjectID   string `json:"project_id,omitempty"`
-	SessionID   string `json:"session_id,omitempty"`
-	ModelRef    string `json:"model_config_ref,omitempty"`
-	RequestID   string `json:"request_id,omitempty"`
-	RequestHash string `json:"request_hash,omitempty"`
+	Protocol    string                      `json:"protocol"`
+	MessageID   string                      `json:"message_id"`
+	Operation   string                      `json:"operation"`
+	HostID      string                      `json:"host_id"`
+	ProjectID   string                      `json:"project_id,omitempty"`
+	SessionID   string                      `json:"session_id,omitempty"`
+	ModelRef    string                      `json:"model_config_ref,omitempty"`
+	RequestID   string                      `json:"request_id,omitempty"`
+	RequestHash string                      `json:"request_hash,omitempty"`
+	Coding      *domain.RuntimeCodingIntent `json:"coding,omitempty"`
 }
 
 type DesktopManagement struct {
@@ -99,16 +100,27 @@ func decodeDesktopManagement(raw []byte) (DesktopManagementFrame, error) {
 		return f, errors.New("management protocol, message and exact Host required")
 	}
 	switch f.Operation {
+	case "PREPARE_CODING":
+		if f.ProjectID == "" || f.SessionID == "" || f.ModelRef == "" || f.RequestID != "" || f.RequestHash != "" || f.Coding == nil {
+			return f, errors.New("PREPARE_CODING requires original project, session, model and explicit coding intent")
+		}
+		if e := domain.ValidateRuntimeCodingIntent(*f.Coding); e != nil {
+			return f, e
+		}
+	case "CONFIRM_CODING", "STATUS_CODING":
+		if f.ProjectID == "" || f.RequestID == "" || f.RequestHash == "" || f.SessionID != "" || f.ModelRef != "" || f.Coding != nil {
+			return f, errors.New("exact prepared coding request identity required")
+		}
 	case "PREPARE":
-		if f.ProjectID == "" || f.SessionID == "" || f.ModelRef == "" || f.RequestID != "" || f.RequestHash != "" {
+		if f.ProjectID == "" || f.SessionID == "" || f.ModelRef == "" || f.RequestID != "" || f.RequestHash != "" || f.Coding != nil {
 			return f, errors.New("PREPARE requires only original project, session and model")
 		}
 	case "CONFIRM", "STATUS":
-		if f.ProjectID == "" || f.RequestID == "" || f.RequestHash == "" || f.SessionID != "" || f.ModelRef != "" {
+		if f.ProjectID == "" || f.RequestID == "" || f.RequestHash == "" || f.SessionID != "" || f.ModelRef != "" || f.Coding != nil {
 			return f, errors.New("exact prepared request identity required")
 		}
 	case "SHUTDOWN":
-		if f.ProjectID != "" || f.SessionID != "" || f.ModelRef != "" || f.RequestID != "" || f.RequestHash != "" {
+		if f.ProjectID != "" || f.SessionID != "" || f.ModelRef != "" || f.RequestID != "" || f.RequestHash != "" || f.Coding != nil {
 			return f, errors.New("SHUTDOWN accepts no execution scope")
 		}
 	default:
@@ -207,6 +219,22 @@ func (d *DesktopManagement) handle(ctx context.Context, f DesktopManagementFrame
 	}
 	defer d.host.revokeCredentialByHash(context.Background(), owner, domain.Digest([]byte(token)))
 	switch f.Operation {
+	case "PREPARE_CODING":
+		if e = d.coordinator.PrepareLocalRuntimeOffline(ctx); e != nil {
+			return nil, e
+		}
+		return d.coordinator.PrepareRuntimeCoding(ctx, token, domain.Hash(d.parent), domain.RuntimeSetupCandidate{ProjectID: f.ProjectID, SessionID: f.SessionID, PrincipalID: owner, ModelRef: f.ModelRef}, *f.Coding, d.host.FreezeRuntimeCoding)
+	case "CONFIRM_CODING":
+		result, err := d.coordinator.ConfirmRuntimeCoding(ctx, token, domain.Hash(d.parent), f.ProjectID, f.RequestID, f.RequestHash, d.host.FreezeRuntimeCoding)
+		if err != nil {
+			return nil, err
+		}
+		if err = d.coordinator.PrepareLocalRuntimeOffline(ctx); err != nil {
+			return nil, err
+		}
+		return result, nil
+	case "STATUS_CODING":
+		return d.coordinator.RuntimeCodingStatus(ctx, token, domain.Hash(d.parent), f.ProjectID, f.RequestID, f.RequestHash)
 	case "PREPARE":
 		if e = d.coordinator.PrepareLocalRuntimeOffline(ctx); e != nil {
 			return nil, e

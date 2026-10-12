@@ -123,11 +123,26 @@ func (s *Service) PrepareClientRuntime(ctx context.Context, token string, candid
 	if err != nil {
 		return result, err
 	}
+	result, err = s.prepareClientRuntimeTx(ctx, tx, p, candidate, assets, schema, authority)
+	if err != nil {
+		return result, err
+	}
+	return result, tx.Commit()
+}
+
+// The caller owns the transaction. Coding installation uses this same path
+// after its original host.configure CAS, before publishing the new reference.
+func (s *Service) prepareClientRuntimeTx(ctx context.Context, tx *sql.Tx, p Principal, candidate RuntimeSetupCandidate, assets RuntimeSetupAssets, schema *SchemaDoc, authority ClientConfigurationAuthority) (RuntimeSetupResult, error) {
+	var result RuntimeSetupResult
 	record, err := s.runtimeSetupConfiguration(ctx, tx, p, candidate, schema, authority)
 	if err != nil {
 		return result, err
 	}
 	project := candidate.ProjectID
+	coding, err := runtimeCodingAuthorization(ctx, tx, p.ID, project, record.Ref)
+	if err != nil {
+		return result, err
+	}
 	key := Hash([]any{"researchos.local-runtime-setup.v1", record.Owner, p.ID, project, record.Ref})
 	// The existing immutable profile and plan are the persistence index. Neither
 	// a second queue nor an editable host-state cache becomes business authority.
@@ -166,6 +181,9 @@ func (s *Service) PrepareClientRuntime(ctx context.Context, token string, candid
 		setup, _ := profile["host_setup"].(map[string]any)
 		if setup["key"] != key {
 			continue
+		}
+		if Hash(profile["coding_authorization"]) != Hash(coding) {
+			return result, Fail(412, "STALE_INPUT", "prepared coding authorization differs from its immutable configuration")
 		}
 		if found {
 			return result, Fail(409, "MODEL_UNAVAILABLE", "multiple prepared runtimes bind this configuration")
@@ -208,6 +226,11 @@ func (s *Service) PrepareClientRuntime(ctx context.Context, token string, candid
 	routeID := "local-model-" + strings.TrimPrefix(key, "sha256:")[:24]
 	model := Object{"ref": record.Ref, "api": "openai-completions", "provider": record.Payload.Provider, "model": record.Payload.Model, "endpoint": endpoint, "route": routeID, "max_output_tokens": 512, "max_calls": 1, "tools": Empty()}
 	profile := Object{"runtime_id": runtime["id"], "technical_hash": runtimeTechnicalHash(runtime), "adapter": runtime["adapter"], "adapter_revision": runtimeBridgeRevision, "platform": "windows-amd64", "build_hash": assets.BuildHash, "bundle_hash": assets.BundleHash, "sandbox": runtimeSandboxProfile, "credential_revision": "none", "backend": runtimeMuBackend, "model": record.Payload.Model, "model_config": model, "command_id": "mu-local-model-v1", "argv": []any{"--preserve-symlinks-main", "--preserve-symlinks", "{bundle}", "{manifest}"}, "effect_routes": []any{Object{"id": routeID, "capability": "MODEL", "credential_revision": "none", "upper_bound": nil}}, "permissions": Object{"network": "none", "environment": "staging-only", "capabilities": Empty(), "process_limit": 1, "memory_mib": 256}, "timeout_seconds": 60, "outputs": []any{"result.json"}, "max_cost": nil, "model_qualification": Object{"route": routeID, "model_config_hash": Hash(model), "max_calls": 1}, "host_setup": Object{"schema": "researchos.local-runtime-setup.v1", "key": key, "owner_host": record.Owner, "principal": p.ID, "model_config_ref": record.Ref, "config_hash": record.ConfigHash, "configuration_command_id": record.CommandID, "configuration_request_hash": record.RequestHash, "initial_session_id": candidate.SessionID}}
+	if coding != nil {
+		if err = applyRuntimeCodingProfile(profile, coding); err != nil {
+			return result, err
+		}
+	}
 	if err = validateRuntimeDispatchProfile(profile); err != nil {
 		return result, err
 	}
@@ -252,7 +275,7 @@ func (s *Service) PrepareClientRuntime(ctx context.Context, token string, candid
 		return result, err
 	}
 	result = RuntimeSetupResult{ProjectID: project, ModelRef: record.Ref, RuntimeID: Str(runtime, "id"), TaskID: Str(task, "id"), ProfileRef: profileRef}
-	return result, tx.Commit()
+	return result, nil
 }
 
 func (s *Service) sealRuntimeSetupProfile(tx *sql.Tx, p Principal, project string, body Object) (Object, error) {

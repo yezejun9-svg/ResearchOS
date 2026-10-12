@@ -97,6 +97,9 @@ func (c *RuntimeCoordinator) runtimeToolGate(ctx context.Context, tx *sql.Tx, ro
 	if e = c.ValidateBinding(ctx, tx, principal, route.ProjectID, workspace, model); e != nil {
 		return request, e
 	}
+	if e = c.validateCodingWorkspace(ctx, tx, principal, route.ProjectID, sessionID, workspace, profile); e != nil {
+		return request, e
+	}
 	binding, e := c.service.binding(ctx, tx, workspace)
 	if e != nil {
 		return request, e

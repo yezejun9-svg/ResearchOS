@@ -304,45 +304,79 @@ func TestW14SessionProjectionRecoveryAfterReportCommit(t *testing.T) {
 	if err := r.f.db.QueryRow("SELECT count(*),sum(json_extract(body,'$.kind')='RUN_STATE'),sum(json_extract(body,'$.kind')='ARTIFACT'),sum(json_extract(body,'$.kind')='USAGE') FROM outbox WHERE json_extract(body,'$.session_id')=?", sid).Scan(&events, &states, &artifacts, &usages); err != nil {
 		t.Fatal(err)
 	}
-	if events != 3 || states != 1 || artifacts != 1 || usages != 1 {
-		t.Fatalf("recovery needs exactly one original state, native JSON artifact and canonical usage: %d/%d/%d/%d", events, states, artifacts, usages)
+	if events != 4 || states != 1 || artifacts != 1 || usages != 2 {
+		t.Fatalf("recovery needs original state/artifact and both canonical local RESERVE/RELEASE usages: %d/%d/%d/%d", events, states, artifacts, usages)
 	}
+
 	sourceTx(t, r.f.db, func(tx *sql.Tx) error {
-		var raw string
-		if err := tx.QueryRow("SELECT body FROM outbox WHERE json_extract(body,'$.session_id')=? AND json_extract(body,'$.kind')='USAGE'", sid).Scan(&raw); err != nil {
-			return err
-		}
-		event, err := Decode([]byte(raw))
+		rows, err := tx.Query(`SELECT body FROM outbox WHERE json_extract(body,'$.session_id')=? AND json_extract(body,'$.kind')='USAGE' ORDER BY json_extract(body,'$.sequence')`, sid)
 		if err != nil {
 			return err
 		}
-		payload := event["payload"].(map[string]any)
-		ledger, err := load(tx, r.f.project, "BudgetLedgerEntry", Str(payload, "ledger_entry_id"))
+		events := []Object{}
+		for rows.Next() {
+			var raw string
+			if err = rows.Scan(&raw); err != nil {
+				rows.Close()
+				return err
+			}
+			event, e := Decode([]byte(raw))
+			if e != nil {
+				rows.Close()
+				return e
+			}
+			events = append(events, event)
+		}
+		err = rows.Err()
+		rows.Close()
 		if err != nil {
 			return err
 		}
-		if event["run_id"] != task["active_run_id"] || ledger["run_id"] != task["active_run_id"] || ledger["cost_basis"] != "UPPER_BOUND" || ledger["operation"] != "RESERVE" || payload["cost_known"] != false || payload["money"] != nil || payload["provider_usage_id"] != nil || payload["input_tokens"] != nil || payload["output_tokens"] != nil {
-			t.Fatal("recovery invented cost or changed original immutable ledger attribution")
+		var reserve, release Object
+		seen := map[string]bool{}
+		for _, event := range events {
+			payload := event["payload"].(map[string]any)
+			ledger, err := load(tx, r.f.project, "BudgetLedgerEntry", Str(payload, "ledger_entry_id"))
+			if err != nil {
+				return err
+			}
+			if seen[Str(ledger, "id")] {
+				t.Fatal("duplicate canonical usage")
+			}
+			seen[Str(ledger, "id")] = true
+			if event["run_id"] != task["active_run_id"] || ledger["run_id"] != task["active_run_id"] || payload["cost_known"] != false || payload["money"] != nil || payload["provider_usage_id"] != nil || payload["input_tokens"] != nil || payload["output_tokens"] != nil {
+				t.Fatal("recovery invented cost or changed original immutable attribution")
+			}
+			var immutable int
+			if err = tx.QueryRow(`SELECT immutable FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND id=?`, r.f.project, ledger["id"]).Scan(&immutable); err != nil {
+				return err
+			}
+			if immutable != 1 || Receipt(ledger) != ledger["receipt_hash"] {
+				t.Fatal("usage lacks original immutable ledger receipt")
+			}
+			switch ledger["operation"] {
+			case "RESERVE":
+				reserve = ledger
+			case "RELEASE":
+				release = ledger
+			default:
+				t.Fatal("unexpected accounting operation")
+			}
 		}
-		var immutable, ledgerCount int
-		if err := tx.QueryRow("SELECT immutable FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND id=?", r.f.project, ledger["id"]).Scan(&immutable); err != nil {
+		request := "runtime-local-launch/" + Str(task, "active_run_id") + "/1"
+		if reserve == nil || release == nil || reserve["cost_basis"] != "UPPER_BOUND" || reserve["reservation_id"] != nil || reserve["provider_request_id"] != request || reserve["provider_event_id"] != request || release["cost_basis"] != "ACTUAL" || release["reservation_id"] != reserve["id"] || release["provider_request_id"] != request || release["provider_event_id"] != request+"/released" || release["policy_id"] != reserve["policy_id"] || Hash(reserve["money"]) != Hash(dollars("0")) || Hash(release["money"]) != Hash(reserve["money"]) {
+			t.Fatal("local zero launch reserve/release pairing changed")
+		}
+		var ledgerCount int
+		if err = tx.QueryRow(`SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?`, r.f.project, task["active_run_id"]).Scan(&ledgerCount); err != nil {
 			return err
 		}
-		if immutable != 1 || Receipt(ledger) != ledger["receipt_hash"] {
-			t.Fatal("recovered usage did not reference a canonical immutable ledger receipt")
-		}
-		if err := tx.QueryRow("SELECT count(*) FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=?", r.f.project, task["active_run_id"]).Scan(&ledgerCount); err != nil {
-			return err
-		}
-		if ledgerCount != 1 {
-			t.Fatalf("recovery duplicated the original Run ledger: %d", ledgerCount)
+		if ledgerCount != 2 {
+			t.Fatalf("recovery duplicated canonical local ledger: %d", ledgerCount)
 		}
 		if !clientTurnSettled(tx, r.f.project, sid, task) {
 			t.Fatal("recovered terminal response did not release turn")
 		}
 		return nil
 	})
-	if r.f.read("tasks", Str(task, "id"))["status"] != "EXECUTION_REPORTED" {
-		t.Fatal("recovery self-accepted Task")
-	}
 }

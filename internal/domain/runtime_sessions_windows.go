@@ -187,8 +187,11 @@ func (c *RuntimeCoordinator) ValidateBinding(ctx context.Context, tx *sql.Tx, pr
 	if e = c.config.WorkspaceAuthority.ConfirmPath(ctx, b.RealPath, b.Access); e != nil {
 		return Fail(403, "WORKSPACE_REVOKED", "workspace authorization is no longer current")
 	}
-	_, _, e = c.sessionModel(tx, project, modelConfigRef)
-	return e
+	_, profile, e := c.sessionModel(tx, project, modelConfigRef)
+	if e != nil {
+		return e
+	}
+	return c.validateCodingWorkspace(ctx, tx, principal, project, "", workspaceRef, profile)
 }
 
 func (c *RuntimeCoordinator) AdmitTurn(ctx context.Context, tx *sql.Tx, project, modelConfigRef string, task Object) error {
@@ -202,7 +205,11 @@ func (c *RuntimeCoordinator) AdmitTurn(ctx context.Context, tx *sql.Tx, project,
 		}
 	} else {
 		s := &ClientService{Domain: c.service, Doc: c.config.ClientSchema, SessionRuntime: c, ConfigurationAuthority: c.config.ConfigurationAuthority}
-		if _, _, err := s.pendingClientTask(ctx, tx, project, modelConfigRef, task); err != nil {
+		sess, principal, err := s.pendingClientTask(ctx, tx, project, modelConfigRef, task)
+		if err != nil {
+			return err
+		}
+		if err = c.validateCodingSession(ctx, tx, principal, project, sess.sessionID); err != nil {
 			return err
 		}
 	}
@@ -254,7 +261,10 @@ func (c *RuntimeCoordinator) validateTaskSessionConfiguration(ctx context.Contex
 		return Fail(503, "MODEL_UNAVAILABLE", "task session creator unavailable")
 	}
 	s := &ClientService{Domain: c.service, Doc: c.config.ClientSchema, SessionRuntime: c, ConfigurationAuthority: c.config.ConfigurationAuthority}
-	return s.validateSessionConfiguration(ctx, tx, principal, sess, false)
+	if e = s.validateSessionConfiguration(ctx, tx, principal, sess, false); e != nil {
+		return e
+	}
+	return c.validateCodingSession(ctx, tx, principal, project, sid)
 }
 
 var _ ClientSessionRuntime = (*RuntimeCoordinator)(nil)

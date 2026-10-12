@@ -212,6 +212,17 @@ func TestRuntimeCheckNativeGo(t *testing.T) {
 		t.Fatalf("native check evidence incomplete: %v", details)
 	}
 	logs := full["sandbox_receipt"].(domain.Object)
+	if value, ok := logs["process_created_ns"].(string); !ok || len(value) < 17 {
+		t.Fatal("exact nanosecond process identity must be a decimal string")
+	}
+	decoded, decodeErr := domain.Decode(domain.Bytes(full))
+	if decodeErr != nil || domain.Hash(decoded) != domain.Hash(full) {
+		t.Fatal("native check fact is not losslessly round-trippable", decodeErr)
+	}
+	if logs["stdout_raw"].([]byte) == nil || logs["stderr_raw"].([]byte) == nil {
+		t.Fatal("captured EOF output must not be null")
+	}
+
 	if domain.Digest(logs["stdout_raw"].([]byte)) != details["stdout_hash"] || domain.Digest(logs["stderr_raw"].([]byte)) != details["stderr_hash"] {
 		t.Fatal("raw check logs do not match visible hashes")
 	}
