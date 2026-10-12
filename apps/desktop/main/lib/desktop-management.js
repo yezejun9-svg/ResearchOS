@@ -176,21 +176,57 @@ class DesktopManagement {
     this.state = 'NOT_STARTED';
     this.child = null; this.hostId = null; this.identity = null;
     this.parentIdentity = null; this.pending = null; this.intent = null;
+    this.retiredIntents = [];
     this.buffer = Buffer.alloc(0); this.ready = null; this.failure = null;
     this.exitPromise = null; this.resolveExit = null; this.shutdownAccepted = false; this.childExited = true;
   }
   hasUnconfirmedChild() { return !!this.child && !this.childExited; }
   summary() {
     const intent = this.intent;
-    if (!intent) return { available: this.state === 'READY', state: this.state, reason: this.failure };
+    let hostFailure = null;
+    if (this.state === 'READY') {
+      try { this.currentHost(); }
+      catch (error) { hostFailure = error.code || 'HOST_IDENTITY_UNAVAILABLE'; }
+    }
+    if (hostFailure && intent) intent.needsRecheck = true;
+    const available = this.state === 'READY' && !hostFailure && !this.pending;
+    const pendingState = this.pending?.timedOut ? 'PRIVATE_COMMAND_UNCERTAIN' :
+      this.pending ? 'PRIVATE_COMMAND_PENDING' : null;
+    const reason = hostFailure || (this.pending?.timedOut ? 'MANAGEMENT_REPLY_UNCERTAIN' :
+      this.pending ? 'MANAGEMENT_COMMAND_PENDING' : this.failure);
+    const previous = this.retiredIntents.at(-1);
+    const history = previous ? { previous_request_id: previous.requestId,
+      previous_expires_at: previous.expiresAt, previous_retired_at: previous.retiredAt } : {};
+    if (!intent) return { available, state: hostFailure ? 'HOST_UNAVAILABLE' : pendingState || this.state,
+      reason, ...history };
     const same = this.sameContext(intent.context);
-    return { available: this.state === 'READY', state: same ? intent.state : 'CONTEXT_CHANGED_PENDING',
-      reason: this.failure, model: same ? intent.model : null, request_id: same ? intent.requestId : null,
-      expires_at: same ? intent.expiresAt : null, model_calls: 1, tools: [], cost_basis: 'UNKNOWN', money: null,
+    const canRetire = this.canRetireExpiredIntent(intent);
+    return { available, state: hostFailure ? 'HOST_UNAVAILABLE' : pendingState ? pendingState :
+      canRetire ? 'EXPIRED' : same ? intent.state : 'CONTEXT_CHANGED_PENDING',
+      reason, model: available && same ? intent.model : null,
+      request_id: intent.requestId, expires_at: intent.expiresAt,
+      model_calls: 1, tools: [], cost_basis: 'UNKNOWN', money: null,
       purpose: 'mu_turn', purpose_seconds: 600, consumed: !!intent.confirmSent,
       // A historical RESULT never proves that the current purpose is still valid.
-      authorized: same && intent.state === 'QUALIFIED_PURPOSE_AUTHORIZED' && Date.now() - intent.checkedAt < 10000,
-      checked_at: same && intent.checkedAt ? new Date(intent.checkedAt).toISOString() : null };
+      authorized: available && same && !intent.needsRecheck &&
+        intent.state === 'QUALIFIED_PURPOSE_AUTHORIZED' && Date.now() - intent.checkedAt < 10000,
+      checked_at: available && same && intent.checkedAt ? new Date(intent.checkedAt).toISOString() : null,
+      ...history };
+  }
+  canRetireExpiredIntent(intent) {
+    return !!intent?.validated && !intent.confirmSent && !this.pending &&
+      ['AWAITING_CONFIRMATION', 'EXPIRED'].includes(intent.state) &&
+      Number.isFinite(Date.parse(intent.expiresAt)) && Date.parse(intent.expiresAt) <= Date.now();
+  }
+  retireExpiredIntent() {
+    const intent = this.intent;
+    if (!this.canRetireExpiredIntent(intent)) throw failure('QUALIFICATION_INTENT_PENDING');
+    // Expiry alone is not enough if the native host or control process changed.
+    // The original identity remains in memory even when a new session prepares.
+    this.currentHost();
+    this.retiredIntents.push(Object.freeze({ ...intent, state: 'EXPIRED',
+      retiredAt: new Date().toISOString(), retireReason: 'VALIDATED_UNCONFIRMED_EXPIRED' }));
+    this.intent = null;
   }
   sameContext(expected) {
     try { return this.options.context() === expected; }
@@ -342,12 +378,11 @@ class DesktopManagement {
     }).then(reply => { if (operation !== 'SHUTDOWN') this.currentHost(); return reply; });
   }
   async prepare(scope, context) {
-    if (this.intent && (this.intent.confirmSent || this.intent.state !== 'EXPIRED'))
-      throw failure('QUALIFICATION_INTENT_PENDING');
     if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
     const { projectId, sessionId, modelRef, model } = scope;
     if (![projectId, sessionId, modelRef].every(v => typeof v === 'string' && ID.test(v)))
       throw failure('QUALIFICATION_SCOPE_INVALID');
+    if (this.intent) this.retireExpiredIntent();
     const reply = await this.exchange('PREPARE', { project_id: projectId, session_id: sessionId,
       model_config_ref: modelRef }, 30000);
     if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
@@ -364,9 +399,9 @@ class DesktopManagement {
     const issued = Date.parse(request.issued_at), expires = Date.parse(request.expires_at), now = Date.now();
     if (!Number.isFinite(issued) || !Number.isFinite(expires) || issued > now || expires <= now ||
         expires <= issued || expires - issued > 60000) throw failure('PREPARE_EXPIRED');
-    this.intent = { state: 'AWAITING_CONFIRMATION', context, projectId, sessionId, modelRef, model,
+    this.intent = { state: 'AWAITING_CONFIRMATION', validated: true, context, projectId, sessionId, modelRef, model,
       requestId: request.request_id, requestHash: value.request_hash, expiresAt: request.expires_at,
-      confirmedAt: null, checkedAt: 0, confirmSent: false };
+      confirmedAt: null, checkedAt: 0, confirmSent: false, needsRecheck: false };
     return this.summary();
   }
   async confirm() {
@@ -397,7 +432,7 @@ class DesktopManagement {
     if (!object(value) || value.request_id !== intent.requestId || value.request_hash !== intent.requestHash ||
         !['AWAITING_CONFIRMATION', 'EXPIRED', 'UNRESOLVED', 'EXECUTION_SETTLED', 'QUALIFIED_PURPOSE_AUTHORIZED'].includes(value.state) ||
         typeof value.consumed !== 'boolean') throw failure('STATUS_RESULT_INVALID');
-    intent.state = value.state; intent.checkedAt = Date.now();
+    intent.state = value.state; intent.checkedAt = Date.now(); intent.needsRecheck = false;
     if (value.consumed) intent.confirmSent = true;
     return this.summary();
   }

@@ -18,12 +18,10 @@ const html = path.join(here, stem + '.html')
 const entry = path.join(here, stem + '.jsx')
 const recorded = []
 let current = { ok: true, state: 'READY', available: true }
-let confirmed = 0
+let confirmed = 0, preparedCount = 0, statusFailure = false
 const prepared = { ok: true, state: 'AWAITING_CONFIRMATION', available: true,
   model: { provider_id: 'ollama', model_id: 'qwen3:4b-instruct' }, request_id: 'req-fixture',
   expires_at: new Date(Date.now() + 45000).toISOString(), consumed: false }
-const authorized = { ...prepared, state: 'QUALIFIED_PURPOSE_AUTHORIZED', consumed: true,
-  authorized: true, checked_at: new Date().toISOString() }
 let server, browser, page
 try {
   fs.writeFileSync(html, `<div id="root"></div><script type="module" src="/${path.basename(entry)}"></script>`, 'utf8')
@@ -50,9 +48,19 @@ try {
   await page.exposeFunction('managedBridge', async (method, args) => {
     recorded.push({ method, args })
     if (method === 'qualificationCurrent') return current
-    if (method === 'qualificationPrepare') { current = prepared; return current }
-    if (method === 'qualificationConfirm') { confirmed++; current = authorized; return current }
-    if (method === 'qualificationStatus') return current
+    if (method === 'qualificationPrepare') {
+      preparedCount++
+      current = preparedCount === 1 ? prepared : { ...prepared, request_id: 'req-fixture-2',
+        previous_request_id: 'req-fixture', previous_expires_at: prepared.expires_at }
+      return current
+    }
+    if (method === 'qualificationConfirm') {
+      confirmed++
+      current = { ...current, state: 'QUALIFIED_PURPOSE_AUTHORIZED', consumed: true,
+        authorized: true, checked_at: new Date().toISOString() }
+      return current
+    }
+    if (method === 'qualificationStatus') return statusFailure ? { ok: false, reason: 'HOST_CHANGED' } : current
     throw Error('unexpected bridge method')
   })
   await page.addInitScript(() => {
@@ -68,6 +76,17 @@ try {
   assert.equal(await page.getByRole('button', { name: '明确确认一次调用' }).isEnabled(), true)
   await page.evaluate(() => window.remount())
   await page.getByText('原请求：req-fixture', { exact: false }).waitFor()
+  current = { ...prepared, state: 'CONTEXT_CHANGED_PENDING', available: true, authorized: false }
+  await page.evaluate(() => window.remount('session-2'))
+  await page.getByText('项目或会话已变更', { exact: false }).waitFor()
+  assert.equal(await page.getByRole('button', { name: '明确确认一次调用' }).isDisabled(), true)
+  current = { ...prepared, state: 'EXPIRED', available: true, authorized: false, consumed: false,
+    expires_at: new Date(Date.now() - 1000).toISOString() }
+  await page.evaluate(() => window.remount('session-2'))
+  await page.getByRole('button', { name: '准备当前会话' }).click()
+  await page.getByText('已退役的过期原请求：req-fixture', { exact: false }).waitFor()
+  assert.equal(preparedCount, 2)
+  assert.equal(confirmed, 0)
   page.on('dialog', dialog => dialog.accept())
   await page.getByRole('button', { name: '明确确认一次调用' }).click()
   await page.getByText('最近一次复核显示用途授权', { exact: false }).waitFor()
@@ -75,14 +94,21 @@ try {
   assert.equal(await page.getByRole('button', { name: '明确确认一次调用' }).isDisabled(), true)
   await page.getByRole('button', { name: '复核原请求' }).click()
   assert.equal(confirmed, 1)
-  current = { ...prepared, state: 'CONTEXT_CHANGED_PENDING', available: true, authorized: false }
+  const authorizedNow = current
   await page.evaluate(() => window.remount('session-2'))
-  await page.getByText('项目或会话已变更', { exact: false }).waitFor()
+  await page.getByText('最近一次复核显示用途授权', { exact: false }).waitFor()
+  statusFailure = true
+  current = { ...authorizedNow, state: 'HOST_UNAVAILABLE', available: false, authorized: false,
+    reason: 'HOST_CHANGED' }
+  await page.getByRole('button', { name: '复核原请求' }).click()
+  await page.getByText('本机主机身份已变化或无法确认', { exact: false }).waitFor()
+  assert.equal(await page.getByText('最近一次复核显示用途授权', { exact: false }).count(), 0)
   assert.equal(await page.getByRole('button', { name: '明确确认一次调用' }).isDisabled(), true)
   assert.deepEqual(errors, [])
   assert(recorded.every(call => call.args.length === 0))
   console.log(JSON.stringify({ status: 'SYNTHETIC_DOM_PASS', cases: ['prepare-zero-model', 'remount-original-request',
-    'one-explicit-confirm', 'status-no-reconfirm', 'changed-context-lock'], bridge_calls: recorded,
+    'one-explicit-confirm', 'status-no-reconfirm', 'changed-context-lock', 'expired-context-reprepare-audit',
+    'failed-status-revokes-old-authorization'], bridge_calls: recorded,
     actual_model_calls: 0, page_errors: errors }))
 } finally {
   await page?.close(); await browser?.close(); await server?.close()

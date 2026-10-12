@@ -208,9 +208,19 @@ export function DesktopQualification({ projectId, sessionId }) {
       if (generation !== lifetime.current) return
       if (!reply?.ok) throw new Error(reply?.reason || '托管资格操作失败')
       setState(reply)
-      setNotice(method === 'qualificationPrepare' ? '准备完成；模型调用尚未开始。请核对后明确确认。' :
+      setNotice(!reply.available ? '操作后本机主机身份无法确认；原请求仅保留为历史，请恢复主机后复核。' :
+        method === 'qualificationPrepare' ? '准备完成；模型调用尚未开始。请核对后明确确认。' :
         method === 'qualificationConfirm' ? '确认调用已结束；下方状态来自原请求的当前复核。' : '已复核原请求的当前状态。')
-    } catch (cause) { if (generation === lifetime.current) setError(cause) }
+    } catch (cause) {
+      if (generation !== lifetime.current) return
+      setError(cause)
+      setState(old => old && ({ ...old, available: false, authorized: false,
+        state: 'CURRENT_RECHECK_REQUIRED', reason: cause?.message || 'CURRENT_RECHECK_REQUIRED' }))
+      try {
+        const current = await window.researchos.desktop.qualificationCurrent()
+        if (generation === lifetime.current && current?.ok) setState(current)
+      } catch { /* Keep the non-authoritative state until a later refresh. */ }
+    }
     finally { if (generation === lifetime.current) setBusy('') }
   }
   const pending = state?.state === 'AWAITING_CONFIRMATION' && !state?.consumed &&
@@ -220,8 +230,10 @@ export function DesktopQualification({ projectId, sessionId }) {
     <p className="small-muted">确认后最多调用模型 1 次，工具 0 个，用途仅为 mu_turn（600 秒）；费用依据 UNKNOWN，金额无法预估。确认可能消耗一次性请求，失败或超时后请用“复核原请求”查询，不要重复确认。</p>
     {state?.model && <p>当前待确认模型：{state.model.provider_id} · {state.model.model_id}</p>}
     {state?.request_id && <p className="break-all">原请求：{state.request_id}；有效至 {state.expires_at || '未知'}</p>}
+    {state?.previous_request_id && <p className="break-all small-muted">已退役的过期原请求：{state.previous_request_id}；过期于 {state.previous_expires_at || '未知'}。该记录仅供审计，不代表当前资格。</p>}
     <p role="status">{state?.state === 'QUALIFIED_PURPOSE_AUTHORIZED' ?
       '最近一次复核显示用途授权；实际使用时服务端再次检查，请按需复核原请求。' :
+      state?.state === 'HOST_UNAVAILABLE' ? '本机主机身份已变化或无法确认；旧请求仅作历史记录，当前不可用。' :
       state?.state === 'CONTEXT_CHANGED_PENDING' ? '项目或会话已变更，原请求保留，当前不可确认。' :
       state?.state || '正在读取托管状态'}{state?.reason ? ` · ${state.reason}` : ''}</p>
     <div className="button-row">
