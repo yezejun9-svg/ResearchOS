@@ -88,7 +88,7 @@ func (c *RuntimeCoordinator) providerRoute(tx *sql.Tx, route RuntimeCoordinatorR
 			return RuntimeProviderRoute{}, e
 		}
 	}
-	for _, provider := range c.config.Providers {
+	for _, provider := range c.runtimeProviders() {
 		if provider.ID != frame.Route || provider.ProjectID != route.ProjectID || provider.RuntimeID != route.RuntimeID || provider.Purpose != task["task_type"] || provider.Capability != frame.Capability || provider.MeasurementMode != admission["mode"] {
 			continue
 		}
@@ -200,7 +200,7 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		operation, basis, money = "UNKNOWN", "UNKNOWN", nil
 	}
 	cost := Object{"policy_id": goal["budget_policy_id"], "run_id": runID, "operation": operation, "money": money, "provider_request_id": frame.Key, "provider_event_id": "prepare/" + frame.Key, "reservation_id": nil, "cost_basis": basis, "occurred_at": run["created_at"]}
-	intent, e := c.service.prepareEffectTx(tx, c.config.SchedulerToken, route.ProjectID, runID, frame.Key, request, cost)
+	intent, e := c.service.prepareEffectTx(tx, c.schedulerCredential(route.ProjectID), route.ProjectID, runID, frame.Key, request, cost)
 	if e != nil {
 		tx.Rollback()
 		return nil, e
@@ -239,7 +239,7 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 			return nil, e
 		}
 	}
-	intent, e = c.service.beginEffectTx(tx, c.config.SchedulerToken, route.ProjectID, runID, frame.Key)
+	intent, e = c.service.beginEffectTx(tx, c.schedulerCredential(route.ProjectID), route.ProjectID, runID, frame.Key)
 	if e != nil {
 		tx.Rollback()
 		return nil, e
@@ -293,7 +293,7 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 	if e != nil || len(raw) > 64*1024 || response.StatusCode < 200 || response.StatusCode >= 300 {
 		return unknown("provider returned no bounded successful receipt")
 	}
-	for _, secret := range []string{provider.BearerToken, c.config.SchedulerToken, route.ExecutorToken} {
+	for _, secret := range []string{provider.BearerToken, c.schedulerCredential(route.ProjectID), route.ExecutorToken} {
 		if secret != "" && bytes.Contains(raw, []byte(secret)) {
 			return unknown("provider response contained a host credential")
 		}

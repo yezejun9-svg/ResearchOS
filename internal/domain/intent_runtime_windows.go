@@ -13,7 +13,7 @@ import (
 // and never interprets a resolved resource request as restored authority.
 func (c *RuntimeCoordinator) advanceIntentTasks(ctx context.Context) error {
 	projects := map[string][]RuntimeCoordinatorRoute{}
-	for _, route := range c.config.Routes {
+	for _, route := range c.runtimeRoutes() {
 		projects[route.ProjectID] = append(projects[route.ProjectID], route)
 	}
 	var failures []error
@@ -39,7 +39,7 @@ func (c *RuntimeCoordinator) advanceIntentTasks(ctx context.Context) error {
 
 func (c *RuntimeCoordinator) advanceIntentProject(tx *sql.Tx, project string, routes []RuntimeCoordinatorRoute) error {
 	s := c.service
-	p, e := resourcePrincipal(tx, c.config.SchedulerToken, project, "SCHEDULER")
+	p, e := resourcePrincipal(tx, c.schedulerCredential(project), project, "SCHEDULER")
 	if e != nil {
 		return e
 	}

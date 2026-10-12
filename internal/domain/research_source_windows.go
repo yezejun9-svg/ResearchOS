@@ -17,7 +17,7 @@ func (c *RuntimeCoordinator) researchSourceAvailable(tx *sql.Tx, project string,
 	if err != nil {
 		return false
 	}
-	for _, provider := range c.config.Providers {
+	for _, provider := range c.runtimeProviders() {
 		if provider.ProjectID != project || provider.RuntimeID != route.RuntimeID || provider.Purpose != task["task_type"] || provider.Capability != "SOURCE" || provider.SourceID != w.SourceID {
 			continue
 		}

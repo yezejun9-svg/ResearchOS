@@ -9,8 +9,11 @@ import (
 )
 
 func (c *RuntimeCoordinator) sessionModel(tx *sql.Tx, project, modelRef string) (Object, Object, error) {
+	if message := c.runtimeSetupFailure(project, modelRef); message != "" {
+		return nil, nil, Fail(503, "MODEL_UNAVAILABLE", message)
+	}
 	var selected, profile Object
-	for _, route := range c.config.Routes {
+	for _, route := range c.runtimeRoutes() {
 		if route.ProjectID != project {
 			continue
 		}
@@ -85,7 +88,7 @@ func (c *RuntimeCoordinator) matchStoredClientConfiguration(tx *sql.Tx, project,
 	}
 	matched := false
 	purposes := map[string]bool{}
-	for _, route := range c.config.Providers {
+	for _, route := range c.runtimeProviders() {
 		if route.ProjectID != project || route.RuntimeID != Str(runtime, "id") || route.Capability != "MODEL" || route.ID != Str(config, "route") {
 			continue
 		}

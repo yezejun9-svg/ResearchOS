@@ -73,7 +73,7 @@ func (c *RuntimeCoordinator) ResolveGoalBinding(ctx context.Context, tx *sql.Tx,
 		}
 	}
 	seen := map[string]bool{}
-	for _, route := range c.config.Routes {
+	for _, route := range c.runtimeRoutes() {
 		if route.ProjectID != project {
 			continue
 		}

@@ -57,6 +57,17 @@ func (s *Service) RegisterRuntimeQualificationPlan(ctx context.Context, token, p
 	if e != nil {
 		return e
 	}
+	if e = s.registerRuntimeQualificationPlanTx(tx, p, project, taskID, runtimeID, profileRef, requiredCapabilities, maxValidity, resumeCheckID); e != nil {
+		return e
+	}
+	return tx.Commit()
+}
+
+// registerRuntimeQualificationPlanTx preserves the trusted plan gates for atomic host preparation.
+func (s *Service) registerRuntimeQualificationPlanTx(tx *sql.Tx, p Principal, project, taskID, runtimeID string, profileRef Object, requiredCapabilities []any, maxValidity time.Duration, resumeCheckID string) error {
+	if maxValidity <= 0 || maxValidity > 30*24*time.Hour || profileRef["entity_type"] != "Artifact" || len(requiredCapabilities) == 0 {
+		return Fail(422, "GATE_FAILED", "bounded profile and capabilities required")
+	}
 	if !p.HasRole("OWNER") || !p.Allowed(project, "", "", false) {
 		return Fail(403, "FORBIDDEN", "current project owner required")
 	}
@@ -155,7 +166,7 @@ func (s *Service) RegisterRuntimeQualificationPlan(ctx context.Context, token, p
 	if _, e = tx.Exec("INSERT INTO runtime_qualification_plans(project,task,runtime,plan,plan_hash,author,author_root) VALUES(?,?,?,?,?,?,?)", project, taskID, runtimeID, string(Bytes(plan)), Hash(plan), p.ID, root); e != nil {
 		return e
 	}
-	return tx.Commit()
+	return nil
 }
 
 func qualificationPlan(tx *sql.Tx, project, taskID, runtimeID string) (Object, string, string, error) {

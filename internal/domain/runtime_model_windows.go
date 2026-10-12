@@ -112,7 +112,7 @@ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoord
 		if err != nil {
 			return unknown("model stream could not open")
 		}
-		quarantine, err := newModelSSEQuarantine(provider.BearerToken, c.config.SchedulerToken, route.ExecutorToken)
+		quarantine, err := newModelSSEQuarantine(provider.BearerToken, c.schedulerCredential(route.ProjectID), route.ExecutorToken)
 		if err != nil {
 			return unknown("model quarantine unavailable")
 		}
@@ -146,7 +146,7 @@ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoord
 		if e != nil || len(raw) > runtimeModelMaxSSEBytes || !completeRuntimeModelSSE(raw) {
 			return unknown("model returned no complete bounded SSE response")
 		}
-		for _, secret := range []string{provider.BearerToken, c.config.SchedulerToken, route.ExecutorToken} {
+		for _, secret := range []string{provider.BearerToken, c.schedulerCredential(route.ProjectID), route.ExecutorToken} {
 			if secret != "" && bytes.Contains(raw, []byte(secret)) {
 				return unknown("model response contained host credential material")
 			}
