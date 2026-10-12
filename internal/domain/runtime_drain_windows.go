@@ -48,7 +48,8 @@ func (s *Service) RuntimeDrainSnapshot(ctx context.Context) (RuntimeDrainSnapsho
 }
 
 // QuiesceForRelease takes the same scan mutex as every Task claim. A busy
-// worker or unresolved Run/effect restores scanning before returning an error.
+// worker or unresolved Run/effect restores only the release-owned fence;
+// managed qualification and prior admission closure remain in force.
 func (c *RuntimeCoordinator) QuiesceForRelease(ctx context.Context) (RuntimeDrainSnapshot, error) {
 	var snap RuntimeDrainSnapshot
 	if !c.scanMu.TryLock() {
@@ -61,6 +62,7 @@ func (c *RuntimeCoordinator) QuiesceForRelease(ctx context.Context) (RuntimeDrai
 	if c.quiesced {
 		return snap, errors.New("runtime coordinator already quiesced")
 	}
+	c.releaseIntakeClosed = c.intakeClosed.Load()
 	c.intakeClosed.Store(true)
 	c.quiesced = true
 	c.mu.Lock()
@@ -69,13 +71,14 @@ func (c *RuntimeCoordinator) QuiesceForRelease(ctx context.Context) (RuntimeDrai
 	observed, e := c.service.RuntimeDrainSnapshot(ctx)
 	if e != nil {
 		c.quiesced = false
-		c.intakeClosed.Store(false)
+		// A failed observation cannot establish that admission is safe.
+		c.intakeClosed.Store(true)
 		return snap, e
 	}
 	observed.ActiveWorkers = snap.ActiveWorkers
 	if observed.ActiveRuns != 0 || observed.UnresolvedEffects != 0 || observed.UnresolvedDispatches != 0 || observed.ActiveWorkers != 0 || observed.Reservations != 0 || observed.UnresolvedCommands != 0 {
 		c.quiesced = false
-		c.intakeClosed.Store(false)
+		c.restoreIntakeAfterRelease(ctx, c.releaseIntakeClosed)
 		return observed, errors.New("runtime busy or external effect unresolved")
 	}
 	return observed, nil
@@ -83,9 +86,25 @@ func (c *RuntimeCoordinator) QuiesceForRelease(ctx context.Context) (RuntimeDrai
 
 func (c *RuntimeCoordinator) ResumeAfterReleaseAbort() {
 	c.scanMu.Lock()
+	defer c.scanMu.Unlock()
+	wasClosed := c.intakeClosed.Load()
+	if c.quiesced {
+		wasClosed = c.releaseIntakeClosed
+	}
 	c.quiesced = false
-	c.intakeClosed.Store(false)
-	c.scanMu.Unlock()
+	c.restoreIntakeAfterRelease(context.Background(), wasClosed)
+}
+
+// Caller holds scanMu, never an admission transaction. Admission reads only
+// the atomic guard, so checking durable state cannot deadlock that transaction.
+func (c *RuntimeCoordinator) restoreIntakeAfterRelease(ctx context.Context, wasClosed bool) {
+	c.intakeClosed.Store(true)
+	if wasClosed || c.qualificationActive || c.config.ManagedStartupHold {
+		return
+	}
+	if fenced, err := c.managedQualificationUnsettled(ctx); err == nil && !fenced {
+		c.intakeClosed.Store(false)
+	}
 }
 
 // Called inside the admission transaction; drain closes intake before reading DB.

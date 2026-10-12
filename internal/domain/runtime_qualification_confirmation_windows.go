@@ -213,6 +213,7 @@ func (c *RuntimeCoordinator) BeginLocalQualificationWindow(ctx context.Context, 
 	}()
 	if !c.startupComplete {
 		if e := c.Recover(ctx); e != nil {
+			previousIntakeClosed = true
 			return e
 		}
 		c.startupComplete = true
