@@ -250,6 +250,118 @@ export function DesktopQualification({ projectId, sessionId }) {
   </Panel>
 }
 
+export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured }) {
+  const [state, setState] = useState(null)
+  const [toolchain, setToolchain] = useState('')
+  const [vendor, setVendor] = useState('')
+  const [readPaths, setReadPaths] = useState('go.mod\npkg/value.go\npkg/value_test.go')
+  const [writePaths, setWritePaths] = useState('pkg/value.go')
+  const [checkPaths, setCheckPaths] = useState('go.mod\npkg/value.go\npkg/value_test.go')
+  const [checkId, setCheckId] = useState('go-check')
+  const [checkPackage, setCheckPackage] = useState('./pkg')
+  const [testPattern, setTestPattern] = useState('^TestValue$')
+  const [limits, setLimits] = useState({ max_read_bytes: 8192, max_write_bytes: 8192,
+    max_tool_calls: 8, max_output_tokens: 2048, timeout_seconds: 90,
+    process_limit: 32, memory_mib: 1024, max_text_bytes: 4096 })
+  const [busy, setBusy] = useState('')
+  const [error, setError] = useState(null)
+  const [notice, setNotice] = useState('')
+  const lifetime = useRef(0)
+  useEffect(() => {
+    const generation = ++lifetime.current
+    setState(null); setToolchain(''); setVendor(''); setError(null); setNotice('')
+    window.researchos?.desktop?.codingCurrent?.().then(reply => {
+      if (generation !== lifetime.current) return
+      if (reply?.ok) setState(reply)
+      else setError(new Error(reply?.reason || '编码授权状态不可用'))
+    }).catch(cause => { if (generation === lifetime.current) setError(cause) })
+    return () => { lifetime.current++ }
+  }, [projectId, sessionId])
+  if (!window.researchos?.desktop?.codingCurrent) return null
+  const lines = value => value.split(/\r?\n/).map(item => item.trim()).filter(Boolean)
+  async function action(label, method, body) {
+    if (busy) return
+    const generation = lifetime.current
+    setBusy(label); setError(null); setNotice('')
+    try {
+      const reply = await window.researchos.desktop[method](body)
+      if (generation !== lifetime.current) return
+      if (!reply?.ok) throw new Error(reply?.reason || '编码授权操作失败')
+      setState(reply)
+      if (method === 'codingConfirm' && reply.state === 'CODING_CONFIGURED') {
+        setNotice('编码配置已保存；运行时仍是 REGISTERED，模型资格与代码检查均尚未执行。')
+        await onConfigured?.()
+      } else setNotice(method === 'codingPrepare' ? '冻结完成；配置尚未写入，也未调用模型。请核对摘要后明确确认。' :
+        method === 'codingStatus' ? '已复核原请求；复核不会重试确认。' : '')
+    } catch (cause) {
+      if (generation !== lifetime.current) return
+      setError(cause)
+      setState(old => old && ({ ...old, available: false, state: 'CURRENT_RECHECK_REQUIRED' }))
+      try { const current = await window.researchos.desktop.codingCurrent()
+        if (generation === lifetime.current && current?.ok) setState(current) } catch { /* Explicit later status remains available. */ }
+    } finally { if (generation === lifetime.current) setBusy('') }
+  }
+  async function pick(kind) {
+    if (busy) return
+    const generation = lifetime.current
+    setBusy('选择目录'); setError(null)
+    try {
+      const reply = await window.researchos.desktop[kind === 'toolchain' ? 'codingPickToolchain' : 'codingPickVendor']()
+      if (generation !== lifetime.current) return
+      if (!reply?.ok) throw new Error(reply?.reason || '目录选择失败')
+      if (reply.selected) (kind === 'toolchain' ? setToolchain : setVendor)(reply.name || '已选择')
+    } catch (cause) { if (generation === lifetime.current) setError(cause) }
+    finally { if (generation === lifetime.current) setBusy('') }
+  }
+  const setLimit = key => event => setLimits(old => ({ ...old, [key]: Number(event.target.value) }))
+  const intent = () => ({ read_paths: lines(readPaths), write_paths: lines(writePaths),
+    max_read_bytes: limits.max_read_bytes, max_write_bytes: limits.max_write_bytes,
+    max_tool_calls: limits.max_tool_calls, max_output_tokens: limits.max_output_tokens,
+    checks: [{ id: checkId.trim(), package: checkPackage.trim(), test_pattern: testPattern.trim(),
+      source_paths: lines(checkPaths), timeout_seconds: limits.timeout_seconds,
+      process_limit: limits.process_limit, memory_mib: limits.memory_mib, max_text_bytes: limits.max_text_bytes }] })
+  const prepared = state?.state === 'AWAITING_CODING_CONFIRMATION' && !state.consumed &&
+    Date.parse(state.expires_at) > Date.now()
+  return <Panel title="显式工作区编码授权">
+    <p>选择当前会话的可读、可写相对文件和离线 Go 检查。准备只冻结文件与检查计划；明确确认才写入新的模型配置，期间模型调用为 0。</p>
+    <div className="button-row"><button disabled={!!busy || !sessionId} onClick={() => pick('toolchain')}>选择 Go 工具链目录</button>
+      <span>{toolchain || '尚未选择'}</span><button disabled={!!busy || !sessionId} onClick={() => pick('vendor')}>选择离线 vendor（可选）</button><span>{vendor || '未选择'}</span></div>
+    <label>可读相对路径（每行一个）<textarea value={readPaths} onChange={event => setReadPaths(event.target.value)}/></label>
+    <label>可写相对路径（须包含在可读路径中）<textarea value={writePaths} onChange={event => setWritePaths(event.target.value)}/></label>
+    <div className="field-grid"><label>单文件读取上限（字节）<input type="number" value={limits.max_read_bytes} onChange={setLimit('max_read_bytes')}/></label>
+      <label>单文件写入上限（字节）<input type="number" value={limits.max_write_bytes} onChange={setLimit('max_write_bytes')}/></label>
+      <label>工具调用上限<input type="number" value={limits.max_tool_calls} onChange={setLimit('max_tool_calls')}/></label>
+      <label>模型输出 token 上限<input type="number" value={limits.max_output_tokens} onChange={setLimit('max_output_tokens')}/></label></div>
+    <h3>离线 Go 检查</h3>
+    <div className="field-grid"><label>检查 ID<input value={checkId} onChange={event => setCheckId(event.target.value)}/></label>
+      <label>包路径<input value={checkPackage} onChange={event => setCheckPackage(event.target.value)}/></label>
+      <label>测试选择器（^…$）<input value={testPattern} onChange={event => setTestPattern(event.target.value)}/></label></div>
+    <label>检查源文件相对路径（每行一个）<textarea value={checkPaths} onChange={event => setCheckPaths(event.target.value)}/></label>
+    <div className="field-grid"><label>检查超时（秒）<input type="number" value={limits.timeout_seconds} onChange={setLimit('timeout_seconds')}/></label>
+      <label>进程上限<input type="number" value={limits.process_limit} onChange={setLimit('process_limit')}/></label>
+      <label>内存上限（MiB）<input type="number" value={limits.memory_mib} onChange={setLimit('memory_mib')}/></label>
+      <label>输出上限（字节）<input type="number" value={limits.max_text_bytes} onChange={setLimit('max_text_bytes')}/></label></div>
+    {state?.scope && <div><h3>本次冻结摘要</h3><p>可读：{state.scope.read_paths.join('、')}；可写：{state.scope.write_paths.join('、')}</p>
+      <p>检查：{state.scope.checks.map(check => `${check.id} ${check.package} ${check.test_pattern}（${check.source_paths.join('、')}）`).join('；')}</p>
+      <p>限制：读取 {state.scope.max_read_bytes} 字节/文件，写入 {state.scope.max_write_bytes} 字节/文件，
+        工具最多 {state.scope.max_tool_calls} 次，模型输出最多 {state.scope.max_output_tokens} token。</p>
+      {state.scope.checks.map(check => <p key={check.id}>检查 {check.id}：超时 {check.timeout_seconds} 秒，
+        最多 {check.process_limit} 个进程、{check.memory_mib} MiB 内存、{check.max_text_bytes} 字节输出；
+        Go 工具链{check.toolchain_selected ? '已选' : '未选'}，离线 vendor {check.vendor_selected ? '已选' : '未选'}。</p>)}
+      <p>最多 8 次普通模型调用；资格验证最多 1 次模型调用、0 次工具调用。当前模型调用：{state.model_calls}。</p>
+      <p>截止：{state.expires_at || '未知'}；冻结检查摘要：{state.frozen_checks?.map(check => check.id).join('、') || '无'}。</p></div>}
+    <p role="status">{state?.state || '正在读取编码授权状态'}{state?.reason ? ` · ${state.reason}` : ''}</p>
+    <div className="button-row"><button disabled={!!busy || !state?.available || !sessionId || !toolchain ||
+      (!!state?.scope && !(state?.state === 'EXPIRED' && !state?.consumed))}
+      onClick={() => action('准备', 'codingPrepare', intent())}>准备并冻结</button>
+      <button className="primary" disabled={!!busy || !state?.available || !prepared} onClick={() => {
+        if (window.confirm('确认写入上述冻结的编码配置？此操作不会调用模型或执行检查，确认请求只能使用一次。')) action('确认', 'codingConfirm')
+      }}>明确确认配置</button>
+      <button disabled={!!busy || !state?.available || !state?.scope} onClick={() => action('复核', 'codingStatus')}>复核原请求</button></div>
+    {busy && <p role="status">{busy}中…</p>}{notice && <p role="status">{notice}</p>}<Failure error={error}/>
+  </Panel>
+}
+
 export function NativeWorkbench({ projectId, profile, api, navigate, shared, onRefresh }) {
   const [state, setState] = useState({ loading: true, sessions: [], host: null, snapshot: null, events: [], error: null })
   const [busy, setBusy] = useState('')
@@ -374,6 +486,8 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
     {state.loading && <div className="loading-state" role="status" aria-busy="true">正在读取本机会话…</div>}
     {!state.loading && state.host && !state.host.model_configurations?.length && <NativeModelConfiguration projectId={projectId} initialHost={state.host} onConfigured={(host, configured) => { setState(old => ({ ...old, host })); setModel(configured.model_config_ref); setNotice(`配置已保存（修订 ${configured.config_revision}）；运行时资格仍待验证。`) }} />}
     <DesktopQualification key={`${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId} sessionId={state.snapshot?.session_id || null}/>
+    <DesktopCodingAuthorization key={`coding:${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId}
+      sessionId={state.snapshot?.session_id || null} onConfigured={load}/>
     <div className="session-layout">
       <Panel title="项目会话"><ul className="session-picker">{state.sessions.map(item => <li key={item.session_id}><button aria-current={snapshot?.session_id === item.session_id ? 'page' : undefined} disabled={disabled} onClick={() => open(item.session_id)}>{item.title || '未命名会话'}<small>{item.run_status || (item.archived_at ? '已归档' : '等待消息')}</small></button></li>)}</ul>
         {state.nextCursor && <button disabled={disabled} onClick={moreSessions}>加载更多会话</button>}

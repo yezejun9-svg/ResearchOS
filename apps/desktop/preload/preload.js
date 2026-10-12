@@ -39,6 +39,12 @@ api.desktop = Object.freeze({
   qualificationPrepare: () => ipcRenderer.invoke('ros:desktop:qualification:prepare'),
   qualificationConfirm: () => ipcRenderer.invoke('ros:desktop:qualification:confirm'),
   qualificationStatus: () => ipcRenderer.invoke('ros:desktop:qualification:status'),
+  codingCurrent: () => ipcRenderer.invoke('ros:desktop:coding:current'),
+  codingPickToolchain: () => ipcRenderer.invoke('ros:desktop:coding:pickToolchain'),
+  codingPickVendor: () => ipcRenderer.invoke('ros:desktop:coding:pickVendor'),
+  codingPrepare: (intent) => ipcRenderer.invoke('ros:desktop:coding:prepare', intent),
+  codingConfirm: () => ipcRenderer.invoke('ros:desktop:coding:confirm'),
+  codingStatus: () => ipcRenderer.invoke('ros:desktop:coding:status'),
 });
 
 contextBridge.exposeInMainWorld('researchos', Object.freeze(api));

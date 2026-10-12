@@ -17,6 +17,12 @@ const START_LIMIT_MS = 15000;
 
 function failure(code) { const e = new Error(code); e.code = code; return e; }
 function object(value) { return value && typeof value === 'object' && !Array.isArray(value); }
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (object(value)) return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
+  return value;
+}
+function sameValue(a, b) { return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b)); }
 function keys(value, required, optional = []) {
   if (!object(value)) throw failure('PRIVATE_FRAME_INVALID');
   const allowed = new Set([...required, ...optional]);
@@ -175,12 +181,41 @@ class DesktopManagement {
     this.spawn = options.spawn || childProcess.spawn;
     this.state = 'NOT_STARTED';
     this.child = null; this.hostId = null; this.identity = null;
-    this.parentIdentity = null; this.pending = null; this.intent = null;
-    this.retiredIntents = [];
+    this.parentIdentity = null; this.pending = null; this.intent = null; this.codingIntent = null;
+    this.retiredIntents = []; this.retiredCodingIntents = [];
     this.buffer = Buffer.alloc(0); this.ready = null; this.failure = null;
     this.exitPromise = null; this.resolveExit = null; this.shutdownAccepted = false; this.childExited = true;
   }
   hasUnconfirmedChild() { return !!this.child && !this.childExited; }
+  codingSummary() {
+    const intent = this.codingIntent;
+    const base = this.summary();
+    if (!intent) return { available: base.available, state: base.state, reason: base.reason || null };
+    const selected = this.sameSelection(intent.projectId, intent.sessionId);
+    return { available: base.available && selected, state: !selected ? 'CONTEXT_CHANGED_PENDING' :
+      !base.available ? base.state : intent.state,
+      reason: base.reason || null,
+      expires_at: intent.expiresAt, consumed: intent.confirmSent,
+      scope: { read_paths: intent.scope.read_paths, write_paths: intent.scope.write_paths,
+        max_read_bytes: intent.scope.max_read_bytes, max_write_bytes: intent.scope.max_write_bytes,
+        max_tool_calls: intent.scope.max_tool_calls, max_output_tokens: intent.scope.max_output_tokens,
+        checks: intent.scope.checks.map(check => ({ id: check.id, package: check.package,
+          test_pattern: check.test_pattern, source_paths: check.source_paths,
+          timeout_seconds: check.timeout_seconds, process_limit: check.process_limit,
+          memory_mib: check.memory_mib, max_text_bytes: check.max_text_bytes,
+          toolchain_selected: !!check.toolchain_root, vendor_selected: !!check.vendor_root })) },
+      frozen_checks: intent.frozenChecks.map(check => ({ id: check.id, package: check.package,
+        test_pattern: check.test_pattern, source_count: check.source_count, source_bytes: check.source_bytes,
+        source_manifest_hash: check.source_manifest_hash, toolchain_hash: check.toolchain_hash,
+        build_hash: check.build_hash, vendor_hash: check.vendor_hash })), model_calls: 0,
+      normal_max_model_calls: 8, qualification_model_calls: 1, qualification_tool_calls: 0,
+      model_config_ref: intent.newModelRef || null, runtime_status: intent.runtimeStatus || null,
+      profile_ref: intent.profileRef || null, config_revision: intent.configRevision || null };
+  }
+  sameSelection(projectId, sessionId) {
+    try { const context = JSON.parse(this.options.context()); return context[0] === projectId && context[1] === sessionId; }
+    catch { return false; }
+  }
   summary() {
     const intent = this.intent;
     let hostFailure = null;
@@ -298,6 +333,7 @@ class DesktopManagement {
     if (this.ready) { clearTimeout(this.ready.timer); this.ready.reject(failure(reason)); this.ready = null; }
     if (this.pending) { const pending = this.pending; this.pending = null; clearTimeout(pending.timer); pending.reject(failure(reason)); }
     if (this.intent?.confirmSent) this.intent.state = 'UNRESOLVED';
+    if (this.codingIntent?.confirmSent) this.codingIntent.state = 'UNRESOLVED';
   }
   onExit(code, signal) {
     this.childExited = true;
@@ -347,7 +383,7 @@ class DesktopManagement {
       this.child.on('exit', (code, signal) => this.onExit(code, signal));
       this.child.on('error', () => this.broken('CONTROL_SPAWN_FAILED'));
       // Diagnostics remain private to main and bounded. They are never a protocol response.
-      this.child.stderr?.on('data', bytes => { o.diagnostic?.(String(bytes).slice(0, 1024)); });
+      this.child.stderr?.on('data', bytes => { o.diagnostic?.(bytes); });
       const result = await readyPromise;
       if (this.ready) { clearTimeout(this.ready.timer); this.ready = null; }
       if (installed.controlHash !== this.identity.ImageSHA256) throw failure('CONTROL_IMAGE_CHANGED');
@@ -378,6 +414,7 @@ class DesktopManagement {
     }).then(reply => { if (operation !== 'SHUTDOWN') this.currentHost(); return reply; });
   }
   async prepare(scope, context) {
+    if (this.codingIntent && this.codingIntent.state !== 'CODING_CONFIGURED') throw failure('CODING_INTENT_PENDING');
     if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
     const { projectId, sessionId, modelRef, model } = scope;
     if (![projectId, sessionId, modelRef].every(v => typeof v === 'string' && ID.test(v)))
@@ -435,6 +472,115 @@ class DesktopManagement {
     intent.state = value.state; intent.checkedAt = Date.now(); intent.needsRecheck = false;
     if (value.consumed) intent.confirmSent = true;
     return this.summary();
+  }
+  async prepareCoding(scope, context) {
+    if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
+    if (this.codingIntent) {
+      const old = this.codingIntent;
+      if (old.state !== 'EXPIRED' || old.confirmSent || !old.statusCheckedAt ||
+          Date.parse(old.expiresAt) > Date.now()) throw failure('CODING_ORIGINAL_REQUEST_PENDING');
+      this.currentHost();
+      this.retiredCodingIntents.push(Object.freeze({ ...old, retiredAt: new Date().toISOString() }));
+      this.codingIntent = null;
+    }
+    if (this.intent) {
+      if (!this.intent.confirmSent && this.canRetireExpiredIntent(this.intent)) this.retireExpiredIntent();
+      else if (!(this.intent.confirmSent && ['EXECUTION_SETTLED', 'QUALIFIED_PURPOSE_AUTHORIZED'].includes(this.intent.state) &&
+        !this.intent.needsRecheck && Date.now() - this.intent.checkedAt < 10000))
+        throw failure('QUALIFICATION_ORIGINAL_REQUEST_PENDING');
+    }
+    const { projectId, sessionId, modelRef, coding } = scope;
+    if (![projectId, sessionId, modelRef].every(v => typeof v === 'string' && ID.test(v)) || !object(coding))
+      throw failure('CODING_SCOPE_INVALID');
+    const reply = await this.exchange('PREPARE_CODING', { project_id: projectId, session_id: sessionId,
+      model_config_ref: modelRef, coding }, 45000);
+    if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
+    if (reply.kind !== 'RESULT') throw failure('CODING_PREPARE_REJECTED');
+    const value = reply.result;
+    if (!object(value) || value.state !== 'AWAITING_CODING_CONFIRMATION' ||
+        typeof value.request_id !== 'string' || !ID.test(value.request_id) || !HASH.test(value.request_hash) ||
+        value.project_id !== projectId || value.session_id !== sessionId || value.old_model_config_ref !== modelRef ||
+        !object(value.scope) || !sameValue(value.scope, coding) ||
+        !Array.isArray(value.frozen_checks) || value.frozen_checks.length !== coding.checks.length ||
+        value.normal_max_model_calls !== 8 || value.qualification_model_calls !== 1 ||
+        value.qualification_tool_calls !== 0 || value.model_calls !== 0)
+      throw failure('CODING_PREPARE_RESULT_INVALID');
+    for (const check of value.frozen_checks) {
+      keys(check, ['id', 'package', 'test_pattern', 'source_count', 'source_bytes',
+        'source_manifest_hash', 'toolchain_hash', 'build_hash', 'vendor_hash']);
+      if (typeof check.id !== 'string' || typeof check.package !== 'string' ||
+          typeof check.test_pattern !== 'string' || !Number.isSafeInteger(check.source_count) ||
+          !Number.isSafeInteger(check.source_bytes) ||
+          ![check.source_manifest_hash, check.toolchain_hash, check.build_hash].every(v => HASH.test(v)) ||
+          !(check.vendor_hash === '' || HASH.test(check.vendor_hash)))
+        throw failure('CODING_FROZEN_CHECK_INVALID');
+    }
+    const expires = Date.parse(value.expires_at);
+    if (!Number.isFinite(expires) || expires <= Date.now() || expires - Date.now() > 60000)
+      throw failure('CODING_PREPARE_EXPIRED');
+    this.codingIntent = { state: value.state, context, projectId, sessionId, modelRef,
+      requestId: value.request_id, requestHash: value.request_hash, expiresAt: value.expires_at,
+      scope: value.scope, frozenChecks: value.frozen_checks, confirmSent: false };
+    return this.codingSummary();
+  }
+  async confirmCoding() {
+    const intent = this.codingIntent;
+    if (!intent || intent.confirmSent || intent.state !== 'AWAITING_CODING_CONFIRMATION')
+      throw failure('CODING_CONFIRM_NOT_AVAILABLE');
+    if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
+    if (Date.parse(intent.expiresAt) <= Date.now()) { intent.state = 'EXPIRED'; throw failure('CODING_CONFIRM_EXPIRED'); }
+    this.currentHost();
+    if (this.pending) throw failure('MANAGEMENT_COMMAND_PENDING');
+    intent.confirmSent = true; intent.state = 'CONFIRM_SENT';
+    try {
+      const reply = await this.exchange('CONFIRM_CODING', { project_id: intent.projectId,
+        request_id: intent.requestId, request_hash: intent.requestHash }, 195000);
+      if (reply.kind !== 'RESULT') { intent.state = 'UNRESOLVED'; throw failure('CODING_CONFIRM_REJECTED_CHECK_STATUS'); }
+      this.acceptCodingResult(intent, reply.result);
+      this.retireQualificationAfterCodingCommit();
+      return this.codingSummary();
+    } catch (error) { if (intent.state === 'CONFIRM_SENT') intent.state = 'UNRESOLVED'; throw error; }
+  }
+  acceptCodingResult(intent, value) {
+    if (!object(value) || value.state !== 'CODING_CONFIGURED' || value.request_id !== intent.requestId ||
+        value.request_hash !== intent.requestHash || value.project_id !== intent.projectId ||
+        value.session_id !== intent.sessionId || value.old_model_config_ref !== intent.modelRef ||
+        typeof value.model_config_ref !== 'string' || !ID.test(value.model_config_ref) ||
+        value.runtime_status !== 'REGISTERED' || typeof value.profile_ref !== 'string' ||
+        value.model_calls !== 0 || value.normal_max_model_calls !== 8 ||
+        value.qualification_model_calls !== 1 || value.qualification_tool_calls !== 0 ||
+        !object(value.scope) || !sameValue(value.scope, intent.scope) ||
+        !Array.isArray(value.frozen_checks) || !sameValue(value.frozen_checks, intent.frozenChecks) ||
+        !Number.isSafeInteger(value.revision) || !Number.isSafeInteger(value.config_revision))
+      throw failure('CODING_RESULT_INVALID');
+    intent.state = value.state; intent.newModelRef = value.model_config_ref;
+    intent.runtimeStatus = value.runtime_status; intent.profileRef = value.profile_ref;
+    intent.configRevision = value.config_revision;
+  }
+  retireQualificationAfterCodingCommit() {
+    if (this.intent?.confirmSent && ['EXECUTION_SETTLED', 'QUALIFIED_PURPOSE_AUTHORIZED'].includes(this.intent.state)) {
+      this.currentHost();
+      this.retiredIntents.push(Object.freeze({ ...this.intent, retiredAt: new Date().toISOString(),
+        retireReason: 'CODING_COMMITTED' })); this.intent = null;
+    }
+  }
+  async statusCoding() {
+    const intent = this.codingIntent;
+    if (!intent) throw failure('CODING_ORIGINAL_REQUEST_REQUIRED');
+    if (!this.sameSelection(intent.projectId, intent.sessionId)) throw failure('CONTEXT_CHANGED');
+    const reply = await this.exchange('STATUS_CODING', { project_id: intent.projectId,
+      request_id: intent.requestId, request_hash: intent.requestHash }, 30000);
+    if (reply.kind !== 'RESULT') throw failure('CODING_STATUS_REJECTED');
+    const value = reply.result;
+    if (value?.state === 'CODING_CONFIGURED') {
+      this.acceptCodingResult(intent, value); this.retireQualificationAfterCodingCommit();
+    }
+    else if (!object(value) || !['AWAITING_CODING_CONFIRMATION', 'EXPIRED'].includes(value.state) ||
+        value.request_id !== intent.requestId || value.request_hash !== intent.requestHash ||
+        value.project_id !== intent.projectId || value.session_id !== intent.sessionId)
+      throw failure('CODING_STATUS_RESULT_INVALID');
+    else { intent.state = value.state; intent.statusCheckedAt = Date.now(); }
+    return this.codingSummary();
   }
   async shutdown() {
     if (this.state === 'STOPPED') return { state: 'STOPPED', process_exit_confirmed: true };
