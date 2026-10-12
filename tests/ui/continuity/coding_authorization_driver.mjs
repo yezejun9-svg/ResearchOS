@@ -29,6 +29,7 @@ const frozen = { ok: true, available: true, state: 'AWAITING_CODING_CONFIRMATION
 let state = { ok: true, available: true, state: 'READY' }, confirms = 0, prepares = 0, refreshes = 0, refreshAttempts = 0
 const statusRecovery = process.env.ROS_STATUS_RECOVERY === '1'
 const refreshFailOnce = process.env.ROS_REFRESH_FAIL_ONCE === '1'
+const prepareErrorRepick = process.env.ROS_PREPARE_ERROR_REPICK === '1'
 let server, browser, page
 try {
   fs.writeFileSync(html, `<div id="root"></div><script type="module" src="/${path.basename(entry)}"></script>`, 'utf8')
@@ -61,7 +62,14 @@ try {
     if (method === 'codingCurrent') return state
     if (method === 'codingPickToolchain') return { ok: true, selected: true, name: 'go-toolchain', ...state }
     if (method === 'codingPickVendor') return { ok: true, selected: true, name: 'vendor', ...state }
-    if (method === 'codingPrepare') { prepares++; state = frozen; return state }
+    if (method === 'codingPrepare') {
+      prepares++
+      if (prepareErrorRepick && prepares === 1) {
+        state = { ok: true, available: true, state: 'PREPARE_REJECTED', reason: 'CODING_PREPARE_REJECTED' }
+        return { ok: false, reason: 'CODING_PREPARE_REJECTED' }
+      }
+      state = frozen; return state
+    }
     if (method === 'codingConfirm') { confirms++; state = { ...frozen, state: 'CODING_CONFIGURED',
       consumed: true, model_config_ref: 'model-2', runtime_status: 'REGISTERED',
       config_revision: 2, commit_key: 'original-commit-1' };
@@ -79,8 +87,13 @@ try {
   await page.getByRole('button', { name: '选择 Go 工具链目录' }).click()
   await page.getByText('go-toolchain').waitFor()
   await page.getByRole('button', { name: '准备并冻结' }).click()
+  if (prepareErrorRepick) {
+    await page.getByRole('alert').getByText('CODING_PREPARE_REJECTED').waitFor()
+    await page.getByRole('button', { name: '选择 Go 工具链目录' }).click()
+    await page.getByRole('button', { name: '准备并冻结' }).click()
+  }
   await page.getByText('冻结完成；配置尚未写入', { exact: false }).waitFor()
-  assert.equal(prepares, 1); assert.equal(confirms, 0)
+  assert.equal(prepares, prepareErrorRepick ? 2 : 1); assert.equal(confirms, 0)
   const preparedInput = record.find(item => item.method === 'codingPrepare').args[0]
   assert.equal(preparedInput.checks[0].toolchain_root, undefined)
   assert.equal(preparedInput.read_paths[0], 'go.mod')
@@ -112,7 +125,8 @@ try {
   assert.equal(refreshes, 1)
   assert.equal(await page.getByText('C:/trusted-go').count(), 0)
   assert.deepEqual(errors, [])
-  console.log(JSON.stringify({ status: refreshFailOnce ? 'SYNTHETIC_CODING_REFRESH_RETRY_PASS' :
+  console.log(JSON.stringify({ status: prepareErrorRepick ? 'SYNTHETIC_CODING_PREPARE_ERROR_REPICK_PASS' :
+    refreshFailOnce ? 'SYNTHETIC_CODING_REFRESH_RETRY_PASS' :
     statusRecovery ? 'SYNTHETIC_CODING_STATUS_RECOVERY_PASS' : 'SYNTHETIC_CODING_DOM_PASS',
     prepares, confirms, refreshes, refresh_attempts: refreshAttempts, actual_model_calls: 0, page_errors: errors }))
 } finally {
