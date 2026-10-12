@@ -898,6 +898,11 @@ func (s *ClientService) dispatch(ctx context.Context, tx *sql.Tx, env *Envelope,
 	if *env.Method == "workspace.register" || *env.Method == "project.bootstrap" {
 		return s.clientFirstUse(ctx, tx, env, principal)
 	}
+	if *env.Method == "host.status" || *env.Method == "workspace.list" {
+		if env.SessionID != nil || env.ExpectedRevision != nil || env.WriterEpoch != nil {
+			return reject(0, nil, "INVALID_REQUEST", "workspace metadata reads cannot claim session or writer state"), nil
+		}
+	}
 	if deref(env.SessionID) != "" {
 		if err := clientSessionOwner(ctx, tx, deref(env.ProjectID), deref(env.SessionID), principal); err != nil {
 			return reject(0, nil, "FORBIDDEN", "session belongs to another principal"), nil
@@ -1013,13 +1018,11 @@ func (s *ClientService) handleRead(ctx context.Context, tx *sql.Tx, env *Envelop
 		for _, m := range methods {
 			support = append(support, m)
 		}
-		nulls := func(in []any) []any {
-			if in == nil {
-				return []any{}
-			}
-			return in
-		}
 		revision, configs, credentials, err := s.clientConfigurationStatus(ctx, tx, principal)
+		if err != nil {
+			return clientFault(env, err)
+		}
+		workspaces, err := s.clientWorkspaceProjection(ctx, tx, env, principal)
 		if err != nil {
 			return clientFault(env, err)
 		}
@@ -1028,9 +1031,15 @@ func (s *ClientService) handleRead(ctx context.Context, tx *sql.Tx, env *Envelop
 			"protocol_versions": []any{ProtocolV2}, "host_state": "READY",
 			"client_id": deref(env.ClientID), "authenticated_principal_ref": principal,
 			"config_revision": revision, "model_configurations": configs,
-			"credentials": credentials, "workspaces": nulls(s.Host.WorkspaceBind),
+			"credentials": credentials, "workspaces": workspaces,
 			"supported_methods": support, "operating_mode": mode,
 		}), nil
+	case "workspace.list":
+		workspaces, err := s.clientWorkspaceProjection(ctx, tx, env, principal)
+		if err != nil {
+			return clientFault(env, err)
+		}
+		return complete(1, map[string]any{"items": workspaces}), nil
 	case "workspace.tree", "workspace.read", "workspace.diff":
 		return s.readClientWorkspace(ctx, tx, env, principal)
 	case "session.get", "session.attach":
