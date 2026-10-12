@@ -110,15 +110,15 @@ func (s *Service) qualificationEvidence(tx *sql.Tx, project string, receipt Obje
 	if tx.QueryRow("SELECT author FROM runtime_qualification_plans WHERE project=? AND task=?", project, t["id"]).Scan(&author) != nil || !runtimeRoleAndGrant(tx, author, project, "OWNER") || !runtimeRoleAndGrant(tx, Str(receipt, "verifier_principal_id"), project, "VERIFIER") {
 		return nil, nil, nil, Fail(403, "FORBIDDEN", "qualification authority revoked")
 	}
-	verifierRoot, e := authorityRoot(tx, Str(receipt, "verifier_principal_id"))
+	verifierRoot, e := currentAuthorityRoot(tx, Str(receipt, "verifier_principal_id"))
 	if e != nil {
 		return nil, nil, nil, e
 	}
-	executorRoot, e := authorityRoot(tx, Str(r, "executor_principal_id"))
+	executorRoot, e := currentAuthorityRoot(tx, Str(r, "executor_principal_id"))
 	if e != nil {
 		return nil, nil, nil, e
 	}
-	authorRoot, e := authorityRoot(tx, author)
+	authorRoot, e := currentAuthorityRoot(tx, author)
 	if e != nil {
 		return nil, nil, nil, e
 	}
@@ -126,7 +126,7 @@ func (s *Service) qualificationEvidence(tx *sql.Tx, project string, receipt Obje
 		return nil, nil, nil, Fail(403, "FORBIDDEN", "qualification author authority changed")
 	}
 	if caller != "" {
-		callerRoot, err := authorityRoot(tx, caller)
+		callerRoot, err := currentAuthorityRoot(tx, caller)
 		if err != nil {
 			return nil, nil, nil, err
 		}

@@ -240,6 +240,26 @@ func (s *Service) RecordLocalRuntimeAdministration(ctx context.Context, token, p
 	if evidence["schema"] != "researchos.local-runtime-administration.v1" {
 		return nil, Fail(422, "GATE_FAILED", "local administration evidence schema required")
 	}
+	if evidence["action"] == "EXPLICIT_QUALIFICATION_REQUEST" {
+		child, root := Str(evidence, "verifier_principal"), Str(evidence, "service_root")
+		actual, e := currentAuthorityRoot(tx, child)
+		ownerRoot, ownerErr := currentAuthorityRoot(tx, p.ID)
+		var parent string
+		if e != nil || ownerErr != nil || actual != root || root == ownerRoot || root == child || !runtimeRoleAndGrant(tx, child, project, "VERIFIER") || tx.QueryRow(`SELECT parent FROM orchestration_identity WHERE principal=?`, child).Scan(&parent) != nil || parent != root {
+			return nil, Fail(403, "FORBIDDEN", "explicit active independent verifier lineage required")
+		}
+		anchor := Object{"schema": "researchos.managed-verifier-lineage.v1", "principal": child, "root": root, "project_id": project, "registered_by": p.ID}
+		var prior string
+		e = tx.QueryRow(`SELECT request_hash FROM idempotency WHERE principal=? AND project=? AND operation='host:managed-verifier-lineage' AND key=?`, child, project, child).Scan(&prior)
+		if e == sql.ErrNoRows {
+			_, e = tx.Exec(`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES(?,?,'host:managed-verifier-lineage',?,?,200,?,'{}',?)`, child, project, child, Hash(anchor), Bytes(anchor), Now())
+		} else if e == nil && prior != Hash(anchor) {
+			e = Fail(403, "FORBIDDEN", "managed verifier original lineage changed")
+		}
+		if e != nil {
+			return nil, e
+		}
+	}
 	a, e := s.serverArtifactMode(tx, project, p.ID, "MANIFEST", "LIVE", Bytes(evidence), Empty())
 	if e != nil {
 		return nil, e
