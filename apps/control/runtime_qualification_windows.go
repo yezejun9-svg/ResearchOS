@@ -41,7 +41,7 @@ func (m *managedLocalQualification) run(ctx context.Context, h *host.Host, s *do
 	defer cancel()
 	// Offline preparation is explicitly shared with the normal coordinator.
 	// It starts no qualification by itself; the frozen request is checked next.
-	if e := c.Scan(deadline); e != nil {
+	if e := c.PrepareLocalRuntimeOffline(deadline); e != nil {
 		return e
 	}
 	result, e := h.QualifyLocalRuntime(deadline, s, c, apiURL, m.request, m.installation)

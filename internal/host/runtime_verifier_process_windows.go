@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"researchos.local/research-os/internal/canonical"
 	"researchos.local/research-os/internal/domain"
 	"researchos.local/research-os/internal/verifier"
 	"researchos.local/research-os/ops/supervisor"
@@ -84,7 +85,11 @@ func readRuntimeManagedFile(path string, limit int64) ([]byte, error) {
 	return os.ReadFile(path)
 }
 func decodeRuntimeManaged(raw []byte, target any) error {
-	d := json.NewDecoder(strings.NewReader(string(raw)))
+	strict, e := canonical.JSON(raw)
+	if e != nil {
+		return errors.New("managed runtime JSON must have unique keys and valid encoding")
+	}
+	d := json.NewDecoder(strings.NewReader(string(strict)))
 	d.DisallowUnknownFields()
 	if d.Decode(target) != nil {
 		return errors.New("managed runtime request invalid")

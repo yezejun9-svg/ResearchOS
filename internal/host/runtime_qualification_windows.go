@@ -7,10 +7,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"golang.org/x/sys/windows"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+	"unsafe"
 
 	"researchos.local/research-os/internal/domain"
 	"researchos.local/research-os/internal/verifier"
@@ -21,12 +23,48 @@ import (
 // effect. The consumer must own the existing control data-root lease.
 func LoadLocalRuntimeQualificationRequest(path string) (domain.LocalRuntimeQualificationRequest, error) {
 	var request domain.LocalRuntimeQualificationRequest
+	sid, e := currentSIDString()
+	if e != nil {
+		return request, e
+	}
+	expected, e := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + sid + ")")
+	if e != nil {
+		return request, e
+	}
+	actual, e := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if e != nil || !samePrivateRequestACL(actual, expected) {
+		return request, errors.New("qualification request requires protected current-user-only file ACL")
+	}
 	raw, e := readRuntimeManagedFile(path, 64<<10)
 	if e != nil {
 		return request, e
 	}
 	e = decodeRuntimeManaged(raw, &request)
 	return request, e
+}
+
+func samePrivateRequestACL(actual, expected *windows.SECURITY_DESCRIPTOR) bool {
+	control, _, e := actual.Control()
+	if e != nil || control&windows.SE_DACL_PROTECTED == 0 {
+		return false
+	}
+	a, _, e := actual.DACL()
+	if e != nil || a == nil || a.AceCount != 1 {
+		return false
+	}
+	b, _, e := expected.DACL()
+	if e != nil || b == nil || b.AceCount != 1 {
+		return false
+	}
+	var left, right *windows.ACCESS_ALLOWED_ACE
+	if windows.GetAce(a, 0, &left) != nil || windows.GetAce(b, 0, &right) != nil {
+		return false
+	}
+	if left.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || left.Header.AceFlags != 0 || left.Mask != right.Mask {
+		return false
+	}
+	ls, rs := (*windows.SID)(unsafe.Pointer(&left.SidStart)), (*windows.SID)(unsafe.Pointer(&right.SidStart))
+	return ls.IsValid() && rs.IsValid() && ls.Equals(rs)
 }
 
 type runtimeVerifierRegistration struct {
@@ -117,6 +155,10 @@ func (h *Host) ensureRuntimeVerifier(ctx context.Context, owner, project string,
 // coordinator remains the sole launcher; this administrative host has no model
 // client. Separate verifier credentials never enter the coordinator or worker.
 func (h *Host) QualifyLocalRuntime(ctx context.Context, service *domain.Service, coordinator *domain.RuntimeCoordinator, apiURL string, request domain.LocalRuntimeQualificationRequest, install RuntimeVerifierInstallation) (domain.Object, error) {
+	if e := coordinator.BeginLocalQualificationWindow(ctx, request.RequestID); e != nil {
+		return nil, e
+	}
+	defer coordinator.EndLocalQualificationWindow(context.Background())
 	if _, e := h.reverify(); e != nil {
 		return nil, e
 	}
