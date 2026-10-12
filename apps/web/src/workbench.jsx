@@ -6,6 +6,8 @@ import { SessionContinuation } from './session-continuation.jsx'
 const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
 const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
 const settled = value => value?.completed === true && (value?.protocol_status || value?.kind) === 'COMPLETED'
+const sameConfiguration = (value, request) => !!value?.model_config_ref &&
+  ['config_revision', 'provider_id', 'base_url', 'model_id', 'credential_ref'].every(key => value[key] === request[key])
 // The shell owns the command lifetime. This observable renderer snapshot holds
 // only the public payload and terminal result across route unmounts.
 const modelConfigurationPending = new Map()
@@ -49,8 +51,10 @@ export function NativeModelConfiguration({ projectId, initialHost, onConfigured 
     const selected = await window.researchos.desktop.selectProject(projectId)
     if (!selected?.ok) throw new Error(selected?.reason || '项目选择失败')
     if (!live.current) throw new Error('页面已切换')
-    const value = unwrap(await window.researchos.v2['host.status']({}))
+    const reply = await window.researchos.v2['host.status']({})
+    const value = { ...unwrap(reply), localHostOrigin: reply?.local_host_origin }
     if (!Number.isSafeInteger(value?.config_revision) || value.config_revision < 0) throw new Error('主机未返回有效的配置修订')
+    if (!/^[a-f0-9]{64}$/.test(value.localHostOrigin || '')) throw new Error('主机未返回可信的本地身份')
     if (!live.current) throw new Error('页面已切换')
     setHost(value)
     return value
@@ -62,32 +66,29 @@ export function NativeModelConfiguration({ projectId, initialHost, onConfigured 
     entry.reconciling = (async () => {
       if (!live.current || modelPending(projectId) !== entry) return
       const reply = entry.outcome
-      if (reply?.ok && settled(reply)) {
-        const saved = unwrap(reply)
-        if (saved?.config_revision !== entry.payload.config_revision || !saved?.model_config_ref) throw new Error('主机配置回执缺少修订或模型引用')
-        const refreshed = await readHost()
-        if (!refreshed.model_configurations?.some(item => item.model_config_ref === saved.model_config_ref)) throw new Error('配置已返回成功，但主机状态尚未列出该模型，请刷新核对')
+      if (reply?.dispatch_state === 'NOT_SENT') {
+        // This attempt never reached HTTP. It has no original-host effect to
+        // reconcile, even if another project's command owns the shell barrier.
+        updateModelPending(projectId, null)
+        setError((() => { try { unwrap(reply) } catch (cause) { return cause } })() || new Error(reply?.reason || '本地请求未发送'))
+        return
+      }
+      const refreshed = await readHost()
+      if (!entry.origin || refreshed.localHostOrigin !== entry.origin || reply?.local_host_origin !== entry.origin) {
+        throw new Error('主机已切换；原配置只能在原主机核对，当前主机不可证明保存结果')
+      }
+      if ((reply?.ok && settled(reply)) || reply?.reason === 'STALE_RESPONSE') {
+        const saved = reply?.reason === 'STALE_RESPONSE' ? reply.local_terminal_result : unwrap(reply)
+        if (!sameConfiguration(saved, entry.payload)) throw new Error('原配置回执缺少完整的配置身份；请核对原主机状态')
+        if (!refreshed.model_configurations?.some(item => sameConfiguration(item, entry.payload) && item.model_config_ref === saved.model_config_ref)) {
+          throw new Error('原主机状态尚未列出同一配置；请刷新核对')
+        }
         if (!live.current || modelPending(projectId) !== entry) return
         updateModelPending(projectId, null)
         onConfigured?.(refreshed, saved)
         setNotice(`配置已保存（修订 ${saved.config_revision}）。运行时资格尚未确认，创建会话或发送消息仍以服务端检查为准。`)
       } else {
         const reason = reply?.reason || reply?.error_code
-        if (reason === 'STALE_RESPONSE') {
-          // The shell completed the original command but discarded the old
-          // component's presentation ticket. Only an exact host record proves
-          // that this configuration was saved; ambiguity remains locked.
-          const refreshed = await readHost()
-          const saved = refreshed.model_configurations?.find(item => item.config_revision === entry.payload.config_revision &&
-            item.provider_id === entry.payload.provider_id && item.base_url === entry.payload.base_url &&
-            item.model_id === entry.payload.model_id && item.credential_ref === entry.payload.credential_ref && item.model_config_ref)
-          if (!saved) throw new Error('原配置命令已结束，但主机状态未能证明保存结果；请核对主机状态')
-          if (!live.current || modelPending(projectId) !== entry) return
-          updateModelPending(projectId, null)
-          onConfigured?.(refreshed, saved)
-          setNotice(`配置已保存（修订 ${saved.config_revision}）。运行时资格尚未确认，创建会话或发送消息仍以服务端检查为准。`)
-          return
-        }
         if (!live.current || modelPending(projectId) !== entry) return
         updateModelPending(projectId, null)
         setError((() => { try { unwrap(reply) } catch (cause) { return cause } })() || new Error(reason || '主机拒绝配置'))
@@ -113,18 +114,19 @@ export function NativeModelConfiguration({ projectId, initialHost, onConfigured 
         credential_ref: form.credential_ref.trim() || null,
       }
       if (!live.current) return
-      if (!remembered) updateModelPending(projectId, { payload: request, form: { ...form }, outcome: null })
+      if (!remembered) updateModelPending(projectId, { payload: request, form: { ...form }, origin: current.localHostOrigin, outcome: null })
       const reply = await window.researchos.v2['host.configure'](request)
       const entry = modelPending(projectId)
       if (entry?.payload !== request) return
       if (reply?.ok && !settled(reply)) {
+        if (reply.local_host_origin && reply.local_host_origin !== entry.origin) updateModelPending(projectId, { ...entry, origin: reply.local_host_origin })
         if (live.current) setNotice('主机已接收配置命令，尚未确认保存。请用同一请求继续查询结果。')
         return
       }
       // Only a trusted shell terminal response or pre-HTTP fact ends this
       // intent. Every other failure remains an uncertain replay.
       if (settled(reply) || reply?.protocol_status === 'REJECTED' || reply?.reason === 'STALE_RESPONSE' || reply?.dispatch_state === 'NOT_SENT' || (!remembered && reply?.reason === 'COMMAND_PENDING')) {
-        const terminal = { ...entry, outcome: reply }
+        const terminal = { ...entry, origin: reply?.local_host_origin || null, outcome: reply }
         updateModelPending(projectId, terminal)
         if (live.current) await reconcile(terminal)
       } else if (live.current) unwrap(reply)
