@@ -22,6 +22,8 @@ type Service struct {
 	Protected protectedstore.Provider
 	// Fixed by a trusted constructor, never by a request or environment selector.
 	projectBindingRoute string
+	// Supplied only by a trusted local Root witness integration; nil fails closed.
+	preparedAbandonmentAuthority preparedRunAbandonmentAuthority
 }
 type Fault struct {
 	Status        int

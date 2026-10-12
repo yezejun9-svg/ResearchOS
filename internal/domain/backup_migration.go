@@ -58,7 +58,7 @@ func CheckMigrationSafety(db *sql.DB, files []string) error {
 }
 
 func checkMigrationInventory(db *sql.DB, files []string) (int, error) {
-	if len(files) == 0 || len(files) > 23 {
+	if len(files) == 0 || len(files) > 24 {
 		return 0, fmt.Errorf("MIGRATION_SOURCE_INVENTORY")
 	}
 	for i, file := range files {

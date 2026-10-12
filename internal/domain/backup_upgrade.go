@@ -243,6 +243,9 @@ func upgradeTemplate(ctx context.Context, sqls [][]byte, contracts *Contracts) (
 }
 
 func upgradeLocal(ctx context.Context, opt LocalUpgradeOptions, verifier upgradeVerifier) (RestoreReport, error) {
+	if opt.Plan == PreparedAbandonmentSchemaUpgradePlan {
+		return upgradePreparedAbandonmentLocal(ctx, opt, verifier)
+	}
 	if opt.Plan == ConfigurationSchemaUpgradePlan {
 		return upgradeConfigurationLocal(ctx, opt, verifier)
 	}

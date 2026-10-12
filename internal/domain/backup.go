@@ -57,6 +57,13 @@ type backupPolicy struct {
 	afterRecovery                          func(*sql.DB) error
 	preserveQueueUpgradeWorkspaces         func(*sql.DB) error
 	preserveConfigurationUpgradeWorkspaces func(*sql.DB) error
+	preservePreparedAbandonmentUpgradeWorkspaces func(*sql.DB) error
+	publicPreparedAbandonmentHandoff bool
+}
+
+// Ordinary public validation remains mandatory for the fixed handoff policy.
+func backupOrdinaryPublicPolicy(policy *backupPolicy) bool {
+    return policy == nil || policy.publicPreparedAbandonmentHandoff
 }
 
 func backupFormat(policy *backupPolicy) string {
@@ -524,10 +531,10 @@ func readBackupPolicy(directory string, key []byte, policy *backupPolicy) (Backu
 		}
 		files[f.Name] = raw
 	}
-	if files["state.sqlite"] == nil || (policy == nil && files["portable.json"] == nil) {
+	if files["state.sqlite"] == nil || (backupOrdinaryPublicPolicy(policy) && files["portable.json"] == nil) {
 		return m, nil, fmt.Errorf("BACKUP_REQUIRED_FILE_MISSING")
 	}
-	if policy != nil && files["portable.json"] != nil {
+	if !backupOrdinaryPublicPolicy(policy) && files["portable.json"] != nil {
 		return m, nil, fmt.Errorf("UPGRADE_PORTABLE_EXPORT_PROHIBITED")
 	}
 	return m, files, nil
@@ -578,7 +585,7 @@ func restoreBackupPolicy(ctx context.Context, directory, destination string, opt
 	if e != nil {
 		return r, e
 	}
-	if policy == nil {
+	if backupOrdinaryPublicPolicy(policy) {
 		if e = backupWorkspaceRestorePaths(files, directory, destination); e != nil {
 			return r, e
 		}
@@ -630,7 +637,7 @@ func restoreBackupPolicy(ctx context.Context, directory, destination string, opt
 	if schema != m.SchemaHash {
 		return r, fmt.Errorf("BACKUP_SCHEMA_HASH_MISMATCH")
 	}
-	if policy == nil {
+	if backupOrdinaryPublicPolicy(policy) {
 		queue, err := backupQueueState(db)
 		if err != nil {
 			return r, err
@@ -691,6 +698,15 @@ func restoreBackupPolicy(ctx context.Context, directory, destination string, opt
 			return r, fmt.Errorf("RESTORE_CONFIGURATION_WORKSPACE_POLICY_MISMATCH")
 		}
 		e = policy.preserveConfigurationUpgradeWorkspaces(db)
+	} else if policy != nil && policy.preservePreparedAbandonmentUpgradeWorkspaces != nil {
+		plan, ok := policy.purpose["plan"].(Object)
+        fixedLocal := ok && policy.format == localUpgradeFormat && plan["id"] == PreparedAbandonmentSchemaUpgradePlan
+        fixedPublic := policy.publicPreparedAbandonmentHandoff && policy.format == "RESEARCHOS_BACKUP_V1" &&
+            len(policy.purpose) == 0 && policy.allowProtected == nil
+        if !fixedLocal && !fixedPublic {
+            return r, fmt.Errorf("RESTORE_PREPARED_ABANDONMENT_WORKSPACE_POLICY_MISMATCH")
+        }
+		e = policy.preservePreparedAbandonmentUpgradeWorkspaces(db)
 	} else {
 		workspaceRequests, e = backupPrepareWorkspaces(ctx, db, files, stage, destination)
 	}
