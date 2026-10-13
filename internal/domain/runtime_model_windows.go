@@ -171,7 +171,7 @@ func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoord
 		return nil, e
 	}
 	// Late responses may update billing/effect facts, but never regain execution authority.
-	tx, _, _, e := c.dispatchGate(ctx, route, runID, lease, epoch)
+	tx, _, _, e := c.dispatchGate(ctx, route, runID, lease, epoch, runtimePauseGatePurpose{kind: "effect-finish", effectKey: frame.Key, requestHash: Str(intent, "request_hash")})
 	if e != nil {
 		return nil, e
 	}

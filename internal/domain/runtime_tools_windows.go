@@ -119,7 +119,7 @@ func (c *RuntimeCoordinator) brokerTool(ctx context.Context, route RuntimeCoordi
 	notApplied := func(reason string) (Object, error) {
 		return c.recordNotAppliedEffect(route, provider, runID, epoch, bridge, frame, intent, dispatch, "HOST_TOOL_NOT_APPLIED", reason)
 	}
-	tx, run, current, e := c.dispatchGate(ctx, route, runID, lease, epoch)
+	tx, run, current, e := c.dispatchGate(ctx, route, runID, lease, epoch, runtimePauseGatePurpose{kind: "effect-continue", effectKey: frame.Key, requestHash: Str(intent, "request_hash")})
 	if e != nil {
 		return notApplied("tool authority ended before host dispatch")
 	}
@@ -151,7 +151,7 @@ func (c *RuntimeCoordinator) brokerTool(ctx context.Context, route RuntimeCoordi
 	// Physical publication rechecks the original run and lease after acquiring
 	// its file guards. The child cannot supply or replace this callback.
 	request.Revalidate = func(checkCtx context.Context) error {
-		checkTx, checkRun, checkDispatch, err := c.dispatchGate(checkCtx, route, runID, lease, epoch)
+		checkTx, checkRun, checkDispatch, err := c.dispatchGate(checkCtx, route, runID, lease, epoch, runtimePauseGatePurpose{kind: "effect-continue", effectKey: frame.Key, requestHash: Str(intent, "request_hash")})
 		if err != nil {
 			return err
 		}
@@ -221,7 +221,7 @@ func (c *RuntimeCoordinator) brokerTool(ctx context.Context, route RuntimeCoordi
 	if e = c.ingestEffectFact(context.Background(), fact); e != nil {
 		return nil, e
 	}
-	tx, _, _, e = c.dispatchGate(ctx, route, runID, lease, epoch)
+	tx, _, _, e = c.dispatchGate(ctx, route, runID, lease, epoch, runtimePauseGatePurpose{kind: "effect-finish", effectKey: frame.Key, requestHash: Str(intent, "request_hash")})
 	if e != nil {
 		return nil, e
 	}

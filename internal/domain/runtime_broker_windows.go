@@ -142,7 +142,7 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 	if e != nil {
 		return nil, Fail(400, "INVALID_REQUEST", "effect JSON object required")
 	}
-	tx, run, dispatch, e := c.dispatchGate(ctx, route, runID, lease, epoch)
+	tx, run, dispatch, e := c.dispatchGate(ctx, route, runID, lease, epoch, runtimePauseGatePurpose{kind: "effect-read", effectKey: frame.Key})
 	if e != nil {
 		return nil, e
 	}
@@ -223,7 +223,7 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		}
 		return nil, Fail(409, "STATE_CONFLICT", "effect outcome unknown; retry prohibited")
 	}
-	tx, run, dispatch, e = c.dispatchGate(ctx, route, runID, lease, epoch)
+	tx, run, dispatch, e = c.dispatchGate(ctx, route, runID, lease, epoch, runtimePauseGatePurpose{kind: "effect-start", effectKey: frame.Key, requestHash: Str(intent, "request_hash")})
 	if e != nil {
 		return nil, e
 	}

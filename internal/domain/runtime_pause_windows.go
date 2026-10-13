@@ -140,6 +140,92 @@ func validatePauseQueue(tx *sql.Tx, intent, snapshot Object) error {
 	return rows.Err()
 }
 
+// A purpose is constructed by the Host call site, never by the worker. The
+// ordinary dispatch path has no purpose and keeps its strict lifecycle gate.
+type runtimePauseGatePurpose struct {
+	kind, pauseID, effectKey, requestHash string
+}
+
+func pauseDispatchPurposeGate(tx *sql.Tx, project string, task, run, dispatch Object, purpose *runtimePauseGatePurpose) (Object, error) {
+	if task["status"] != "BLOCKED" || purpose == nil {
+		return nil, nil
+	}
+	if task["active_run_id"] != run["id"] || run["status"] != "RUNNING" || run["cancel_requested_at"] != nil ||
+		run["executor_principal_id"] == nil || run["runtime_id"] == nil {
+		return nil, Fail(409, "STATE_CONFLICT", "current pause lifecycle required")
+	}
+	goal, err := load(tx, project, "Goal", Str(task, "goal_id"))
+	if err != nil {
+		return nil, err
+	}
+	if goal["status"] != "ACTIVE" {
+		return nil, Fail(409, "STATE_CONFLICT", "current pause goal inactive")
+	}
+	intent, err := pauseIntent(tx, project, Str(run, "id"), run["lease_epoch"])
+	if err != nil {
+		return nil, err
+	}
+	if intent == nil || intent["project"] != project || intent["task"] != task["id"] || intent["run"] != run["id"] ||
+		Hash(intent["epoch"]) != Hash(run["lease_epoch"]) || intent["runtime"] != run["runtime_id"] ||
+		intent["dispatch_key"] != dispatch["dispatch_key"] || intent["manifest_hash"] != dispatch["manifest_hash"] ||
+		intent["process_identity_hash"] != Hash(dispatch["identity"]) || Str(intent, "pause_id") == "" {
+		return nil, Fail(409, "GATE_FAILED", "current pause dispatch binding changed")
+	}
+	witness, err := requiredPauseReceipt(tx, intent, "STATE_TRANSITION")
+	if err != nil {
+		return nil, err
+	}
+	if witness["state"] != intent["state"] || Hash(witness["revision"]) != Hash(intent["revision"]) || witness["intent_hash"] != Hash(intent) {
+		return nil, Fail(409, "GATE_FAILED", "current pause witness changed")
+	}
+	if _, err = freshPauseActor(tx, Str(intent, "principal"), project, Str(task, "id"), Str(run, "id")); err != nil {
+		return nil, err
+	}
+	var state, session, generation, key, manifestHash, identity string
+	var epoch int64
+	var restored int
+	if err = tx.QueryRow(`SELECT state,session_id,generation,dispatch_key,manifest_hash,process_identity,runtime_epoch,restore_fenced FROM client_queue_fences WHERE project=? AND task_id=? AND run_id=?`, project, task["id"], run["id"]).Scan(&state, &session, &generation, &key, &manifestHash, &identity, &epoch, &restored); err != nil {
+		return nil, err
+	}
+	process, err := Decode([]byte(identity))
+	if err != nil || state != "OPEN" || restored != 0 || session != intent["session_id"] || generation != intent["generation"] ||
+		Hash(epoch) != Hash(intent["epoch"]) || key != dispatch["dispatch_key"] || manifestHash != dispatch["manifest_hash"] || Hash(process) != Hash(dispatch["identity"]) {
+		return nil, Fail(409, "GATE_FAILED", "current pause queue binding changed")
+	}
+	var control string
+	if err = tx.QueryRow(`SELECT action FROM orchestration_task_controls WHERE project=? AND task=?`, project, task["id"]).Scan(&control); err != nil || control != "PAUSE" {
+		return nil, Fail(409, "STATE_CONFLICT", "current pause control ended")
+	}
+	switch purpose.kind {
+	case "checkpoint", "heartbeat":
+		if purpose.pauseID == "" || purpose.pauseID != intent["pause_id"] ||
+			(intent["state"] != "PAUSE_REQUESTED" && !(purpose.kind == "heartbeat" && intent["state"] == "CHECKPOINT_SEALED")) {
+			return nil, Fail(409, "STATE_CONFLICT", "current pause checkpoint phase ended")
+		}
+	case "effect-read", "effect-start", "effect-observe", "effect-continue", "effect-finish":
+		if intent["state"] != "PAUSE_REQUESTED" || purpose.effectKey == "" {
+			return nil, Fail(409, "STATE_CONFLICT", "current pause effect phase ended")
+		}
+		effect, effectErr := latestEffect(tx, project, Str(run, "id"), purpose.effectKey)
+		if effectErr != nil || Hash(effect["epoch"]) != Hash(run["lease_epoch"]) ||
+			(purpose.requestHash != "" && effect["request_hash"] != purpose.requestHash) || effect["state"] == "UNKNOWN" {
+			return nil, Fail(409, "GATE_FAILED", "current pause effect binding changed")
+		}
+		admitted, cutoffErr := pauseEffectInCutoff(tx, intent, effect, purpose.kind == "effect-start")
+		if cutoffErr != nil {
+			return nil, cutoffErr
+		}
+		if !admitted || (purpose.kind == "effect-observe" && effect["state"] != "STARTED" && effect["state"] != "CONFIRMED") ||
+			(purpose.kind == "effect-continue" && effect["state"] != "STARTED") ||
+			(purpose.kind == "effect-finish" && effect["state"] != "CONFIRMED" && effect["state"] != "NOT_APPLIED") {
+			return nil, Fail(409, "STATE_CONFLICT", "effect is outside original pause cutoff")
+		}
+	default:
+		return nil, Fail(409, "GATE_FAILED", "unknown pause dispatch purpose")
+	}
+	return intent, nil
+}
+
 func (c *RuntimeCoordinator) pauseCheckpoint(ctx context.Context, route RuntimeCoordinatorRoute, runID, lease string, epoch int64, key string, bridge *rt.Bridge, frame rt.BridgeFrame) (Object, error) {
 	j := bridge.Read()
 	cp := j.Checkpoint
@@ -154,7 +240,7 @@ func (c *RuntimeCoordinator) pauseCheckpoint(ctx context.Context, route RuntimeC
 	if err != nil {
 		return nil, err
 	}
-	tx, run, dispatch, err := c.dispatchGate(ctx, route, runID, lease, epoch)
+	tx, run, dispatch, err := c.dispatchGate(ctx, route, runID, lease, epoch, runtimePauseGatePurpose{kind: "checkpoint", pauseID: cp.PauseID})
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +268,7 @@ func (c *RuntimeCoordinator) pauseCheckpoint(ctx context.Context, route RuntimeC
 	if err != nil {
 		return nil, err
 	}
-	if err = c.heartbeat(ctx, route, runID, lease, epoch, key, Str(artifact, "id")); err != nil {
+	if err = c.heartbeat(ctx, route, runID, lease, epoch, key, Str(artifact, "id"), runtimePauseGatePurpose{kind: "heartbeat", pauseID: cp.PauseID}); err != nil {
 		return nil, err
 	}
 	tx, err = c.service.DB.BeginTx(ctx, nil)
@@ -760,6 +846,10 @@ func (s *Service) requiredSealedPauseProof(tx *sql.Tx, project string, run, inte
 }
 
 func (s *Service) pauseActivationGate(tx *sql.Tx, project string, run, dispatch Object) error {
+	return s.pauseActivationGateWithCurrentPause(tx, project, run, dispatch, nil)
+}
+
+func (s *Service) pauseActivationGateWithCurrentPause(tx *sql.Tx, project string, run, dispatch, currentPause Object) error {
 	manifest, _ := dispatch["manifest"].(map[string]any)
 	admission, _ := manifest["admission"].(map[string]any)
 	marker, _ := admission["sealed_pause_activation"].(map[string]any)
@@ -803,7 +893,7 @@ func (s *Service) pauseActivationGate(tx *sql.Tx, project string, run, dispatch 
 	if err != nil {
 		return err
 	}
-	if task["status"] != "RUNNING" || task["active_run_id"] != run["id"] || goal["status"] != "ACTIVE" || run["cancel_requested_at"] != nil || (run["status"] != "QUEUED" && run["status"] != "STARTING" && run["status"] != "RUNNING") {
+	if (task["status"] != "RUNNING" && (task["status"] != "BLOCKED" || currentPause == nil)) || task["active_run_id"] != run["id"] || goal["status"] != "ACTIVE" || run["cancel_requested_at"] != nil || (run["status"] != "QUEUED" && run["status"] != "STARTING" && run["status"] != "RUNNING") {
 		return Fail(409, "STATE_CONFLICT", "required activation lifecycle fenced")
 	}
 	oldEpoch, _ := Num(a, "previous_epoch")

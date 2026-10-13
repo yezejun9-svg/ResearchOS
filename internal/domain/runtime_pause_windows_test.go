@@ -3,11 +3,188 @@
 package domain
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func runtimeLocalLaunchAdmission() Object {
+	return Object{"profile": Object{"sandbox": runtimeSandboxProfile, "adapter_revision": runtimeBridgeRevision, "platform": "windows-amd64", "command_id": "multi-epoch-probe", "build_hash": "fixture-build", "permissions": Object{"capabilities": Empty(), "network": "none", "environment": "staging-only", "process_limit": 1, "memory_mib": 256}, "timeout_seconds": 60, "outputs": []any{"result.json"}}}
+}
+
+func runtimeLocalLaunchEpoch(t *testing.T, o *orchestrationFixture, runID string, epoch float64) error {
+	t.Helper()
+	tx, err := o.f.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	run, err := load(tx, o.f.project, "Run", runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run["lease_epoch"] = epoch
+	if err = o.f.s.reserveRuntimeLocalLaunch(tx, o.f.project, run, runtimeLocalLaunchAdmission()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func runtimeLocalLaunchRows(t *testing.T, o *orchestrationFixture, runID string) []Object {
+	t.Helper()
+	rows, err := o.f.db.Query("SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_request_id') LIKE ? ORDER BY rowid", o.f.project, "runtime-local-launch/"+runID+"/%")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := []Object{}
+	for rows.Next() {
+		var raw string
+		if err = rows.Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		entry, decodeErr := Decode([]byte(raw))
+		if decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		out = append(out, entry)
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestRuntimeLocalLaunchRepeatedEpochsAndReleaseBindings(t *testing.T) {
+	t.Run("four-epochs", func(t *testing.T) {
+		o := orchestrationSetup(t)
+		task := o.task("multi-epoch-accounting", Empty(), Empty())
+		r := o.claim(task)
+		runID := Str(r.run, "id")
+		for epoch := 1; epoch <= 4; epoch++ {
+			if err := runtimeLocalLaunchEpoch(t, o, runID, float64(epoch)); err != nil {
+				t.Fatalf("epoch %d: %v", epoch, err)
+			}
+			before := runtimeLocalLaunchRows(t, o, runID)
+			if err := runtimeLocalLaunchEpoch(t, o, runID, float64(epoch)); err != nil {
+				t.Fatalf("same epoch %d: %v", epoch, err)
+			}
+			if Hash(before) != Hash(runtimeLocalLaunchRows(t, o, runID)) {
+				t.Fatalf("same epoch %d changed ledger", epoch)
+			}
+		}
+		rows := runtimeLocalLaunchRows(t, o, runID)
+		if len(rows) != 7 {
+			t.Fatalf("want four holds and three releases, got %d", len(rows))
+		}
+		holds, releases := map[string]Object{}, map[string]Object{}
+		for _, row := range rows {
+			if row["receipt_hash"] != Receipt(row) {
+				t.Fatal("invalid ledger receipt")
+			}
+			request := Str(row, "provider_request_id")
+			switch row["operation"] {
+			case "RESERVE":
+				if holds[request] != nil {
+					t.Fatal("duplicate hold", request)
+				}
+				holds[request] = row
+			case "RELEASE":
+				if releases[request] != nil {
+					t.Fatal("duplicate release", request)
+				}
+				releases[request] = row
+			default:
+				t.Fatal("unexpected operation", row["operation"])
+			}
+		}
+		for epoch := 1; epoch <= 4; epoch++ {
+			request := "runtime-local-launch/" + runID + "/" + string(Bytes(epoch))
+			hold := holds[request]
+			if hold == nil {
+				t.Fatal("missing hold", epoch)
+			}
+			release := releases[request]
+			if epoch == 4 {
+				if release != nil {
+					t.Fatal("current epoch already released")
+				}
+				continue
+			}
+			if release == nil || release["reservation_id"] != hold["id"] || release["provider_event_id"] != request+"/released" || release["policy_id"] != hold["policy_id"] || Hash(release["money"]) != Hash(hold["money"]) {
+				t.Fatalf("epoch %d release not bound to original hold", epoch)
+			}
+		}
+	})
+	for _, mutation := range []string{"project_id", "run_id", "provider_request_id", "provider_event_id", "reservation_id", "policy_id", "currency", "operation", "amount", "receipt_hash"} {
+		t.Run("reject-"+mutation, func(t *testing.T) {
+			o := orchestrationSetup(t)
+			task := o.task("bad-release-binding", Empty(), Empty())
+			r := o.claim(task)
+			runID := Str(r.run, "id")
+			if err := runtimeLocalLaunchEpoch(t, o, runID, 1); err != nil {
+				t.Fatal(err)
+			}
+			request := "runtime-local-launch/" + runID + "/1"
+			hold := runtimeLocalLaunchRows(t, o, runID)[0]
+			entry := Merge(Base(o.f.project), Object{"policy_id": hold["policy_id"], "run_id": runID, "operation": "RELEASE", "money": Object{"amount": "0", "currency": "USD"}, "provider_request_id": request, "provider_event_id": request + "/released", "reservation_id": hold["id"], "cost_basis": "ACTUAL", "occurred_at": Now()})
+			delete(entry, "updated_at")
+			switch mutation {
+			case "currency", "amount":
+				money := Object(entry["money"].(map[string]any))
+				if mutation == "currency" {
+					money["currency"] = "EUR"
+				} else {
+					money["amount"] = "1"
+				}
+				entry["money"] = money
+			case "receipt_hash":
+				entry["receipt_hash"] = "invalid"
+			default:
+				entry[mutation] = "wrong"
+			}
+			if mutation != "receipt_hash" {
+				entry["receipt_hash"] = Receipt(entry)
+			}
+			if _, err := o.f.db.Exec("INSERT INTO domain_objects(project,kind,id,revision,body,content_hash,immutable) VALUES(?,'BudgetLedgerEntry',?,1,?,?,1)", o.f.project, entry["id"], string(Bytes(entry)), Hash(entry)); err != nil {
+				t.Fatal(err)
+			}
+			before := runtimeLocalLaunchRows(t, o, runID)
+			var runBefore, runAfter string
+			if err := o.f.db.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='Run' AND id=?", o.f.project, runID).Scan(&runBefore); err != nil {
+				t.Fatal(err)
+			}
+			tx, err := o.f.db.BeginTx(context.Background(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec("UPDATE domain_objects SET body=json_set(body,'$.lease_epoch',2) WHERE project=? AND kind='Run' AND id=?", o.f.project, runID); err != nil {
+				t.Fatal(err)
+			}
+			run, err := load(tx, o.f.project, "Run", runID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = o.f.s.reserveRuntimeLocalLaunch(tx, o.f.project, run, runtimeLocalLaunchAdmission()); err == nil {
+				t.Fatal("wrong release binding accepted")
+			}
+			if err = tx.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+			if err = o.f.db.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='Run' AND id=?", o.f.project, runID).Scan(&runAfter); err != nil {
+				t.Fatal(err)
+			}
+			if runBefore != runAfter {
+				t.Fatal("rejected successor partially changed Run")
+			}
+			if Hash(before) != Hash(runtimeLocalLaunchRows(t, o, runID)) {
+				t.Fatal("rejected successor partially changed ledger")
+			}
+		})
+	}
+}
 
 func TestRuntimePauseRecoveryBoundedFile(t *testing.T) {
 	root := t.TempDir()
@@ -73,6 +250,91 @@ func TestRuntimePauseActivationNeverFallsThroughMissingProof(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRuntimePausePurposeRequiresCurrentBoundIntent(t *testing.T) {
+	for _, mutation := range []string{"valid", "no-purpose", "missing-intent", "old-epoch", "wrong-pause", "wrong-dispatch", "wrong-identity", "wrong-session", "owner-revoked", "goal-stopped", "cancel-control", "reconciling", "unrelated-block"} {
+		t.Run(mutation, func(t *testing.T) {
+			db, task, run, dispatch := runtimePausePurposeFixture(t, mutation != "missing-intent")
+			purpose := &runtimePauseGatePurpose{kind: "checkpoint", pauseID: "pause2"}
+			switch mutation {
+			case "no-purpose":
+				purpose = nil
+			case "old-epoch":
+				run["lease_epoch"] = 3
+			case "wrong-pause":
+				purpose.pauseID = "other"
+			case "wrong-dispatch":
+				dispatch["dispatch_key"] = "other"
+			case "wrong-identity":
+				dispatch["identity"] = Object{"pid": 2}
+			case "wrong-session":
+				pauseStorageExec(t, db, `UPDATE client_queue_fences SET session_id='other'`)
+			case "owner-revoked":
+				pauseStorageExec(t, db, `UPDATE auth_principals SET revoked=1 WHERE id='actor'`)
+			case "goal-stopped":
+				pauseStorageExec(t, db, `UPDATE domain_objects SET body=json_set(body,'$.status','CANCELLED') WHERE kind='Goal'`)
+			case "cancel-control":
+				pauseStorageExec(t, db, `UPDATE orchestration_task_controls SET action='CANCEL'`)
+			case "reconciling":
+				pauseStorageExec(t, db, `UPDATE runtime_pause_intents SET state='RECONCILING',revision=revision+1`)
+			case "unrelated-block":
+				task["active_run_id"] = "other"
+			}
+			tx, err := db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			current, err := pauseDispatchPurposeGate(tx, "p", task, run, dispatch, purpose)
+			if mutation == "valid" {
+				if err != nil || current == nil {
+					t.Fatalf("valid current pause denied: %v", err)
+				}
+			} else if current != nil || (mutation != "no-purpose" && err == nil) {
+				t.Fatalf("%s passed current pause gate: %v", mutation, err)
+			}
+		})
+	}
+}
+
+func runtimePausePurposeFixture(t *testing.T, withIntent bool) (*sql.DB, Object, Object, Object) {
+	db, _ := configurationDB(t, 25, true)
+	t.Cleanup(func() { db.Close() })
+	pauseStorageExec(t, db, `INSERT INTO auth_principals(id,roles) VALUES('actor','["OWNER"]')`)
+	pauseStorageExec(t, db, `INSERT INTO auth_grants(principal,project,task,run) VALUES('actor','p','','')`)
+	pauseStorageExec(t, db, `INSERT INTO domain_objects(project,kind,id,revision,body) VALUES('p','Goal','goal',1,'{"id":"goal","status":"ACTIVE"}'),('p','Task','t',1,'{}'),('p','Run','r',1,'{}')`)
+	task := Object{"id": "t", "status": "BLOCKED", "goal_id": "goal", "active_run_id": "r"}
+	run := Object{"id": "r", "status": "RUNNING", "task_id": "t", "lease_epoch": 2, "runtime_id": "runtime", "executor_principal_id": "executor", "cancel_requested_at": nil}
+	dispatch := Object{"dispatch_key": "d2", "manifest_hash": "m2", "identity": Object{"pid": 1}}
+	pauseStorageExec(t, db, `INSERT INTO client_sessions(id,project_id,revision,created_at,updated_at,task_id,run_id,writer_epoch,writer_client_id,event_watermark,upstream_session_id) VALUES('session','p',1,'now','now','t','r',2,'client',0,'native')`)
+	pauseStorageExec(t, db, `INSERT INTO client_queue_fences(project,task_id,session_id,generation,state,run_id,runtime_epoch,dispatch_key,manifest_hash,process_identity) VALUES('p','t','session','generation','OPEN','r',2,'d2','m2',?)`, string(Bytes(dispatch["identity"])))
+	pauseStorageExec(t, db, `INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,identity,prepared_at,updated_at) VALUES('p','r',2,'d2','{}','m2','PREPARED',?,'now','now')`, string(Bytes(dispatch["identity"])))
+	if !withIntent {
+		return db, task, run, dispatch
+	}
+	pauseStorageExec(t, db, `INSERT INTO runtime_pause_intents(project,pause_id,task,run,epoch,session_id,generation,principal,request_key,request_hash,runtime,dispatch_key,manifest_hash,process_identity_hash,original_input_hash,state,created_at,updated_at) VALUES('p','pause2','t','r',2,'session','generation','actor','request','hash','runtime','d2','m2',?,'input','PAUSE_REQUESTED','now','now')`, Hash(dispatch["identity"]))
+	pauseStorageExec(t, db, `INSERT INTO orchestration_task_controls(project,task,action,reason,requested_at) VALUES('p','t','PAUSE','test','now')`)
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := pauseIntent(tx, "p", "r", 2)
+	if err == nil {
+		err = pauseWitness(tx, intent)
+	}
+	if err == nil {
+		err = recordPauseEffectCutoff(tx, intent)
+	}
+	if err == nil {
+		err = tx.Commit()
+	} else {
+		tx.Rollback()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db, task, run, dispatch
 }
 
 // This is a storage fixture. The host test separately proves the actual native
