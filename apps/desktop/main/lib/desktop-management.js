@@ -243,11 +243,29 @@ class DesktopManagement {
         before[0] === now[0] && before[1] === now[1] && before[6] === now[6];
     } catch { return false; }
   }
+  sameQualificationSelection(intent) {
+    if (this.sameContext(intent.context)) return true;
+    try {
+      const before = JSON.parse(intent.context), now = JSON.parse(this.options.context());
+      // Only the native eight-field context can relax writer/lease revisions.
+      return Array.isArray(before) && Array.isArray(now) && before.length === 8 && now.length === 8 &&
+        before[0] === intent.projectId && before[1] === intent.sessionId &&
+        before[0] === now[0] && before[1] === now[1] &&
+        Number.isSafeInteger(before[6]) && before[6] === now[6];
+    } catch { return false; }
+  }
+  qualificationOrigin(intent) {
+    const current = this.currentHost();
+    if (this.hostId !== intent.hostId || current.data_dir !== intent.dataRoot ||
+        !sameIdentity(this.identity, intent.controlIdentity) ||
+        !sameIdentity(this.parentIdentity, intent.parentIdentity))
+      throw failure('QUALIFICATION_ORIGIN_CHANGED');
+  }
   summary() {
     const intent = this.intent;
     let hostFailure = null;
     if (this.state === 'READY') {
-      try { this.currentHost(); }
+      try { if (intent) this.qualificationOrigin(intent); else this.currentHost(); }
       catch (error) { hostFailure = error.code || 'HOST_IDENTITY_UNAVAILABLE'; }
     }
     if (hostFailure && intent) intent.needsRecheck = true;
@@ -262,17 +280,24 @@ class DesktopManagement {
     if (!intent) return { available, state: hostFailure ? 'HOST_UNAVAILABLE' : pendingState || this.state,
       reason, ...history };
     const same = this.sameContext(intent.context);
+    const selected = this.sameQualificationSelection(intent);
+    const historical = !same && selected;
     const canRetire = this.canRetireExpiredIntent(intent);
     return { available, state: hostFailure ? 'HOST_UNAVAILABLE' : pendingState ? pendingState :
-      canRetire ? 'EXPIRED' : same ? intent.state : 'CONTEXT_CHANGED_PENDING',
+      canRetire ? 'EXPIRED' : same ? intent.state : historical ? 'ORIGINAL_REQUEST_HISTORY' : 'CONTEXT_CHANGED_PENDING',
       reason, model: available && same ? intent.model : null,
       request_id: intent.requestId, expires_at: intent.expiresAt,
       model_calls: 1, tools: [], cost_basis: 'UNKNOWN', money: null,
       purpose: 'mu_turn', purpose_seconds: 600, consumed: !!intent.confirmSent,
+      status_scope: historical ? 'ORIGINAL_REQUEST_HISTORY' : same ? 'CURRENT_CONTEXT' : 'OTHER_SELECTION',
+      original_state: intent.state,
+      original_checked_at: available && selected && !intent.needsRecheck && intent.checkedAt ?
+        new Date(intent.checkedAt).toISOString() : null,
       // A historical RESULT never proves that the current purpose is still valid.
-      authorized: available && same && !intent.needsRecheck &&
+      authorized: available && same && intent.checkedContext === intent.context && !intent.needsRecheck &&
         intent.state === 'QUALIFIED_PURPOSE_AUTHORIZED' && Date.now() - intent.checkedAt < 10000,
-      checked_at: available && same && intent.checkedAt ? new Date(intent.checkedAt).toISOString() : null,
+      checked_at: available && same && intent.checkedContext === intent.context && !intent.needsRecheck &&
+        intent.checkedAt ? new Date(intent.checkedAt).toISOString() : null,
       ...history };
   }
   canRetireExpiredIntent(intent) {
@@ -461,9 +486,13 @@ class DesktopManagement {
     if (![projectId, sessionId, modelRef].every(v => typeof v === 'string' && ID.test(v)))
       throw failure('QUALIFICATION_SCOPE_INVALID');
     if (this.intent) this.retireExpiredIntent();
+    const originHost = this.currentHost();
+    const origin = { hostId: this.hostId, dataRoot: originHost.data_dir,
+      controlIdentity: structuredClone(this.identity), parentIdentity: structuredClone(this.parentIdentity) };
     const reply = await this.exchange('PREPARE', { project_id: projectId, session_id: sessionId,
       model_config_ref: modelRef }, 30000);
     if (!this.sameContext(context)) throw failure('CONTEXT_CHANGED');
+    this.qualificationOrigin(origin);
     if (reply.kind !== 'RESULT') throw failure('PREPARE_REJECTED');
     const value = reply.result, request = value?.request;
     if (!object(value) || value.state !== 'AWAITING_CONFIRMATION' || value.model_calls !== 1 ||
@@ -477,7 +506,7 @@ class DesktopManagement {
     const issued = Date.parse(request.issued_at), expires = Date.parse(request.expires_at), now = Date.now();
     if (!Number.isFinite(issued) || !Number.isFinite(expires) || issued > now || expires <= now ||
         expires <= issued || expires - issued > 60000) throw failure('PREPARE_EXPIRED');
-    this.intent = { state: 'AWAITING_CONFIRMATION', validated: true, context, projectId, sessionId, modelRef, model,
+    this.intent = { state: 'AWAITING_CONFIRMATION', validated: true, context, projectId, sessionId, modelRef, model, ...origin,
       requestId: request.request_id, requestHash: value.request_hash, expiresAt: request.expires_at,
       confirmedAt: null, checkedAt: 0, confirmSent: false, needsRecheck: false };
     return this.summary();
@@ -488,7 +517,7 @@ class DesktopManagement {
     if (!intent || intent.confirmSent || intent.state !== 'AWAITING_CONFIRMATION') throw failure('CONFIRM_NOT_AVAILABLE');
     if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
     if (!(Date.parse(intent.expiresAt) > Date.now())) { intent.state = 'EXPIRED'; throw failure('CONFIRM_EXPIRED'); }
-    this.currentHost();
+    this.qualificationOrigin(intent);
     intent.confirmSent = true; intent.state = 'CONFIRM_SENT';
     try {
       const reply = await this.exchange('CONFIRM', { project_id: intent.projectId, request_id: intent.requestId,
@@ -503,16 +532,22 @@ class DesktopManagement {
     this.commandIdle();
     const intent = this.intent;
     if (!intent) throw failure('STATUS_ORIGINAL_REQUEST_REQUIRED');
-    if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
+    intent.needsRecheck = true;
+    if (!this.sameQualificationSelection(intent)) throw failure('CONTEXT_CHANGED');
+    this.qualificationOrigin(intent);
+    const checkedContext = this.options.context();
     const reply = await this.exchange('STATUS', { project_id: intent.projectId,
       request_id: intent.requestId, request_hash: intent.requestHash }, 30000);
-    if (!this.sameContext(intent.context)) throw failure('CONTEXT_CHANGED');
+    if (this.intent !== intent || !this.sameQualificationSelection(intent)) throw failure('CONTEXT_CHANGED');
+    this.qualificationOrigin(intent);
     if (reply.kind !== 'RESULT') throw failure('STATUS_REJECTED');
     const value = reply.result;
     if (!object(value) || value.request_id !== intent.requestId || value.request_hash !== intent.requestHash ||
         !['AWAITING_CONFIRMATION', 'EXPIRED', 'UNRESOLVED', 'EXECUTION_SETTLED', 'QUALIFIED_PURPOSE_AUTHORIZED'].includes(value.state) ||
         typeof value.consumed !== 'boolean') throw failure('STATUS_RESULT_INVALID');
     intent.state = value.state; intent.checkedAt = Date.now(); intent.needsRecheck = false;
+    // History can clear the settled-operation barrier, never grant current authority.
+    intent.checkedContext = checkedContext === intent.context && this.sameContext(intent.context) ? intent.context : null;
     if (value.consumed) intent.confirmSent = true;
     return this.summary();
   }
@@ -543,9 +578,12 @@ class DesktopManagement {
     }
     if (this.intent) {
       if (!this.intent.confirmSent && this.canRetireExpiredIntent(this.intent)) this.retireExpiredIntent();
-      else if (!(this.intent.confirmSent && ['EXECUTION_SETTLED', 'QUALIFIED_PURPOSE_AUTHORIZED'].includes(this.intent.state) &&
-        !this.intent.needsRecheck && Date.now() - this.intent.checkedAt < 10000))
+      else if (!(this.sameQualificationSelection(this.intent) && this.intent.confirmSent &&
+        ['EXECUTION_SETTLED', 'QUALIFIED_PURPOSE_AUTHORIZED'].includes(this.intent.state) &&
+        !this.intent.needsRecheck && this.intent.checkedAt > 0 &&
+        Date.now() >= this.intent.checkedAt && Date.now() - this.intent.checkedAt < 10000))
         throw failure('QUALIFICATION_ORIGINAL_REQUEST_PENDING');
+      else this.qualificationOrigin(this.intent);
     }
     // Retain the original operation before sending. A changed UI selection or
     // a missing reply cannot make another PREPARE appear safe.

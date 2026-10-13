@@ -212,6 +212,7 @@ export function DesktopQualification({ projectId, sessionId }) {
       if (!reply?.ok) throw new Error(reply?.reason || '托管资格操作失败')
       setState(reply)
       setNotice(!reply.available ? '操作后本机主机身份无法确认；原请求仅保留为历史，请恢复主机后复核。' :
+        reply.status_scope === 'ORIGINAL_REQUEST_HISTORY' ? '已复核原请求历史状态；该结果不代表当前模型或写入权已获用途授权。' :
         method === 'qualificationPrepare' ? '准备完成；模型调用尚未开始。请核对后明确确认。' :
         method === 'qualificationConfirm' ? '确认调用已结束；下方状态来自原请求的当前复核。' : '已复核原请求的当前状态。')
     } catch (cause) {
@@ -234,8 +235,11 @@ export function DesktopQualification({ projectId, sessionId }) {
     {state?.model && <p>当前待确认模型：{state.model.provider_id} · {state.model.model_id}</p>}
     {state?.request_id && <p className="break-all">原请求：{state.request_id}；有效至 {state.expires_at || '未知'}</p>}
     {state?.previous_request_id && <p className="break-all small-muted">已退役的过期原请求：{state.previous_request_id}；过期于 {state.previous_expires_at || '未知'}。该记录仅供审计，不代表当前资格。</p>}
-    <p role="status">{state?.state === 'QUALIFIED_PURPOSE_AUTHORIZED' ?
+    <p role="status">{state?.status_scope === 'ORIGINAL_REQUEST_HISTORY' ?
+      `原请求历史状态：${state.original_state}；${state.original_checked_at ? `复核于 ${state.original_checked_at}` : '尚需复核'}。当前模型或写入权的用途授权须另行核对。` :
+      state?.authorized ?
       '最近一次复核显示用途授权；实际使用时服务端再次检查，请按需复核原请求。' :
+      state?.state === 'QUALIFIED_PURPOSE_AUTHORIZED' ? '保留上次用途授权结果；当前授权尚未确认，请复核原请求。' :
       state?.state === 'HOST_UNAVAILABLE' ? '本机主机身份已变化或无法确认；旧请求仅作历史记录，当前不可用。' :
       state?.state === 'CONTEXT_CHANGED_PENDING' ? '项目或会话已变更，原请求保留，当前不可确认。' :
       state?.state || '正在读取托管状态'}{state?.reason ? ` · ${state.reason}` : ''}</p>
