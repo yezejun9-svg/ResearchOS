@@ -4,10 +4,12 @@ package host
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 // coordinator after recovery and before its scan. It never invokes a provider,
 // begins a qualification Run, accepts a Task, or upgrades runtime status.
 type RuntimeSetup struct {
+	candidate *TrustedCandidatePolicy
 	host      *Host
 	service   *domain.Service
 	schema    *domain.SchemaDoc
@@ -147,7 +150,12 @@ func (setup *RuntimeSetup) prepare(ctx context.Context, coordinator *domain.Runt
 	if err = setup.service.ValidateRuntimeSetup(ctx, token, candidate, setup.schema, h); err != nil {
 		return err
 	}
-	assets, err := LoadRuntimeSetupAssets(setup.assetsDir)
+	var assets domain.RuntimeSetupAssets
+	if setup.candidate != nil {
+		assets, err = LoadTrustedCandidateRuntimeSetupAssets(*setup.candidate)
+	} else {
+		assets, err = LoadRuntimeSetupAssets(setup.assetsDir)
+	}
 	if err != nil {
 		return err
 	}
@@ -180,4 +188,87 @@ func (setup *RuntimeSetup) prepare(ctx context.Context, coordinator *domain.Runt
 	}
 	installed = true
 	return nil
+}
+
+// TrustedCandidatePolicy is supplied only by the host composition. It is never
+// decoded from request payloads or selected via environment variables.
+type TrustedCandidatePolicy struct {
+	AssetRoot    string
+	ManifestHash string
+	BundleHash   string
+	NodeHash     string
+	SourceHash   string
+}
+
+// LoadTrustedCandidateRuntimeSetupAssets leaves the installed loader and its
+// legacy pin untouched. The caller must pin the independently accepted build.
+func LoadTrustedCandidateRuntimeSetupAssets(policy TrustedCandidatePolicy) (domain.RuntimeSetupAssets, error) {
+	bad := func() (domain.RuntimeSetupAssets, error) {
+		return domain.RuntimeSetupAssets{}, domain.Fail(503, "MODEL_UNAVAILABLE", "trusted candidate runtime assets unavailable")
+	}
+	if !filepath.IsAbs(policy.AssetRoot) || !candidateHash(policy.BundleHash) || !candidateHash(policy.NodeHash) || !candidateHash(policy.SourceHash) || policy.ManifestHash != "sha256:9e5dd1e5d93f19c6a4aa5eb5c0e2ebd7f0d1e05a987f6ec03963b4b560139da9" {
+		return bad()
+	}
+	root, err := filepath.EvalSymlinks(policy.AssetRoot)
+	if err != nil || !strings.EqualFold(filepath.Clean(root), filepath.Clean(policy.AssetRoot)) {
+		return bad()
+	}
+	read := func(name string, limit int64) ([]byte, error) {
+		p := filepath.Join(root, name)
+		info, e := os.Lstat(p)
+		if e != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > limit {
+			return nil, errors.New("candidate resource invalid")
+		}
+		actual, e := filepath.EvalSymlinks(p)
+		if e != nil || !strings.EqualFold(actual, p) {
+			return nil, errors.New("candidate resource reparse")
+		}
+		return os.ReadFile(p)
+	}
+	raw, err := read("mu-worker.mjs.build.json", 64<<10)
+	if err != nil {
+		return bad()
+	}
+	var meta struct {
+		SourceMode string `json:"source_mode"`
+		Manifest   string `json:"candidate_manifest_sha256"`
+		Base       string `json:"candidate_base"`
+		Patch      string `json:"candidate_patch_sha256"`
+		Review     string `json:"independent_review_sha256"`
+		Protocol   string `json:"protocol_capability"`
+		Bundle     string `json:"bundle_sha256"`
+		Source     string `json:"source_sha256"`
+		Bytes      int64  `json:"bundle_bytes"`
+		Inputs     int    `json:"compiled_inputs"`
+		Census     string `json:"compiled_inputs_sha256"`
+	}
+	if json.Unmarshal(raw, &meta) != nil || meta.SourceMode != "ACCEPTED_M0_CANDIDATE" || "sha256:"+meta.Manifest != policy.ManifestHash || meta.Base != "7ec619a16a932ae02daa7c2e6132d266528a1da8" || meta.Patch != "f82f8b8f866ae920bb769b657faf0a1a8709844979422fa409cb5bbc5194ad67" || meta.Review != "13c6ce9fbad76c6e6f2b2c8537bbaa2e662dc5539709c0161fa5219d06dd7489" || meta.Protocol != "RESEARCHOS_PAUSE_V1" || "sha256:"+meta.Bundle != policy.BundleHash || "sha256:"+meta.Source != policy.SourceHash || meta.Inputs < 2 || !candidateHash("sha256:"+meta.Census) {
+		return bad()
+	}
+	bundle, err := read("mu-worker.mjs", 128<<20)
+	if err != nil || int64(len(bundle)) != meta.Bytes || domain.Digest(bundle) != policy.BundleHash {
+		return bad()
+	}
+	node, err := read("node.exe", 128<<20)
+	if err != nil || len(node) < 2 || string(node[:2]) != "MZ" || domain.Digest(node) != policy.NodeHash {
+		return bad()
+	}
+	return domain.RuntimeSetupAssets{Executable: filepath.Join(root, "node.exe"), BundleFile: filepath.Join(root, "mu-worker.mjs"), BuildHash: policy.NodeHash, BundleHash: policy.BundleHash}, nil
+}
+func candidateHash(value string) bool {
+	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	_, err := hex.DecodeString(value[7:])
+	return err == nil
+}
+
+// NewTrustedCandidateRuntimeSetup is an explicit host-only composition point.
+func (h *Host) NewTrustedCandidateRuntimeSetup(service *domain.Service, schema *domain.SchemaDoc, policy TrustedCandidatePolicy) (*RuntimeSetup, error) {
+	if _, err := LoadTrustedCandidateRuntimeSetupAssets(policy); err != nil {
+		return nil, err
+	}
+	setup := h.NewRuntimeSetup(service, schema, policy.AssetRoot)
+	setup.candidate = &policy
+	return setup, nil
 }
