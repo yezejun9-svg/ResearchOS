@@ -48,27 +48,73 @@ type MigrationGrant struct {
     Options json.RawMessage `json:"options"`
 }
 func validMigrationBinding(b MigrationBinding) error {
-    if b.PlanID!=MigrationPlanID || b.OwnerRoot=="" || b.ProjectID=="" || b.Root=="" || b.RootIdentity=="" || b.Database=="" || b.DatabaseIdentity=="" || b.SQLSHA256!=MigrationSQLSHA256 { return errors.New("AUTHORITY_MIGRATION_BINDING") }
-    for _,s:=range []string{b.SourceReleaseSHA256,b.TargetReleaseSHA256,b.SourceInventorySHA256,b.TargetInventorySHA256,b.SourceSchemaSHA256,b.TargetSchemaSHA256,b.OriginalRowsSHA256,b.OptionsSHA256,b.Backup.SHA256,b.Rehearsal.SHA256} { if !validHash(s) { return errors.New("AUTHORITY_MIGRATION_DIGEST") } }
-    if b.Backup.Path=="" || b.Backup.Bytes<=0 || b.Backup.Role!="encrypted-backup-manifest" || b.Rehearsal.Path=="" || b.Rehearsal.Bytes<=0 || b.Rehearsal.Role!="isolated-restore-rehearsal" { return errors.New("AUTHORITY_MIGRATION_BACKUP_REHEARSAL") }; return nil
+	return validMigrationBindingFor(b, preparedMigrationDescriptor)
 }
-func verifyMigrationGrant(raw,releaseRaw []byte) (MigrationGrant,error) {
-    var g MigrationGrant
-    if e:=verifyDocument(raw,MigrationPurpose+"/grant",&g); e!=nil { return g,e }
-    nonce,e:=hexNonce(g.Nonce)
-    if e!=nil || len(nonce)!=32 || g.Schema!="researchos.recovery-migration-grant.v1" || g.Purpose!=MigrationPurpose || g.Stage!="APPLY_ORIGINAL" || g.ReleaseSHA256!=digest(releaseRaw) || !validInterval(g.IssuedUTC,g.ExpiresUTC,time.Now(),5*time.Minute) { return g,errors.New("AUTHORITY_MIGRATION_GRANT") }
-    if e=validMigrationBinding(g.Binding); e!=nil { return g,e }
-    if digest(g.Options)!=g.Binding.OptionsSHA256 { return g,errors.New("AUTHORITY_MIGRATION_OPTIONS") }
-    required:=map[string]string{"source-program":g.Binding.SourceReleaseSHA256,"target-program":g.Binding.TargetReleaseSHA256,"migration-sql":MigrationSQLSHA256,"encrypted-backup-manifest":g.Binding.Backup.SHA256,"isolated-restore-rehearsal":g.Binding.Rehearsal.SHA256}
-    seen:=map[string]bool{}
-    for _,p:=range g.Pins {
-        if seen[p.Role] || !validHash(p.SHA256) || p.Bytes<0 || p.Path=="" { return g,errors.New("AUTHORITY_MIGRATION_RAW_PINS") }; seen[p.Role]=true
-        if expected,ok:=required[p.Role]; ok && expected!=p.SHA256 { return g,errors.New("AUTHORITY_MIGRATION_PIN_BINDING") }
-        if p.Role==g.Binding.Backup.Role && !bytes.Equal(encoded(p),encoded(g.Binding.Backup)) { return g,errors.New("AUTHORITY_MIGRATION_BACKUP_PIN") }
-        if p.Role==g.Binding.Rehearsal.Role && !bytes.Equal(encoded(p),encoded(g.Binding.Rehearsal)) { return g,errors.New("AUTHORITY_MIGRATION_REHEARSAL_PIN") }
-    }
-    for role:=range required { if !seen[role] { return g,errors.New("AUTHORITY_MIGRATION_MISSING_PIN") } }
-    return g,nil
+func validMigrationBindingFor(b MigrationBinding, spec migrationDescriptor) error {
+	if b.PlanID != spec.plan || b.OwnerRoot == "" || b.ProjectID == "" || b.Root == "" || b.RootIdentity == "" || b.Database == "" || b.DatabaseIdentity == "" || b.SQLSHA256 != spec.sql {
+		return errors.New("AUTHORITY_MIGRATION_BINDING")
+	}
+	for _, s := range []string{b.SourceReleaseSHA256, b.TargetReleaseSHA256, b.SourceInventorySHA256, b.TargetInventorySHA256, b.SourceSchemaSHA256, b.TargetSchemaSHA256, b.OriginalRowsSHA256, b.OptionsSHA256, b.Backup.SHA256, b.Rehearsal.SHA256} {
+		if !validHash(s) {
+			return errors.New("AUTHORITY_MIGRATION_DIGEST")
+		}
+	}
+	if b.Backup.Path == "" || b.Backup.Bytes <= 0 || b.Backup.Role != "encrypted-backup-manifest" || b.Rehearsal.Path == "" || b.Rehearsal.Bytes <= 0 || b.Rehearsal.Role != "isolated-restore-rehearsal" {
+		return errors.New("AUTHORITY_MIGRATION_BACKUP_REHEARSAL")
+	}
+	return nil
+}
+func verifyMigrationGrant(raw, releaseRaw []byte) (MigrationGrant, error) {
+	return verifyMigrationGrantFor(raw, releaseRaw, preparedMigrationDescriptor)
+}
+func verifyMigrationGrantFor(raw, releaseRaw []byte, spec migrationDescriptor) (MigrationGrant, error) {
+	var g MigrationGrant
+	if e := verifyDocument(raw, spec.purpose+"/grant", &g); e != nil {
+		return g, e
+	}
+	if g.ReleaseSHA256 != digest(releaseRaw) {
+		return g, errors.New("AUTHORITY_MIGRATION_GRANT")
+	}
+	return g, validateMigrationGrantFields(g, spec)
+}
+
+func validateMigrationGrantFields(g MigrationGrant, spec migrationDescriptor) error {
+	nonce, e := hexNonce(g.Nonce)
+	if e != nil || len(nonce) != 32 || g.Schema != spec.schema || g.Purpose != spec.purpose || g.Stage != "APPLY_ORIGINAL" || !validHash(g.ReleaseSHA256) || !validInterval(g.IssuedUTC, g.ExpiresUTC, time.Now(), 5*time.Minute) {
+		return errors.New("AUTHORITY_MIGRATION_GRANT")
+	}
+	if e = validMigrationBindingFor(g.Binding, spec); e != nil {
+		return e
+	}
+	if digest(g.Options) != g.Binding.OptionsSHA256 {
+		return errors.New("AUTHORITY_MIGRATION_OPTIONS")
+	}
+	required := map[string]string{"source-program": g.Binding.SourceReleaseSHA256, "target-program": g.Binding.TargetReleaseSHA256, "migration-sql": spec.sql, "encrypted-backup-manifest": g.Binding.Backup.SHA256, "isolated-restore-rehearsal": g.Binding.Rehearsal.SHA256}
+	for _, role := range spec.extraRoles {
+		required[role] = ""
+	}
+	seen := map[string]bool{}
+	for _, p := range g.Pins {
+		if seen[p.Role] || !validHash(p.SHA256) || p.Bytes < 0 || p.Path == "" {
+			return errors.New("AUTHORITY_MIGRATION_RAW_PINS")
+		}
+		seen[p.Role] = true
+		if expected, ok := required[p.Role]; ok && expected != "" && expected != p.SHA256 {
+			return errors.New("AUTHORITY_MIGRATION_PIN_BINDING")
+		}
+		if p.Role == g.Binding.Backup.Role && !bytes.Equal(encoded(p), encoded(g.Binding.Backup)) {
+			return errors.New("AUTHORITY_MIGRATION_BACKUP_PIN")
+		}
+		if p.Role == g.Binding.Rehearsal.Role && !bytes.Equal(encoded(p), encoded(g.Binding.Rehearsal)) {
+			return errors.New("AUTHORITY_MIGRATION_REHEARSAL_PIN")
+		}
+	}
+	for role := range required {
+		if !seen[role] {
+			return errors.New("AUTHORITY_MIGRATION_MISSING_PIN")
+		}
+	}
+	return nil
 }
 
 // MigrationToken cannot be converted to Token. Its scope contains no Run

@@ -25,7 +25,7 @@ func main() {
 }
 func run() error {
 	if len(os.Args) < 2 {
-		return fmt.Errorf("usage: backup keygen|create|export|restore|upgrade-local|upgrade-prepared-backup [flags]")
+		return fmt.Errorf("usage: backup keygen|create|export|restore|upgrade-local|upgrade-prepared-backup|upgrade-pause-backup [flags]")
 	}
 	command := os.Args[1]
 	f := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -39,8 +39,9 @@ func run() error {
 	sourceProgram := f.String("source-program", "", "upgrade: preserved matching old program")
 	targetProgram := f.String("target-program", "", "upgrade: reviewed target program")
 	plan := f.String("plan", "", "upgrade: schema13-to14-remote-access-v1 or schema13-to20-research-runtime-v1 (exact releases only)")
-    handoffBinding := f.String("handoff-binding", "", "upgrade-prepared-backup: externally reviewed and pinned producer binding")
-    handoffSHA256 := f.String("handoff-binding-sha256", "", "upgrade-prepared-backup: expected sha256: digest of binding")
+	rehearsalProgram := f.String("rehearsal-program", "", "upgrade-pause-backup: reviewed schema25 backup image")
+	handoffBinding := f.String("handoff-binding", "", "upgrade-prepared-backup: externally reviewed and pinned producer binding")
+	handoffSHA256 := f.String("handoff-binding-sha256", "", "upgrade-prepared-backup: expected sha256: digest of binding")
 	if e := f.Parse(os.Args[2:]); e != nil {
 		return e
 	}
@@ -69,24 +70,40 @@ func run() error {
 		fmt.Println(`{"status":"KEY_CREATED_SEPARATELY","key_bytes_printed":false}`)
 		return nil
 	}
-	if command != "create" && command != "export" && command != "restore" && command != "upgrade-local" && command != "upgrade-prepared-backup" {
+	if command != "create" && command != "export" && command != "restore" && command != "upgrade-local" && command != "upgrade-prepared-backup" && command != "upgrade-pause-backup" {
 		return fmt.Errorf("unknown command")
 	}
 	if *out == "" {
 		return fmt.Errorf("--out required")
 	}
-    if command == "upgrade-prepared-backup" {
-        r, e := domain.UpgradePreparedAbandonmentBackup(context.Background(), domain.PreparedBackupHandoffOptions{
-            Upgrade: domain.LocalUpgradeOptions{
-                Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
-                SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
-                TargetProgram: *targetProgram, Plan: *plan,
-            },
-            BindingFile: *handoffBinding, BindingSHA256: *handoffSHA256,
-        })
-        if e != nil { return e }
-        return json.NewEncoder(os.Stdout).Encode(r)
-    }
+	if command == "upgrade-pause-backup" {
+		r, e := domain.UpgradePauseSchemaBackup(context.Background(), domain.PauseSchemaUpgradeOptions{
+			Upgrade: domain.LocalUpgradeOptions{
+				Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
+				SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
+				TargetProgram: *targetProgram, Plan: *plan,
+			},
+			RehearsalProgram: *rehearsalProgram, HandoffBindingFile: *handoffBinding, HandoffBindingSHA256: *handoffSHA256,
+		})
+		if e != nil {
+			return e
+		}
+		return json.NewEncoder(os.Stdout).Encode(r)
+	}
+	if command == "upgrade-prepared-backup" {
+		r, e := domain.UpgradePreparedAbandonmentBackup(context.Background(), domain.PreparedBackupHandoffOptions{
+			Upgrade: domain.LocalUpgradeOptions{
+				Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
+				SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
+				TargetProgram: *targetProgram, Plan: *plan,
+			},
+			BindingFile: *handoffBinding, BindingSHA256: *handoffSHA256,
+		})
+		if e != nil {
+			return e
+		}
+		return json.NewEncoder(os.Stdout).Encode(r)
+	}
 	if command == "upgrade-local" {
 		r, e := domain.UpgradeLocal(context.Background(), domain.LocalUpgradeOptions{
 			Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,

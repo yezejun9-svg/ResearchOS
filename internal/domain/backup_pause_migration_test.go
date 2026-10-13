@@ -85,7 +85,7 @@ func TestPauseMigrationDDLRetainsEveryOldRowAndProof(t *testing.T) {
 }
 
 func TestPauseMigrationRejectsAndRollsBack(t *testing.T) {
-	for _, mutation := range []string{"sql", "source-schema", "target-schema", "stale-rows", "version", "trigger"} {
+	for _, mutation := range []string{"sql", "source-schema", "target-schema", "stale-rows", "version", "future-version", "extra-table", "trigger"} {
 		t.Run(mutation, func(t *testing.T) {
 			db, raw, schemas := pauseMigrationTestDB(t)
 			before, err := preparedUpgradeSnapshot(db)
@@ -108,6 +108,10 @@ func TestPauseMigrationRejectsAndRollsBack(t *testing.T) {
 				_, err = tx.Exec(`UPDATE auth_credentials SET revoked=1`)
 			case "version":
 				_, err = tx.Exec(`DELETE FROM schema_migrations WHERE version=24`)
+			case "future-version":
+				_, err = tx.Exec(`INSERT INTO schema_migrations(version) VALUES(25)`)
+			case "extra-table":
+				_, err = tx.Exec(`CREATE TABLE unexpected_source(x)`)
 			case "trigger":
 				_, err = tx.Exec(`DROP TRIGGER runtime_prepared_abandonments_immutable`)
 			}
