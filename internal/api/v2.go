@@ -113,12 +113,12 @@ func coreBuildID() (string, string) {
 
 func operatingMode() string { return "LOCAL_USER_HOST" }
 
-// leaseTTL is host configuration, not a client parameter; unset means the writer-lease policy
-// is unavailable and v2 stays closed rather than publishing an invented lease.
+// leaseTTL is host configuration, not a client parameter; unset uses the local
+// host's 90-second writer lease.
 func leaseTTL() (time.Duration, error) {
 	raw := os.Getenv("RESEARCHOS_WRITER_LEASE_TTL")
 	if raw == "" {
-		return 15 * time.Minute, nil
+		return 90 * time.Second, nil
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 || d > 15*time.Minute {

@@ -316,7 +316,7 @@ func TestW14SessionWriterLeaseHandoff(t *testing.T) {
 	take["session_id"] = snapshot["session_id"]
 	take["client_id"] = "client-two"
 	take["expected_revision"] = 1
-	if r := f.call(t, f.token, take); r["status"] != "ACKNOWLEDGED" {
+	if r := f.call(t, f.token, take); r["status"] != "COMPLETED" || sessionResult(t, r)["write_owner_acquired"] != true || r["revision"] != float64(3) {
 		t.Fatal(r)
 	}
 	get := f.envelope("session.get", "lease-get", domain.Object{})
@@ -336,6 +336,60 @@ func TestW14SessionWriterLeaseHandoff(t *testing.T) {
 	var previous string
 	if err = f.db.QueryRow("SELECT json_extract(body,'$.payload.previous_client_id') FROM outbox WHERE project=? AND json_extract(body,'$.kind')='CLIENT_HANDOFF'", f.project).Scan(&previous); err != nil || previous != "client-one" {
 		t.Fatalf("handoff attribution %s %v", previous, err)
+	}
+}
+
+func TestAttachHTTPRawReplayAndDefaultLease(t *testing.T) {
+	t.Setenv("RESEARCHOS_WRITER_LEASE_TTL", "")
+	f := newSessionHTTPFixture(t)
+	snapshot := f.create(t, "default-lease-create")
+	sid := snapshot["session_id"].(string)
+	if _, err := f.db.Exec(`UPDATE client_sessions SET lease_expires_at=? WHERE id=?`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), sid); err != nil {
+		t.Fatal(err)
+	}
+	take := f.envelope("session.attach", "default-lease-attach", domain.Object{"after_sequence": 0, "request_write_owner": true})
+	take["session_id"], take["client_id"], take["expected_revision"] = sid, "client-two", 1
+	callRaw := func() []byte {
+		req, err := http.NewRequest("POST", f.server.URL+"/v2/command", bytes.NewReader(domain.Bytes(take)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+f.token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := f.server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil || resp.StatusCode != 200 {
+			t.Fatalf("HTTP attach status=%d body=%s err=%v", resp.StatusCode, raw, err)
+		}
+		return raw
+	}
+	before := time.Now().UTC()
+	first := callRaw()
+	second := callRaw()
+	if !bytes.Equal(first, second) {
+		t.Fatalf("HTTP replay bytes changed: first=%s second=%s", first, second)
+	}
+	var result domain.Object
+	if err := json.Unmarshal(first, &result); err != nil {
+		t.Fatal(err)
+	}
+	attach := sessionResult(t, result)
+	if attach["write_owner_acquired"] != true || result["revision"] != float64(3) {
+		t.Fatalf("attach result: %s", first)
+	}
+	final := attach["snapshot"].(map[string]any)
+	writer := final["writer"].(map[string]any)
+	expires, err := time.Parse(time.RFC3339Nano, writer["expires_at"].(string))
+	if err != nil || writer["client_id"] != "client-two" || writer["epoch"] != float64(2) || final["revision"] != float64(3) || final["event_sequence"] != float64(1) || expires.Before(before.Add(85*time.Second)) || expires.After(time.Now().UTC().Add(95*time.Second)) {
+		t.Fatalf("default lease or snapshot differs: %s err=%v", first, err)
+	}
+	var events int
+	if err := f.db.QueryRow(`SELECT count(*) FROM outbox WHERE project=? AND json_extract(body,'$.session_id')=? AND json_extract(body,'$.kind')='CLIENT_HANDOFF'`, f.project, sid).Scan(&events); err != nil || events != 1 {
+		t.Fatalf("replay duplicated handoff events=%d err=%v", events, err)
 	}
 }
 
