@@ -86,6 +86,9 @@ func runPauseSchemaMaintenance(ctx context.Context) error {
 	if err != nil || domain.Digest(canonical) != binding.OptionsSHA256 || !bytes.Equal(canonical, raw) {
 		return errors.New("native schema maintenance options differ from grant")
 	}
+	if err = pauseSchemaMaintenancePaths(binding, opt); err != nil {
+		return err
+	}
 	db, err := openExclusiveRecoveryDB(ctx, binding.Database)
 	if err != nil {
 		return err
@@ -97,4 +100,15 @@ func runPauseSchemaMaintenance(ctx context.Context) error {
 		return err
 	}
 	return json.NewEncoder(os.Stdout).Encode(result)
+}
+
+// Validate URI ambiguity before opening even an enrolled database. The domain
+// coordinator repeats complete canonical/alias/overlap checks under its token.
+func pauseSchemaMaintenancePaths(binding recoveryauthority.MigrationBinding, opt domain.PauseSchemaUpgradeOptions) error {
+ u:=opt.Upgrade
+ for _,path:=range []string{binding.Root,binding.Database,u.Source,u.SourceRoot,u.TargetRoot,u.SourceProgram,u.TargetProgram,u.KeyFile,u.Snapshot,u.Destination,opt.RehearsalProgram,opt.HandoffBindingFile} {
+  if !filepath.IsAbs(path) || strings.ContainsAny(path,"#?") { return errors.New("PAUSE_UPGRADE_AMBIGUOUS_OR_RELATIVE_PATH") }
+ }
+ if !strings.EqualFold(filepath.Clean(binding.Database),filepath.Clean(u.Source)) || !strings.EqualFold(filepath.Clean(binding.Root),filepath.Dir(u.Source)) { return errors.New("PAUSE_UPGRADE_NATIVE_DATABASE") }
+ return nil
 }
