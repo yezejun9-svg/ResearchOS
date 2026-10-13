@@ -79,7 +79,7 @@ func configurationBackupRows(db configurationBackupQuery, query string, args ...
 // derived from the fixed SQL23 bytes; no runtime database can redefine it.
 func backupConfigurationPresent(db *sql.DB) (bool, error) {
 	versions, e := backupMigrations(db)
-	if e != nil || len(versions) == 0 || len(versions) > 24 {
+	if e != nil || len(versions) == 0 || len(versions) > 25 {
 		return false, fmt.Errorf("BACKUP_CONFIGURATION_VERSION")
 	}
 	for i, v := range versions {
@@ -89,6 +89,14 @@ func backupConfigurationPresent(db *sql.DB) (bool, error) {
 	}
 	if len(versions) == 24 {
 		if e = backupPreparedAbandonmentSchema(db); e != nil {
+			return false, e
+		}
+	}
+	if len(versions) == 25 {
+		if e = backupPauseSchema(db); e != nil {
+			return false, e
+		}
+		if e = backupPreparedAbandonmentFingerprint(db); e != nil {
 			return false, e
 		}
 	}

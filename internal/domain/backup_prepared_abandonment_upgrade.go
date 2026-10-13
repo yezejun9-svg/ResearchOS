@@ -557,6 +557,12 @@ ORDER BY type,name`
 // This validates exactly the table, autoindexes and six triggers from SQL24.
 func backupPreparedAbandonmentSchema(db *sql.DB) error {
     if err := preparedUpgradeVersions(db, 24); err != nil { return err }
+    return backupPreparedAbandonmentFingerprint(db)
+}
+
+// The fixed23-to24 entry retains its version gate; schema25 separately validates
+// its own exact version before reusing the unchanged additive24 fingerprint.
+func backupPreparedAbandonmentFingerprint(db *sql.DB) error {
     backupPreparedAbandonmentSchemaOnce.Do(func() {
         if Digest(backupPreparedAbandonmentSQL) != preparedUpgradeSQLHash {
             backupPreparedAbandonmentSchemaError = fmt.Errorf("BACKUP_PREPARED_ABANDONMENT_SQL_HASH")
