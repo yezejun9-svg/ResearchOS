@@ -37,15 +37,7 @@ func (c *RuntimeCoordinator) recoverCheckpoints(ctx context.Context, project, ru
 	var latest Object
 	var latestSequence int64
 	for _, path := range paths {
-		actual, err := filepath.EvalSymlinks(path)
-		if err != nil || !strings.EqualFold(actual, path) {
-			return errors.New("host checkpoint reparse rejected")
-		}
-		info, err := os.Stat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Size() > 128*1024 {
-			return errors.New("host checkpoint exceeds bound")
-		}
-		raw, err := os.ReadFile(path)
+		raw, err := readRuntimePauseFile(path, 128*1024)
 		if err != nil {
 			return err
 		}
@@ -54,6 +46,19 @@ func (c *RuntimeCoordinator) recoverCheckpoints(ctx context.Context, project, ru
 			return err
 		}
 		sequence, err := Num(fact, "sequence")
+		if fact["version"] == runtimePauseProtocol {
+			if err != nil || sequence <= 0 || filepath.Base(path) != "checkpoint-"+strconv.FormatInt(sequence, 10)+".json" || fact["project_id"] != project || fact["run_id"] != runID || Hash(fact["epoch"]) != Hash(epoch) || fact["manifest_hash"] != dispatch["manifest_hash"] || fact["dispatch_key"] != dispatch["dispatch_key"] {
+				return errors.New("pause checkpoint fact identity mismatch")
+			}
+			artifact, err := c.recoverPauseCheckpoint(tx, project, runID, directory, epoch, dispatch, fact, raw)
+			if err != nil {
+				return err
+			}
+			if sequence > latestSequence {
+				latestSequence, latest = sequence, artifact
+			}
+			continue
+		}
 		payload, ok := fact["payload"].(map[string]any)
 		if err != nil || sequence <= 0 || !ok || filepath.Base(path) != "checkpoint-"+strconv.FormatInt(sequence, 10)+".json" || fact["project_id"] != project || fact["run_id"] != runID || Hash(fact["epoch"]) != Hash(epoch) || fact["manifest_hash"] != dispatch["manifest_hash"] || fact["dispatch_key"] != dispatch["dispatch_key"] || fact["content_hash"] != Digest(Bytes(payload)) {
 			return errors.New("host checkpoint binding mismatch")
@@ -174,6 +179,9 @@ func (c *RuntimeCoordinator) recoverTerminal(ctx context.Context, project, runID
 	}
 	if e := c.ingestObservation(ctx, project, runID, epoch, j); e != nil {
 		return e
+	}
+	if j.PauseProtocol == rt.PauseProtocol && j.State == "PAUSED" {
+		return c.confirmRuntimePause(ctx, project, runID, epoch, j)
 	}
 	observation, e := j.Observation()
 	if e != nil {

@@ -51,7 +51,27 @@ func (s *Service) RecoverExpiredRuns(ctx context.Context, token, project string)
 	if e != nil {
 		return nil, e
 	}
+	recovered := []Object{}
 	for _, r := range runs {
+		paused, proofErr := provenRuntimePause(tx, project, r)
+		if proofErr != nil {
+			paused = false
+			intent, err := pauseIntent(tx, project, Str(r, "id"), r["lease_epoch"])
+			if err != nil {
+				return nil, err
+			}
+			if intent == nil {
+				return nil, proofErr
+			}
+			if intent["state"] != "CANCELLED" && intent["state"] != "RESUMED" && intent["state"] != "RECONCILING" {
+				if _, err = pauseCAS(tx, intent, "RECONCILING", nil); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if paused {
+			continue
+		}
 		r["status"] = "RECONCILING"
 		if e = bump(r); e != nil {
 			return nil, e
@@ -62,8 +82,9 @@ func (s *Service) RecoverExpiredRuns(ctx context.Context, token, project string)
 		if e = s.event(tx, project, "Run", r, p.ID, ID(), "RUN_CHANGED"); e != nil {
 			return nil, e
 		}
+		recovered = append(recovered, r)
 	}
-	return runs, tx.Commit()
+	return recovered, tx.Commit()
 }
 
 func (s *Service) taskFailed(tx *sql.Tx, project string, t Object, reason string) error {

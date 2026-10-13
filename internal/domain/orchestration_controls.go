@@ -2,8 +2,13 @@ package domain
 
 import "database/sql"
 
-func (s *Service) controlTask(tx *sql.Tx, p Principal, project string, t, b Object, cid string) (Object, error) {
+func (s *Service) controlTask(tx *sql.Tx, p Principal, project string, t, b Object, cid string, meta ...taskRequestMeta) (Object, error) {
 	action := Str(b, "action")
+	if action == "PAUSE" {
+		if result, handled, err := s.requestRuntimePause(tx, p, project, t, b, meta); handled {
+			return result, err
+		}
+	}
 	status := Str(t, "status")
 	if action == "CANCEL" {
 		if err := fenceClientTask(tx, project, Str(t, "id")); err != nil {

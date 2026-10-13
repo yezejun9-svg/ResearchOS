@@ -146,6 +146,10 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 	if e != nil {
 		return nil, e
 	}
+	if e = pauseEffectAdmission(tx, route.ProjectID, runID, frame.Key, epoch); e != nil {
+		tx.Rollback()
+		return nil, e
+	}
 	provider, e := c.providerRoute(tx, route, run, dispatch, frame)
 	if e != nil {
 		tx.Rollback()

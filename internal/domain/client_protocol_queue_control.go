@@ -44,6 +44,9 @@ func (s *Service) cancelGoalQueueTasks(tx *sql.Tx, project, goal string) error {
 }
 
 func fenceClientTask(tx *sql.Tx, project, task string) error {
+	if err := cancelTaskPauses(tx, project, task); err != nil {
+		return err
+	}
 	installed, err := clientQueueInstalled(tx)
 	if err != nil || !installed {
 		return err
