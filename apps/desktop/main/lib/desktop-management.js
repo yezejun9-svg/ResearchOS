@@ -12,6 +12,7 @@ const PROTOCOL = 'researchos-desktop-management/1';
 const FRAME_LIMIT = 65536;
 const HASH = /^sha256:[a-f0-9]{64}$/;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const ARTIFACT_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/;
 const DECIMAL = /^(0|[1-9][0-9]*)$/;
 const START_LIMIT_MS = 15000;
 
@@ -39,6 +40,14 @@ function keys(value, required, optional = []) {
   const allowed = new Set([...required, ...optional]);
   if (required.some(name => !Object.hasOwn(value, name)) || Object.keys(value).some(name => !allowed.has(name)))
     throw failure('PRIVATE_FRAME_FIELDS');
+}
+
+function artifactVersionRef(value) {
+  return object(value) && Object.keys(value).length === 4 &&
+    ['entity_type', 'id', 'revision', 'content_hash'].every(key => Object.hasOwn(value, key)) &&
+    value.entity_type === 'Artifact' && typeof value.id === 'string' && ARTIFACT_ID.test(value.id) &&
+    Number.isSafeInteger(value.revision) && value.revision > 0 &&
+    typeof value.content_hash === 'string' && HASH.test(value.content_hash);
 }
 
 // JSON.parse silently accepts duplicate keys and rounds large integers. The
@@ -721,7 +730,7 @@ class DesktopManagement {
         value.request_hash !== intent.requestHash || value.project_id !== intent.projectId ||
         value.session_id !== intent.sessionId || value.old_model_config_ref !== intent.modelRef ||
         typeof value.model_config_ref !== 'string' || !ID.test(value.model_config_ref) ||
-        value.runtime_status !== 'REGISTERED' || typeof value.profile_ref !== 'string' ||
+        value.runtime_status !== 'REGISTERED' || !artifactVersionRef(value.profile_ref) ||
         value.model_calls !== 0 || value.normal_max_model_calls !== 8 ||
         value.qualification_model_calls !== 1 || value.qualification_tool_calls !== 0 ||
         !object(value.scope) || !sameValue(value.scope, intent.scope) ||
@@ -729,7 +738,7 @@ class DesktopManagement {
         !Number.isSafeInteger(value.revision) || !Number.isSafeInteger(value.config_revision))
       throw failure('CODING_RESULT_INVALID');
     intent.state = value.state; intent.newModelRef = value.model_config_ref;
-    intent.runtimeStatus = value.runtime_status; intent.profileRef = value.profile_ref;
+    intent.runtimeStatus = value.runtime_status; intent.profileRef = frozenCopy(value.profile_ref);
     intent.configRevision = value.config_revision;
     intent.commitKey = digest(Buffer.from(JSON.stringify([intent.hostId, intent.projectId,
       intent.sessionId, intent.requestId, value.model_config_ref, value.revision, value.config_revision])));
