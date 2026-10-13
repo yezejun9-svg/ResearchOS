@@ -36,7 +36,7 @@ func codingInventory(t *testing.T) (*os.Root, string, domain.RuntimeCodingCheck)
 	return root, workspace, domain.RuntimeCodingCheck{ID: "selected", Package: "./pkg", TestPattern: "^TestSelected$", SourcePaths: []string{"go.mod", "pkg/main.go", "pkg/main_test.go"}, ToolchainRoot: toolchain, TimeoutSeconds: 30, ProcessLimit: 8, MemoryMiB: 512, MaxTextBytes: 2048}
 }
 func TestProductCodingCheckInventory(t *testing.T) {
-	for _, name := range []string{"complete", "missing_mod", "missing_sum", "missing_production", "missing_helper", "missing_import", "missing_embed", "zero_tests", "test_main", "test_init", "unanchored", "complete_import", "complete_embed"} {
+	for _, name := range []string{"complete", "complete_predeclared_any_conversion", "missing_mod", "missing_sum", "missing_production", "missing_helper", "missing_helper_with_any_conversion", "missing_import", "missing_embed", "zero_tests", "test_main", "test_init", "unanchored", "complete_import", "complete_embed"} {
 		t.Run(name, func(t *testing.T) {
 			root, workspace, check := codingInventory(t)
 			write := func(p, s string) {
@@ -50,6 +50,8 @@ func TestProductCodingCheckInventory(t *testing.T) {
 				}
 			}
 			switch name {
+			case "complete_predeclared_any_conversion":
+				write("pkg/main.go", "package pkg\nfunc Value() any { return any(nil) }")
 			case "missing_mod":
 				check.SourcePaths = check.SourcePaths[1:]
 			case "missing_sum":
@@ -58,6 +60,9 @@ func TestProductCodingCheckInventory(t *testing.T) {
 				write("pkg/other.go", "package pkg\nfunc Other(){}")
 			case "missing_helper":
 				write("pkg/main_test.go", "package pkg\nimport \"testing\"\nfunc TestSelected(t *testing.T){missingHelper(t)}")
+			case "missing_helper_with_any_conversion":
+				write("pkg/main.go", "package pkg\nfunc Value() any { return any(nil) }")
+				write("pkg/main_test.go", "package pkg\nimport \"testing\"\nfunc TestSelected(t *testing.T){missingHelper(any(nil))}")
 			case "missing_import", "complete_import":
 				write("pkg/main.go", "package pkg\nimport \"fixture.local/coding/helper\"\nfunc Value() int{return helper.Value()}")
 				write("helper/value.go", "package helper\nfunc Value()int{return 1}")

@@ -321,7 +321,7 @@ func validateCodingCheckSources(ctx context.Context, root *os.Root, workspace st
 		}
 		// Detect direct helper calls which cannot be supplied by the selected
 		// compilation unit. Full semantic correctness remains the real check's job.
-		builtins := map[string]bool{"append": true, "cap": true, "clear": true, "close": true, "complex": true, "copy": true, "delete": true, "imag": true, "len": true, "make": true, "max": true, "min": true, "new": true, "panic": true, "print": true, "println": true, "real": true, "recover": true, "string": true, "bool": true, "byte": true, "rune": true, "int": true, "int8": true, "int16": true, "int32": true, "int64": true, "uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true, "uintptr": true, "float32": true, "float64": true, "complex64": true, "complex128": true, "error": true}
+		builtins := map[string]bool{"any": true, "append": true, "cap": true, "clear": true, "close": true, "complex": true, "copy": true, "delete": true, "imag": true, "len": true, "make": true, "max": true, "min": true, "new": true, "panic": true, "print": true, "println": true, "real": true, "recover": true, "string": true, "bool": true, "byte": true, "rune": true, "int": true, "int8": true, "int16": true, "int32": true, "int64": true, "uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true, "uintptr": true, "float32": true, "float64": true, "complex64": true, "complex128": true, "error": true}
 		for _, file := range files {
 			var missing string
 			ast.Inspect(file, func(node ast.Node) bool {
