@@ -282,12 +282,22 @@ func backupInventory(db *sql.DB) (Object, error) {
 	if configuration != nil {
 		inventory["host_configuration_digest"] = Hash(configuration)
 	}
+	pause, err := backupPauseState(db)
+	if err != nil {
+		return nil, err
+	}
+	if pause != nil {
+		inventory["runtime_pause_digest"] = Hash(pause)
+	}
 	return inventory, nil
 }
 func backupIntegrity(db *sql.DB) error {
 	return backupIntegrityPolicy(db, nil)
 }
 func backupIntegrityPolicy(db *sql.DB, policy *backupPolicy) error {
+	if err := validateBackupPause(db); err != nil {
+		return err
+	}
 	if err := validateBackupHostConfiguration(db); err != nil {
 		return err
 	}
