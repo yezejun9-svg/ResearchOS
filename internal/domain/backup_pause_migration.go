@@ -209,12 +209,78 @@ func pauseMigrationDDL(ctx context.Context, tx *sql.Tx, raw []byte, before prepa
 	return preparedUpgradeIntegrity(ctx, tx)
 }
 
-func pauseMigrationTemplate(ctx context.Context, sqls [][]byte, contracts *Contracts) (pauseMigrationSchemas, error) {
+// The template has no ambient temporary-directory authority. Both callers pass
+// the parent derived from the same options that bind the rehearsal destination
+// (and, in the Native caller, have already matched the signed options hash).
+func pauseMigrationStageParent(opt PauseSchemaUpgradeOptions, parent string) (string, error) {
+	u := opt.Upgrade
+	if u.Plan != PauseSchemaUpgradePlan || parent == "" || !filepath.IsAbs(parent) ||
+		strings.ContainsAny(parent, "?#\x00") || parent != filepath.Dir(u.Destination) {
+		return "", fmt.Errorf("PAUSE_UPGRADE_STAGE_BINDING")
+	}
+	canonical := func(path string, existing bool) (string, error) {
+		if path == "" || !filepath.IsAbs(path) || strings.ContainsAny(path, "?#\x00") {
+			return "", fmt.Errorf("PAUSE_UPGRADE_STAGE_CANONICAL_PATH")
+		}
+		resolved, err := pauseMigrationPath(path, existing)
+		if err != nil || !strings.EqualFold(filepath.Clean(path), resolved) {
+			return "", fmt.Errorf("PAUSE_UPGRADE_STAGE_CANONICAL_PATH: %s", path)
+		}
+		return resolved, nil
+	}
+	resolved, err := canonical(parent, true)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("PAUSE_UPGRADE_STAGE_DIRECTORY_REQUIRED")
+	}
+	_, statErr := os.Lstat(u.Destination)
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return "", statErr
+	}
+	if _, err = canonical(u.Destination, statErr == nil); err != nil {
+		return "", err
+	}
+	if statErr == nil {
+		info, err := os.Stat(u.Destination)
+		if err != nil || !info.IsDir() {
+			return "", fmt.Errorf("PAUSE_UPGRADE_STAGE_DESTINATION_DIRECTORY")
+		}
+	}
+	for _, protected := range []struct {
+		path string
+		file bool
+	}{{u.Source, true}, {u.KeyFile, true}, {u.Snapshot, false}, {u.SourceRoot, false}, {u.TargetRoot, false}} {
+		path, err := canonical(protected.path, true)
+		if err != nil {
+			return "", err
+		}
+		if protected.file {
+			path = filepath.Dir(path)
+		}
+		if upgradeInside(path, resolved) || upgradeInside(resolved, path) {
+			return "", fmt.Errorf("PAUSE_UPGRADE_STAGE_OVERLAP")
+		}
+	}
+	return resolved, nil
+}
+
+func pauseMigrationTemplateStage(opt PauseSchemaUpgradeOptions, parent string) (string, error) {
+	parent, err := pauseMigrationStageParent(opt, parent)
+	if err != nil {
+		return "", err
+	}
+	return os.MkdirTemp(parent, ".researchos-backup-stage-")
+}
+
+func pauseMigrationTemplate(ctx context.Context, opt PauseSchemaUpgradeOptions, parent string, sqls [][]byte, contracts *Contracts) (pauseMigrationSchemas, error) {
 	var result pauseMigrationSchemas
 	if len(sqls) != 26 || Digest(sqls[24]) != pauseUpgradeSQLHash || Digest(sqls[25]) != upgradeQueueSessionHash {
 		return result, fmt.Errorf("PAUSE_UPGRADE_TEMPLATE_INPUT")
 	}
-	stage, err := os.MkdirTemp("", ".researchos-backup-stage-")
+	stage, err := pauseMigrationTemplateStage(opt, parent)
 	if err != nil {
 		return result, err
 	}

@@ -1,10 +1,78 @@
 package domain
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// This is a source wiring guard, not Native authority execution. The actual
+// Native branch cannot be called with a fabricated nonzero migration token.
+func TestPauseMigrationTemplateCallersBindTheirOwnDestination(t *testing.T) {
+	for _, test := range []struct{ file, function, options, upgrade string }{
+		{"backup_pause_handoff.go", "upgradePauseSchemaBackup", "opt", "u"},
+		{"backup_pause_migration_windows.go", "ExecutePauseSchemaUpgrade", "pauseOpt", "opt"},
+	} {
+		t.Run(test.function, func(t *testing.T) {
+			file, err := parser.ParseFile(token.NewFileSet(), test.file, nil, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			for _, decl := range file.Decls {
+				function, ok := decl.(*ast.FuncDecl)
+				if !ok || function.Name.Name != test.function {
+					continue
+				}
+				ast.Inspect(function.Body, func(node ast.Node) bool {
+					call, ok := node.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					name, ok := call.Fun.(*ast.Ident)
+					if !ok || name.Name != "pauseMigrationTemplate" {
+						return true
+					}
+					calls++
+					if len(call.Args) != 5 {
+						t.Fatal("template lacks explicit bound options/parent")
+					}
+					options, ok := call.Args[1].(*ast.Ident)
+					if !ok || options.Name != test.options {
+						t.Fatal("template uses unrelated options")
+					}
+					parent, ok := call.Args[2].(*ast.CallExpr)
+					if !ok || len(parent.Args) != 1 {
+						t.Fatal("template parent not derived from destination")
+					}
+					selector, ok := parent.Fun.(*ast.SelectorExpr)
+					if !ok || selector.Sel.Name != "Dir" {
+						t.Fatal("template parent function changed")
+					}
+					pkg, ok := selector.X.(*ast.Ident)
+					if !ok || pkg.Name != "filepath" {
+						t.Fatal("template parent function is not filepath.Dir")
+					}
+					destination, ok := parent.Args[0].(*ast.SelectorExpr)
+					if !ok || destination.Sel.Name != "Destination" {
+						t.Fatal("template parent is not destination parent")
+					}
+					upgrade, ok := destination.X.(*ast.Ident)
+					if !ok || upgrade.Name != test.upgrade {
+						t.Fatal("template parent uses unrelated options")
+					}
+					return true
+				})
+			}
+			if calls != 1 {
+				t.Fatal("expected one bound template call", calls)
+			}
+		})
+	}
+}
 
 func TestPauseHandoffMetadataSeparatesThreePrograms(t *testing.T) {
 	programs := pauseMigrationPrograms{Digest([]byte("source24")), Digest([]byte("control25")), Digest([]byte("backup25"))}

@@ -81,6 +81,11 @@ func pauseMigrationPaths(opt *PauseSchemaUpgradeOptions, existingDestination boo
 	if u.Plan != PauseSchemaUpgradePlan {
 		return fmt.Errorf("PAUSE_UPGRADE_PLAN_UNSUPPORTED")
 	}
+	// Check aliases before normalizing them away. This also requires the
+	// explicitly bound staging parent to exist before any filesystem staging.
+	if _, err := pauseMigrationStageParent(*opt, filepath.Dir(u.Destination)); err != nil {
+		return err
+	}
 	for _, p := range []*string{&u.Source, &u.Snapshot, &u.KeyFile, &u.SourceRoot, &u.TargetRoot, &u.SourceProgram, &u.TargetProgram, &opt.RehearsalProgram, &opt.HandoffBindingFile} {
 		path, err := pauseMigrationPath(*p, true)
 		if err != nil {
@@ -241,7 +246,7 @@ func upgradePauseSchemaBackup(ctx context.Context, opt PauseSchemaUpgradeOptions
 	if err != nil {
 		return report, err
 	}
-	schemas, err := pauseMigrationTemplate(ctx, sqls, contracts)
+	schemas, err := pauseMigrationTemplate(ctx, opt, filepath.Dir(u.Destination), sqls, contracts)
 	if err != nil {
 		return report, err
 	}

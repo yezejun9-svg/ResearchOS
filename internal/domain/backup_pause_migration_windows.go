@@ -147,7 +147,7 @@ func ExecutePauseSchemaUpgrade(ctx context.Context, db *sql.DB, token recoveryau
 	if err != nil {
 		return result, err
 	}
-	schemas, err := pauseMigrationTemplate(ctx, sqls, contracts)
+	schemas, err := pauseMigrationTemplate(ctx, pauseOpt, filepath.Dir(opt.Destination), sqls, contracts)
 	if err != nil {
 		return result, err
 	}
