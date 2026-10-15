@@ -175,6 +175,16 @@ func persistStopResult(plan Plan, result Result) (Result, error) {
 	return result, err
 }
 
+func checkCommitSignalBoundary(ctx context.Context, g operationGrant) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := g.checkAction("commit", true); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
 // Commit has no force flag. An exact independent evidence review and a later
 // exact root operation plan review must already exist in the verifier namespace.
 // This card does not produce either review and grants no current-Core action.
@@ -192,6 +202,11 @@ func Commit(ctx context.Context, planPath, expectPlanSHA string) (Result, error)
 	}
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	// WithDeadline retains an earlier caller deadline. Keep this original
+	// monotonic boundary through all waits and the final native signal.
+	if earlier, ok := ctx.Deadline(); ok && earlier.Before(deadline) {
+		deadline = earlier
+	}
 	lock, err := acquireOperationLock(g, false)
 	if err != nil {
 		return Result{}, err
@@ -282,8 +297,8 @@ func Commit(ctx context.Context, planPath, expectPlanSHA string) (Result, error)
 	if err != nil || authority != p.Host {
 		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "current Host/Owner/database identity differs"))
 	}
-	if _, err = g.checkAction("commit", true); err != nil {
-		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "grant expired before native intent"))
+	if err = checkCommitSignalBoundary(ctx, g); err != nil {
+		return persistStopResult(p, stopResult(p, planSHA, "STOP_UNAVAILABLE", "caller/grant unavailable before native intent: "+err.Error()))
 	}
 	if _, err = writeOwnedJournal(p.OutputDir, "TERMINATE_INTENT.json", struct {
 		Schema, OperationID, PlanSHA256, GrantSHA256 string
@@ -291,10 +306,10 @@ func Commit(ctx context.Context, planPath, expectPlanSHA string) (Result, error)
 	}{"researchos.owned-core-stop-terminate-intent.v1", p.OperationID, planSHA, g.digest, p.Native}); err != nil {
 		return Result{}, err
 	}
-	if _, err = g.checkAction("commit", true); err != nil {
-		return persistStopResult(p, stopResult(p, planSHA, "UNKNOWN", "grant expired after durable intent; zero signal"))
+	if err = checkCommitSignalBoundary(ctx, g); err != nil {
+		return persistStopResult(p, stopResult(p, planSHA, "UNKNOWN", "caller/grant unavailable after durable intent; zero signal: "+err.Error()))
 	}
-	exit, nativeErr := h.TerminateOnceAndWaitUntil(15*time.Second, deadline, g.expires)
+	exit, nativeErr := h.TerminateOnceAndWaitUntilContext(ctx, 15*time.Second, deadline, g.expires)
 	if nativeErr != nil {
 		result := stopResult(p, planSHA, "UNKNOWN", fmt.Sprintf("single native attempt or wait unknown: %v", nativeErr))
 		result.Native = &exit

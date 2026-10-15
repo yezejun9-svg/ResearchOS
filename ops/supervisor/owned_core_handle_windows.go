@@ -3,6 +3,7 @@
 package supervisor
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -39,7 +40,7 @@ type OwnedCoreNativeIdentity struct {
 
 type ownedNativeProcess struct {
 	handle  windows.Handle
-	image   *os.File
+	image   *ownedImageFile
 	path    string
 	created int64
 	sid     string
@@ -48,9 +49,37 @@ type ownedNativeProcess struct {
 	index   uint64
 }
 
+type ownedImageAnchor struct {
+	handle   windows.Handle
+	volume   uint32
+	index    uint64
+	security string
+}
+
+type ownedImageFile struct {
+	file      *os.File
+	ancestors []ownedImageAnchor
+	final     ownedImageAnchor
+	sha       string
+}
+
+func (im *ownedImageFile) Close() {
+	if im == nil {
+		return
+	}
+	if im.file != nil {
+		_ = im.file.Close()
+		im.file = nil
+	}
+	for i := len(im.ancestors) - 1; i >= 0; i-- {
+		_ = windows.CloseHandle(im.ancestors[i].handle)
+	}
+	im.ancestors = nil
+}
+
 func (p *ownedNativeProcess) close() {
 	if p.image != nil {
-		_ = p.image.Close()
+		p.image.Close()
 		p.image = nil
 	}
 	if p.handle != 0 {
@@ -66,51 +95,104 @@ func ownedNativePath(h windows.Handle) (string, error) {
 		return "", err
 	}
 	path := windows.UTF16ToString(buf[:size])
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path || !strings.EqualFold(filepath.Ext(path), ".exe") {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(filepath.VolumeName(path)) != 2 || strings.Contains(path[2:], ":") || !strings.EqualFold(filepath.Ext(path), ".exe") {
 		return "", errors.New("canonical executable path required")
-	}
-	actual, err := filepath.EvalSymlinks(path)
-	if err != nil || !strings.EqualFold(actual, path) {
-		return "", errors.New("executable path reparse rejected")
 	}
 	return path, nil
 }
 
-func ownedNativeImage(path string) (*os.File, string, uint32, uint64, error) {
-	wide, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return nil, "", 0, 0, err
+func observeOwnedImageAnchor(h windows.Handle, directory bool) (ownedImageAnchor, windows.ByHandleFileInformation, error) {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+		return ownedImageAnchor{}, info, err
 	}
-	h, err := windows.CreateFile(wide, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
-	if err != nil {
-		return nil, "", 0, 0, err
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory || info.VolumeSerialNumber == 0 || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) == 0 || (!directory && info.NumberOfLinks != 1) {
+		return ownedImageAnchor{}, info, errors.New("image ancestor reparse/alias/native identity rejected")
 	}
-	f := os.NewFile(uintptr(h), path)
-	var before windows.ByHandleFileInformation
-	if err = windows.GetFileInformationByHandle(h, &before); err != nil {
-		f.Close()
-		return nil, "", 0, 0, err
+	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil || sd == nil || !sd.IsValid() {
+		return ownedImageAnchor{}, info, errors.New("image native security descriptor unavailable")
 	}
-	if before.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 || before.NumberOfLinks != 1 || before.FileSizeHigh != 0 || before.FileSizeLow > 256<<20 {
-		f.Close()
-		return nil, "", 0, 0, errors.New("image reparse/alias/size rejected")
+	owner, _, err := sd.Owner()
+	if err != nil || owner == nil || !owner.IsValid() {
+		return ownedImageAnchor{}, info, errors.New("image ancestor owner unavailable")
 	}
-	hash := sha256.New()
-	n, err := io.Copy(hash, io.LimitReader(f, 256<<20+1))
-	if err != nil {
-		f.Close()
-		return nil, "", 0, 0, err
+	acl, _, err := sd.DACL()
+	if err != nil || acl == nil || acl.AceCount == 0 {
+		return ownedImageAnchor{}, info, errors.New("image ancestor DACL unavailable")
 	}
-	var after windows.ByHandleFileInformation
-	if err = windows.GetFileInformationByHandle(h, &after); err != nil {
-		f.Close()
-		return nil, "", 0, 0, err
+	security := sd.String()
+	if security == "" {
+		return ownedImageAnchor{}, info, errors.New("image ancestor owner/DACL serialization unavailable")
 	}
-	if n != int64(before.FileSizeLow) || before.VolumeSerialNumber != after.VolumeSerialNumber || before.FileIndexHigh != after.FileIndexHigh || before.FileIndexLow != after.FileIndexLow || before.FileSizeLow != after.FileSizeLow || before.LastWriteTime != after.LastWriteTime {
-		f.Close()
-		return nil, "", 0, 0, errors.New("image changed during retained read")
+	return ownedImageAnchor{handle: h, volume: info.VolumeSerialNumber, index: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow), security: security}, info, nil
+}
+
+func ownedNativeImage(path string) (_ *ownedImageFile, err error) {
+	image := &ownedImageFile{}
+	defer func() {
+		if err != nil {
+			image.Close()
+		}
+	}()
+	volume := filepath.VolumeName(path)
+	current := volume + string(filepath.Separator)
+	parts := strings.Split(strings.TrimPrefix(path[len(volume):], string(filepath.Separator)), string(filepath.Separator))
+	paths := []string{current}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return nil, errors.New("noncanonical image path component")
+		}
+		current = filepath.Join(current, part)
+		paths = append(paths, current)
 	}
-	return f, hex.EncodeToString(hash.Sum(nil)), before.VolumeSerialNumber, uint64(before.FileIndexHigh)<<32 | uint64(before.FileIndexLow), nil
+	for i, name := range paths {
+		last := i == len(paths)-1
+		wide, e := windows.UTF16PtrFromString(name)
+		if e != nil {
+			return nil, e
+		}
+		access := uint32(windows.FILE_READ_ATTRIBUTES | windows.READ_CONTROL)
+		share := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE)
+		if last {
+			access = windows.GENERIC_READ | windows.READ_CONTROL
+			share = windows.FILE_SHARE_READ
+		}
+		h, e := windows.CreateFile(wide, access, share, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+		if e != nil {
+			return nil, e
+		}
+		anchor, info, e := observeOwnedImageAnchor(h, !last)
+		if e != nil {
+			_ = windows.CloseHandle(h)
+			return nil, e
+		}
+		if last {
+			if info.FileSizeHigh != 0 || info.FileSizeLow == 0 || info.FileSizeLow > 256<<20 {
+				_ = windows.CloseHandle(h)
+				return nil, errors.New("bounded image size required")
+			}
+			image.final = anchor
+			image.file = os.NewFile(uintptr(h), name)
+			hash := sha256.New()
+			var n int64
+			n, err = io.Copy(hash, io.LimitReader(image.file, 256<<20+1))
+			if err != nil {
+				return nil, err
+			}
+			var after windows.ByHandleFileInformation
+			if err = windows.GetFileInformationByHandle(h, &after); err != nil {
+				return nil, err
+			}
+			if n != int64(info.FileSizeLow) || info.VolumeSerialNumber != after.VolumeSerialNumber || info.FileIndexHigh != after.FileIndexHigh || info.FileIndexLow != after.FileIndexLow || info.FileSizeLow != after.FileSizeLow || info.LastWriteTime != after.LastWriteTime {
+				return nil, errors.New("image changed during retained read")
+			}
+			image.sha = hex.EncodeToString(hash.Sum(nil))
+		} else {
+			image.ancestors = append(image.ancestors, anchor)
+		}
+	}
+	return image, nil
 }
 
 func ownedNativeProcessFromHandle(h windows.Handle) (p ownedNativeProcess, err error) {
@@ -138,7 +220,10 @@ func ownedNativeProcessFromHandle(h windows.Handle) (p ownedNativeProcess, err e
 	if p.path, err = ownedNativePath(h); err != nil {
 		return p, err
 	}
-	p.image, p.sha, p.volume, p.index, err = ownedNativeImage(p.path)
+	p.image, err = ownedNativeImage(p.path)
+	if err == nil {
+		p.sha, p.volume, p.index = p.image.sha, p.image.final.volume, p.image.final.index
+	}
 	return p, err
 }
 
@@ -277,6 +362,23 @@ func (h *OwnedCoreRetainedHandle) Identity() OwnedCoreNativeIdentity {
 	return h.identity
 }
 
+func verifyOwnedImageFile(image *ownedImageFile, volume uint32, index uint64) error {
+	if image == nil || image.file == nil || image.final.volume != volume || image.final.index != index {
+		return errors.New("retained image identity absent")
+	}
+	for _, original := range image.ancestors {
+		current, _, err := observeOwnedImageAnchor(original.handle, true)
+		if err != nil || current.volume != original.volume || current.index != original.index || current.security != original.security {
+			return errors.New("retained image ancestor identity/ACL changed")
+		}
+	}
+	current, _, err := observeOwnedImageAnchor(windows.Handle(image.file.Fd()), false)
+	if err != nil || current.volume != image.final.volume || current.index != image.final.index || current.security != image.final.security {
+		return errors.New("retained image file identity/ACL changed")
+	}
+	return nil
+}
+
 func (h *OwnedCoreRetainedHandle) verifyRetained() error {
 	if h == nil || h.closed || h.core.handle == 0 {
 		return errors.New("native handle closed")
@@ -289,10 +391,10 @@ func (h *OwnedCoreRetainedHandle) verifyRetained() error {
 	if err = windows.GetProcessTimes(h.core.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.CreatedNS {
 		return errors.New("retained process creation changed")
 	}
-	// File share mode prevents replacement while the retained image is open.
-	var info windows.ByHandleFileInformation
-	if err = windows.GetFileInformationByHandle(windows.Handle(h.core.image.Fd()), &info); err != nil || info.VolumeSerialNumber != h.identity.ImageVolume || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) != h.identity.ImageIndex {
-		return errors.New("retained image file changed")
+	// Every path component remains open without delete sharing. The final image
+	// also denies write sharing; identity and security are rechecked by handle.
+	if err = verifyOwnedImageFile(h.core.image, h.identity.ImageVolume, h.identity.ImageIndex); err != nil {
+		return err
 	}
 	parentPID, err := windows.GetProcessId(h.parent.handle)
 	if err != nil || parentPID != h.identity.ParentPID {
@@ -305,8 +407,8 @@ func (h *OwnedCoreRetainedHandle) verifyRetained() error {
 	if err != nil || parentStatus != uint32(windows.WAIT_TIMEOUT) {
 		return errors.New("retained parent no longer live")
 	}
-	if err = windows.GetFileInformationByHandle(windows.Handle(h.parent.image.Fd()), &info); err != nil || info.VolumeSerialNumber != h.identity.ParentImageVolume || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) != h.identity.ParentImageIndex {
-		return errors.New("retained parent image changed")
+	if err = verifyOwnedImageFile(h.parent.image, h.identity.ParentImageVolume, h.identity.ParentImageIndex); err != nil {
+		return err
 	}
 	return nil
 }
@@ -335,9 +437,22 @@ func (h *OwnedCoreRetainedHandle) TerminateOnceAndWait(timeout time.Duration) (O
 // A failed deadline check returns with zero TerminateProcess calls; the caller's
 // already-durable intent remains consumed.
 func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntil(timeout time.Duration, invocationDeadline, wallExpiry time.Time) (OwnedCoreNativeExit, error) {
+	return h.TerminateOnceAndWaitUntilContext(context.Background(), timeout, invocationDeadline, wallExpiry)
+}
+
+func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntilContext(ctx context.Context, timeout time.Duration, invocationDeadline, wallExpiry time.Time) (OwnedCoreNativeExit, error) {
 	var out OwnedCoreNativeExit
+	if ctx == nil {
+		return out, errors.New("caller context required")
+	}
 	if timeout <= 0 || timeout > 30*time.Second {
 		return out, errors.New("bounded native wait required")
+	}
+	if earlier, ok := ctx.Deadline(); ok && earlier.Before(invocationDeadline) {
+		invocationDeadline = earlier
+	}
+	if err := ctx.Err(); err != nil {
+		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
 	}
 	if err := h.verifyRetained(); err != nil {
 		return out, err
@@ -360,8 +475,14 @@ func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntil(timeout time.Duratio
 	if status != uint32(windows.WAIT_TIMEOUT) {
 		return out, fmt.Errorf("unexpected native wait status %d", status)
 	}
+	if err := ctx.Err(); err != nil {
+		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
+	}
 	if now := time.Now(); !now.Before(invocationDeadline) || !now.Before(wallExpiry) {
-		return out, errors.New("grant expired before native signal")
+		return out, errors.New("invocation or grant expired before native signal")
+	}
+	if err := ctx.Err(); err != nil {
+		return out, fmt.Errorf("caller unavailable before native signal: %w", err)
 	}
 	h.terminateCalls = 1
 	out.TerminateCalls = 1

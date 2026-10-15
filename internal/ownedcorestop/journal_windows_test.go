@@ -3,10 +3,12 @@
 package ownedcorestop
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"researchos.local/research-os/internal/host"
 	"researchos.local/research-os/internal/store"
@@ -136,6 +138,18 @@ func TestOwnedCoreStopInspectJournalCrashBoundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("UNKNOWN") // before/after native call without durable wait proof
+	boundaryGrant := operationGrant{AllowedActions: []string{"commit"}, notBefore: time.Now().Add(-time.Minute), expires: time.Now().Add(time.Minute)}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := checkCommitSignalBoundary(canceled, boundaryGrant); err != context.Canceled {
+		t.Fatalf("cancellation after durable intent was ignored: %v", err)
+	}
+	check("UNKNOWN") // consumed intent remains, including after cancellation
+	boundaryGrant.expires = time.Now().Add(-time.Second)
+	if err := checkCommitSignalBoundary(context.Background(), boundaryGrant); err == nil {
+		t.Fatal("grant expiry after durable intent was ignored")
+	}
+	check("UNKNOWN") // expired grant cannot refund consumed intent
 	nativeExit := supervisor.OwnedCoreNativeExit{TerminateCalls: 1, ExitObserved: true, ExitCode: supervisor.OwnedCoreMaintenanceExitCode}
 	if _, err := writeOwnedJournal(out, "NATIVE_EXIT.json", ownedExitRecord{Schema: "researchos.owned-core-stop-native-exit.v1", OperationID: op, PlanSHA256: planSHA, GrantSHA256: grantSHA, Native: nativeExit}); err != nil {
 		t.Fatal(err)

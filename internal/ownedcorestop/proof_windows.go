@@ -155,9 +155,9 @@ type historicalEvidence struct {
 	RawSHA256                map[string]string      `json:"raw_sha256"`
 	NativePID                uint32                 `json:"native_pid,omitempty"`
 	NativeCreatedNS          int64                  `json:"native_created_ns,omitempty"`
-	NativeExitCode           uint32                 `json:"native_exit_code,omitempty"`
+	NativeExitCode           *uint32                `json:"native_exit_code,omitempty"`
 	NativeWaitAPI            string                 `json:"native_wait_api,omitempty"`
-	NativeWaitResult         uint32                 `json:"native_wait_result,omitempty"`
+	NativeWaitResult         *uint32                `json:"native_wait_result,omitempty"`
 	NativeExitAPI            string                 `json:"native_exit_api,omitempty"`
 	NativeHandleRecordSHA256 string                 `json:"native_handle_record_sha256,omitempty"`
 	BaselineSHA256           string                 `json:"baseline_sha256,omitempty"`
@@ -237,6 +237,13 @@ func proofNeeds(kind string) []string {
 	}
 }
 
+func nativeExitEvidenceComplete(receipt historicalEvidence, corePID uint32) bool {
+	return receipt.NativePID != 0 && receipt.NativePID != corePID && receipt.NativeCreatedNS != 0 &&
+		receipt.NativeWaitAPI == "WaitForSingleObject" && receipt.NativeWaitResult != nil && *receipt.NativeWaitResult == 0 &&
+		receipt.NativeExitAPI == "GetExitCodeProcess" && receipt.NativeExitCode != nil &&
+		validSHA(receipt.NativeHandleRecordSHA256)
+}
+
 func validateHistoricalEvidence(plan Plan, held ...*heldDocuments) (string, []string) {
 	missing := []string{}
 	refs := map[string]EvidenceRef{}
@@ -283,7 +290,7 @@ func validateHistoricalEvidence(plan Plan, held ...*heldDocuments) (string, []st
 		if kind == "worker_native_exit" || kind == "verifier_native_exit" {
 			// An ignored cmd.Wait error, a PID-list absence, or an assumed exit 0
 			// cannot satisfy this typed original OS wait and numeric-exit receipt.
-			if receipt.NativePID == 0 || receipt.NativePID == plan.Native.PID || receipt.NativeCreatedNS == 0 || receipt.NativeWaitAPI != "WaitForSingleObject" || receipt.NativeWaitResult != 0 || receipt.NativeExitAPI != "GetExitCodeProcess" || !validSHA(receipt.NativeHandleRecordSHA256) {
+			if !nativeExitEvidenceComplete(receipt, plan.Native.PID) {
 				missing = append(missing, kind+": captured exact OS wait/exit/handle identity absent")
 			}
 		}

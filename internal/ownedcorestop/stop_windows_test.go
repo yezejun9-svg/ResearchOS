@@ -144,3 +144,21 @@ func TestOwnedCoreStopInvalidPreflightNeverCreatesOutput(t *testing.T) {
 		t.Fatalf("invalid preflight created output: %v", err)
 	}
 }
+
+func TestCommitSignalBoundaryHonorsCallerCancellationAndEarlierDeadline(t *testing.T) {
+	now := time.Now()
+	g := operationGrant{AllowedActions: []string{"commit"}, notBefore: now.Add(-time.Minute), expires: now.Add(time.Minute)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := checkCommitSignalBoundary(ctx, g); err != context.Canceled {
+		t.Fatalf("canceled caller reached intent: %v", err)
+	}
+	ctx, cancel = context.WithDeadline(context.Background(), now.Add(-time.Second))
+	defer cancel()
+	if err := checkCommitSignalBoundary(ctx, g); err != context.DeadlineExceeded {
+		t.Fatalf("earlier caller deadline reached intent: %v", err)
+	}
+	if err := checkCommitSignalBoundary(context.Background(), g); err != nil {
+		t.Fatalf("valid caller/grant denied: %v", err)
+	}
+}

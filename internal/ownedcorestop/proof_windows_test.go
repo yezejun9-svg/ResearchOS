@@ -103,3 +103,55 @@ func TestOwnedCoreStopCallerReviewCannotOmitExactScope(t *testing.T) {
 		t.Fatal("non-independent review path accepted")
 	}
 }
+
+func TestNativeExitProofRequiresExplicitNumericCapturePerClass(t *testing.T) {
+	sha := strings.Repeat("a", 64)
+	for _, kind := range []string{"worker_native_exit", "verifier_native_exit"} {
+		for _, tc := range []struct {
+			name  string
+			field string
+			value any
+			omit  bool
+			want  bool
+		}{
+			{"explicit exit zero", "native_exit_code", 0, false, true},
+			{"explicit exit nonzero", "native_exit_code", 137, false, true},
+			{"missing exit", "native_exit_code", nil, true, false},
+			{"null exit", "native_exit_code", nil, false, false},
+			{"negative exit", "native_exit_code", -1, false, false},
+			{"overflow exit", "native_exit_code", int64(1) << 32, false, false},
+			{"fractional exit", "native_exit_code", 0.5, false, false},
+			{"explicit wait zero", "native_wait_result", 0, false, true},
+			{"missing wait", "native_wait_result", nil, true, false},
+			{"null wait", "native_wait_result", nil, false, false},
+			{"nonzero wait", "native_wait_result", 258, false, false},
+			{"negative wait", "native_wait_result", -1, false, false},
+			{"overflow wait", "native_wait_result", int64(1) << 32, false, false},
+			{"fractional wait", "native_wait_result", 0.5, false, false},
+		} {
+			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+				fields := map[string]any{
+					"kind": kind, "native_pid": 8, "native_created_ns": 123,
+					"native_wait_api": "WaitForSingleObject", "native_wait_result": 0,
+					"native_exit_api": "GetExitCodeProcess", "native_exit_code": 0,
+					"native_handle_record_sha256": sha,
+				}
+				if tc.omit {
+					delete(fields, tc.field)
+				} else {
+					fields[tc.field] = tc.value
+				}
+				raw, err := json.Marshal(fields)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var proof historicalEvidence
+				err = decodeCanonicalAuthority(raw, &proof)
+				got := err == nil && nativeExitEvidenceComplete(proof, 9)
+				if got != tc.want {
+					t.Fatalf("native proof %s accepted=%v want=%v decode=%v: %s", tc.name, got, tc.want, err, raw)
+				}
+			})
+		}
+	}
+}

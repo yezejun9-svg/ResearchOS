@@ -3,9 +3,13 @@
 package supervisor
 
 import (
+	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +22,132 @@ func TestOwnedCoreFixtureChild(t *testing.T) {
 		return
 	}
 	time.Sleep(12 * time.Second)
+}
+
+func TestOwnedCoreFixtureParent(t *testing.T) {
+	if os.Getenv("RESEARCHOS_OWNED_PARENT_CHILD") != "yes" {
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestOwnedCoreFixtureChild$")
+	cmd.Env = append(os.Environ(), "RESEARCHOS_OWNED_CORE_CHILD=yes")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	if err := os.WriteFile(os.Getenv("RESEARCHOS_OWNED_CHILD_PID_FILE"), []byte(strconv.Itoa(cmd.Process.Pid)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(12 * time.Second)
+}
+
+func TestOwnedCoreAndParentImageAncestorsRetained(t *testing.T) {
+	base := t.TempDir()
+	imageDir := filepath.Join(base, "image", "nested")
+	if err := os.MkdirAll(imageDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := os.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	copyPath := filepath.Join(imageDir, "parent.exe")
+	output, err := os.Create(copyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = io.Copy(output, input); err != nil {
+		output.Close()
+		t.Fatal(err)
+	}
+	if err = output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(imageDir, "alias.exe")
+	if err = os.Link(copyPath, alias); err != nil {
+		t.Fatalf("new fixture hardlink cut unavailable: %v", err)
+	}
+	if image, e := ownedNativeImage(copyPath); e == nil {
+		image.Close()
+		t.Fatal("hardlink image alias accepted")
+	}
+	if err = os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(base, "image-link")
+	if err = os.Symlink(imageDir, linkDir); err != nil {
+		if output, e := exec.Command("cmd", "/c", "mklink", "/J", linkDir, imageDir).CombinedOutput(); e != nil {
+			t.Logf("REPARSE_CUT_UNAVAILABLE symlink=%v junction=%v output=%q", err, e, output)
+		} else {
+			err = nil
+		}
+	}
+	if err == nil {
+		if image, e := ownedNativeImage(filepath.Join(linkDir, "parent.exe")); e == nil {
+			image.Close()
+			t.Fatal("reparse image ancestor accepted")
+		}
+	}
+	pidFile := filepath.Join(base, "child.pid")
+	parent := exec.Command(copyPath, "-test.run=^TestOwnedCoreFixtureParent$")
+	parent.Env = append(os.Environ(), "RESEARCHOS_OWNED_PARENT_CHILD=yes", "RESEARCHOS_OWNED_CHILD_PID_FILE="+pidFile)
+	if err = parent.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = parent.Process.Kill(); _ = parent.Wait() }()
+	var childPID uint64
+	for until := time.Now().Add(5 * time.Second); time.Now().Before(until); time.Sleep(20 * time.Millisecond) {
+		if raw, e := os.ReadFile(pidFile); e == nil {
+			childPID, err = strconv.ParseUint(string(raw), 10, 32)
+			if err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	if childPID == 0 {
+		t.Fatal("owned fixture child PID unavailable")
+	}
+	childProcess, err := os.FindProcess(int(childPID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer childProcess.Kill()
+	id, err := ObserveOwnedCoreReadOnly(uint32(childPID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.ParentPID != uint32(parent.Process.Pid) || id.ImagePath != copyPath || id.ParentImagePath != copyPath {
+		t.Fatalf("actual Core/parent fixture images differ: %+v", id)
+	}
+	h, err := OpenOwnedCoreRetained(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if len(h.core.image.ancestors) < 2 || len(h.parent.image.ancestors) < 2 || h.core.image.final.index != id.ImageIndex || h.parent.image.final.index != id.ParentImageIndex {
+		t.Fatal("Core and parent image ancestors were not retained")
+	}
+	if err = os.Rename(imageDir, filepath.Join(base, "swapped")); err == nil {
+		t.Fatal("retained image ancestor allowed directory swap")
+	}
+	if file, e := os.OpenFile(copyPath, os.O_WRONLY, 0); e == nil {
+		file.Close()
+		t.Fatal("retained image allowed write-sharing")
+	}
+	wrong := id
+	wrong.ParentCreatedNS++
+	if other, e := OpenOwnedCoreRetained(wrong); e == nil {
+		other.Close()
+		t.Fatal("wrong parent identity accepted")
+	}
+	if err = h.verifyRetained(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestOwnedCoreTerminateFailureIsSingleUnknownAttempt(t *testing.T) {
@@ -96,6 +226,57 @@ func TestOwnedCoreExpiredGrantBoundaryMakesZeroNativeCalls(t *testing.T) {
 	}
 	if _, err = ObserveOwnedCoreReadOnly(uint32(core.Process.Pid)); err != nil {
 		t.Fatalf("zero-call target died: %v", err)
+	}
+}
+
+func TestOwnedCoreCallerCancellationAtFinalNativeBoundary(t *testing.T) {
+	for _, mode := range []string{"already canceled", "earlier caller deadline", "canceled by prewait"} {
+		t.Run(mode, func(t *testing.T) {
+			core := ownedCoreChild(t)
+			defer func() { _ = core.Process.Kill(); _ = core.Wait() }()
+			id, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid))
+			if err != nil {
+				t.Fatal(err)
+			}
+			h, err := OpenOwnedCoreRetained(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			if mode == "earlier caller deadline" {
+				ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(10*time.Millisecond))
+			}
+			defer cancel()
+			if mode == "already canceled" {
+				cancel()
+			}
+			if mode == "canceled by prewait" {
+				h.wait = func(handle windows.Handle, ms uint32) (uint32, error) {
+					if ms == 0 {
+						cancel()
+					}
+					return windows.WaitForSingleObject(handle, ms)
+				}
+			}
+			if mode == "earlier caller deadline" {
+				h.wait = func(handle windows.Handle, ms uint32) (uint32, error) {
+					if ms == 0 {
+						time.Sleep(20 * time.Millisecond)
+					}
+					return windows.WaitForSingleObject(handle, ms)
+				}
+			}
+			calls := 0
+			h.terminate = func(windows.Handle, uint32) error { calls++; return nil }
+			exit, err := h.TerminateOnceAndWaitUntilContext(ctx, time.Second, time.Now().Add(time.Minute), time.Now().Add(time.Minute))
+			if err == nil || exit.TerminateCalls != 0 || calls != 0 || h.terminateCalls != 0 {
+				t.Fatalf("canceled/deadline native signal occurred: %+v calls=%d err=%v", exit, calls, err)
+			}
+			if _, err = ObserveOwnedCoreReadOnly(uint32(core.Process.Pid)); err != nil {
+				t.Fatalf("zero-call Core disappeared: %v", err)
+			}
+		})
 	}
 }
 
