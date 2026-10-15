@@ -582,7 +582,9 @@ func (w *Bridge) wait(ctx context.Context, profile map[string]any) {
 		}
 	}
 	if err != nil {
-		w.journal.Reason = err.Error()
+		if w.journal.Reason == "" {
+			w.journal.Reason = err.Error()
+		}
 	}
 	w.err = errors.Join(err, w.persist())
 }
@@ -611,8 +613,10 @@ func (w *Bridge) Renew(epoch int64, lease time.Duration) error {
 }
 func (w *Bridge) Cancel(reason string) {
 	w.mu.Lock()
+	if !w.journal.Cancelled {
+		w.journal.Reason = reason
+	}
 	w.journal.Cancelled = true
-	w.journal.Reason = reason
 	w.persist()
 	w.mu.Unlock()
 	w.mu.Lock()

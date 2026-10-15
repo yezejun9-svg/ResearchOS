@@ -147,6 +147,15 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 	if e != nil {
 		return nil, e
 	}
+	rejection, e := c.qualificationFirstGateRejectionTx(tx, route, run, dispatch, bridge, frame, payload)
+	if e != nil {
+		tx.Rollback()
+		return nil, e
+	}
+	if rejection != nil {
+		tx.Rollback()
+		return nil, rejection
+	}
 	provider, e := c.providerRoute(tx, route, run, dispatch, frame)
 	if e != nil {
 		tx.Rollback()

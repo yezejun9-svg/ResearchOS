@@ -5,6 +5,7 @@ package domain
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	rt "researchos.local/research-os/adapters/runtime"
 	"strings"
@@ -423,7 +424,7 @@ func (c *RuntimeCoordinator) ingestClientQueueFrame(ctx context.Context, route R
 
 // Effects may block on a model/tool. Only this flow owns ACK order; a bounded
 // result pump lets the same coordinator receive SDK receipts and send controls.
-func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, route RuntimeCoordinatorRoute, run, lease string, epoch int64, locator string, bridge *rt.Bridge, mutation *sync.Mutex) error {
+func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, cancelBroker context.CancelFunc, route RuntimeCoordinatorRoute, run, lease string, epoch int64, locator string, bridge *rt.Bridge, mutation *sync.Mutex) (qualificationBrokerDrain, error) {
 	type completion struct {
 		seq      int64
 		response any
@@ -431,6 +432,7 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
 	}
 	results := make(chan completion, 32)
 	ready := map[int64]completion{}
+	registry := newQualificationBrokerRegistry()
 	inflight := 0
 	next := int64(1)
 	frames := bridge.Frames()
@@ -439,24 +441,70 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
 	var initialized time.Time
 	var cancelSent time.Time
 	var deferredError error
+	var firstError error
+	var closing bool
+	ctxDone := ctx.Done()
+	var fence *time.Timer
+	var fenceExpired <-chan time.Time
+	defer func() {
+		if fence != nil {
+			fence.Stop()
+		}
+	}()
+	closeAdmission := func(cause error, rejectedSeq int64) {
+		if firstError == nil {
+			firstError = cause
+		}
+		if closing {
+			if rejectedSeq > 0 {
+				registry.disqualify()
+			}
+			return
+		}
+		closing = true
+		registry.close(rejectedSeq)
+		cancelBroker()
+		if rejectedSeq > 0 {
+			bridge.Cancel("qualification first dispatch gate denied TOOL")
+		} else {
+			bridge.Cancel("protocol reconciliation failed")
+		}
+		fence = time.NewTimer(15 * time.Second)
+		fenceExpired = fence.C
+	}
 	for frames != nil || inflight > 0 {
 		select {
 		case observation := <-bridge.ModelObservations():
+			if closing {
+				registry.disqualify()
+				continue
+			}
 			ids, watermark, err := c.commitModelObservation(ctx, route, run, lease, epoch, observation)
 			if err != nil {
-				return err
+				closeAdmission(err, 0)
+				continue
 			}
 			if err = bridge.CreditModelObservation(ctx, observation, ids, watermark); err != nil {
-				return err
+				closeAdmission(err, 0)
+				continue
 			}
 		case frame, ok := <-frames:
 			if !ok {
 				frames = nil
 				continue
 			}
+			if closing {
+				registry.disqualify()
+				continue
+			}
 			if frame.Type == "effect.request" {
 				if inflight >= 16 {
-					return Fail(409, "GATE_FAILED", "effect concurrency exceeds bound")
+					closeAdmission(Fail(409, "GATE_FAILED", "effect concurrency exceeds bound"), 0)
+					continue
+				}
+				if !registry.admit(frame) {
+					closeAdmission(Fail(409, "GATE_FAILED", "duplicate broker admission"), 0)
+					continue
 				}
 				inflight++
 				go func(f rt.BridgeFrame) {
@@ -471,7 +519,8 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
 					if err == nil && frame.Type == "command.accepted" {
 						payload, e := Decode(frame.Payload)
 						if e != nil {
-							return e
+							closeAdmission(e, 0)
+							continue
 						}
 						if payload["initialized"] == true {
 							response = Object{"sequence": frame.Sequence, "key": "command.initialize", "state": "CONFIRMED", "payload": Object{}}
@@ -484,26 +533,57 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
 					mutation.Unlock()
 				}
 				if err != nil {
-					return err
+					closeAdmission(err, 0)
+					continue
 				}
 				ready[frame.Sequence] = completion{seq: frame.Sequence, response: response}
 			}
 		case done := <-results:
+			if closing {
+				registry.disqualify()
+			}
+			if !registry.complete(done.seq, Hash([]any{done.response, fmt.Sprint(done.err)})) {
+				closeAdmission(Fail(409, "GATE_FAILED", "broker completion duplicated or unadmitted"), 0)
+				continue
+			}
 			inflight--
 			if done.err != nil {
+				var rejection *qualificationPreEffectRejection
+				if errors.As(done.err, &rejection) {
+					closeAdmission(done.err, done.seq)
+					continue
+				}
+				if closing {
+					registry.disqualify()
+					continue
+				}
 				var fenced int
 				if err := c.service.DB.QueryRowContext(ctx, `SELECT count(*) FROM client_queue_fences WHERE project=? AND run_id=? AND state='CANCEL_FENCED'`, route.ProjectID, run).Scan(&fenced); err != nil || fenced != 1 {
-					return done.err
+					closeAdmission(done.err, 0)
+					continue
 				}
 				deferredError = done.err
 			}
-			ready[done.seq] = done
-		case <-tick.C:
-			if err := c.deliverClientQueue(ctx, route, run, bridge, &initialized, &cancelSent); err != nil {
-				return err
+			if !closing {
+				ready[done.seq] = done
 			}
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-tick.C:
+			if closing {
+				continue
+			}
+			if err := c.deliverClientQueue(ctx, route, run, bridge, &initialized, &cancelSent); err != nil {
+				closeAdmission(err, 0)
+				continue
+			}
+		case <-ctxDone:
+			closeAdmission(ctx.Err(), 0)
+			ctxDone = nil
+		case <-fenceExpired:
+			registry.disqualify()
+			return registry.snapshot(), errors.Join(firstError, Fail(409, "GATE_FAILED", "broker drain timed out"))
+		}
+		if closing {
+			continue
 		}
 		for {
 			done, ok := ready[next]
@@ -511,19 +591,24 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
 				break
 			}
 			if err := bridge.Acknowledge(ctx, next, done.response); err != nil {
-				return err
+				closeAdmission(err, 0)
+				break
 			}
 			if next == bridge.Read().QueueInitSequence && bridge.ModelInitializationDelivered() {
 				if err := c.modelInitializationDelivered(ctx, route.ProjectID, run, bridge); err != nil {
-					return err
+					closeAdmission(err, 0)
+					break
 				}
 			}
 			delete(ready, next)
 			next++
 		}
 	}
-	if len(ready) != 0 {
-		return Fail(409, "GATE_FAILED", "protocol receipt gap")
+	if closing {
+		return registry.snapshot(), firstError
 	}
-	return deferredError
+	if len(ready) != 0 {
+		return registry.snapshot(), Fail(409, "GATE_FAILED", "protocol receipt gap")
+	}
+	return registry.snapshot(), deferredError
 }
