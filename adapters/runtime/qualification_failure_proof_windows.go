@@ -11,6 +11,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -122,7 +123,10 @@ func qualificationGuardDirectory(directory string, protected bool) (*qualificati
 			g.Close()
 			return nil, err
 		}
-		h, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+		// Metadata-only access does not participate in CreateFile sharing checks.
+		// Listing access makes a retained directory handle reject DELETE opens,
+		// including rename, while its children are opened by pathname.
+		h, err := windows.CreateFile(name, windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 		if err != nil {
 			g.Close()
 			return nil, err
@@ -249,6 +253,88 @@ type QualificationNativeFacts struct {
 	FrameHashes    []string
 	AuxAfterThird  bool
 	Rejection      []byte
+}
+
+// QualificationNativeHold pins the selected directory namespace and the
+// original terminal files until the consuming transaction has finished using
+// the facts. The caller must Close it after commit or rollback.
+type QualificationNativeHold struct {
+	mu     sync.Mutex
+	guard  *qualificationPathGuard
+	files  []*qualificationSourceFile
+	closed bool
+}
+
+func (h *QualificationNativeHold) Check() error {
+	if h == nil {
+		return errors.New("qualification native hold unavailable")
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.guard == nil {
+		return errors.New("qualification native hold closed")
+	}
+	if err := h.guard.Check(); err != nil {
+		return err
+	}
+	for _, f := range h.files {
+		if err := f.Check(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *QualificationNativeHold) Close() error {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+	var err error
+	for i := len(h.files) - 1; i >= 0; i-- {
+		err = errors.Join(err, h.files[i].file.Close())
+	}
+	if h.guard != nil {
+		h.guard.Close()
+	}
+	return err
+}
+
+// HoldQualificationNativeFacts rereads the bounded native evidence while
+// retaining its original file and MODEL Host fact handles for the transaction.
+func HoldQualificationNativeFacts(directory, manifestHash, modelKey string) (QualificationNativeFacts, *QualificationNativeHold, error) {
+	var zero QualificationNativeFacts
+	if modelKey == "" {
+		return zero, nil, errors.New("qualification model key required")
+	}
+	guard, err := qualificationGuardDirectory(directory, true)
+	if err != nil {
+		return zero, nil, err
+	}
+	hold := &QualificationNativeHold{guard: guard}
+	modelName := "effect-" + strings.TrimPrefix(Hash([]byte(modelKey)), "sha256:") + ".json"
+	for _, name := range []string{"bridge.json", "stdout.raw", "stderr.raw", qualificationRejectionFile, modelName} {
+		f, openErr := qualificationOpenSource(filepath.Join(directory, name), guard.current, false)
+		if openErr != nil {
+			hold.Close()
+			return zero, nil, openErr
+		}
+		hold.files = append(hold.files, f)
+	}
+	facts, err := ReadQualificationNativeFacts(directory, manifestHash)
+	if err == nil {
+		err = hold.Check()
+	}
+	if err != nil {
+		hold.Close()
+		return zero, nil, err
+	}
+	return facts, hold, nil
 }
 
 func ReadQualificationNativeFacts(directory, manifestHash string) (QualificationNativeFacts, error) {

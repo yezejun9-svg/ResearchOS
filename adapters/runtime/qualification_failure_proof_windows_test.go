@@ -14,6 +14,118 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func TestQualificationDirectoryGuardBindsFinalNamespace(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "dispatch")
+	if err := os.Mkdir(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrivateDirectory(directory); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := qualificationGuardDirectory(directory, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	heldID := guard.ids[len(guard.ids)-1]
+	moved := directory + "-held"
+	if err := os.Rename(directory, moved); err == nil {
+		guard.Close()
+		t.Fatal("selected directory was renamed while its native guard was held")
+	}
+	path := filepath.Join(directory, qualificationRejectionFile)
+	f, err := qualificationOpenSource(path, guard.current, true)
+	if err != nil {
+		guard.Close()
+		t.Fatal(err)
+	}
+	raw := []byte(`{"original_namespace":true}`)
+	if _, err := f.file.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(f.Check(), guard.Check(), f.file.Close()); err != nil {
+		guard.Close()
+		t.Fatal(err)
+	}
+	guard.Close()
+	if err := os.Rename(directory, moved); err != nil {
+		t.Fatalf("directory remained locked after guard close: %v", err)
+	}
+	if err := os.Mkdir(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrivateDirectory(directory); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := qualificationGuardDirectory(directory, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newID := replacement.ids[len(replacement.ids)-1]
+	replacement.Close()
+	if heldID == newID {
+		t.Fatal("replacement did not change native directory identity")
+	}
+	oldBytes, oldErr := os.ReadFile(filepath.Join(moved, qualificationRejectionFile))
+	if oldErr != nil || string(oldBytes) != string(raw) {
+		t.Fatalf("write/flush missed retained original directory: %v", oldErr)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("replacement directory inherited a receipt from the original namespace")
+	}
+}
+
+func TestQualificationSourceFileHandleBlocksCompetingChange(t *testing.T) {
+	directory := t.TempDir()
+	if _, err := PrivateDirectory(directory); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := qualificationGuardDirectory(directory, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guard.Close()
+	path := filepath.Join(directory, "fact.json")
+	f, err := qualificationOpenSource(path, guard.current, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"continuous":true}`)
+	if _, err := f.file.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("changed"), 0600); err == nil {
+		t.Fatal("write-open allowed a competing writer")
+	}
+	if err := os.Remove(path); err == nil {
+		t.Fatal("write-open allowed deletion")
+	}
+	if err := f.file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(f.Check(), guard.Check(), f.file.Close()); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := qualificationOpenSource(path, guard.current, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.file.Close()
+	if err := os.WriteFile(path, []byte("changed"), 0600); err == nil {
+		t.Fatal("read-open allowed a competing writer")
+	}
+	if err := os.Rename(path, path+".moved"); err == nil {
+		t.Fatal("read-open allowed rename")
+	}
+	got, err := reader.ReadBounded(1024)
+	if err != nil || string(got) != string(raw) {
+		t.Fatalf("write/flush/read changed original bytes: %s %v", got, err)
+	}
+}
+
 func TestQualificationRejectionReceiptPrivateCreateNew(t *testing.T) {
 	private := t.TempDir()
 	if _, err := PrivateDirectory(private); err != nil {
