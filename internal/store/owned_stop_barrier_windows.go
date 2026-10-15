@@ -153,6 +153,8 @@ func ownedStopSafetySnapshot(ctx context.Context, source ownedStopQueryer, subje
 	if err := source.QueryRowContext(ctx, `SELECT state,dispatch_key FROM runtime_dispatches WHERE project=? AND run=? AND epoch=?`, subject.Project, subject.Run, subject.Epoch).Scan(&s.DispatchState, &s.DispatchKey); err != nil {
 		return s, err
 	}
+	// SQLite != yields NULL for a missing/null state. IS NOT makes that
+	// latest effect unsafe without changing the per-key latest-row selection.
 	queries := []struct {
 		sql  string
 		args []any
@@ -161,7 +163,7 @@ func ownedStopSafetySnapshot(ctx context.Context, source ownedStopQueryer, subje
 		{`SELECT count(*) FROM domain_objects WHERE kind='Run' AND NOT(project=? AND id=?) AND coalesce(json_extract(body,'$.status'),'UNKNOWN') NOT IN ('SETTLED','FAILED','CANCELLED')`, []any{subject.Project, subject.Run}, &s.UnresolvedOtherRuns},
 		{`SELECT count(*) FROM runtime_dispatches WHERE NOT(project=? AND run=? AND epoch=?) AND state IN ('PREPARED','STARTED','UNKNOWN')`, []any{subject.Project, subject.Run, subject.Epoch}, &s.UnresolvedOtherDispatches},
 		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.state') IN ('PREPARED','STARTED','UNKNOWN')`, nil, &s.UnresolvedExternalEffects},
-		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND (coalesce(json_extract(body,'$.payload.capability'),'')!='MODEL' OR json_extract(body,'$.state')!='CONFIRMED' OR NOT(x.project=? AND x.run=?))`, []any{subject.Project, subject.Run}, &s.NonModelEffects},
+		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND (coalesce(json_extract(body,'$.payload.capability'),'')!='MODEL' OR json_extract(body,'$.state') IS NOT 'CONFIRMED' OR NOT(x.project=? AND x.run=?))`, []any{subject.Project, subject.Run}, &s.NonModelEffects},
 		{`SELECT count(*) FROM resource_effects x WHERE sequence=(SELECT max(y.sequence) FROM resource_effects y WHERE y.project=x.project AND y.run=x.run AND y.effect_key=x.effect_key) AND json_extract(body,'$.payload.capability')='MODEL' AND json_extract(body,'$.state')='CONFIRMED' AND x.project=? AND x.run=?`, []any{subject.Project, subject.Run}, &s.ConfirmedModelEffects},
 		{`SELECT count(*) FROM client_command_queue WHERE state NOT IN ('CONSUMED','DROPPED')`, nil, &s.PendingClientCommands},
 		{`SELECT count(*) FROM client_control_requests WHERE state!='CONFIRMED'`, nil, &s.PendingControlRequests},

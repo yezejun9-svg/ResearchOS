@@ -107,6 +107,60 @@ func TestOwnedStopSchema24SafetyRejectsUnresolvedEffectsAndOtherDispatches(t *te
 	}
 }
 
+func TestOwnedStopLatestEffectStateFiniteMatrix(t *testing.T) {
+	cases := []struct {
+		name, key, body string
+		sequence        int
+		wantSafe        bool
+	}{
+		{"additional null", "extra", `{"state":null,"payload":{"capability":"MODEL"}}`, 1, false},
+		{"additional missing", "extra", `{"payload":{"capability":"MODEL"}}`, 1, false},
+		{"additional boolean", "extra", `{"state":true,"payload":{"capability":"MODEL"}}`, 1, false},
+		{"additional numeric", "extra", `{"state":0,"payload":{"capability":"MODEL"}}`, 1, false},
+		{"additional array", "extra", `{"state":[],"payload":{"capability":"MODEL"}}`, 1, false},
+		{"additional object", "extra", `{"state":{},"payload":{"capability":"MODEL"}}`, 1, false},
+		{"additional empty string", "extra", `{"state":"","payload":{"capability":"MODEL"}}`, 1, false},
+		{"additional unknown enum", "extra", `{"state":"UNRECOGNIZED","payload":{"capability":"MODEL"}}`, 1, false},
+		{"additional UNKNOWN", "extra", `{"state":"UNKNOWN","payload":{"capability":"MODEL"}}`, 1, false},
+		{"additional CONFIRMED", "extra", `{"state":"CONFIRMED","payload":{"capability":"MODEL"}}`, 1, false},
+		{"missing capability", "extra", `{"state":null}`, 1, false},
+		{"null capability", "extra", `{"state":null,"payload":{"capability":null}}`, 1, false},
+		{"old latest null", "old-model", `{"state":null,"payload":{"capability":"MODEL"}}`, 2, false},
+		{"old latest missing", "old-model", `{"payload":{"capability":"MODEL"}}`, 2, false},
+		{"old history null before valid latest", "old-model", `{"state":null,"payload":{"capability":"MODEL"}}`, 0, true},
+		{"old history UNKNOWN before valid latest", "old-model", `{"state":"UNKNOWN","payload":{"capability":"MODEL"}}`, 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path, db, subject := ownedStopSchema24Fixture(t)
+			if _, err := db.Exec(`INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,?,?)`, subject.Project, subject.Run, tc.key, tc.sequence, tc.body); err != nil {
+				t.Fatalf("real schema fixture insert: %v", err)
+			}
+			preflight, err := ReadOwnedStopSafetyPreflight(context.Background(), path, subject)
+			if err != nil || preflight.ExactOldSubjectSafe() != tc.wantSafe {
+				t.Fatalf("preflight safety=%v want=%v snapshot=%+v error=%v", preflight.ExactOldSubjectSafe(), tc.wantSafe, preflight, err)
+			}
+			barrier, err := AcquireOwnedStopBarrier(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer barrier.Close()
+			reserved, err := barrier.SafetySnapshot(context.Background(), subject)
+			if err != nil || reserved.ExactOldSubjectSafe() != tc.wantSafe {
+				t.Fatalf("reserved safety=%v want=%v snapshot=%+v error=%v", reserved.ExactOldSubjectSafe(), tc.wantSafe, reserved, err)
+			}
+			if preflight != reserved {
+				t.Fatalf("preflight and reserved classifications differ: %+v %+v", preflight, reserved)
+			}
+			if tc.key == "extra" && (tc.name == "additional null" || tc.name == "additional missing") {
+				if reserved.NonModelEffects != 1 || reserved.ConfirmedModelEffects != 1 {
+					t.Fatalf("latest extra malformed MODEL was not counted unsafe: %+v", reserved)
+				}
+			}
+		})
+	}
+}
+
 func TestOwnedStopBarrierNativeQueryOnlyAndReservedWriter(t *testing.T) {
 	path, db := ownedStopFixtureDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
