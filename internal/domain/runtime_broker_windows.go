@@ -181,14 +181,7 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		}
 	}
 	if provider.Capability == "MODEL" {
-		var effective map[string]any
-		effective, e = runtimepolicy.Effective(dispatch["manifest"].(map[string]any), Str(task, "task_type"))
-		if e == nil {
-			_, e = validateRuntimeModelRequest(effective, payload)
-		}
-		if e == nil {
-			e = runtimeModelCallGate(tx, route.ProjectID, runID, frame.Key, effective)
-		}
+		e = validateModelEffectBeforePrepare(tx, route.ProjectID, runID, task, dispatch["manifest"].(map[string]any), frame.Key, payload)
 		if e != nil {
 			tx.Rollback()
 			return nil, e
@@ -321,6 +314,20 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		return nil, e
 	}
 	return Object{"sequence": frame.Sequence, "key": frame.Key, "state": receipt["state"], "payload": receipt["payload"]}, nil
+}
+
+// This is the last MODEL authority gate before prepareEffectTx writes the
+// first durable effect. Keeping all three checks together lets a fixture prove
+// that a rejected projection cannot create a reservation or provider request.
+func validateModelEffectBeforePrepare(tx *sql.Tx, project, runID string, task Object, manifest map[string]any, effectKey string, payload Object) error {
+	effective, err := runtimepolicy.Effective(manifest, Str(task, "task_type"))
+	if err != nil {
+		return err
+	}
+	if _, err = validateRuntimeModelRequest(effective, payload); err != nil {
+		return err
+	}
+	return runtimeModelCallGate(tx, project, runID, effectKey, effective)
 }
 
 const runtimeFactMaxBytes = 4*1024*1024 + 128*1024

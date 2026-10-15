@@ -8,8 +8,11 @@ import (
 
 func fixtureManifest(t *testing.T) map[string]any {
 	t.Helper()
-	tool := map[string]any{"type": "function", "function": map[string]any{"name": "run_check", "parameters": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}}}}
-	config := map[string]any{"api": "openai-completions", "model": "模型😀", "provider": "local", "ref": "source-ref", "route": "route-1", "endpoint": "http://127.0.0.1:1234/v1/chat/completions", "max_output_tokens": json.Number("2048"), "max_calls": json.Number("8"), "tools": []any{tool}}
+	tools := []any{}
+	for _, name := range []string{"run_check", "read_file", "edit_file", "shell_command"} {
+		tools = append(tools, map[string]any{"type": "function", "function": map[string]any{"name": name, "parameters": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}}}})
+	}
+	config := map[string]any{"api": "openai-completions", "model": "模型😀", "provider": "local", "ref": "source-ref", "route": "route-1", "endpoint": "http://127.0.0.1:1234/v1/chat/completions", "max_output_tokens": json.Number("2048"), "max_calls": json.Number("8"), "tools": tools}
 	configHash, err := Hash(config)
 	if err != nil {
 		t.Fatal(err)
@@ -36,12 +39,12 @@ func TestQualificationProjectionPureAndTamper(t *testing.T) {
 		t.Fatalf("effective bounds: %v", effective)
 	}
 	original := m["admission"].(map[string]any)["profile"].(map[string]any)["model_config"].(map[string]any)
-	if !exactNumber(original["max_calls"], 8) || len(original["tools"].([]any)) != 1 {
+	if !exactNumber(original["max_calls"], 8) || len(original["tools"].([]any)) != 4 {
 		t.Fatal("source changed")
 	}
 	effective["model"] = "changed"
 	effective["tools"] = append(effective["tools"].([]any), map[string]any{"name": "injected"})
-	if original["model"] != "模型😀" || len(original["tools"].([]any)) != 1 {
+	if original["model"] != "模型😀" || len(original["tools"].([]any)) != 4 {
 		t.Fatal("effective aliases source")
 	}
 	other, err := Effective(m, "")
@@ -105,7 +108,7 @@ func TestQualificationProjectionLegacyAndCreation(t *testing.T) {
 	legacy := fixtureManifest(t)
 	original := legacy["admission"].(map[string]any)["profile"].(map[string]any)["model_config"].(map[string]any)
 	got, err := Effective(legacy, "runtime_qualification")
-	if err != nil || !reflect.DeepEqual(got["tools"], original["tools"]) {
+	if err != nil || !reflect.DeepEqual(got, original) || !exactNumber(got["max_calls"], 8) || len(got["tools"].([]any)) != 4 {
 		t.Fatal("legacy config changed", err)
 	}
 	if err := Prepare(legacy, "mu_turn"); err == nil {
@@ -127,8 +130,35 @@ func TestQualificationProjectionLegacyAndCreation(t *testing.T) {
 		t.Fatal("normal turn marked")
 	}
 	got, err = Effective(normal, "mu_turn")
-	if err != nil || !reflect.DeepEqual(got["tools"], original["tools"]) {
+	if err != nil || !reflect.DeepEqual(got, original) || !exactNumber(got["max_calls"], 8) || len(got["tools"].([]any)) != 4 {
 		t.Fatal("normal turn schemas changed", err)
+	}
+}
+
+func TestQualificationProjectionNativeOfflineAndMuIncomplete(t *testing.T) {
+	for _, taskType := range []string{"runtime_qualification", "ordinary"} {
+		manifest := map[string]any{"admission": map[string]any{"profile": map[string]any{"backend": "native-offline", "model": "none"}}}
+		before, err := Hash(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := Prepare(manifest, taskType); err != nil {
+			t.Fatalf("supported native-offline %s rejected: %v", taskType, err)
+		}
+		after, _ := Hash(manifest)
+		if before != after || manifest[ProjectionField] != nil {
+			t.Fatalf("native-offline %s was marked or altered", taskType)
+		}
+		manifest[ProjectionField] = nil
+		if err := Prepare(manifest, taskType); err == nil {
+			t.Fatalf("native-offline %s accepted present null marker", taskType)
+		}
+	}
+	for _, taskType := range []string{"runtime_qualification", "mu_turn"} {
+		manifest := map[string]any{"admission": map[string]any{"profile": map[string]any{"backend": "mu-sdk-broker-v1"}}}
+		if err := Prepare(manifest, taskType); err == nil {
+			t.Fatalf("Mu %s without model config fell back", taskType)
+		}
 	}
 }
 

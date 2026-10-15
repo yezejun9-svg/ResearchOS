@@ -155,6 +155,23 @@ func Prepare(manifest map[string]any, taskType string) error {
 	if _, exists := manifest[ProjectionField]; exists {
 		return errors.New("projection marker already present")
 	}
+	// A native-offline runtime can execute a runtime_qualification Task without
+	// a model. Its verified admission is complete without model_config, so keep
+	// that original dispatch unmarked. Only the Mu backend reaches projection.
+	admission, ok := manifest["admission"].(map[string]any)
+	if !ok {
+		return errors.New("projection admission missing")
+	}
+	profile, ok := admission["profile"].(map[string]any)
+	if !ok {
+		return errors.New("projection profile missing")
+	}
+	if profile["backend"] == "native-offline" && profile["model"] == "none" {
+		return nil
+	}
+	if profile["backend"] != "mu-sdk-broker-v1" {
+		return errors.New("unsupported projection backend")
+	}
 	admission, profile, config, permission, err := projectionInput(manifest)
 	if err != nil {
 		partialAdmission, _ := manifest["admission"].(map[string]any)

@@ -115,12 +115,23 @@ func desktopExitFixture(t *testing.T) (*fixture, *RuntimeCoordinator, string, st
 	return desktopExitFixtureTools(t, false)
 }
 func desktopExitFixtureTools(t *testing.T, oldTools bool) (*fixture, *RuntimeCoordinator, string, string) {
+	return desktopExitFixtureSeed(t, oldTools, nil)
+}
+func desktopExitFixtureSeed(t *testing.T, oldTools bool, seed func(Object) Object) (*fixture, *RuntimeCoordinator, string, string) {
 	t.Helper()
 	f, c, r, executor := confirmationFixture(t)
 	ctx := context.Background()
+	var finishSeed func() capturedInitialDispatch
+	if seed != nil {
+		finishSeed = captureInitialDispatch(t, f.db)
+	}
 	run, _, e := c.beginManagedLocalQualification(ctx, f.token, r, executor)
 	if e != nil {
 		t.Fatal(e)
+	}
+	var captured capturedInitialDispatch
+	if finishSeed != nil {
+		captured = finishSeed()
 	}
 	runID := Str(run, "id")
 	key := r.TaskID + ":" + runID + ":1:model:1"
@@ -129,11 +140,17 @@ func desktopExitFixtureTools(t *testing.T, oldTools bool) (*fixture, *RuntimeCoo
 		if e != nil {
 			return e
 		}
-		dispatch, e := runtimeDispatch(tx, f.project, runID, 1)
-		if e != nil {
-			return e
+		var dispatch Object
+		var manifest Object
+		if finishSeed != nil {
+			manifest = captured.manifest
+		} else {
+			dispatch, e = runtimeDispatch(tx, f.project, runID, 1)
+			if e != nil {
+				return e
+			}
+			manifest = dispatch["manifest"].(map[string]any)
 		}
-		manifest := dispatch["manifest"].(map[string]any)
 		admission := manifest["admission"].(map[string]any)
 		profile := admission["profile"].(map[string]any)
 		config := profile["model_config"].(map[string]any)
@@ -146,19 +163,44 @@ func desktopExitFixtureTools(t *testing.T, oldTools bool) (*fixture, *RuntimeCoo
 			request["payload"].(map[string]any)["body"].(map[string]any)["tools"] = []any{Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object"}}}}
 		}
 		cost := Object{"policy_id": goal["budget_policy_id"], "run_id": runID, "operation": "UNKNOWN", "money": nil, "provider_request_id": key, "provider_event_id": "prepare/" + key, "reservation_id": nil, "cost_basis": "UNKNOWN", "occurred_at": run["created_at"]}
-		effect, e := c.service.prepareEffectTx(tx, c.schedulerCredential(f.project), f.project, runID, key, request, cost)
-		if e != nil {
-			return e
-		}
-		effect, e = c.service.beginEffectTx(tx, c.schedulerCredential(f.project), f.project, runID, key)
-		if e != nil {
-			return e
+		var effect Object
+		if finishSeed != nil {
+			// The invalid dispatch cannot authorize normal effect preparation. Build
+			// the same append-only fixture stages before its first durable INSERT.
+			ledger, err := f.s.appendBudget(tx, f.project, cost)
+			if err != nil {
+				return err
+			}
+			effect = Object{"project_id": f.project, "goal_id": goal["id"], "task_id": task["id"], "run_id": runID, "key": key, "request_hash": Hash([]any{request, cost}), "payload": request, "reservation_id": ledger["id"], "state": "PREPARED", "epoch": run["lease_epoch"], "context_bundle_id": task["context_bundle_id"], "checkpoint_artifact_id": run["checkpoint_artifact_id"], "receipt": nil}
+			if err := effectAppend(tx, f.project, runID, key, effect); err != nil {
+				return err
+			}
+			effect["state"] = "STARTED"
+			if err := effectAppend(tx, f.project, runID, key, effect); err != nil {
+				return err
+			}
+		} else {
+			effect, e = c.service.prepareEffectTx(tx, c.schedulerCredential(f.project), f.project, runID, key, request, cost)
+			if e != nil {
+				return e
+			}
+			effect, e = c.service.beginEffectTx(tx, c.schedulerCredential(f.project), f.project, runID, key)
+			if e != nil {
+				return e
+			}
 		}
 		raw := []byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
 		receipt := Object{"key": key, "epoch": 1, "run_id": runID, "receipt_id": Digest(raw), "state": "CONFIRMED", "model_transport": true, "actual_cost": nil, "payload": Object{"status": 200, "content_type": "text/event-stream", "body": string(raw)}}
 		effect["state"], effect["receipt"] = "CONFIRMED", receipt
 		if e = effectAppend(tx, f.project, runID, key, effect); e != nil {
 			return e
+		}
+		if finishSeed != nil {
+			stored := seed(qualificationProjectionClone(t, manifest))
+			if e = captured.insert(tx, stored); e != nil {
+				return e
+			}
+			dispatch = Object{"dispatch_key": captured.key, "manifest_hash": Hash(stored)}
 		}
 		identity := Object{"pid": 12345, "created": 123, "image": "fixture"}
 		observation := Object{"state": "SETTLED", "children_stopped": true, "queue_empty": true, "streams_drained": true, "cleanup_complete": true, "ended": Now(), "dispatch_key": dispatch["dispatch_key"], "manifest_hash": dispatch["manifest_hash"], "worker": "fixture-worker", "identity": identity, "observation_sequence": 1, "spec": Object{"profile_hash": admission["profile_hash"], "run_id": runID, "task_id": task["id"], "epoch": 1}}
@@ -222,6 +264,74 @@ func TestQualificationProjectionUnknownCostRejectsOldTools(t *testing.T) {
 	}
 	if before != after {
 		t.Fatal("UNKNOWN ledger changed after rejection")
+	}
+}
+
+func TestQualificationProjectionUnknownCostFullMatrix(t *testing.T) {
+	check := func(t *testing.T, seed func(Object) Object, mutation string) {
+		t.Helper()
+		wantReject := mutation != ""
+		f, _, runID, _ := desktopExitFixtureSeed(t, false, seed)
+		var ledgerBefore, effectsBefore string
+		if err := f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid)").Scan(&ledgerBefore); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM resource_effects WHERE run=? ORDER BY rowid)", runID).Scan(&effectsBefore); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := f.db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw string
+		if err := tx.QueryRow("SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' AND json_extract(body,'$.run_id')=? AND json_extract(body,'$.operation')='UNKNOWN' ORDER BY rowid DESC LIMIT 1", runID).Scan(&raw); err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+		ledger, err := Decode([]byte(raw))
+		if err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+		err = f.s.completedLocalUnknownCost(tx, f.project, ledger)
+		if wantReject {
+			t.Logf("entry=completedLocalUnknownCost rejection=%v", err)
+		}
+		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+			t.Fatal(rollbackErr)
+		}
+		if wantReject && err == nil || !wantReject && err != nil {
+			t.Fatalf("completedLocalUnknownCost reject=%t: %v", wantReject, err)
+		}
+		if wantReject {
+			cause := "qualification projection"
+			if mutation == "authority.profile_ref" || mutation == "authority.profile_hash" || mutation == "authority.profile.model_config" || mutation == "authority.model_qualification.route" || mutation == "authority.model_qualification.model_config_hash" {
+				cause = "frozen profile binding"
+			} else if mutation == "authority.model_qualification.max_calls" {
+				cause = "profile bytes"
+			}
+			if !strings.Contains(err.Error(), cause) {
+				t.Fatalf("%s rejected for unrelated cause: %v", mutation, err)
+			}
+		}
+		var ledgerAfter, effectsAfter string
+		if err := f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid)").Scan(&ledgerAfter); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM resource_effects WHERE run=? ORDER BY rowid)", runID).Scan(&effectsAfter); err != nil {
+			t.Fatal(err)
+		}
+		if ledgerBefore != ledgerAfter || effectsBefore != effectsAfter {
+			t.Fatal("UNKNOWN cost entry changed original ledger or effect history")
+		}
+	}
+	t.Run("unmodified_seed", func(t *testing.T) {
+		check(t, func(manifest Object) Object { return qualificationProjectionClone(t, manifest) }, "")
+	})
+	for _, mutation := range qualificationProjectionMutations() {
+		t.Run(mutation.name, func(t *testing.T) {
+			check(t, func(manifest Object) Object { return qualificationProjectionMutant(t, manifest, mutation) }, mutation.name)
+		})
 	}
 }
 func TestDesktopExitUnknownIncompleteRefused(t *testing.T) {

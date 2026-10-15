@@ -4,14 +4,73 @@ package domain
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
+	"strings"
 	"testing"
 
 	rt "researchos.local/research-os/adapters/runtime"
 )
 
+type capturedInitialDispatch struct {
+	project, run, key, prepared, updated string
+	epoch                                int64
+	manifest                             Object
+}
+
+func (captured capturedInitialDispatch) insert(execer interface {
+	Exec(string, ...any) (sql.Result, error)
+}, manifest Object) error {
+	_, err := execer.Exec(`INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES(?,?,?,?,?,?,'PREPARED',?,?)`, captured.project, captured.run, captured.epoch, captured.key, string(Bytes(manifest)), Hash(manifest), captured.prepared, captured.updated)
+	return err
+}
+
+// A disposable database captures Begin's proposed dispatch without storing it.
+// The caller supplies the first durable row from this exact in-memory manifest.
+func captureInitialDispatch(t *testing.T, db *sql.DB) func() capturedInitialDispatch {
+	t.Helper()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err := db.Exec(`CREATE TEMP TABLE projection_first_dispatch(project TEXT, run TEXT, epoch INTEGER, dispatch_key TEXT, manifest TEXT, prepared_at TEXT, updated_at TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TEMP TRIGGER projection_suppress_dispatch BEFORE INSERT ON main.runtime_dispatches BEGIN
+		INSERT INTO projection_first_dispatch(project,run,epoch,dispatch_key,manifest,prepared_at,updated_at)
+		VALUES(NEW.project,NEW.run,NEW.epoch,NEW.dispatch_key,NEW.manifest,NEW.prepared_at,NEW.updated_at);
+		SELECT RAISE(IGNORE);
+	END`); err != nil {
+		t.Fatal(err)
+	}
+	return func() capturedInitialDispatch {
+		t.Helper()
+		var captured capturedInitialDispatch
+		var raw string
+		if err := db.QueryRow(`SELECT project,run,epoch,dispatch_key,manifest,prepared_at,updated_at FROM projection_first_dispatch`).Scan(&captured.project, &captured.run, &captured.epoch, &captured.key, &raw, &captured.prepared, &captured.updated); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`DROP TRIGGER projection_suppress_dispatch`); err != nil {
+			t.Fatal(err)
+		}
+		manifest, err := Decode([]byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		captured.manifest = manifest
+		if _, err := db.Exec(`DROP TABLE projection_first_dispatch`); err != nil {
+			t.Fatal(err)
+		}
+		return captured
+	}
+}
+
 func TestQualificationProjectionStageAndPretransportTamper(t *testing.T) {
-	c, route, r, calls := muBrokerFixture(t, nil)
+	tool := func(name string) Object {
+		return Object{"type": "function", "function": Object{"name": name, "parameters": Object{"type": "object"}}}
+	}
+	c, route, r, calls := muBrokerFixtureProgram(t, nil, func(config, _ Object) {
+		config["max_calls"] = 8
+		config["tools"] = []any{tool("run_check"), tool("read_file"), tool("edit_file"), tool("shell_command")}
+	})
 	var raw string
 	if err := r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&raw); err != nil {
 		t.Fatal(err)
@@ -22,20 +81,31 @@ func TestQualificationProjectionStageAndPretransportTamper(t *testing.T) {
 	}
 	provider := c.config.Providers[0]
 	payload := Object{"body": Object{"model": "fixture-model", "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}, "tools": Empty()}}
-	for _, field := range []string{"schema", "project_id", "task_id", "run_id", "epoch", "runtime_id", "dispatch_key", "profile_ref", "profile_hash", "source_profile_body_hash", "source_model_config_hash", "qualification_plan_hash", "permission_hash", "effective_model_config_hash", "policy"} {
-		t.Run(field, func(t *testing.T) {
-			copy, err := Decode(Bytes(manifest))
+	for _, mutation := range qualificationProjectionMutations() {
+		t.Run(mutation.name, func(t *testing.T) {
+			positive := qualificationProjectionClone(t, manifest)
+			positiveInputs := map[string][]byte{}
+			if err := stageRuntimeProgram(route, Object{"manifest": positive}, positiveInputs); err != nil {
+				t.Fatalf("unmodified clone did not stage: %v", err)
+			}
+			staged, err := Decode(positiveInputs["worker.json"])
 			if err != nil {
 				t.Fatal(err)
 			}
-			copy["model_execution_projection"].(map[string]any)[field] = "tampered"
+			if n, _ := Num(staged, "max_calls"); n != 1 || len(Arr(staged, "tools")) != 0 {
+				t.Fatal("positive projection did not reach worker")
+			}
+			copy := qualificationProjectionMutant(t, manifest, mutation)
 			inputs := map[string][]byte{}
 			if err := stageRuntimeProgram(route, Object{"manifest": copy}, inputs); err == nil {
-				t.Fatal("staging accepted tampered marker")
+				t.Fatal("staging accepted tampered projection")
+			}
+			if _, exists := inputs["worker.json"]; exists {
+				t.Fatal("rejected projection staged worker configuration")
 			}
 			_, err = c.brokerModel(context.Background(), route, provider, Str(r.run, "id"), r.lease, 1, nil, rt.BridgeFrame{}, payload, nil, Object{"manifest": copy})
 			if err == nil {
-				t.Fatal("pretransport accepted tampered marker")
+				t.Fatal("pretransport accepted tampered projection")
 			}
 		})
 	}
@@ -78,9 +148,12 @@ func TestQualificationProjectionPrepareUsesActualTask(t *testing.T) {
 }
 
 func TestQualificationProjectionLegacyAndNormalMuStage(t *testing.T) {
-	_, route, r, _ := muBrokerFixtureProgram(t, nil, func(config, profile Object) {
+	tool := func(name string) Object {
+		return Object{"type": "function", "function": Object{"name": name, "parameters": Object{"type": "object"}}}
+	}
+	c, route, r, _ := muBrokerFixtureProgram(t, nil, func(config, profile Object) {
 		config["max_calls"] = 8
-		config["tools"] = []any{Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object"}}}}
+		config["tools"] = []any{tool("run_check"), tool("read_file"), tool("edit_file"), tool("shell_command")}
 	})
 	var raw string
 	if err := r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&raw); err != nil {
@@ -91,6 +164,12 @@ func TestQualificationProjectionLegacyAndNormalMuStage(t *testing.T) {
 		t.Fatal(err)
 	}
 	delete(manifest, "model_execution_projection")
+	source := manifest["admission"].(map[string]any)["profile"].(map[string]any)["model_config"].(map[string]any)
+	sourceRaw := Bytes(source)
+	sourceHash := Hash(source)
+	if n, _ := Num(source, "max_calls"); n != 8 || len(Arr(source, "tools")) != 4 || Hash(c.config.Providers[0].ModelConfig) != sourceHash {
+		t.Fatal("original 8/4 and host provider identity mismatch")
+	}
 	inputs := map[string][]byte{}
 	if err := stageRuntimeProgram(route, Object{"manifest": manifest}, inputs); err != nil {
 		t.Fatal(err)
@@ -99,7 +178,7 @@ func TestQualificationProjectionLegacyAndNormalMuStage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := Num(worker, "max_calls"); n != 8 || len(Arr(worker, "tools")) != 1 {
+	if n, _ := Num(worker, "max_calls"); n != 8 || len(Arr(worker, "tools")) != 4 || Hash(worker) != sourceHash || string(Bytes(worker)) != string(sourceRaw) {
 		t.Fatal("legacy qualification did not retain original config")
 	}
 	admission := manifest["admission"].(map[string]any)
@@ -113,7 +192,7 @@ func TestQualificationProjectionLegacyAndNormalMuStage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := Num(worker, "max_calls"); n != 8 || len(Arr(worker, "tools")) != 1 {
+	if n, _ := Num(worker, "max_calls"); n != 8 || len(Arr(worker, "tools")) != 4 || Hash(worker) != sourceHash || string(Bytes(worker)) != string(sourceRaw) {
 		t.Fatal("normal Mu turn lost original config")
 	}
 	payload := Object{"body": Object{"model": worker["model"], "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}, "tools": worker["tools"]}}
@@ -164,5 +243,117 @@ func TestQualificationProjectionHostPreprepareRejectsOldToolsAndSecondModel(t *t
 	}
 	if calls.Load() != 0 {
 		t.Fatal("second request reached provider")
+	}
+}
+
+func TestQualificationProjectionBrokerPreprepareFullMatrix(t *testing.T) {
+	tool := func(name string) Object {
+		return Object{"type": "function", "function": Object{"name": name, "parameters": Object{"type": "object"}}}
+	}
+	_, _, r, calls := muBrokerFixtureProgram(t, nil, func(config, _ Object) {
+		config["max_calls"] = 8
+		config["tools"] = []any{tool("run_check"), tool("read_file"), tool("edit_file"), tool("shell_command")}
+	})
+	var raw string
+	if err := r.f.db.QueryRow("SELECT manifest FROM runtime_dispatches WHERE run=?", r.run["id"]).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := Decode([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := Str(r.task, "id") + ":" + Str(r.run, "id") + ":1:model:1"
+	payload := Object{"body": Object{"model": "fixture-model", "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}, "tools": Empty()}}
+	for _, mutation := range qualificationProjectionMutations() {
+		t.Run(mutation.name, func(t *testing.T) {
+			tx, err := r.f.db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			task, err := load(tx, r.f.project, "Task", Str(r.task, "id"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			positive := qualificationProjectionClone(t, manifest)
+			if err := validateModelEffectBeforePrepare(tx, r.f.project, Str(r.run, "id"), task, positive, key, payload); err != nil {
+				t.Fatalf("unmodified preprepare gate invalid: %v", err)
+			}
+			mutated := qualificationProjectionMutant(t, manifest, mutation)
+			if err := validateModelEffectBeforePrepare(tx, r.f.project, Str(r.run, "id"), task, mutated, key, payload); err == nil {
+				t.Fatal("broker preprepare gate accepted mutation")
+			}
+			var effects int
+			if err := tx.QueryRow("SELECT count(*) FROM resource_effects WHERE run=?", r.run["id"]).Scan(&effects); err != nil || effects != 0 {
+				t.Fatalf("rejected projection wrote effect: %d %v", effects, err)
+			}
+			if calls.Load() != 0 {
+				t.Fatalf("rejected projection reached provider %d times", calls.Load())
+			}
+		})
+	}
+}
+
+func TestQualificationProjectionBrokerEffectEntryFullMatrix(t *testing.T) {
+	request := Object{"body": Object{"model": "fixture-model", "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}, "tools": Empty()}}
+	check := func(t *testing.T, mutation *qualificationProjectionMutation) {
+		t.Helper()
+		var seed func(Object) Object
+		if mutation != nil {
+			seed = func(manifest Object) Object { return qualificationProjectionMutant(t, manifest, *mutation) }
+		}
+		c, route, r, calls := muBrokerFirstDispatchFixture(t, seed)
+		runID := Str(r.run, "id")
+		frame := rt.BridgeFrame{Key: Str(r.task, "id") + ":" + runID + ":1:model:1", Route: "model-fixture", Capability: "MODEL", Payload: Bytes(request)}
+		var ledgerBefore string
+		if scanErr := r.f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid)").Scan(&ledgerBefore); scanErr != nil {
+			t.Fatal(scanErr)
+		}
+		_, err := c.brokerEffect(context.Background(), route, runID, r.lease, 1, nil, frame)
+		if mutation != nil {
+			t.Logf("entry=brokerEffect mutation=%s rejection=%v", mutation.name, err)
+		}
+		var effects, observations int
+		var state, worker, ledgerAfter string
+		if scanErr := r.f.db.QueryRow("SELECT group_concat(body,'|') FROM (SELECT body FROM domain_objects WHERE kind='BudgetLedgerEntry' ORDER BY rowid)").Scan(&ledgerAfter); scanErr != nil {
+			t.Fatal(scanErr)
+		}
+		if scanErr := r.f.db.QueryRow("SELECT count(*) FROM resource_effects WHERE run=?", runID).Scan(&effects); scanErr != nil {
+			t.Fatal(scanErr)
+		}
+		if scanErr := r.f.db.QueryRow("SELECT count(*) FROM runtime_observations WHERE run=?", runID).Scan(&observations); scanErr != nil {
+			t.Fatal(scanErr)
+		}
+		if scanErr := r.f.db.QueryRow("SELECT state,worker FROM runtime_dispatches WHERE run=?", runID).Scan(&state, &worker); scanErr != nil {
+			t.Fatal(scanErr)
+		}
+		if mutation == nil {
+			if calls.Load() != 1 || effects < 2 {
+				t.Fatalf("unmodified first dispatch did not reach provider after PREPARED: calls=%d effects=%d err=%v", calls.Load(), effects, err)
+			}
+		} else if err == nil || calls.Load() != 0 || effects != 0 || ledgerBefore != ledgerAfter {
+			t.Fatalf("brokerEffect accepted %s or crossed prepare/transport: err=%v calls=%d effects=%d ledgerChanged=%t", mutation.name, err, calls.Load(), effects, ledgerBefore != ledgerAfter)
+		}
+		if mutation != nil {
+			cause := "STALE_INPUT: dispatch authority snapshot changed"
+			switch {
+			case strings.HasPrefix(mutation.name, "marker."):
+				cause = "projection"
+			case mutation.name == "authority.qualification_bootstrap":
+				cause = "runtime not available"
+			case mutation.name == "authority.profile_ref":
+				cause = "immutable profile ref hash mismatch"
+			}
+			if !strings.Contains(err.Error(), cause) {
+				t.Fatalf("%s rejected for unrelated cause: %v", mutation.name, err)
+			}
+		}
+		if observations != 0 || state != "PREPARED" || worker != "" {
+			t.Fatalf("brokerEffect launched worker: observation=%d state=%s worker=%q", observations, state, worker)
+		}
+	}
+	t.Run("unmodified_seed", func(t *testing.T) { check(t, nil) })
+	for _, mutation := range qualificationProjectionMutations() {
+		t.Run(mutation.name, func(t *testing.T) { check(t, &mutation) })
 	}
 }
