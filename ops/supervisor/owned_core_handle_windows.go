@@ -294,7 +294,25 @@ func (h *OwnedCoreRetainedHandle) verifyRetained() error {
 	if err = windows.GetFileInformationByHandle(windows.Handle(h.core.image.Fd()), &info); err != nil || info.VolumeSerialNumber != h.identity.ImageVolume || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) != h.identity.ImageIndex {
 		return errors.New("retained image file changed")
 	}
+	parentPID, err := windows.GetProcessId(h.parent.handle)
+	if err != nil || parentPID != h.identity.ParentPID {
+		return errors.New("retained parent PID changed")
+	}
+	if err = windows.GetProcessTimes(h.parent.handle, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() != h.identity.ParentCreatedNS {
+		return errors.New("retained parent creation changed")
+	}
+	parentStatus, err := h.nativeParentWait()
+	if err != nil || parentStatus != uint32(windows.WAIT_TIMEOUT) {
+		return errors.New("retained parent no longer live")
+	}
+	if err = windows.GetFileInformationByHandle(windows.Handle(h.parent.image.Fd()), &info); err != nil || info.VolumeSerialNumber != h.identity.ParentImageVolume || uint64(info.FileIndexHigh)<<32|uint64(info.FileIndexLow) != h.identity.ParentImageIndex {
+		return errors.New("retained parent image changed")
+	}
 	return nil
+}
+
+func (h *OwnedCoreRetainedHandle) nativeParentWait() (uint32, error) {
+	return windows.WaitForSingleObject(h.parent.handle, 0)
 }
 
 // OwnedCoreNativeExit records whether the one call was made and the numeric
@@ -309,6 +327,14 @@ type OwnedCoreNativeExit struct {
 const OwnedCoreMaintenanceExitCode uint32 = 0x52534f53
 
 func (h *OwnedCoreRetainedHandle) TerminateOnceAndWait(timeout time.Duration) (OwnedCoreNativeExit, error) {
+	return h.TerminateOnceAndWaitUntil(timeout, time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+}
+
+// TerminateOnceAndWaitUntil applies both the invocation monotonic deadline and
+// the grant's wall expiry at the last native boundary, after pre-signal waits.
+// A failed deadline check returns with zero TerminateProcess calls; the caller's
+// already-durable intent remains consumed.
+func (h *OwnedCoreRetainedHandle) TerminateOnceAndWaitUntil(timeout time.Duration, invocationDeadline, wallExpiry time.Time) (OwnedCoreNativeExit, error) {
 	var out OwnedCoreNativeExit
 	if timeout <= 0 || timeout > 30*time.Second {
 		return out, errors.New("bounded native wait required")
@@ -333,6 +359,9 @@ func (h *OwnedCoreRetainedHandle) TerminateOnceAndWait(timeout time.Duration) (O
 	}
 	if status != uint32(windows.WAIT_TIMEOUT) {
 		return out, fmt.Errorf("unexpected native wait status %d", status)
+	}
+	if now := time.Now(); !now.Before(invocationDeadline) || !now.Before(wallExpiry) {
+		return out, errors.New("grant expired before native signal")
 	}
 	h.terminateCalls = 1
 	out.TerminateCalls = 1

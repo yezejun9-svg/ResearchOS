@@ -132,4 +132,15 @@ func TestOwnedCoreCLIRequiresExactArguments(t *testing.T) {
 	if got := run([]string{"inspect"}); got != 2 {
 		t.Fatalf("inspect accepted missing plan: %d", got)
 	}
+	for _, args := range [][]string{
+		{"commit", "--plan", "x", "--plan", "y"},
+		{"commit", "--plan", "x", "--expect-plan-sha256", "a", "--out", "z"},
+		{"preflight", "--input", "a", "--operation-id", "b", "--out", "c", "commit"},
+		{"inspect", "--plan", "x", "--expect-plan-sha256", "a"},
+		{"inspect", "--plan", "x", "--plan", "y"},
+	} {
+		if got := run(args); got != 2 {
+			t.Fatalf("mixed or duplicate flags accepted: %q exit=%d", args, got)
+		}
+	}
 }

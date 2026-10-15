@@ -38,6 +38,54 @@ func TestOwnedCoreStopJournalExclusiveAndPrivate(t *testing.T) {
 	}
 }
 
+func TestHeldAuthorityAndOperationLockDenyReplacement(t *testing.T) {
+	base := t.TempDir()
+	data := filepath.Join(base, "data")
+	if err := os.Mkdir(data, 0700); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(base, "operation")
+	if err := createPrivateOutput(out, data); err != nil {
+		t.Fatal(err)
+	}
+	h, err := openHeldFile(out, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := nativeFileIdentity(h.info, out)
+	h.Close()
+	g := operationGrant{DataRoot: grantFileIdentity{Path: data}, OperationDir: id}
+	lock, err := acquireOperationLock(g, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second, err := acquireOperationLock(g, false); err == nil {
+		second.Close()
+		t.Fatal("parallel operation acquired exclusive lock")
+	}
+	if _, err := writeOwnedJournal(out, "authority.json", map[string]string{"role": "fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := openHeldFile(filepath.Join(out, "authority.json"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, e := os.OpenFile(filepath.Join(out, "authority.json"), os.O_WRONLY, 0); e == nil {
+		f.Close()
+		t.Fatal("held authority file allowed write sharing")
+	}
+	if err := os.Rename(out, filepath.Join(base, "replacement")); err == nil {
+		t.Fatal("held ancestor directory renamed")
+	}
+	doc.Close()
+	lock.Close()
+	replay, err := acquireOperationLock(g, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay.Close()
+}
+
 func TestOwnedCoreStopInspectJournalCrashBoundaries(t *testing.T) {
 	base := t.TempDir()
 	dataRoot := filepath.Join(base, "data")
@@ -65,29 +113,36 @@ func TestOwnedCoreStopInspectJournalCrashBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(out, "plan.json")
+	grantSHA := strings.Repeat("e", 64)
+	g := operationGrant{OperationID: op, OperationDir: grantFileIdentity{Path: out}, digest: grantSHA}
+	if _, err := writeOwnedJournal(out, "STOP_ATTEMPT.json", stopAttemptRecord{Schema: "researchos.owned-core-stop-attempt.v1", OperationID: op, GrantSHA256: grantSHA, PlanSHA256: planSHA}); err != nil {
+		t.Fatal(err)
+	}
 	check := func(state string) {
 		t.Helper()
-		got, err := Inspect(path)
+		docs := &heldDocuments{}
+		got, err := readExistingStopOutcome(docs, g, plan, planSHA)
+		docs.Close()
 		if err != nil || got.State != state || got.PlanSHA256 != planSHA {
 			t.Fatalf("inspect %s: %+v %v", state, got, err)
 		}
 	}
 	check("UNKNOWN") // before BEGIN
-	if _, err := writeOwnedJournal(out, "BEGIN.json", ownedBeginRecord{"researchos.owned-core-stop-begin.v1", op, planSHA}); err != nil {
+	if _, err := writeOwnedJournal(out, "BEGIN.json", ownedBeginRecord{Schema: "researchos.owned-core-stop-begin.v1", OperationID: op, PlanSHA256: planSHA, GrantSHA256: grantSHA}); err != nil {
 		t.Fatal(err)
 	}
 	check("UNKNOWN") // after BEGIN, before termination intent
-	if _, err := writeOwnedJournal(out, "TERMINATE_INTENT.json", ownedIntentRecord{"researchos.owned-core-stop-terminate-intent.v1", op, planSHA, plan.Native}); err != nil {
+	if _, err := writeOwnedJournal(out, "TERMINATE_INTENT.json", ownedIntentRecord{Schema: "researchos.owned-core-stop-terminate-intent.v1", OperationID: op, PlanSHA256: planSHA, GrantSHA256: grantSHA, Native: plan.Native}); err != nil {
 		t.Fatal(err)
 	}
 	check("UNKNOWN") // before/after native call without durable wait proof
 	nativeExit := supervisor.OwnedCoreNativeExit{TerminateCalls: 1, ExitObserved: true, ExitCode: supervisor.OwnedCoreMaintenanceExitCode}
-	if _, err := writeOwnedJournal(out, "NATIVE_EXIT.json", ownedExitRecord{"researchos.owned-core-stop-native-exit.v1", op, planSHA, nativeExit}); err != nil {
+	if _, err := writeOwnedJournal(out, "NATIVE_EXIT.json", ownedExitRecord{Schema: "researchos.owned-core-stop-native-exit.v1", OperationID: op, PlanSHA256: planSHA, GrantSHA256: grantSHA, Native: nativeExit}); err != nil {
 		t.Fatal(err)
 	}
-	check("STOP_OBSERVED_MAINTENANCE_BLOCKED") // after exit, before lease
+	check("UNKNOWN") // after exit, before immutable terminal
 	final := stopResult(plan, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "lease unavailable")
+	final.StopGrantSHA256 = grantSHA
 	final.Native = &nativeExit
 	if _, err := writeOwnedJournal(out, "POSTFLIGHT.json", final); err != nil {
 		t.Fatal(err)
@@ -97,7 +152,10 @@ func TestOwnedCoreStopInspectJournalCrashBoundaries(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(out, "POSTFLIGHT.json"), []byte("{\"schema\":\"forged\"}"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Inspect(path); err == nil {
+	docs := &heldDocuments{}
+	_, err = readExistingStopOutcome(docs, g, plan, planSHA)
+	docs.Close()
+	if err == nil {
 		t.Fatal("corrupt terminal receipt silently fell back to earlier journal")
 	}
 }

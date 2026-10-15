@@ -9,13 +9,133 @@ import (
 	"path/filepath"
 	"strings"
 
+	"researchos.local/research-os/internal/host"
 	"researchos.local/research-os/internal/store"
 )
 
 const proofSchema = "researchos.owned-core-stop-independent-evidence.v1"
 const planReviewSchema = "researchos.owned-core-stop-independent-plan-review.v1"
+const grantAuthoritySchema = "researchos.owned-core-stop-authority-document.v1"
+const historicalManifestSchema = "researchos.owned-core-stop-historical-manifest.v1"
 
 var proofKinds = []string{"f01_ready", "retained_window", "native_entry_gates", "worker_native_exit", "verifier_native_exit", "effect_census", "independent_evidence_review"}
+
+type grantAuthorityDocument struct {
+	Schema                    string                           `json:"schema"`
+	Role                      string                           `json:"role"`
+	OperationID               string                           `json:"operation_id"`
+	Action                    string                           `json:"action"`
+	Subject                   store.OwnedStopSubject           `json:"subject"`
+	Native                    grantNativeIdentity              `json:"native"`
+	Host                      host.OwnedCoreStopPublicIdentity `json:"host"`
+	OperationDir              grantFileIdentity                `json:"operation_dir"`
+	HistoricalManifestSHA256  string                           `json:"historical_manifest_sha256"`
+	PlanSHA256                string                           `json:"plan_sha256,omitempty"`
+	PreflightManifestSHA256   string                           `json:"preflight_manifest_sha256,omitempty"`
+	PreflightGrantSHA256      string                           `json:"preflight_grant_sha256,omitempty"`
+	PreflightExecutableSHA256 string                           `json:"preflight_executable_sha256,omitempty"`
+	Reviewer                  string                           `json:"reviewer"`
+	Verdict                   string                           `json:"verdict"`
+}
+
+type historicalManifest struct {
+	Schema      string        `json:"schema"`
+	OperationID string        `json:"operation_id"`
+	Evidence    []EvidenceRef `json:"evidence"`
+}
+
+func decodeCanonicalAuthority(raw []byte, v any) error {
+	return strictJSON(raw, v)
+}
+
+func validateAuthorityDocument(d grantAuthorityDocument, g operationGrant, role, action string) error {
+	if d.Schema != grantAuthoritySchema || d.Role != role || d.OperationID != g.OperationID || d.Action != action || d.Subject != g.Subject || d.Native != g.Native || d.Host != g.Host || d.OperationDir != g.OperationDir || d.HistoricalManifestSHA256 != g.HistoricalManifest.SHA256 || d.Reviewer == "" || strings.Contains(d.Reviewer, "owned_core_stop_builder") || d.Verdict != "ACCEPTED" {
+		return errors.New("authority document semantics differ")
+	}
+	if action == "preflight" {
+		if d.PlanSHA256 != "" || d.PreflightManifestSHA256 != "" || d.PreflightGrantSHA256 != "" || d.PreflightExecutableSHA256 != "" {
+			return errors.New("preflight authority refers to future output")
+		}
+	} else if d.PlanSHA256 != g.PlanSHA256 || d.PreflightManifestSHA256 != g.PreflightManifestSHA256 || d.PreflightGrantSHA256 != g.PreflightGrantSHA256 || d.PreflightExecutableSHA256 != g.PreflightExecutableSHA256 {
+		return errors.New("stop authority predecessor differs")
+	}
+	return nil
+}
+
+func validateHistoricalManifest(g operationGrant, d *heldDocuments, evidence []EvidenceRef) error {
+	raw, err := d.read(g.HistoricalManifest, 128<<10)
+	if err != nil {
+		return err
+	}
+	var m historicalManifest
+	if err = decodeCanonicalAuthority(raw, &m); err != nil {
+		return err
+	}
+	if m.Schema != historicalManifestSchema || m.OperationID != g.OperationID || len(m.Evidence) != len(proofKinds) || len(evidence) != len(proofKinds) {
+		return errors.New("historical manifest identity/count")
+	}
+	for i, k := range proofKinds {
+		if m.Evidence[i] != evidence[i] || evidence[i].Kind != k || !validSHA(evidence[i].SHA256) {
+			return errors.New("historical manifest class/order/binding")
+		}
+	}
+	return nil
+}
+
+func validatePreflightAuthority(g operationGrant, d *heldDocuments, in Input) error {
+	if err := validateHistoricalManifest(g, d, in.Evidence); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		ref  grantDocument
+		role string
+	}{{g.PreflightScope, "root_preflight_scope"}, {g.PreflightReview, "independent_preflight_review"}} {
+		if err := verifierPath(in.SourceRepository, item.ref.Path); err != nil {
+			return err
+		}
+		raw, err := d.read(item.ref, 128<<10)
+		if err != nil {
+			return err
+		}
+		var doc grantAuthorityDocument
+		if err = decodeCanonicalAuthority(raw, &doc); err != nil {
+			return err
+		}
+		if err = validateAuthorityDocument(doc, g, item.role, "preflight"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateStopAuthority(g operationGrant, d *heldDocuments, p Plan, planSHA string) error {
+	if err := validateHistoricalManifest(g, d, p.Input.Evidence); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		ref  grantDocument
+		role string
+	}{{g.StopReview, "independent_stop_review"}, {g.RootOperationScope, "root_operation_scope"}} {
+		if err := verifierPath(p.Input.SourceRepository, item.ref.Path); err != nil {
+			return err
+		}
+		raw, err := d.read(item.ref, 128<<10)
+		if err != nil {
+			return err
+		}
+		var doc grantAuthorityDocument
+		if err = decodeCanonicalAuthority(raw, &doc); err != nil {
+			return err
+		}
+		if err = validateAuthorityDocument(doc, g, item.role, "commit"); err != nil {
+			return err
+		}
+	}
+	if p.Input.PlanReviewPath != g.StopReview.Path || planSHA != g.PlanSHA256 {
+		return errors.New("plan review path/hash differs")
+	}
+	return nil
+}
 
 // These are observations in independent receipts, not caller-side booleans.
 // Every required digest names a separate raw artifact retained by its reviewer.
@@ -117,7 +237,7 @@ func proofNeeds(kind string) []string {
 	}
 }
 
-func validateHistoricalEvidence(plan Plan) (string, []string) {
+func validateHistoricalEvidence(plan Plan, held ...*heldDocuments) (string, []string) {
 	missing := []string{}
 	refs := map[string]EvidenceRef{}
 	for _, r := range plan.Input.Evidence {
@@ -136,7 +256,22 @@ func validateHistoricalEvidence(plan Plan) (string, []string) {
 			missing = append(missing, kind+": missing")
 			continue
 		}
-		receipt, err := readEvidence(plan.Input.SourceRepository, ref)
+		var receipt historicalEvidence
+		var err error
+		if len(held) > 0 && held[0] != nil {
+			if err = verifierPath(plan.Input.SourceRepository, ref.Path); err == nil {
+				var raw []byte
+				raw, err = held[0].read(grantDocument{Path: ref.Path, SHA256: ref.SHA256}, 128<<10)
+				if err == nil {
+					err = decodeCanonicalAuthority(raw, &receipt)
+				}
+				if err == nil && (receipt.Schema != proofSchema || receipt.Kind != ref.Kind || receipt.Reviewer == "" || strings.Contains(receipt.Reviewer, "owned_core_stop_builder")) {
+					err = errors.New("independent evidence identity invalid")
+				}
+			}
+		} else {
+			receipt, err = readEvidence(plan.Input.SourceRepository, ref)
+		}
 		if err != nil {
 			missing = append(missing, kind+": "+err.Error())
 			continue

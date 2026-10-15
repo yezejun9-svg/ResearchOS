@@ -75,6 +75,30 @@ func TestOwnedCoreWaitDeadlineNeverRetriesSignal(t *testing.T) {
 	}
 }
 
+func TestOwnedCoreExpiredGrantBoundaryMakesZeroNativeCalls(t *testing.T) {
+	core := ownedCoreChild(t)
+	defer func() { _ = core.Process.Kill(); _ = core.Wait() }()
+	id, err := ObserveOwnedCoreReadOnly(uint32(core.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := OpenOwnedCoreRetained(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	called := 0
+	h.terminate = func(windows.Handle, uint32) error { called++; return nil }
+	before := time.Now().Add(-time.Second)
+	exit, err := h.TerminateOnceAndWaitUntil(time.Second, before, before)
+	if err == nil || exit.TerminateCalls != 0 || called != 0 || h.terminateCalls != 0 {
+		t.Fatalf("expired signal boundary allowed call: %+v calls=%d err=%v", exit, called, err)
+	}
+	if _, err = ObserveOwnedCoreReadOnly(uint32(core.Process.Pid)); err != nil {
+		t.Fatalf("zero-call target died: %v", err)
+	}
+}
+
 func ownedCoreChild(t *testing.T) *exec.Cmd {
 	t.Helper()
 	exe, err := os.Executable()
