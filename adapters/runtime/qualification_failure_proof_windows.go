@@ -11,6 +11,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"researchos.local/research-os/internal/canonical"
@@ -19,69 +20,227 @@ import (
 
 const qualificationRejectionFile = "qualification-rejection-00000000000000000003.json"
 
-// qualificationPrivateDirectory checks an existing dispatch directory. A proof
-// cannot make an already permissive or redirected directory trustworthy.
-func qualificationPrivateDirectory(directory string) error {
-	if !filepath.IsAbs(directory) {
-		return errors.New("absolute qualification dispatch directory required")
+// These handles deny FILE_SHARE_DELETE while each pathname and its descendants
+// are inspected. Reparse points and a changed DACL fail closed; no caller path
+// is repaired or made private by the proof reader/writer.
+type qualificationPathGuard struct {
+	handles []windows.Handle
+	ids     []qualificationFileID
+	current *windows.SID
+	private bool
+}
+
+type qualificationFileID struct {
+	volume, high, low uint32
+}
+
+func qualificationIdentity(h windows.Handle, directory bool) (qualificationFileID, error) {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+		return qualificationFileID{}, err
 	}
-	clean := filepath.Clean(directory)
-	for path := clean; ; path = filepath.Dir(path) {
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil || !strings.EqualFold(filepath.Clean(resolved), path) {
-			return errors.New("qualification directory has reparse ancestry")
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
+		return qualificationFileID{}, errors.New("qualification source reparse or type mismatch")
+	}
+	return qualificationFileID{info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow}, nil
+}
+
+type qualificationACLHeader struct {
+	revision, reserved     byte
+	size, count, reserved2 uint16
+}
+
+func qualificationPrivateACL(h windows.Handle, current *windows.SID, protected bool) error {
+	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil || sd == nil {
+		return errors.New("qualification source security descriptor unavailable")
+	}
+	owner, _, err := sd.Owner()
+	if err != nil || owner == nil || !owner.Equals(current) {
+		return errors.New("qualification source owner differs")
+	}
+	control, _, err := sd.Control()
+	if err != nil || protected && control&windows.SE_DACL_PROTECTED == 0 {
+		return errors.New("qualification source DACL is not protected")
+	}
+	acl, _, err := sd.DACL()
+	if err != nil || acl == nil {
+		return errors.New("qualification source DACL unavailable")
+	}
+	header := (*qualificationACLHeader)(unsafe.Pointer(acl))
+	if header.size < uint16(unsafe.Sizeof(qualificationACLHeader{})) || header.count == 0 || header.count > 32 {
+		return errors.New("qualification source DACL shape invalid")
+	}
+	effectiveCurrent := false
+	for i := uint16(0); i < header.count; i++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(acl, uint32(i), &ace); err != nil || ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceSize < uint16(unsafe.Sizeof(windows.ACCESS_ALLOWED_ACE{})) {
+			return errors.New("qualification source contains unsupported ACE")
 		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if !sid.IsValid() || !sid.Equals(current) {
+			return errors.New("qualification source grants access to another principal")
+		}
+		// INHERIT_ONLY does not grant access on this object. The same SID may
+		// inherit a second effective ACE on a child, but it cannot replace one.
+		if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE == 0 {
+			const fileAllAccess = 0x001f01ff
+			if uint32(ace.Mask)&fileAllAccess == fileAllAccess || uint32(ace.Mask)&windows.GENERIC_ALL != 0 {
+				effectiveCurrent = true
+			}
+		}
+	}
+	if !effectiveCurrent {
+		return errors.New("qualification source lacks current owner access")
+	}
+	return nil
+}
+
+func qualificationGuardDirectory(directory string, protected bool) (*qualificationPathGuard, error) {
+	if !filepath.IsAbs(directory) {
+		return nil, errors.New("absolute qualification dispatch directory required")
+	}
+	currentUser, err := user.Current()
+	if err != nil {
+		return nil, err
+	}
+	current, err := windows.StringToSid(currentUser.Uid)
+	if err != nil || current == nil {
+		return nil, errors.New("current qualification SID unavailable")
+	}
+	g := &qualificationPathGuard{current: current, private: protected}
+	paths := []string{}
+	for path := filepath.Clean(directory); ; path = filepath.Dir(path) {
+		paths = append(paths, path)
 		if next := filepath.Dir(path); next == path {
 			break
 		}
 	}
-	info, err := os.Stat(clean)
-	if err != nil || !info.IsDir() {
-		return errors.New("qualification dispatch directory unavailable")
+	for i := len(paths) - 1; i >= 0; i-- {
+		name, err := windows.UTF16PtrFromString(paths[i])
+		if err != nil {
+			g.Close()
+			return nil, err
+		}
+		h, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+		if err != nil {
+			g.Close()
+			return nil, err
+		}
+		id, err := qualificationIdentity(h, true)
+		if err != nil {
+			windows.CloseHandle(h)
+			g.Close()
+			return nil, err
+		}
+		g.handles = append(g.handles, h)
+		g.ids = append(g.ids, id)
 	}
-	current, err := user.Current()
+	if err := qualificationPrivateACL(g.handles[len(g.handles)-1], current, protected); err != nil {
+		g.Close()
+		return nil, err
+	}
+	return g, nil
+}
+
+func (g *qualificationPathGuard) Check() error {
+	for i, h := range g.handles {
+		id, err := qualificationIdentity(h, true)
+		if err != nil || id != g.ids[i] {
+			return errors.New("qualification directory identity changed")
+		}
+	}
+	return qualificationPrivateACL(g.handles[len(g.handles)-1], g.current, g.private)
+}
+
+func (g *qualificationPathGuard) Close() {
+	for i := len(g.handles) - 1; i >= 0; i-- {
+		windows.CloseHandle(g.handles[i])
+	}
+}
+
+type qualificationSourceFile struct {
+	file *os.File
+	id   qualificationFileID
+	sid  *windows.SID
+}
+
+func qualificationOpenSource(path string, current *windows.SID, create bool) (*qualificationSourceFile, error) {
+	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	sd, err := windows.GetNamedSecurityInfo(clean, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	access, disposition := uint32(windows.GENERIC_READ|windows.READ_CONTROL), uint32(windows.OPEN_EXISTING)
+	if create {
+		access, disposition = windows.GENERIC_WRITE|windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL, windows.CREATE_NEW
+	}
+	h, err := windows.CreateFile(name, access, windows.FILE_SHARE_READ, nil, disposition, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_ATTRIBUTE_NORMAL, 0)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	acl := sd.String()
-	if !strings.Contains(acl, "D:P") || !strings.Contains(acl, current.Uid) {
-		return errors.New("qualification dispatch directory is not private")
+	id, idErr := qualificationIdentity(h, false)
+	aclErr := qualificationPrivateACL(h, current, false)
+	if idErr != nil || aclErr != nil {
+		windows.CloseHandle(h)
+		return nil, errors.Join(idErr, aclErr)
 	}
-	return nil
+	return &qualificationSourceFile{file: os.NewFile(uintptr(h), path), id: id, sid: current}, nil
+}
+
+func (f *qualificationSourceFile) Check() error {
+	id, err := qualificationIdentity(windows.Handle(f.file.Fd()), false)
+	if err != nil || id != f.id {
+		return errors.New("qualification source file identity changed")
+	}
+	return qualificationPrivateACL(windows.Handle(f.file.Fd()), f.sid, false)
+}
+
+func (f *qualificationSourceFile) ReadBounded(limit int64) ([]byte, error) {
+	if _, err := f.file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	raw, err := io.ReadAll(io.LimitReader(f.file, limit+1))
+	if err != nil || int64(len(raw)) > limit {
+		return nil, errors.New("bounded qualification source unavailable")
+	}
+	return raw, f.Check()
 }
 
 // PersistQualificationRejection is a create-new durable host fact, not a
 // success flag. The domain gate holds its write reservation until this returns.
 func PersistQualificationRejection(directory string, raw []byte) error {
+	return persistQualificationRejection(directory, raw, (*os.File).Write, (*os.File).Sync)
+}
+
+func persistQualificationRejection(directory string, raw []byte, write func(*os.File, []byte) (int, error), sync func(*os.File) error) error {
 	if len(raw) == 0 || len(raw) > 64*1024 {
 		return errors.New("qualification rejection exceeds bound")
 	}
-	if err := qualificationPrivateDirectory(directory); err != nil {
-		return err
-	}
-	path := filepath.Join(directory, qualificationRejectionFile)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	guard, err := qualificationGuardDirectory(directory, true)
 	if err != nil {
 		return err
 	}
-	n, writeErr := f.Write(raw)
+	defer guard.Close()
+	path := filepath.Join(directory, qualificationRejectionFile)
+	f, err := qualificationOpenSource(path, guard.current, true)
+	if err != nil {
+		return err
+	}
+	n, writeErr := write(f.file, raw)
 	if writeErr == nil && n != len(raw) {
 		writeErr = io.ErrShortWrite
 	}
-	err = errors.Join(writeErr, f.Sync(), f.Close())
+	err = errors.Join(writeErr, sync(f.file), f.Check(), guard.Check(), f.file.Close())
 	if err != nil {
 		return err
 	}
-	return qualificationPrivateDirectory(directory)
+	return nil
 }
 
 // QualificationNativeFacts contains bounded source facts only. Callers must
 // still validate the domain subject and effect/transaction history.
 type QualificationNativeFacts struct {
+	Directory      string
 	Journal        BridgeJournal
 	RawJournalHash string
 	StdoutHash     string
@@ -94,29 +253,105 @@ type QualificationNativeFacts struct {
 
 func ReadQualificationNativeFacts(directory, manifestHash string) (QualificationNativeFacts, error) {
 	var facts QualificationNativeFacts
-	if err := qualificationPrivateDirectory(directory); err != nil {
+	guard, err := qualificationGuardDirectory(directory, true)
+	if err != nil {
 		return facts, err
+	}
+	defer guard.Close()
+	files := make(map[string]*qualificationSourceFile)
+	defer func() {
+		for _, f := range files {
+			f.file.Close()
+		}
+	}()
+	open := func(name string) (*qualificationSourceFile, error) {
+		f, err := qualificationOpenSource(filepath.Join(directory, name), guard.current, false)
+		if err == nil {
+			files[name] = f
+		}
+		return f, err
+	}
+	journalFile, err := open("bridge.json")
+	if err != nil {
+		return facts, err
+	}
+	journalRaw, err := journalFile.ReadBounded(4 * 1024 * 1024)
+	if err != nil {
+		return facts, err
+	}
+	var expected BridgeJournal
+	if err := json.Unmarshal(journalRaw, &expected); err != nil {
+		return facts, err
+	}
+	stdoutFile, err := open("stdout.raw")
+	if err != nil {
+		return facts, err
+	}
+	stderrFile, err := open("stderr.raw")
+	if err != nil {
+		return facts, err
+	}
+	rejectionFile, err := open(qualificationRejectionFile)
+	if err != nil {
+		return facts, err
+	}
+	if expected.Checkpoint != nil {
+		if _, err := open("checkpoint.sealed.json"); err != nil {
+			return facts, err
+		}
+	}
+	var artifactGuards []*qualificationPathGuard
+	defer func() {
+		for _, g := range artifactGuards {
+			g.Close()
+		}
+	}()
+	for _, artifact := range expected.Artifacts {
+		if !filepath.IsLocal(artifact.Path) || artifact.Size < 0 || artifact.Size > 64*1024*1024 {
+			return facts, errors.New("qualification output path invalid")
+		}
+		name := filepath.Join("output", artifact.Path)
+		parent, err := qualificationGuardDirectory(filepath.Join(directory, filepath.Dir(name)), true)
+		if err != nil {
+			return facts, err
+		}
+		artifactGuards = append(artifactGuards, parent)
+		if _, err := open(name); err != nil {
+			return facts, err
+		}
 	}
 	j, err := ReadBridgeTerminal(directory, manifestHash)
 	if err != nil {
 		return facts, err
 	}
+	if err := guard.Check(); err != nil {
+		return facts, err
+	}
+	for _, g := range artifactGuards {
+		if err := g.Check(); err != nil {
+			return facts, err
+		}
+	}
+	for _, f := range files {
+		if err := f.Check(); err != nil {
+			return facts, err
+		}
+	}
 	if !j.Receipt.Stopped || !j.Receipt.StreamsDrained || !j.Receipt.CleanupComplete || !j.Receipt.OutputCopied || j.Ended == "" {
 		return facts, errors.New("native qualification closure incomplete")
 	}
-	journalRaw, err := os.ReadFile(filepath.Join(directory, "bridge.json"))
-	if err != nil || len(journalRaw) > 4*1024*1024 {
-		return facts, errors.New("bounded native journal unavailable")
+	if j.Identity.PID == 0 || j.Identity.Created <= 0 || j.Identity.Job == "" || j.Identity.SID == "" || j.Identity.Profile == "" || j.Identity.StagingDirectory == "" || j.Receipt.PID != j.Identity.PID || j.Receipt.Created != j.Identity.Created || j.Receipt.Job != j.Identity.Job || j.Receipt.SID != j.Identity.SID || j.Receipt.Profile != j.Identity.Profile {
+		return facts, errors.New("native qualification process identity incomplete")
 	}
-	stdout, err := os.ReadFile(filepath.Join(directory, "stdout.raw"))
+	stdout, err := stdoutFile.ReadBounded(sandbox.MaxStreamBytes)
 	if err != nil || len(stdout) > sandbox.MaxStreamBytes || Hash(stdout) != j.StdoutHash {
 		return facts, errors.New("qualification stdout changed")
 	}
-	stderr, err := os.ReadFile(filepath.Join(directory, "stderr.raw"))
+	stderr, err := stderrFile.ReadBounded(sandbox.MaxStreamBytes)
 	if err != nil || len(stderr) > sandbox.MaxStreamBytes || Hash(stderr) != j.StderrHash {
 		return facts, errors.New("qualification stderr changed")
 	}
-	rejection, err := os.ReadFile(filepath.Join(directory, qualificationRejectionFile))
+	rejection, err := rejectionFile.ReadBounded(64 * 1024)
 	if err != nil || len(rejection) == 0 || len(rejection) > 64*1024 {
 		return facts, errors.New("immutable qualification rejection unavailable")
 	}
@@ -151,9 +386,34 @@ func ReadQualificationNativeFacts(directory, manifestHash string) (Qualification
 		facts.FrameHashes = append(facts.FrameHashes, Hash(line))
 	}
 	facts.Journal = j
+	facts.Directory = directory
 	facts.RawJournalHash = Hash(journalRaw)
 	facts.StdoutHash = Hash(stdout)
 	facts.StderrHash = Hash(stderr)
 	facts.Rejection = rejection
 	return facts, nil
+}
+
+// ReadQualificationModelFact reopens the original Host fact under the same
+// owner, ACL, reparse, and bounded-read policy used for native gate facts.
+func ReadQualificationModelFact(directory, key string) ([]byte, error) {
+	if key == "" {
+		return nil, errors.New("qualification model key required")
+	}
+	guard, err := qualificationGuardDirectory(directory, true)
+	if err != nil {
+		return nil, err
+	}
+	defer guard.Close()
+	name := "effect-" + strings.TrimPrefix(Hash([]byte(key)), "sha256:") + ".json"
+	f, err := qualificationOpenSource(filepath.Join(directory, name), guard.current, false)
+	if err != nil {
+		return nil, err
+	}
+	defer f.file.Close()
+	raw, err := f.ReadBounded(4*1024*1024 + 128*1024)
+	if err != nil {
+		return nil, err
+	}
+	return raw, guard.Check()
 }
