@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -23,6 +25,86 @@ func ownedStopFixtureDB(t *testing.T) (string, *sql.DB) {
 		t.Fatal(err)
 	}
 	return path, db
+}
+
+func ownedStopSchema24Fixture(t *testing.T) (string, *sql.DB, OwnedStopSubject) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "schema24.sqlite")
+	db, err := sql.Open("sqlite", ownedStopURI(path, "rwc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	files, err := filepath.Glob(filepath.Join("..", "..", "migrations", "sqlite", "[0-9][0-9][0-9][0-9]_*.sql"))
+	if err != nil || len(files) != 24 {
+		t.Fatalf("exact schema24 source migration files required: %d %v", len(files), err)
+	}
+	sort.Strings(files)
+	for i, file := range files {
+		raw, e := os.ReadFile(file)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if _, e = db.Exec(string(raw)); e != nil {
+			t.Fatalf("fixture migration %s: %v", file, e)
+		}
+		if _, e = db.Exec(`INSERT INTO schema_migrations(version) VALUES(?)`, i+1); e != nil {
+			t.Fatalf("fixture migration version %d: %v", i+1, e)
+		}
+	}
+	subject := OwnedStopSubject{Project: "fixture-project", Run: "f3dcb996b2e43cf52cba874be7abfc70", Epoch: 1, DispatchKey: "705b11ec99044fef19e85f57e2d2b712", RequestKey: "bc269e772ada7e1bce54439fd080550c"}
+	queries := []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO domain_objects(project,kind,id,revision,body) VALUES(?,'Run',?,1,'{"status":"RUNNING"}')`, []any{subject.Project, subject.Run}},
+		{`INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES(?,?,?,?,'{}','fixture-hash','UNKNOWN','fixture-time','fixture-time')`, []any{subject.Project, subject.Run, subject.Epoch, subject.DispatchKey}},
+		{`INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?, 'old-model',1,'{"state":"CONFIRMED","payload":{"capability":"MODEL"}}')`, []any{subject.Project, subject.Run}},
+		{`INSERT INTO idempotency(principal,project,operation,key,request_hash,status,body,headers,created_at) VALUES('fixture-principal',?,'host:managed-runtime-qualification',?,'fixture-hash',202,x'00','{}','fixture-time')`, []any{subject.Project, subject.RequestKey}},
+	}
+	for _, q := range queries {
+		if _, err = db.Exec(q.sql, q.args...); err != nil {
+			t.Fatalf("schema24 fixture insert %s: %v", q.sql, err)
+		}
+	}
+	return path, db, subject
+}
+
+func TestOwnedStopSchema24SafetyRejectsUnresolvedEffectsAndOtherDispatches(t *testing.T) {
+	for _, kind := range []string{"baseline", "prepared-effect", "started-effect", "unknown-effect", "other-prepared-dispatch", "other-running-run"} {
+		t.Run(kind, func(t *testing.T) {
+			path, db, subject := ownedStopSchema24Fixture(t)
+			if strings.HasSuffix(kind, "effect") {
+				state := strings.ToUpper(strings.TrimSuffix(kind, "-effect"))
+				if _, err := db.Exec(`INSERT INTO resource_effects(project,run,effect_key,sequence,body) VALUES(?,?,?,1,?)`, subject.Project, subject.Run, kind, `{"state":"`+state+`","payload":{"capability":"MODEL"}}`); err != nil {
+					t.Fatal(err)
+				}
+			} else if kind == "other-prepared-dispatch" {
+				if _, err := db.Exec(`INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES(?,'other-run',1,'other-key','{}','hash','PREPARED','time','time')`, subject.Project); err != nil {
+					t.Fatal(err)
+				}
+			} else if kind == "other-running-run" {
+				if _, err := db.Exec(`INSERT INTO domain_objects(project,kind,id,revision,body) VALUES(?,'Run','other-run',1,'{"status":"RUNNING"}')`, subject.Project); err != nil {
+					t.Fatal(err)
+				}
+			}
+			barrier, err := AcquireOwnedStopBarrier(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer barrier.Close()
+			snap, err := barrier.SafetySnapshot(context.Background(), subject)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == "baseline" && !snap.ExactOldSubjectSafe() {
+				t.Fatalf("exact old RUNNING/UNKNOWN subject rejected: %+v", snap)
+			}
+			if kind != "baseline" && snap.ExactOldSubjectSafe() {
+				t.Fatalf("unresolved %s accepted: %+v", kind, snap)
+			}
+		})
+	}
 }
 
 func TestOwnedStopBarrierNativeQueryOnlyAndReservedWriter(t *testing.T) {

@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -155,6 +154,15 @@ func Commit(ctx context.Context, planPath, expectPlanSHA string) (Result, error)
 		result.Native = &exit
 		return persistStopResult(p, result)
 	}
+	return finishAfterNativeExit(ctx, p, planSHA, exit)
+}
+
+// Called only after an observed native exit and release of the reserved writer.
+// A real DataRootLease plus fresh database and authority reads determine state.
+func finishAfterNativeExit(ctx context.Context, p Plan, planSHA string, exit supervisor.OwnedCoreNativeExit) (Result, error) {
+	if !exit.ExitObserved {
+		return persistStopResult(p, stopResult(p, planSHA, "UNKNOWN", "native exit not observed"))
+	}
 	lease, err := rt.AcquireDataRootLease(p.Input.DataRoot)
 	if err != nil {
 		result := stopResult(p, planSHA, "STOP_OBSERVED_MAINTENANCE_BLOCKED", "real DataRootLease unavailable")
@@ -180,11 +188,4 @@ func Commit(ctx context.Context, planPath, expectPlanSHA string) (Result, error)
 		result.Reason = "poststop logical/schema/authority/integrity drift"
 	}
 	return persistStopResult(p, result)
-}
-
-func planDirectoryValid(out string) error {
-	if _, err := os.Stat(out); err == nil {
-		return errors.New("new output directory required")
-	}
-	return nil
 }
