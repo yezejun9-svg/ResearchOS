@@ -17,6 +17,89 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func testOperatorSID(t *testing.T) string {
+	t.Helper()
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil || u == nil || u.User.Sid == nil {
+		t.Fatalf("operator SID unavailable: %v", err)
+	}
+	return u.User.Sid.String()
+}
+
+func testImageSecurityDescriptor(t *testing.T, sddl string) *windows.SECURITY_DESCRIPTOR {
+	t.Helper()
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		t.Fatalf("fixture SDDL %q: %v", sddl, err)
+	}
+	return sd
+}
+
+func setTestImageDACL(t *testing.T, path, sddl string) {
+	t.Helper()
+	sd := testImageSecurityDescriptor(t, sddl)
+	acl, _, err := sd.DACL()
+	if err != nil || acl == nil {
+		t.Fatalf("fixture DACL absent: %v", err)
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
+		t.Fatalf("setting task-owned fixture DACL: %v", err)
+	}
+}
+
+func TestOwnedImageOwnerAndACEAuthorization(t *testing.T) {
+	operator := testOperatorSID(t)
+	for _, tc := range []struct {
+		name, sddl string
+		directory  bool
+		wantError  bool
+	}{
+		{"current operator", "O:" + operator + "D:P(A;;FA;;;" + operator + ")", false, false},
+		{"SYSTEM install owner", "O:SYD:P(A;;FA;;;SY)", false, false},
+		{"Administrators install owner", "O:BAD:P(A;;FA;;;BA)", true, false},
+		{"TrustedInstaller install owner", "O:" + trustedInstallerSID + "D:P(A;;FA;;;SY)", false, false},
+		{"foreign owner", "O:WDD:P(A;;FA;;;SY)", false, true},
+		{"Everyone direct full control", "O:SYD:P(A;;FA;;;SY)(A;;FA;;;WD)", false, true},
+		{"Users direct write", "O:SYD:P(A;;FA;;;SY)(A;;GW;;;BU)", false, true},
+		{"Users direct control", "O:SYD:P(A;;FA;;;SY)(A;;WD;;;BU)", true, true},
+		{"Everyone inherited write", "O:SYD:P(A;;FA;;;SY)(A;ID;GW;;;WD)", true, true},
+		{"Users inherited delete child", "O:SYD:P(A;;FA;;;SY)(A;ID;DC;;;BU)", true, true},
+		{"inherit only does not grant on directory", "O:SYD:P(A;;FA;;;SY)(A;OICIIO;FA;;;WD)", true, false},
+		{"generic read remains safe", "O:SYD:P(A;;FA;;;SY)(A;;GR;;;WD)", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := imageSecurityAuthorized(testImageSecurityDescriptor(t, tc.sddl), tc.directory)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("authorization mismatch: error=%v wantError=%t", err, tc.wantError)
+			}
+		})
+	}
+	t.Run("unsupported ACE type", func(t *testing.T) {
+		sd := testImageSecurityDescriptor(t, "O:SYD:P(A;;FA;;;SY)")
+		acl, _, _ := sd.DACL()
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(acl, 0, &ace); err != nil {
+			t.Fatal(err)
+		}
+		ace.Header.AceType = 9 // callback allow: not safely interpreted by this policy
+		if err := imageSecurityAuthorized(sd, false); err == nil {
+			t.Fatal("unsupported ACE type accepted")
+		}
+	})
+	t.Run("malformed ACE size", func(t *testing.T) {
+		sd := testImageSecurityDescriptor(t, "O:SYD:P(A;;FA;;;SY)")
+		acl, _, _ := sd.DACL()
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(acl, 0, &ace); err != nil {
+			t.Fatal(err)
+		}
+		ace.Header.AceSize = 4
+		if err := imageSecurityAuthorized(sd, false); err == nil {
+			t.Fatal("malformed ACE accepted")
+		}
+	})
+}
+
 func TestOwnedCoreFixtureChild(t *testing.T) {
 	if os.Getenv("RESEARCHOS_OWNED_CORE_CHILD") != "yes" {
 		return
@@ -135,9 +218,39 @@ func TestOwnedCoreAndParentImageAncestorsRetained(t *testing.T) {
 	if err = os.Rename(imageDir, filepath.Join(base, "swapped")); err == nil {
 		t.Fatal("retained image ancestor allowed directory swap")
 	}
+	wideDir, err := windows.UTF16PtrFromString(imageDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writable, e := windows.CreateFile(wideDir, windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0); e == nil {
+		defer windows.CloseHandle(writable)
+		t.Log("writable directory handle opened; this alone does not replace the selected path")
+		if err = os.Rename(imageDir, filepath.Join(base, "swapped-with-writer")); err == nil {
+			t.Fatal("writable directory handle replaced retained selected ancestor")
+		}
+		t.Logf("selected ancestor rename with writer denied: %v", err)
+	} else {
+		t.Logf("writable directory handle denied: %v", e)
+	}
 	if file, e := os.OpenFile(copyPath, os.O_WRONLY, 0); e == nil {
 		file.Close()
 		t.Fatal("retained image allowed write-sharing")
+	}
+	if err = os.Remove(copyPath); err == nil {
+		t.Fatal("retained image allowed removal")
+	}
+	if err = os.Rename(copyPath, filepath.Join(imageDir, "moved.exe")); err == nil {
+		t.Fatal("retained image allowed final-name swap")
+	}
+	if err = os.WriteFile(copyPath, []byte("replacement"), 0600); err == nil {
+		t.Fatal("retained image allowed overwrite")
+	}
+	attacker := filepath.Join(imageDir, "attacker.exe")
+	if err = os.WriteFile(attacker, []byte("replacement"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Rename(attacker, copyPath); err == nil {
+		t.Fatal("retained image allowed same-name replacement")
 	}
 	wrong := id
 	wrong.ParentCreatedNS++
@@ -147,6 +260,91 @@ func TestOwnedCoreAndParentImageAncestorsRetained(t *testing.T) {
 	}
 	if err = h.verifyRetained(); err != nil {
 		t.Fatal(err)
+	}
+	operator := testOperatorSID(t)
+	setTestImageDACL(t, copyPath, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;"+operator+")(A;;GW;;;WD)")
+	if err = h.verifyRetained(); err == nil {
+		t.Fatal("retained image allowed ACL grant drift")
+	}
+}
+
+func TestOwnedImageRejectsUnsafeInstallationAndCopiedProcessACL(t *testing.T) {
+	if path := os.Getenv("RESEARCHOS_R4_UNTRUSTED_IMAGE"); path != "" {
+		t.Run("D installation inherited untrusted modify", func(t *testing.T) {
+			if image, err := ownedNativeImage(path); err == nil {
+				image.Close()
+				t.Fatal("D installation with untrusted ancestor modify ACL accepted")
+			}
+		})
+	}
+	operator := testOperatorSID(t)
+	for _, tc := range []struct {
+		name, target, rights, trustee string
+	}{
+		{"Everyone direct final full control", "final", "FA", "WD"},
+		{"Users direct final write", "final", "GW", "BU"},
+		{"Everyone inherited ancestor full control", "ancestor", "FA", "WD"},
+		{"Users inherited ancestor write", "ancestor", "GW", "BU"},
+		{"Users inherited ancestor control", "ancestor", "WD", "BU"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			imageDir := filepath.Join(t.TempDir(), "image")
+			if err := os.Mkdir(imageDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			trusted := "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + operator + ")"
+			if tc.target == "ancestor" {
+				setTestImageDACL(t, imageDir, "D:P"+trusted+"(A;OICI;"+tc.rights+";;;"+tc.trustee+")")
+			}
+			original, err := os.Open(os.Args[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer original.Close()
+			copyPath := filepath.Join(imageDir, "parent.exe")
+			copyFile, err := os.Create(copyPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = io.Copy(copyFile, original); err != nil {
+				copyFile.Close()
+				t.Fatal(err)
+			}
+			if err = copyFile.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if tc.target == "final" {
+				setTestImageDACL(t, copyPath, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;"+operator+")(A;;"+tc.rights+";;;"+tc.trustee+")")
+			}
+			pidFile := filepath.Join(t.TempDir(), "child.pid")
+			parent := exec.Command(copyPath, "-test.run=^TestOwnedCoreFixtureParent$")
+			parent.Env = append(os.Environ(), "RESEARCHOS_OWNED_PARENT_CHILD=yes", "RESEARCHOS_OWNED_CHILD_PID_FILE="+pidFile)
+			if err := parent.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = parent.Process.Kill(); _ = parent.Wait() })
+			var childPID uint64
+			for until := time.Now().Add(5 * time.Second); time.Now().Before(until); time.Sleep(20 * time.Millisecond) {
+				if raw, e := os.ReadFile(pidFile); e == nil {
+					childPID, err = strconv.ParseUint(string(raw), 10, 32)
+					if err != nil {
+						t.Fatal(err)
+					}
+					break
+				}
+			}
+			if childPID == 0 {
+				t.Fatal("copied child PID unavailable")
+			}
+			child, err := os.FindProcess(int(childPID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = child.Kill() })
+			if _, err = ObserveOwnedCoreReadOnly(uint32(childPID)); err == nil || !strings.Contains(err.Error(), "image DACL grants write or control") {
+				t.Fatalf("unsafe copied parent/child ACL was not refused before signal: %v", err)
+			}
+		})
 	}
 }
 

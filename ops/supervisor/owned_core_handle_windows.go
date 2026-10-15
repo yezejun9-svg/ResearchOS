@@ -63,6 +63,72 @@ type ownedImageFile struct {
 	sha       string
 }
 
+const trustedInstallerSID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+
+func trustedImageSID(sid string) (bool, error) {
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
+		return false, errors.New("current operator SID unavailable")
+	}
+	switch sid {
+	case user.User.Sid.String(), "S-1-5-18", "S-1-5-32-544", trustedInstallerSID:
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func imageSecurityAuthorized(sd *windows.SECURITY_DESCRIPTOR, directory bool) error {
+	owner, _, err := sd.Owner()
+	if err != nil || owner == nil || !owner.IsValid() {
+		return errors.New("image owner unavailable")
+	}
+	trusted, err := trustedImageSID(owner.String())
+	if err != nil || !trusted {
+		return errors.New("image owner is outside trusted operator/OS/install boundary")
+	}
+	acl, _, err := sd.DACL()
+	if err != nil || acl == nil || acl.AceCount == 0 {
+		return errors.New("image DACL unavailable")
+	}
+	unsafeRights := uint32(windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA | windows.FILE_WRITE_EA | windows.FILE_WRITE_ATTRIBUTES | windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER | windows.GENERIC_WRITE | windows.GENERIC_ALL | windows.MAXIMUM_ALLOWED | windows.ACCESS_SYSTEM_SECURITY)
+	if directory {
+		unsafeRights |= 0x40 // FILE_DELETE_CHILD on a directory.
+	}
+	for i := uint32(0); i < uint32(acl.AceCount); i++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(acl, i, &ace); err != nil || ace == nil || ace.Header.AceSize < 16 {
+			return errors.New("image ACE malformed")
+		}
+		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE && ace.Header.AceType != windows.ACCESS_DENIED_ACE_TYPE {
+			return errors.New("image DACL contains unsupported ACE type")
+		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if !sid.IsValid() || 8+sid.Len() > int(ace.Header.AceSize) {
+			return errors.New("image ACE SID malformed")
+		}
+		if ace.Header.AceType == windows.ACCESS_DENIED_ACE_TYPE || ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
+			continue
+		}
+		trusted, err := trustedImageSID(sid.String())
+		if err != nil {
+			return err
+		}
+		unsafeGranted := uint32(ace.Mask) & unsafeRights
+		// FILE_ADD_SUBDIRECTORY alone can create a sibling at an ancestor.
+		// It cannot replace the selected child while every selected component
+		// is retained without FILE_SHARE_DELETE. C: grants this isolated right
+		// to Authenticated Users on common Windows installations.
+		if directory && unsafeGranted == windows.FILE_APPEND_DATA {
+			unsafeGranted = 0
+		}
+		if !trusted && unsafeGranted != 0 {
+			return errors.New("image DACL grants write or control to untrusted trustee")
+		}
+	}
+	return nil
+}
+
 func (im *ownedImageFile) Close() {
 	if im == nil {
 		return
@@ -113,13 +179,8 @@ func observeOwnedImageAnchor(h windows.Handle, directory bool) (ownedImageAnchor
 	if err != nil || sd == nil || !sd.IsValid() {
 		return ownedImageAnchor{}, info, errors.New("image native security descriptor unavailable")
 	}
-	owner, _, err := sd.Owner()
-	if err != nil || owner == nil || !owner.IsValid() {
-		return ownedImageAnchor{}, info, errors.New("image ancestor owner unavailable")
-	}
-	acl, _, err := sd.DACL()
-	if err != nil || acl == nil || acl.AceCount == 0 {
-		return ownedImageAnchor{}, info, errors.New("image ancestor DACL unavailable")
+	if err := imageSecurityAuthorized(sd, directory); err != nil {
+		return ownedImageAnchor{}, info, err
 	}
 	security := sd.String()
 	if security == "" {
@@ -153,7 +214,7 @@ func ownedNativeImage(path string) (_ *ownedImageFile, err error) {
 			return nil, e
 		}
 		access := uint32(windows.FILE_READ_ATTRIBUTES | windows.READ_CONTROL)
-		share := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE)
+		share := uint32(windows.FILE_SHARE_READ)
 		if last {
 			access = windows.GENERIC_READ | windows.READ_CONTROL
 			share = windows.FILE_SHARE_READ
@@ -165,7 +226,7 @@ func ownedNativeImage(path string) (_ *ownedImageFile, err error) {
 		anchor, info, e := observeOwnedImageAnchor(h, !last)
 		if e != nil {
 			_ = windows.CloseHandle(h)
-			return nil, e
+			return nil, fmt.Errorf("image component %q: %w", name, e)
 		}
 		if last {
 			if info.FileSizeHigh != 0 || info.FileSizeLow == 0 || info.FileSizeLow > 256<<20 {
