@@ -27,6 +27,7 @@ import (
 )
 
 const replacementSchema = "researchos.runtime-verifier-replacement.v1"
+const replacementPlanSchema = "researchos.runtime-verifier-replacement-plan.v2"
 const replacementJournal = "runtime-verifier-replacements"
 
 type RuntimeVerifierReplacementInput struct {
@@ -55,33 +56,37 @@ type replacementFileID struct {
 	IndexLow  uint32
 }
 type replacementPlan struct {
-	Schema              string                      `json:"schema"`
-	OperationID         string                      `json:"operation_id"`
-	CreatedAt           string                      `json:"created_at"`
-	DataRoot            string                      `json:"data_root"`
-	HostPath            string                      `json:"host_path"`
-	DBPath              string                      `json:"db_path"`
-	FileIDs             [3]replacementFileID        `json:"file_ids"`
-	PrincipalRef        string                      `json:"principal_ref"`
-	HostID              string                      `json:"host_id"`
-	Owner               string                      `json:"owner"`
-	Root                string                      `json:"service_root"`
-	StateSHA256         string                      `json:"state_sha256"`
-	LineageHash         string                      `json:"lineage_hash"`
-	SchemaVersion       int                         `json:"schema_version"`
-	Census              [4]int                      `json:"readonly_census"`
-	OldBytes            []byte                      `json:"old_record_bytes"`
-	OldSHA256           string                      `json:"old_record_sha256"`
-	OldHash             string                      `json:"old_registration_hash"`
-	OldInstallationHash string                      `json:"old_installation_hash"`
-	Manifest            string                      `json:"manifest"`
-	ManifestSHA256      string                      `json:"manifest_sha256"`
-	Installation        RuntimeVerifierInstallation `json:"installation"`
-	NewBytes            []byte                      `json:"new_record_bytes"`
-	NewSHA256           string                      `json:"new_record_sha256"`
-	NewHash             string                      `json:"registration_hash"`
-	NewInstallationHash string                      `json:"installation_hash"`
-	RollbackOf          string                      `json:"rollback_of,omitempty"`
+	Schema                  string                      `json:"schema"`
+	HistorySequence         uint64                      `json:"history_sequence"`
+	PredecessorOperation    string                      `json:"predecessor_operation,omitempty"`
+	PredecessorPlanSHA256   string                      `json:"predecessor_plan_sha256,omitempty"`
+	PredecessorTerminalHash string                      `json:"predecessor_terminal_hash,omitempty"`
+	OperationID             string                      `json:"operation_id"`
+	CreatedAt               string                      `json:"created_at"`
+	DataRoot                string                      `json:"data_root"`
+	HostPath                string                      `json:"host_path"`
+	DBPath                  string                      `json:"db_path"`
+	FileIDs                 [3]replacementFileID        `json:"file_ids"`
+	PrincipalRef            string                      `json:"principal_ref"`
+	HostID                  string                      `json:"host_id"`
+	Owner                   string                      `json:"owner"`
+	Root                    string                      `json:"service_root"`
+	StateSHA256             string                      `json:"state_sha256"`
+	LineageHash             string                      `json:"lineage_hash"`
+	SchemaVersion           int                         `json:"schema_version"`
+	Census                  [4]int                      `json:"readonly_census"`
+	OldBytes                []byte                      `json:"old_record_bytes"`
+	OldSHA256               string                      `json:"old_record_sha256"`
+	OldHash                 string                      `json:"old_registration_hash"`
+	OldInstallationHash     string                      `json:"old_installation_hash"`
+	Manifest                string                      `json:"manifest"`
+	ManifestSHA256          string                      `json:"manifest_sha256"`
+	Installation            RuntimeVerifierInstallation `json:"installation"`
+	NewBytes                []byte                      `json:"new_record_bytes"`
+	NewSHA256               string                      `json:"new_record_sha256"`
+	NewHash                 string                      `json:"registration_hash"`
+	NewInstallationHash     string                      `json:"installation_hash"`
+	RollbackOf              string                      `json:"rollback_of,omitempty"`
 }
 
 // Seams are package-private and are never wired from argv or environment. Tests
@@ -217,7 +222,7 @@ var replacementCensusSQL = [4]string{
 }
 
 func replacementSnapshot(ctx context.Context, root string) (replacementPlan, error) {
-	p := replacementPlan{Schema: replacementSchema, DataRoot: root, HostPath: filepath.Join(root, "host"), DBPath: filepath.Join(root, "researchos.sqlite")}
+	p := replacementPlan{Schema: replacementPlanSchema, DataRoot: root, HostPath: filepath.Join(root, "host"), DBPath: filepath.Join(root, "researchos.sqlite")}
 	for n, path := range []string{p.DataRoot, p.HostPath, p.DBPath} {
 		id, e := replacementIdentity(path, n < 2)
 		if e != nil {
@@ -324,8 +329,8 @@ func replacementSnapshot(ctx context.Context, root string) (replacementPlan, err
 	if e = tx.QueryRowContext(ctx, "SELECT root FROM orchestration_identity WHERE principal=?", p.Owner).Scan(&ownerRoot); e != nil || ownerRoot == "" || ownerRoot == p.Root {
 		return p, errors.New("Owner lineage invalid")
 	}
-	// Include both root/parent links and every derived verifier ID. A detached or
-	// reparented service child cannot disappear from the validation census.
+	// The reserved namespace is enumerated independently of mutable lineage and
+	// grants. Losing both cannot make an existing verifier child disappear.
 	rows, e = tx.QueryContext(ctx, "SELECT principal,root,parent FROM orchestration_identity ORDER BY principal")
 	if e != nil {
 		return p, e
@@ -358,61 +363,80 @@ func replacementSnapshot(ctx context.Context, root string) (replacementPlan, err
 		Grants    []grant
 	}
 	members := []member{}
-	foundRoot := false
+	byID := map[string]principal{}
+	for _, v := range principals {
+		byID[v.ID] = v
+	}
+	allGrants := map[string][]grant{}
+	rows, e = tx.QueryContext(ctx, "SELECT principal,project,task,run,restricted FROM auth_grants ORDER BY principal,project,task,run,restricted")
+	if e != nil {
+		return p, e
+	}
+	for rows.Next() {
+		var id string
+		var g grant
+		if e = rows.Scan(&id, &g.Project, &g.Task, &g.Run, &g.Restricted); e != nil {
+			rows.Close()
+			return p, e
+		}
+		allGrants[id] = append(allGrants[id], g)
+		if strings.HasPrefix(id, "local-verifier-") {
+			if _, ok := byID[id]; !ok {
+				rows.Close()
+				return p, errors.New("orphan reserved verifier grant")
+			}
+		}
+	}
+	e = rows.Err()
+	rows.Close()
+	if e != nil {
+		return p, e
+	}
+	validRoot := func(id string) bool {
+		v, exists := byID[id]
+		l, linked := lines[id]
+		suffix := strings.TrimPrefix(id, "local-verifier-root-")
+		decoded, err := hex.DecodeString(suffix)
+		return strings.HasPrefix(id, "local-verifier-root-") && err == nil && len(decoded) == 12 && strings.ToLower(suffix) == suffix && exists && linked && v.Roles == `["VERIFIER"]` && v.Create == 0 && (v.Revoked == 0 || v.Revoked == 1) && (id != p.Root || v.Revoked == 0) && l.Root == id && !l.Parent.Valid && len(allGrants[id]) == 0
+	}
+	if !validRoot(p.Root) {
+		return p, errors.New("service root missing or changed")
+	}
 	for _, v := range principals {
 		l := lines[v.ID]
-		belongs := v.ID == p.Root || l.Root == p.Root || (l.Parent.Valid && l.Parent.String == p.Root)
-		grows, e := tx.QueryContext(ctx, "SELECT project,task,run,restricted FROM auth_grants WHERE principal=? ORDER BY project,task,run,restricted", v.ID)
-		if e != nil {
-			return p, e
+		gs := allGrants[v.ID]
+		if gs == nil {
+			gs = []grant{}
 		}
-		gs := []grant{}
-		for grows.Next() {
-			var g grant
-			if e = grows.Scan(&g.Project, &g.Task, &g.Run, &g.Restricted); e != nil {
-				grows.Close()
-				return p, e
+		reserved := strings.HasPrefix(v.ID, "local-verifier-")
+		if !reserved {
+			if l.Root == p.Root || (l.Parent.Valid && l.Parent.String == p.Root) {
+				return p, errors.New("non-verifier in service lineage")
 			}
-			gs = append(gs, g)
-			derived := "local-verifier-" + strings.TrimPrefix(domain.Hash([]any{p.Root, g.Project}), "sha256:")[:32]
-			if v.ID == derived {
-				belongs = true
-			}
-		}
-		e = grows.Err()
-		grows.Close()
-		if e != nil {
-			return p, e
-		}
-		if !belongs {
 			continue
 		}
-		if v.Revoked != 0 || v.Create != 0 || v.Roles != `["VERIFIER"]` || l.Root != p.Root {
-			return p, errors.New("service principal or lineage drift")
-		}
-		if v.ID == p.Root {
-			foundRoot = true
-			if l.Parent.Valid || len(gs) != 0 {
-				return p, errors.New("service root drift")
+		if strings.HasPrefix(v.ID, "local-verifier-root-") {
+			if !validRoot(v.ID) {
+				return p, errors.New("reserved verifier root drift")
 			}
 		} else {
-			if !l.Parent.Valid || l.Parent.String != p.Root || len(gs) != 1 {
-				return p, errors.New("service child lineage/grants drift")
+			if !replacementID(strings.TrimPrefix(v.ID, "local-verifier-")) || !validRoot(l.Root) || !l.Parent.Valid || l.Parent.String != l.Root || len(gs) != 1 || v.Create != 0 || v.Roles != `["VERIFIER"]` || (v.Revoked != 0 && v.Revoked != 1) || (l.Root == p.Root && v.Revoked != 0) {
+				return p, errors.New("reserved verifier child lineage/grants drift")
 			}
 			g := gs[0]
-			derived := "local-verifier-" + strings.TrimPrefix(domain.Hash([]any{p.Root, g.Project}), "sha256:")[:32]
+			derived := "local-verifier-" + strings.TrimPrefix(domain.Hash([]any{l.Root, g.Project}), "sha256:")[:32]
 			if g.Project == "" || g.Task != "" || g.Run != "" || g.Restricted || derived != v.ID {
 				return p, errors.New("service child grant drift")
 			}
 		}
+		// Structurally intact children of another service root are not members
+		// of this registration. Their root/child revocation may be retained, but
+		// all reserved identities remain in the plan's drift digest. No foreign
+		// root grants authority to replace this host's registration.
 		members = append(members, member{v, l, gs})
-		delete(lines, v.ID)
-	}
-	if !foundRoot {
-		return p, errors.New("service root missing")
 	}
 	for _, l := range lines {
-		if l.Root == p.Root || (l.Parent.Valid && l.Parent.String == p.Root) {
+		if _, exists := byID[l.ID]; !exists && (strings.HasPrefix(l.ID, "local-verifier-") || l.Root == p.Root || (l.Parent.Valid && l.Parent.String == p.Root)) {
 			return p, errors.New("orphan service lineage")
 		}
 	}
@@ -436,6 +460,12 @@ func replacementCandidate(ctx context.Context, in RuntimeVerifierReplacementInpu
 		return p, e
 	}
 	p.OperationID, p.CreatedAt, p.Manifest, p.RollbackOf = in.OperationID, time.Now().UTC().Format(time.RFC3339Nano), in.Manifest, in.RollbackOf
+	head, e := replacementReadHistory(p.DataRoot, p.OperationID)
+	if e != nil {
+		return p, e
+	}
+	p.HistorySequence = head.Sequence + 1
+	p.PredecessorOperation, p.PredecessorPlanSHA256, p.PredecessorTerminalHash = head.OperationID, head.PlanSHA256, head.TerminalHash
 	p.OldBytes, e = replacementRead(filepath.Join(p.HostPath, "runtime-verifier-installation.json"), 64<<10)
 	if e != nil {
 		return p, e
@@ -513,8 +543,11 @@ func replacementLoadPlan(path, digest string) (replacementPlan, []byte, error) {
 	return p, raw, nil
 }
 func replacementPlanValid(p replacementPlan) error {
-	if p.Schema != replacementSchema || !replacementID(p.OperationID) || (p.RollbackOf != "" && (!replacementID(p.RollbackOf) || p.RollbackOf == p.OperationID)) || p.SchemaVersion != 24 || p.Census != [4]int{} || replacementPath(p.DataRoot) != nil || p.HostPath != filepath.Join(p.DataRoot, "host") || p.DBPath != filepath.Join(p.DataRoot, "researchos.sqlite") {
+	if p.Schema != replacementPlanSchema || !replacementID(p.OperationID) || (p.RollbackOf != "" && (!replacementID(p.RollbackOf) || p.RollbackOf == p.OperationID)) || p.SchemaVersion != 24 || p.Census != [4]int{} || replacementPath(p.DataRoot) != nil || p.HostPath != filepath.Join(p.DataRoot, "host") || p.DBPath != filepath.Join(p.DataRoot, "researchos.sqlite") {
 		return errors.New("invalid replacement plan")
+	}
+	if p.HistorySequence == 0 || (p.HistorySequence == 1 && (p.PredecessorOperation != "" || p.PredecessorPlanSHA256 != "" || p.PredecessorTerminalHash != "")) || (p.HistorySequence > 1 && (!replacementID(p.PredecessorOperation) || p.PredecessorOperation == p.OperationID || !replacementDigest(p.PredecessorPlanSHA256) || !replacementDigest(p.PredecessorTerminalHash))) {
+		return errors.New("invalid causal history binding")
 	}
 	if _, e := time.Parse(time.RFC3339Nano, p.CreatedAt); e != nil {
 		return e
@@ -670,7 +703,7 @@ func RuntimeVerifierReplacement(ctx context.Context, in RuntimeVerifierReplaceme
 	if e != nil {
 		return out, e
 	}
-	if !replacementSameSnapshot(p, fresh) || !bytes.Equal(fresh.NewBytes, p.NewBytes) || fresh.OldSHA256 != p.OldSHA256 {
+	if !replacementSameSnapshot(p, fresh) || !replacementSameHistory(p, fresh) || !bytes.Equal(fresh.NewBytes, p.NewBytes) || fresh.OldSHA256 != p.OldSHA256 {
 		return out, errors.New("stale plan")
 	}
 	out.Outcome = "UNKNOWN"
@@ -707,7 +740,7 @@ func RuntimeVerifierReplacement(ctx context.Context, in RuntimeVerifierReplaceme
 	}
 	replacementBoundary("stage")
 	fresh, e = replacementCandidate(ctx, RuntimeVerifierReplacementInput{DataRoot: p.DataRoot, OperationID: p.OperationID, Manifest: p.Manifest, ExpectRecordSHA256: p.OldSHA256, ExpectManifestSHA256: p.ManifestSHA256, RollbackOf: p.RollbackOf})
-	if e != nil || !replacementSameSnapshot(p, fresh) {
+	if e != nil || !replacementSameSnapshot(p, fresh) || !replacementSameHistory(p, fresh) {
 		return out, errors.New("final preconditions changed")
 	}
 	target := filepath.Join(p.HostPath, "runtime-verifier-installation.json")
@@ -740,6 +773,9 @@ func RuntimeVerifierReplacement(ctx context.Context, in RuntimeVerifierReplaceme
 	}
 	replacementBoundary("committed")
 	if e = replacementApplied(p, dir); e != nil {
+		return out, e
+	}
+	if e = RuntimeVerifierReplacementStartupGate(lease); e != nil {
 		return out, e
 	}
 	return replacementResult(in.Action, p, in.ExpectPlanSHA256, "COMMITTED", "APPLIED"), nil

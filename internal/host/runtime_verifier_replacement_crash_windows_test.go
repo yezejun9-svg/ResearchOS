@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"researchos.local/research-os/internal/domain"
 )
 
 // Only the test executable reads these variables. The shipped maintenance
@@ -169,6 +171,35 @@ func TestRuntimeVerifierReplacementCrashRecovery(t *testing.T) {
 			again, e := RuntimeVerifierReplacement(context.Background(), recover)
 			if e != nil || again.State != out.State {
 				t.Fatalf("repeated recovery: %+v %v", again, e)
+			}
+			// A recovered ABORTED terminal participates in durable causal order
+			// even though the registration bytes did not change.
+			next := f.Input
+			next.OperationID = strings.Repeat("c", 32)
+			next.Out = filepath.Join(f.Base, "after-recovery.json")
+			if applied {
+				next.Manifest = f.OldManifest
+				manifest, e := os.ReadFile(next.Manifest)
+				if e != nil {
+					t.Fatal(e)
+				}
+				next.ExpectManifestSHA256 = domain.Digest(manifest)
+				next.ExpectRecordSHA256 = out.NewRecordSHA256
+				next.RollbackOf = f.Input.OperationID
+			}
+			planned, e := RuntimeVerifierReplacement(context.Background(), next)
+			if e != nil {
+				t.Fatal(e)
+			}
+			p, _, e := replacementLoadPlan(next.Out, planned.PlanSHA256)
+			if e != nil || p.HistorySequence != 2 || p.PredecessorOperation != f.Input.OperationID || p.PredecessorTerminalHash == "" {
+				t.Fatalf("recovered terminal not bound: %+v %v", p, e)
+			}
+			if out, e := RuntimeVerifierReplacement(context.Background(), RuntimeVerifierReplacementInput{Action: "commit", DataRoot: f.Root, Plan: next.Out, ExpectPlanSHA256: planned.PlanSHA256}); e != nil || out.Outcome != "APPLIED" {
+				t.Fatalf("post-recovery commit: %+v %v", out, e)
+			}
+			if e = replacementTestGate(f.Root); e != nil {
+				t.Fatal(e)
 			}
 		})
 	}

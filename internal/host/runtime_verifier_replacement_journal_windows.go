@@ -35,6 +35,17 @@ type replacementJournalView struct {
 	Events []replacementEvent
 	Files  map[string][]byte
 }
+type replacementHistoryHead struct {
+	Sequence                                            uint64
+	OperationID, PlanSHA256, TerminalHash, RecordSHA256 string
+}
+
+func replacementSameHistory(a, b replacementPlan) bool {
+	return a.HistorySequence == b.HistorySequence && a.PredecessorOperation == b.PredecessorOperation && a.PredecessorPlanSHA256 == b.PredecessorPlanSHA256 && a.PredecessorTerminalHash == b.PredecessorTerminalHash
+}
+func replacementExtendsHead(p replacementPlan, h replacementHistoryHead) bool {
+	return p.HistorySequence == h.Sequence+1 && p.PredecessorOperation == h.OperationID && p.PredecessorPlanSHA256 == h.PlanSHA256 && p.PredecessorTerminalHash == h.TerminalHash && (h.Sequence == 0 || p.OldSHA256 == h.RecordSHA256)
+}
 
 // Supply the protected descriptor to the native create itself. A process death
 // between mkdir and a later SetNamedSecurityInfo must not strand recovery with
@@ -195,9 +206,8 @@ func replacementReadJournal(dir string, p replacementPlan, raw []byte) (replacem
 			if len(v.Events) > 0 {
 				last := v.Events[len(v.Events)-1]
 				previous, state = last.Hash, last.State
-				if event.At < last.At {
-					return v, errors.New("event time regressed")
-				}
+				// Audit clocks can change precision or move backwards. Sequence,
+				// previous hash and transition are the only ordering authority.
 			}
 			if event.Previous != previous || !replacementTransition(state, event.State) {
 				return v, errors.New("event chain invalid")
@@ -314,6 +324,13 @@ func replacementRecover(in RuntimeVerifierReplacementInput, p replacementPlan, r
 	if e != nil {
 		return out, e
 	}
+	head, e := replacementReadHistory(p.DataRoot, p.OperationID)
+	if e != nil {
+		return out, e
+	}
+	if !replacementExtendsHead(p, head) {
+		return out, errors.New("recovery causal predecessor differs")
+	}
 	state := ""
 	if len(v.Events) > 0 {
 		state = v.Events[len(v.Events)-1].State
@@ -359,6 +376,9 @@ func replacementRecover(in RuntimeVerifierReplacementInput, p replacementPlan, r
 			if e = replacementApplied(p, dir); e != nil {
 				return out, e
 			}
+			if e = replacementCheckHistoryCurrent(p.DataRoot); e != nil {
+				return out, e
+			}
 			out.State, out.Outcome = "COMMITTED", "APPLIED"
 			return out, nil
 		}
@@ -383,6 +403,9 @@ func replacementRecover(in RuntimeVerifierReplacementInput, p replacementPlan, r
 			}
 		}
 		if e = replacementAppend(dir, p, raw, "ABORTED"); e != nil {
+			return out, e
+		}
+		if e = replacementCheckHistoryCurrent(p.DataRoot); e != nil {
 			return out, e
 		}
 		out.State = "ABORTED"
@@ -419,89 +442,109 @@ func RuntimeVerifierReplacementStartupGate(lease *rt.DataRootLease) error {
 	if lease == nil || !lease.Held() {
 		return errors.New("replacement startup gate requires data-root lease")
 	}
-	root := filepath.Join(lease.Root(), "host", replacementJournal)
-	if _, e := os.Lstat(root); os.IsNotExist(e) {
-		return nil
-	} else if e != nil {
+	return replacementCheckHistoryCurrent(lease.Root())
+}
+func replacementCheckHistoryCurrent(dataRoot string) error {
+	head, e := replacementReadHistory(dataRoot, "")
+	if e != nil {
 		return e
+	}
+	if head.Sequence == 0 {
+		return nil
+	}
+	raw, e := replacementRead(filepath.Join(dataRoot, "host", "runtime-verifier-installation.json"), 64<<10)
+	if e != nil {
+		return e
+	}
+	if domain.Digest(raw) != head.RecordSHA256 {
+		return errors.New("latest replacement registration drift")
+	}
+	return nil
+}
+
+// Every new plan binds the previous immutable terminal, including ABORTED
+// operations. No wall clock, directory enumeration order, or byte-hash cycle is
+// used to infer causality. Unbound older draft plans remain intact and fail
+// closed; this maintenance command does not silently rewrite/migrate history.
+func replacementReadHistory(dataRoot, excludeOperation string) (head replacementHistoryHead, err error) {
+	root := filepath.Join(dataRoot, "host", replacementJournal)
+	if _, e := os.Lstat(root); os.IsNotExist(e) {
+		return head, nil
+	} else if e != nil {
+		return head, e
 	}
 	if _, e := replacementIdentity(root, true); e != nil {
-		return e
+		return head, e
 	}
 	if e := replacementACL(root, true, true); e != nil {
-		return e
+		return head, e
 	}
 	guards, e := guardWriteDirectories(root)
 	if e != nil {
-		return e
+		return head, e
 	}
 	defer closeWriteGuards(guards)
 	entries, e := os.ReadDir(root)
 	if e != nil {
-		return e
+		return head, e
 	}
 	type terminal struct {
-		P replacementPlan
-		E replacementEvent
+		P          replacementPlan
+		E          replacementEvent
+		PlanSHA256 string
 	}
 	var all []terminal
 	for _, entry := range entries {
 		if !entry.IsDir() || !replacementID(entry.Name()) {
-			return errors.New("replacement journal malformed; explicit recover required")
+			return head, errors.New("replacement journal malformed; explicit recover required")
+		}
+		if entry.Name() == excludeOperation {
+			continue
 		}
 		dir := filepath.Join(root, entry.Name())
 		raw, e := replacementRead(filepath.Join(dir, "plan.json"), 256<<10)
 		if e != nil {
-			return fmt.Errorf("replacement unfinished; explicit recover required: %w", e)
+			return head, fmt.Errorf("replacement unfinished; explicit recover required: %w", e)
 		}
 		var p replacementPlan
-		if decodeRuntimeManaged(raw, &p) != nil || replacementPlanValid(p) != nil || p.OperationID != entry.Name() || p.DataRoot != lease.Root() {
-			return errors.New("replacement plan invalid; explicit recover required")
+		if decodeRuntimeManaged(raw, &p) != nil || replacementPlanValid(p) != nil || p.OperationID != entry.Name() || p.DataRoot != dataRoot {
+			return head, errors.New("replacement plan invalid; explicit recover required")
 		}
 		v, e := replacementReadJournal(dir, p, raw)
 		if e != nil {
-			return e
+			return head, e
 		}
 		if len(v.Events) == 0 {
-			return errors.New("replacement unfinished; explicit recover required")
+			return head, errors.New("replacement unfinished; explicit recover required")
 		}
 		last := v.Events[len(v.Events)-1]
 		switch last.State {
 		case "COMMITTED":
 			if !bytes.Equal(v.Files["actual-backup.bin"], p.OldBytes) || v.Files["stage.bin"] != nil {
-				return errors.New("committed backup/stage invalid")
+				return head, errors.New("committed backup/stage invalid")
 			}
 		case "ABORTED":
 			if v.Files["actual-backup.bin"] != nil {
-				return errors.New("aborted journal has publication evidence")
+				return head, errors.New("aborted journal has publication evidence")
 			}
 		default:
-			return errors.New("replacement unfinished; use --runtime-verifier-replacement recover")
+			return head, errors.New("replacement unfinished; use --runtime-verifier-replacement recover")
 		}
-		all = append(all, terminal{p, last})
+		all = append(all, terminal{p, last, domain.Digest(raw)})
 	}
 	if len(all) == 0 {
-		return nil
+		return head, nil
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].E.At < all[j].E.At })
-	expected := all[0].P.OldSHA256
-	for i, t := range all {
-		if i > 0 && t.E.At == all[i-1].E.At {
-			return errors.New("ambiguous terminal ordering")
+	sort.Slice(all, func(i, j int) bool { return all[i].P.HistorySequence < all[j].P.HistorySequence })
+	for _, t := range all {
+		if !replacementExtendsHead(t.P, head) {
+			return head, errors.New("causal history fork, cycle, missing predecessor or digest drift")
 		}
-		if t.P.OldSHA256 != expected {
-			return errors.New("divergent replacement history")
-		}
+		record := t.P.OldSHA256
 		if t.E.State == "COMMITTED" {
-			expected = t.P.NewSHA256
+			record = t.P.NewSHA256
 		}
+		head = replacementHistoryHead{Sequence: t.P.HistorySequence, OperationID: t.P.OperationID, PlanSHA256: t.PlanSHA256, TerminalHash: t.E.Hash, RecordSHA256: record}
 	}
-	raw, e := replacementRead(filepath.Join(lease.Root(), "host", "runtime-verifier-installation.json"), 64<<10)
-	if e != nil {
-		return e
-	}
-	if domain.Digest(raw) != expected {
-		return errors.New("latest replacement registration drift")
-	}
-	return nil
+	return head, nil
 }
