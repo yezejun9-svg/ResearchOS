@@ -27,6 +27,7 @@ func run() error {
     raw,err:=io.ReadAll(io.LimitReader(os.Stdin,4097)); if err!=nil || len(raw)==0 || len(raw)>4096 { return errors.New("current Owner input unavailable") }
     defer func(){ for i:=range raw { raw[i]=0 } }()
     token:=strings.TrimSpace(string(raw)); ctx,cancel:=context.WithTimeout(context.Background(),5*time.Minute); defer cancel()
+    if len(os.Args)==2 && os.Args[1]=="schema24-to25" { return recoveryauthority.RunEnrolledPauseMigrationRoot(ctx,token) }
     if len(os.Args)==2 && os.Args[1]=="schema23-to24" { return recoveryauthority.RunEnrolledMigrationRoot(ctx,token) }
     if len(os.Args)!=1 { return errors.New("Root accepts only its fixed recovery purpose") }
     return recoveryauthority.RunEnrolledRoot(ctx,token)

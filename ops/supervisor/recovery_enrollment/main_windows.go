@@ -22,5 +22,5 @@ func main() {
         out,err:=os.OpenFile(os.Args[5],os.O_WRONLY|os.O_CREATE|os.O_EXCL,0600); if err!=nil { log.Fatal(err) }
         if _,err=out.Write(signed); err==nil { err=out.Sync() }; closeErr:=out.Close(); if err!=nil { log.Fatal(err) }; if closeErr!=nil { log.Fatal(closeErr) }; return
     }
-    log.Fatal("usage: provision issuer|root-adoption private.dpapi; sign-reviewed release|grant|migration-grant issuer.dpapi reviewed-payload.json new-signed.json")
+    log.Fatal("usage: provision issuer|root-adoption private.dpapi; sign-reviewed release|grant|migration-grant|pause-migration-grant issuer.dpapi reviewed-payload.json new-signed.json")
 }

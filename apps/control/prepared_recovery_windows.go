@@ -22,9 +22,10 @@ import (
 // provider configuration and listeners. A public invocation alone lacks the
 // inherited OS/crypto authority and therefore cannot open the database.
 func runPreparedRecoveryMaintenance(args []string) (bool,error) {
-    if len(args)==0 || (args[0]!=recoveryauthority.MaintenanceArgument && args[0]!=recoveryauthority.MigrationArgument) { return false,nil }
+    if len(args)==0 || (args[0]!=recoveryauthority.MaintenanceArgument && args[0]!=recoveryauthority.MigrationArgument && args[0]!=recoveryauthority.PauseMigrationArgument) { return false,nil }
     if len(args)!=1 { return true,errors.New("private recovery accepts no caller paths or authority options") }
     ctx,cancel:=context.WithTimeout(context.Background(),5*time.Minute); defer cancel()
+    if args[0]==recoveryauthority.PauseMigrationArgument { return true,runPauseSchemaMaintenance(ctx) }
     if args[0]==recoveryauthority.MigrationArgument { return true,runPreparedSchemaMaintenance(ctx) }
     token,ownerToken,err:=recoveryauthority.ReceiveInherited(ctx); if err!=nil { return true,err }
     defer token.Close()
@@ -59,4 +60,55 @@ func runPreparedSchemaMaintenance(ctx context.Context) error {
     result,err:=domain.ExecutePreparedAbandonmentSchemaUpgrade(ctx,db,token,ownerToken,opt)
     ownerToken=""
     if err!=nil { return err }; return json.NewEncoder(os.Stdout).Encode(result)
+}
+
+func runPauseSchemaMaintenance(ctx context.Context) error {
+	token, ownerToken, err := recoveryauthority.ReceivePauseMigrationInherited(ctx)
+	if err != nil {
+		return err
+	}
+	defer token.Close()
+	binding, err := token.Binding()
+	if err != nil {
+		return err
+	}
+	raw, err := token.Options()
+	if err != nil {
+		return err
+	}
+	var opt domain.PauseSchemaUpgradeOptions
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(&opt); err != nil {
+		return err
+	}
+	canonical, err := json.Marshal(opt)
+	if err != nil || domain.Digest(canonical) != binding.OptionsSHA256 || !bytes.Equal(canonical, raw) {
+		return errors.New("native schema maintenance options differ from grant")
+	}
+	if err = pauseSchemaMaintenancePaths(binding, opt); err != nil {
+		return err
+	}
+	db, err := openExclusiveRecoveryDB(ctx, binding.Database)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	result, err := domain.ExecutePauseSchemaUpgrade(ctx, db, token, ownerToken, opt)
+	ownerToken = ""
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(result)
+}
+
+// Validate URI ambiguity before opening even an enrolled database. The domain
+// coordinator repeats complete canonical/alias/overlap checks under its token.
+func pauseSchemaMaintenancePaths(binding recoveryauthority.MigrationBinding, opt domain.PauseSchemaUpgradeOptions) error {
+ u:=opt.Upgrade
+ for _,path:=range []string{binding.Root,binding.Database,u.Source,u.SourceRoot,u.TargetRoot,u.SourceProgram,u.TargetProgram,u.KeyFile,u.Snapshot,u.Destination,opt.RehearsalProgram,opt.HandoffBindingFile} {
+  if !filepath.IsAbs(path) || strings.ContainsAny(path,"#?") { return errors.New("PAUSE_UPGRADE_AMBIGUOUS_OR_RELATIVE_PATH") }
+ }
+ if !strings.EqualFold(filepath.Clean(binding.Database),filepath.Clean(u.Source)) || !strings.EqualFold(filepath.Clean(binding.Root),filepath.Dir(u.Source)) { return errors.New("PAUSE_UPGRADE_NATIVE_DATABASE") }
+ return nil
 }

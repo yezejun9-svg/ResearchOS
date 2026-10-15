@@ -87,11 +87,22 @@ func (c *RuntimeCoordinator) recoverClientQueue(ctx context.Context, project, ru
 	if !j.QueueRequired {
 		return nil
 	}
-	binding, _, _, err := c.queueBinding(ctx, project, run, j)
-	if err != nil {
-		return err
+	// Recover the immutable historical binding, never the successor's fence.
+	var binding Object
+	for _, frame := range j.CommandReceipts {
+		payload, e := Decode(frame.Payload)
+		if e != nil {
+			return e
+		}
+		if frame.Type == "command.accepted" && payload["initialized"] == true {
+			binding = Object{}
+			for _, key := range []string{"project_id", "session_id", "task_id", "run_id", "runtime_epoch", "queue_generation", "dispatch_key", "manifest_hash", "process_identity"} {
+				binding[key] = payload[key]
+			}
+			break
+		}
 	}
-	if Hash(binding["runtime_epoch"]) != Hash(epoch) {
+	if binding == nil || binding["project_id"] != project || binding["run_id"] != run || binding["dispatch_key"] != j.DispatchKey || binding["manifest_hash"] != j.ManifestHash || Hash(binding["runtime_epoch"]) != Hash(epoch) {
 		return Fail(409, "GATE_FAILED", "old queue recovery epoch")
 	}
 	tx, err := c.service.DB.BeginTx(ctx, nil)
@@ -103,7 +114,7 @@ func (c *RuntimeCoordinator) recoverClientQueue(ctx context.Context, project, ru
 	if err != nil {
 		return err
 	}
-	if Hash(dispatch["identity"]) != Hash(binding["process_identity"]) || dispatch["manifest_hash"] != j.ManifestHash || dispatch["dispatch_key"] != j.DispatchKey {
+	if Hash(dispatch["identity"]) != Hash(binding["process_identity"]) || Hash(runtimeNativeIdentity(j.Identity)) != Hash(binding["process_identity"]) || dispatch["manifest_hash"] != j.ManifestHash || dispatch["dispatch_key"] != j.DispatchKey {
 		return Fail(409, "GATE_FAILED", "foreign recovered worker")
 	}
 	var last int64
@@ -162,8 +173,11 @@ func (c *RuntimeCoordinator) recoverClientQueue(ctx context.Context, project, ru
 			if frame.Type == "command.cleared" && state != "CONSUMED" && j.Cancelled && j.QueueCancelIdle && j.Receipt.Stopped {
 				next = "DROPPED"
 			}
-			if frame.Type == "command.accepted" && state != "CONSUMED" && state != "DROPPED" {
+			if frame.Type == "command.accepted" && state != "CONSUMED" && state != "DROPPED" && state != "DROP_REQUESTED" {
 				next = "UNKNOWN"
+				if j.Paused && j.CheckpointSeal != nil {
+					next = "SDK_ACCEPTED"
+				}
 			}
 			if _, e = tx.Exec(`UPDATE client_command_queue SET state=?,revision=revision+1,last_receipt_id=? WHERE generation=? AND command_id=?`, next, id, binding["queue_generation"], command); e != nil {
 				return e
@@ -183,7 +197,7 @@ func (c *RuntimeCoordinator) recoverClientQueue(ctx context.Context, project, ru
 			state = "CANCEL_FENCED"
 		}
 		// A restored future remains fenced even with old snapshot receipts.
-		if _, err = tx.Exec(`UPDATE client_queue_fences SET state=?,sealed_through=accepted_through,revision=revision+1 WHERE generation=? AND restore_fenced=0 AND (state<>? OR sealed_through<>accepted_through)`, state, binding["queue_generation"], state); err != nil {
+		if _, err = tx.Exec(`UPDATE client_queue_fences SET state=?,sealed_through=accepted_through,revision=revision+1 WHERE generation=? AND runtime_epoch=? AND dispatch_key=? AND restore_fenced=0 AND (state<>? OR sealed_through<>accepted_through)`, state, binding["queue_generation"], epoch, j.DispatchKey, state); err != nil {
 			return err
 		}
 	}
@@ -210,7 +224,11 @@ func (c *RuntimeCoordinator) deliverClientQueue(ctx context.Context, route Runti
 		return err
 	}
 	if initialized.IsZero() {
-		if err = bridge.Control(ctx, Object{"type": "command.deliver", "binding": binding, "initialize": true, "command": nil}); err != nil {
+		control := Object{"type": "command.deliver", "binding": binding, "initialize": true, "command": nil}
+		if j.PauseProtocol == rt.PauseProtocol {
+			control["pause_protocol"] = rt.PauseProtocol
+		}
+		if err = bridge.Control(ctx, control); err != nil {
 			return err
 		}
 		*initialized = time.Now()
@@ -237,6 +255,9 @@ func (c *RuntimeCoordinator) deliverClientQueue(ctx context.Context, route Runti
 	}
 	if state == "SEALED" {
 		return nil
+	}
+	if handled, e := c.deliverRuntimePause(ctx, route.ProjectID, run, binding, bridge); handled || e != nil {
+		return e
 	}
 	tx, err := c.service.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -390,6 +411,13 @@ func (c *RuntimeCoordinator) ingestClientQueueFrame(ctx context.Context, route R
 				action = "cancel"
 			}
 		} else if fence == "OPEN" {
+			intent, e := pauseIntent(tx, route.ProjectID, run, binding["runtime_epoch"])
+			if e != nil {
+				return e
+			}
+			if intent != nil && intent["state"] != "RESUMED" {
+				return tx.Commit()
+			}
 			_, err = tx.Exec(`UPDATE client_queue_fences SET state='SEALING',revision=revision+1 WHERE generation=? AND state='OPEN'`, binding["queue_generation"])
 			action = "prepare"
 		} else if fence == "SEALING" && Hash(payload["through"]) == Hash(through) {
@@ -510,8 +538,19 @@ func (c *RuntimeCoordinator) runCommandBridge(ctx, brokerCtx context.Context, ro
 			if !ok {
 				break
 			}
-			if err := bridge.Acknowledge(ctx, next, done.response); err != nil {
-				return err
+			var ackErr error
+			if seal, ok := pauseSealResponse(done.response); ok {
+				ackErr = bridge.SealCheckpoint(ctx, seal)
+			} else {
+				ackErr = bridge.Acknowledge(ctx, next, done.response)
+			}
+			if ackErr != nil {
+				return ackErr
+			}
+			if next == bridge.Read().QueueInitSequence {
+				if err := c.recordPauseCapability(ctx, route.ProjectID, run, bridge); err != nil {
+					return err
+				}
 			}
 			if next == bridge.Read().QueueInitSequence && bridge.ModelInitializationDelivered() {
 				if err := c.modelInitializationDelivered(ctx, route.ProjectID, run, bridge); err != nil {

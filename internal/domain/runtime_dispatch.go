@@ -166,6 +166,9 @@ func (s *Service) currentDispatchAdmission(tx *sql.Tx, project string, task, run
 }
 
 func (s *Service) currentDispatchedRun(tx *sql.Tx, project string, run Object, operation string) error {
+	if err := pauseOperationGate(tx, project, run, operation); err != nil {
+		return err
+	}
 	dispatch, e := runtimeDispatch(tx, project, Str(run, "id"), run["lease_epoch"])
 	if e == sql.ErrNoRows {
 		return nil

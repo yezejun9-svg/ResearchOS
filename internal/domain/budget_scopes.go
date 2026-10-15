@@ -1,6 +1,10 @@
 package domain
 
-import "database/sql"
+import (
+	"database/sql"
+	"strconv"
+	"strings"
+)
 
 // Called only by the server's report/cancellation transaction after terminal
 // native evidence is accepted. Local launch has its own explicit zero charge;
@@ -269,8 +273,44 @@ func (s *Service) reserveRuntimeLocalLaunch(tx *sql.Tx, project string, run, adm
 		return e
 	}
 	for _, hold := range holds {
-		release := Str(hold, "provider_request_id") + "/released"
-		if _, e = s.appendBudget(tx, project, Object{"policy_id": goal["budget_policy_id"], "run_id": run["id"], "operation": "RELEASE", "money": Object{"amount": "0", "currency": currency}, "provider_request_id": Str(hold, "provider_request_id"), "provider_event_id": release, "reservation_id": hold["id"], "cost_basis": "ACTUAL", "occurred_at": Now()}); e != nil {
+		holdRequest := Str(hold, "provider_request_id")
+		holdEpoch, parseErr := strconv.ParseInt(strings.TrimPrefix(holdRequest, prefix), 10, 64)
+		currentEpoch, currentErr := strconv.ParseInt(string(Bytes(run["lease_epoch"])), 10, 64)
+		holdMoney, moneyOK := hold["money"].(map[string]any)
+		amount, moneyErr := moneyAmount(holdMoney)
+		if !strings.HasPrefix(holdRequest, prefix) || parseErr != nil || currentErr != nil || holdEpoch <= 0 || holdEpoch >= currentEpoch ||
+			holdRequest != prefix+strconv.FormatInt(holdEpoch, 10) ||
+			hold["project_id"] != project || hold["run_id"] != run["id"] || hold["operation"] != "RESERVE" ||
+			hold["provider_event_id"] != holdRequest || hold["reservation_id"] != nil ||
+			hold["cost_basis"] != "UPPER_BOUND" || hold["policy_id"] != goal["budget_policy_id"] ||
+			Str(hold, "id") == "" || Str(hold, "occurred_at") == "" || !moneyOK || moneyErr != nil || amount.Sign() != 0 ||
+			Str(holdMoney, "currency") != currency || hold["receipt_hash"] != Receipt(hold) {
+			return Fail(409, "STATE_CONFLICT", "invalid prior runtime local launch reservation")
+		}
+		release := holdRequest + "/released"
+		var rawRelease string
+		e = tx.QueryRow("SELECT body FROM domain_objects WHERE project=? AND kind='BudgetLedgerEntry' AND json_extract(body,'$.provider_event_id')=?", project, release).Scan(&rawRelease)
+		if e == nil {
+			prior, decodeErr := Decode([]byte(rawRelease))
+			if decodeErr != nil {
+				return decodeErr
+			}
+			priorMoney, priorMoneyOK := prior["money"].(map[string]any)
+			priorAmount, priorMoneyErr := moneyAmount(priorMoney)
+			if prior["project_id"] != project || prior["run_id"] != run["id"] || prior["operation"] != "RELEASE" ||
+				prior["provider_request_id"] != holdRequest || prior["provider_event_id"] != release ||
+				prior["reservation_id"] != hold["id"] || prior["policy_id"] != hold["policy_id"] ||
+				prior["cost_basis"] != "ACTUAL" || Str(prior, "id") == "" || Str(prior, "occurred_at") == "" || !priorMoneyOK || priorMoneyErr != nil ||
+				priorAmount.Sign() != 0 || Str(priorMoney, "currency") != Str(holdMoney, "currency") ||
+				prior["receipt_hash"] != Receipt(prior) {
+				return Fail(409, "STATE_CONFLICT", "invalid prior runtime local launch release")
+			}
+			continue
+		}
+		if e != sql.ErrNoRows {
+			return e
+		}
+		if _, e = s.appendBudget(tx, project, Object{"policy_id": hold["policy_id"], "run_id": run["id"], "operation": "RELEASE", "money": holdMoney, "provider_request_id": holdRequest, "provider_event_id": release, "reservation_id": hold["id"], "cost_basis": "ACTUAL", "occurred_at": Now()}); e != nil {
 			return e
 		}
 	}

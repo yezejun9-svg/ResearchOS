@@ -80,7 +80,7 @@ func (c *RuntimeCoordinator) modelStreamBinding(ctx context.Context, route Runti
 	if !bridge.ModelInitializationDelivered() {
 		return nil, Fail(409, "GATE_FAILED", "model stream requires delivered initialization")
 	}
-	tx, current, d, err := c.dispatchGate(ctx, route, run, lease, epoch)
+	tx, current, d, err := c.dispatchGate(ctx, route, run, lease, epoch, runtimePauseGatePurpose{kind: "effect-observe", effectKey: frame.Key, requestHash: Str(intent, "request_hash")})
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +113,7 @@ func (c *RuntimeCoordinator) modelStreamBinding(ctx context.Context, route Runti
 func (c *RuntimeCoordinator) commitModelObservation(ctx context.Context, route RuntimeCoordinatorRoute, run, lease string, epoch int64, obs rt.ModelStreamObservation) ([]string, int64, error) {
 	f := obs.Frame
 	b := Object(f.Binding)
-	tx, current, d, err := c.dispatchGate(ctx, route, run, lease, epoch)
+	tx, current, d, err := c.dispatchGate(ctx, route, run, lease, epoch, runtimePauseGatePurpose{kind: "effect-observe", effectKey: Str(b, "effect_key"), requestHash: Str(b, "request_hash")})
 	if err != nil {
 		return nil, 0, err
 	}

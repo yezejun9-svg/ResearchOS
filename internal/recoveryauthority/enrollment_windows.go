@@ -65,6 +65,21 @@ func SignEnrollmentDocument(keyPath,kind string,payload []byte) ([]byte,error) {
         var value Release; if e=strict(payload,&value); e!=nil { return nil,e }; if value.Purpose!=Purpose || value.Schema!="researchos.recovery-release.v1" { return nil,errors.New("AUTHORITY_RELEASE_SCHEMA") }; if !bytes.Equal(payload,encoded(value)) { return nil,errors.New("AUTHORITY_CANONICAL_TYPED_PAYLOAD_REQUIRED") }; purpose=Purpose+"/release"
     case "grant":
         var value Grant; if e=strict(payload,&value); e!=nil { return nil,e }; if value.Purpose!=Purpose || value.Schema!="researchos.recovery-grant.v1" { return nil,errors.New("AUTHORITY_GRANT_SCHEMA") }; if !bytes.Equal(payload,encoded(value)) { return nil,errors.New("AUTHORITY_CANONICAL_TYPED_PAYLOAD_REQUIRED") }; purpose=Purpose+"/grant"
+	case "pause-migration-grant":
+		var value MigrationGrant
+		if e = strict(payload, &value); e != nil {
+			return nil, e
+		}
+		if value.Purpose != PauseMigrationPurpose || value.Schema != pauseMigrationDescriptor.schema {
+			return nil, errors.New("AUTHORITY_PAUSE_MIGRATION_SCHEMA")
+		}
+		if !bytes.Equal(payload, encoded(value)) {
+			return nil, errors.New("AUTHORITY_CANONICAL_TYPED_PAYLOAD_REQUIRED")
+		}
+		if e = validateMigrationGrantFields(value, pauseMigrationDescriptor); e != nil {
+			return nil, e
+		}
+		purpose = PauseMigrationPurpose + "/grant"
     case "migration-grant":
         var value MigrationGrant; if e=strict(payload,&value); e!=nil { return nil,e }; if value.Purpose!=MigrationPurpose || value.Schema!="researchos.recovery-migration-grant.v1" { return nil,errors.New("AUTHORITY_MIGRATION_SCHEMA") }; if !bytes.Equal(payload,encoded(value)) { return nil,errors.New("AUTHORITY_CANONICAL_TYPED_PAYLOAD_REQUIRED") }; purpose=MigrationPurpose+"/grant"
     default: return nil,errors.New("AUTHORITY_OFFLINE_PURPOSE")

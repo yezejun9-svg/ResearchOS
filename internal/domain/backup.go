@@ -59,11 +59,13 @@ type backupPolicy struct {
 	preserveConfigurationUpgradeWorkspaces func(*sql.DB) error
 	preservePreparedAbandonmentUpgradeWorkspaces func(*sql.DB) error
 	publicPreparedAbandonmentHandoff bool
+	publicPauseUpgradeHandoff bool
+	preservePauseUpgradeWorkspaces func(*sql.DB) error
 }
 
 // Ordinary public validation remains mandatory for the fixed handoff policy.
 func backupOrdinaryPublicPolicy(policy *backupPolicy) bool {
-    return policy == nil || policy.publicPreparedAbandonmentHandoff
+    return policy == nil || policy.publicPreparedAbandonmentHandoff || policy.publicPauseUpgradeHandoff
 }
 
 func backupFormat(policy *backupPolicy) string {
@@ -282,12 +284,22 @@ func backupInventory(db *sql.DB) (Object, error) {
 	if configuration != nil {
 		inventory["host_configuration_digest"] = Hash(configuration)
 	}
+	pause, err := backupPauseState(db)
+	if err != nil {
+		return nil, err
+	}
+	if pause != nil {
+		inventory["runtime_pause_digest"] = Hash(pause)
+	}
 	return inventory, nil
 }
 func backupIntegrity(db *sql.DB) error {
 	return backupIntegrityPolicy(db, nil)
 }
 func backupIntegrityPolicy(db *sql.DB, policy *backupPolicy) error {
+	if err := validateBackupPause(db); err != nil {
+		return err
+	}
 	if err := validateBackupHostConfiguration(db); err != nil {
 		return err
 	}
@@ -707,6 +719,12 @@ func restoreBackupPolicy(ctx context.Context, directory, destination string, opt
             return r, fmt.Errorf("RESTORE_PREPARED_ABANDONMENT_WORKSPACE_POLICY_MISMATCH")
         }
 		e = policy.preservePreparedAbandonmentUpgradeWorkspaces(db)
+	} else if policy != nil && policy.preservePauseUpgradeWorkspaces != nil {
+		if !policy.publicPauseUpgradeHandoff || policy.publicPreparedAbandonmentHandoff ||
+			policy.format != "RESEARCHOS_BACKUP_V1" || len(policy.purpose) != 0 || policy.allowProtected != nil {
+			return r, fmt.Errorf("RESTORE_PAUSE_UPGRADE_WORKSPACE_POLICY_MISMATCH")
+		}
+		e = policy.preservePauseUpgradeWorkspaces(db)
 	} else {
 		workspaceRequests, e = backupPrepareWorkspaces(ctx, db, files, stage, destination)
 	}

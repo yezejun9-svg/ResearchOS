@@ -212,7 +212,13 @@ func (s *Service) put(tx *sql.Tx, kind string, o Object) error {
 			return Fail(409, "STATE_CONFLICT", "revision must advance once")
 		}
 		if kind == "Task" && !taskTransition(old, o) {
-			return Fail(409, "STATE_CONFLICT", "transition requires lifecycle owner")
+			allowed, err := s.pauseTaskTransition(tx, old, o)
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				return Fail(409, "STATE_CONFLICT", "transition requires lifecycle owner")
+			}
 		}
 	} else if f, ok := e.(*Fault); !ok || f.Status != 404 {
 		return e

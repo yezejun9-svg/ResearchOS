@@ -244,7 +244,7 @@ func (s *Service) createTask(tx *sql.Tx, project string, b Object) (Object, erro
 	goal["task_ids"] = append(Arr(goal, "task_ids"), o["id"])
 	return o, s.put(tx, "Goal", goal)
 }
-func (s *Service) actTask(tx *sql.Tx, p Principal, project, id string, b Object, cid string) (Object, error) {
+func (s *Service) actTask(tx *sql.Tx, p Principal, project, id string, b Object, cid string, meta ...taskRequestMeta) (Object, error) {
 	o, e := load(tx, project, "Task", id)
 	if e != nil {
 		return nil, e
@@ -253,7 +253,12 @@ func (s *Service) actTask(tx *sql.Tx, p Principal, project, id string, b Object,
 		return s.revalidateTask(tx, project, o)
 	}
 	if b["action"] == "PAUSE" || b["action"] == "CANCEL" {
-		return s.controlTask(tx, p, project, o, b, cid)
+		return s.controlTask(tx, p, project, o, b, cid, meta...)
+	}
+	if b["action"] == "RESUME" {
+		if result, handled, err := s.requestRuntimeResume(tx, p, project, o, meta); handled {
+			return result, err
+		}
 	}
 	if b["action"] == "SUBMIT" || b["action"] == "RESUME" {
 		return s.orchestrateTask(tx, project, o, b)

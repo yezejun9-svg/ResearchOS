@@ -366,7 +366,7 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request, op Operation) {
 		result, e = s.claimTask(tx, p, project, id, b, cid)
 		status = 201
 	case "actOnTask":
-		result, e = s.actTask(tx, p, project, id, b, cid)
+		result, e = s.actTask(tx, p, project, id, b, cid, taskRequestMeta{Key: key, Hash: requestHash})
 		kind = "Task"
 	case "uploadContent":
 		if p.Allowed(project, "", "", false) {
