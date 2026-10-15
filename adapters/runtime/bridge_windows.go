@@ -193,7 +193,7 @@ func StartBridge(ctx context.Context, directory string, request BridgeRequest) (
 	}
 	admission, _ := manifest["admission"].(map[string]any)
 	profile, _ := admission["profile"].(map[string]any)
-	if e = validateBridgeProgram(profile, request.Inputs); e != nil {
+	if e = validateBridgeProgram(manifest, request.Inputs); e != nil {
 		return nil, e
 	}
 	if request.WorkerID == "" || bridgeString(manifest, "dispatch_key") == "" || bridgeNumber(manifest, "epoch") < 1 || bridgeString(profile, "sandbox") != "appcontainer-zero-capabilities-v1" || bridgeString(profile, "adapter_revision") != BridgeRevision || request.BeforeResume == nil {

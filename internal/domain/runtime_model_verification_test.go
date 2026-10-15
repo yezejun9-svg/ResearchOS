@@ -108,6 +108,36 @@ func TestRuntimeMuVerificationRejectsFabrication(t *testing.T) {
 		"prompt drift": func(s Object) {
 			s["mu_turn"].(map[string]any)["prompt"].(map[string]any)["task_description"] = "changed intent"
 		},
+		"projection copied from another dispatch": func(s Object) {
+			m := s["mu_turn"].(map[string]any)["dispatch"].(map[string]any)["manifest"].(map[string]any)
+			m["model_execution_projection"].(map[string]any)["dispatch_key"] = "foreign-dispatch"
+		},
+		"projection effective hash": func(s Object) {
+			m := s["mu_turn"].(map[string]any)["dispatch"].(map[string]any)["manifest"].(map[string]any)
+			m["model_execution_projection"].(map[string]any)["effective_model_config_hash"] = "sha256:forged"
+		},
+		"projection source profile": func(s Object) {
+			m := s["mu_turn"].(map[string]any)["dispatch"].(map[string]any)["manifest"].(map[string]any)
+			m["admission"].(map[string]any)["profile"].(map[string]any)["model"] = "other"
+		},
+		"projection old tools": func(s Object) {
+			m := s["mu_turn"].(map[string]any)
+			effects := Arr(m, "effects")
+			for _, v := range effects {
+				e := v.(map[string]any)
+				request, _ := e["payload"].(map[string]any)
+				p, _ := request["payload"].(map[string]any)
+				body, _ := p["body"].(map[string]any)
+				if body != nil {
+					body["tools"] = []any{Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object"}}}}
+				}
+			}
+		},
+		"projection model excess": func(s Object) {
+			m := s["mu_turn"].(map[string]any)
+			muMutateResult(s, func(o Object) { o["model_calls"] = 2 })
+			m["effects"] = append(Arr(m, "effects"), Object{"key": "forged-second-model"})
+		},
 		"effect order": func(s Object) {
 			a := Arr(s["mu_turn"].(map[string]any), "effects")
 			a[len(a)-1].(map[string]any)["_journal_position"] = 0

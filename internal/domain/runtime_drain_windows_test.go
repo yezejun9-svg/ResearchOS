@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -111,6 +112,9 @@ func TestRuntimeDrainLeaseAndScanFence(t *testing.T) {
 // Disposable source fixture synthesizes durable record shapes; it makes no
 // native acceptance claim. Actual Host/private-pipe coverage is separate.
 func desktopExitFixture(t *testing.T) (*fixture, *RuntimeCoordinator, string, string) {
+	return desktopExitFixtureTools(t, false)
+}
+func desktopExitFixtureTools(t *testing.T, oldTools bool) (*fixture, *RuntimeCoordinator, string, string) {
 	t.Helper()
 	f, c, r, executor := confirmationFixture(t)
 	ctx := context.Background()
@@ -138,6 +142,9 @@ func desktopExitFixture(t *testing.T) (*fixture, *RuntimeCoordinator, string, st
 			return e
 		}
 		request := Object{"route": config["route"], "capability": "MODEL", "credential_revision": "none", "payload": Object{"body": Object{"model": config["model"], "stream": true, "max_tokens": 32, "messages": []any{Object{"role": "user", "content": "fixture"}}}}}
+		if oldTools {
+			request["payload"].(map[string]any)["body"].(map[string]any)["tools"] = []any{Object{"type": "function", "function": Object{"name": "run_check", "parameters": Object{"type": "object"}}}}
+		}
 		cost := Object{"policy_id": goal["budget_policy_id"], "run_id": runID, "operation": "UNKNOWN", "money": nil, "provider_request_id": key, "provider_event_id": "prepare/" + key, "reservation_id": nil, "cost_basis": "UNKNOWN", "occurred_at": run["created_at"]}
 		effect, e := c.service.prepareEffectTx(tx, c.schedulerCredential(f.project), f.project, runID, key, request, cost)
 		if e != nil {
@@ -196,6 +203,25 @@ func TestDesktopExitCompletedLocalUnknownPreservesReleaseGate(t *testing.T) {
 	c.ResumeAfterReleaseAbort()
 	if !c.ClientIntakeOpen() {
 		t.Fatal("ordinary abort did not restore intake")
+	}
+}
+
+func TestQualificationProjectionUnknownCostRejectsOldTools(t *testing.T) {
+	f, _, _, _ := desktopExitFixtureTools(t, true)
+	var before string
+	if err := f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	err := f.s.completedLocalUnknownCosts(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "tool schemas") {
+		t.Fatalf("old coding tools accepted or wrong guard: %v", err)
+	}
+	var after string
+	if err := f.db.QueryRow(`SELECT group_concat(body) FROM domain_objects WHERE kind='BudgetLedgerEntry'`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatal("UNKNOWN ledger changed after rejection")
 	}
 }
 func TestDesktopExitUnknownIncompleteRefused(t *testing.T) {

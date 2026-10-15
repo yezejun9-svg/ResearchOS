@@ -14,6 +14,7 @@ import (
 	"time"
 
 	rt "researchos.local/research-os/adapters/runtime"
+	"researchos.local/research-os/internal/runtimepolicy"
 )
 
 func stageRuntimeProgram(route RuntimeCoordinatorRoute, dispatch Object, inputs map[string][]byte) error {
@@ -23,6 +24,10 @@ func stageRuntimeProgram(route RuntimeCoordinatorRoute, dispatch Object, inputs 
 		return nil
 	}
 	if e := validateRuntimeModelConfig(profile); e != nil {
+		return e
+	}
+	effective, e := runtimepolicy.Effective(manifest, "")
+	if e != nil {
 		return e
 	}
 	if !filepath.IsAbs(route.BundleFile) {
@@ -41,12 +46,17 @@ func stageRuntimeProgram(route RuntimeCoordinatorRoute, dispatch Object, inputs 
 		return errors.New("Mu bundle differs from frozen profile")
 	}
 	inputs["mu-worker.mjs"] = raw
-	inputs["worker.json"] = Bytes(profile["model_config"])
+	inputs["worker.json"] = Bytes(effective)
 	return nil
 }
 
 func (c *RuntimeCoordinator) brokerModel(ctx context.Context, route RuntimeCoordinatorRoute, provider RuntimeProviderRoute, runID, lease string, epoch int64, bridge *rt.Bridge, frame rt.BridgeFrame, payload, intent, dispatch Object) (Object, error) {
-	body, e := validateRuntimeModelRequest(provider.ModelConfig, payload)
+	manifest := dispatch["manifest"].(map[string]any)
+	effective, e := runtimepolicy.Effective(manifest, provider.Purpose)
+	if e != nil {
+		return nil, e
+	}
+	body, e := validateRuntimeModelRequest(effective, payload)
 	if e != nil {
 		return nil, e
 	}

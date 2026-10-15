@@ -6,6 +6,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+
+	"researchos.local/research-os/internal/runtimepolicy"
 )
 
 // RuntimeDrainSnapshot contains only host-observed counters. It is not a
@@ -222,6 +224,10 @@ func (s *Service) completedLocalUnknownCost(tx *sql.Tx, project string, ledger O
 	if Hash(frozen) != Hash(profile) {
 		return bad("profile bytes")
 	}
+	effective, e := runtimepolicy.Effective(manifest, Str(task, "task_type"))
+	if e != nil {
+		return bad("qualification projection")
+	}
 	effect, e := latestEffect(tx, project, Str(run, "id"), Str(ledger, "provider_request_id"))
 	if e != nil {
 		return e
@@ -233,7 +239,7 @@ func (s *Service) completedLocalUnknownCost(tx *sql.Tx, project string, ledger O
 	if effect["state"] != "CONFIRMED" || effect["project_id"] != project || effect["task_id"] != task["id"] || effect["run_id"] != run["id"] || effect["context_bundle_id"] != run["context_bundle_id"] || Hash(effect["epoch"]) != Hash(run["lease_epoch"]) || request["route"] != config["route"] || receipt["state"] != "CONFIRMED" || receipt["key"] != effect["key"] || receipt["run_id"] != run["id"] || Hash(receipt["epoch"]) != Hash(run["lease_epoch"]) || receipt["model_transport"] != true || receipt["actual_cost"] != nil {
 		return bad("confirmed effect binding")
 	}
-	if _, e = validateRuntimeModelRequest(config, payload); e != nil {
+	if _, e = validateRuntimeModelRequest(effective, payload); e != nil {
 		return e
 	}
 	bound := 0

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	rt "researchos.local/research-os/adapters/runtime"
+	"researchos.local/research-os/internal/runtimepolicy"
 )
 
 // RuntimeProviderRoute is host-owned and never included in a task input.
@@ -180,8 +181,13 @@ func (c *RuntimeCoordinator) brokerEffect(ctx context.Context, route RuntimeCoor
 		}
 	}
 	if provider.Capability == "MODEL" {
-		if _, e = validateRuntimeModelRequest(provider.ModelConfig, payload); e == nil {
-			e = runtimeModelCallGate(tx, route.ProjectID, runID, frame.Key, provider.ModelConfig)
+		var effective map[string]any
+		effective, e = runtimepolicy.Effective(dispatch["manifest"].(map[string]any), Str(task, "task_type"))
+		if e == nil {
+			_, e = validateRuntimeModelRequest(effective, payload)
+		}
+		if e == nil {
+			e = runtimeModelCallGate(tx, route.ProjectID, runID, frame.Key, effective)
 		}
 		if e != nil {
 			tx.Rollback()

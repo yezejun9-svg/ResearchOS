@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"researchos.local/research-os/internal/runtimepolicy"
 )
 
 // muTurnSnapshot adds immutable broker history to BOTH acceptance snapshots.
@@ -405,7 +407,20 @@ func verifyMuTurn(snapshot Object) (string, string) {
 	task, _ := snapshot["task"].(map[string]any)
 	run, _ := snapshot["run"].(map[string]any)
 	profile, _ := mu["profile"].(map[string]any)
-	config, _ := profile["model_config"].(map[string]any)
+	dispatch, _ := mu["dispatch"].(map[string]any)
+	manifest, _ := dispatch["manifest"].(map[string]any)
+	admission, _ := manifest["admission"].(map[string]any)
+	if profile == nil || manifest == nil || admission == nil || Hash(profile) != Hash(admission["profile"]) {
+		return fail("SDK profile differs from immutable dispatch.")
+	}
+	config, err := runtimepolicy.Effective(manifest, Str(task, "task_type"))
+	if err != nil {
+		return fail("Qualification projection binding invalid.")
+	}
+	original, _ := profile["model_config"].(map[string]any)
+	if original == nil || config["route"] != original["route"] || config["ref"] != original["ref"] {
+		return fail("Frozen model identity changed.")
+	}
 	artifacts := Arr(snapshot, "artifacts")
 	if len(artifacts) != 1 {
 		return fail("One sealed SDK result required.")

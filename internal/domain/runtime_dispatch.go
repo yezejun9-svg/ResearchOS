@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"path/filepath"
 	"time"
+
+	"researchos.local/research-os/internal/runtimepolicy"
 )
 
 const runtimeSandboxProfile = "appcontainer-zero-capabilities-v1"
@@ -104,6 +106,9 @@ func (s *Service) prepareRuntimeDispatch(tx *sql.Tx, project string, task, run, 
 	manifest := Object{"version": 1, "project_id": project, "run_id": run["id"], "task_id": task["id"], "epoch": run["lease_epoch"], "runtime_id": run["runtime_id"], "executor_principal_id": run["executor_principal_id"], "contract_hash": task["acceptance_contract"].(map[string]any)["contract_hash"], "input_refs": run["input_refs"], "context_bundle_id": run["context_bundle_id"], "checkpoint_artifact_id": run["checkpoint_artifact_id"], "admission": admission}
 	key := ID()
 	manifest["dispatch_key"] = key
+	if e := runtimepolicy.Prepare(manifest, Str(task, "task_type")); e != nil {
+		return Fail(422, "GATE_FAILED", "qualification projection: "+e.Error())
+	}
 	_, e := tx.Exec("INSERT INTO runtime_dispatches(project,run,epoch,dispatch_key,manifest,manifest_hash,state,prepared_at,updated_at) VALUES(?,?,?,?,?,?,'PREPARED',?,?)", project, run["id"], run["lease_epoch"], key, string(Bytes(manifest)), Hash(manifest), Now(), Now())
 	return e
 }
