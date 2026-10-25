@@ -1,0 +1,455 @@
+//go:build windows
+
+package ownedcorestop
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"researchos.local/research-os/internal/host"
+	"researchos.local/research-os/internal/store"
+	"researchos.local/research-os/ops/supervisor"
+)
+
+// The only operation authority is injected when a dedicated binary is linked.
+// There is intentionally no setter, environment fallback, or caller-supplied
+// grant path. Inspect shares structural validation but may run after expiry.
+var compiledOperationGrantBase64 string
+var compiledGrantOnce sync.Once
+var compiledGrant operationGrant
+var compiledGrantErr error
+
+const grantSchema = "researchos.owned-core-stop-compiled-grant.v1"
+
+type grantDocument struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+}
+
+type grantFileIdentity struct {
+	Path   string `json:"path"`
+	Volume uint32 `json:"volume"`
+	Index  uint64 `json:"index"`
+}
+
+type grantNativeIdentity struct {
+	PID                uint32 `json:"pid"`
+	Created100NS       string `json:"created_100ns"`
+	SID                string `json:"sid"`
+	ImagePath          string `json:"image_path"`
+	ImageSHA256        string `json:"image_sha256"`
+	ImageVolume        uint32 `json:"image_volume"`
+	ImageIndex         uint64 `json:"image_index"`
+	ParentPID          uint32 `json:"parent_pid"`
+	ParentCreated100NS string `json:"parent_created_100ns"`
+	ParentSID          string `json:"parent_sid"`
+	ParentImagePath    string `json:"parent_image_path"`
+	ParentImageSHA256  string `json:"parent_image_sha256"`
+	ParentImageVolume  uint32 `json:"parent_image_volume"`
+	ParentImageIndex   uint64 `json:"parent_image_index"`
+}
+
+type operationGrant struct {
+	Schema                    string                           `json:"schema"`
+	GrantKind                 string                           `json:"grant_kind"`
+	OperationID               string                           `json:"operation_id"`
+	IssuedAt                  string                           `json:"issued_at"`
+	NotBefore                 string                           `json:"not_before"`
+	ExpiresAt                 string                           `json:"expires_at"`
+	Purpose                   string                           `json:"purpose"`
+	TrustedOperatorSID        string                           `json:"trusted_operator_sid"`
+	DataRoot                  grantFileIdentity                `json:"data_root"`
+	Database                  grantFileIdentity                `json:"database"`
+	OperationDir              grantFileIdentity                `json:"operation_dir"`
+	Native                    grantNativeIdentity              `json:"native"`
+	Host                      host.OwnedCoreStopPublicIdentity `json:"host"`
+	Subject                   store.OwnedStopSubject           `json:"subject"`
+	RequiredProofKinds        []string                         `json:"required_proof_kinds"`
+	RulesetVersion            string                           `json:"ruleset_version"`
+	SchemaSHA256              string                           `json:"schema_sha256"`
+	AllowedActions            []string                         `json:"allowed_actions"`
+	TerminateCount            int                              `json:"terminate_count"`
+	Proposal                  grantDocument                    `json:"proposal"`
+	PreflightScope            grantDocument                    `json:"preflight_scope"`
+	PreflightReview           grantDocument                    `json:"preflight_review"`
+	HistoricalManifest        grantDocument                    `json:"historical_evidence_manifest"`
+	PlanSHA256                string                           `json:"plan_sha256"`
+	PreflightManifestSHA256   string                           `json:"preflight_manifest_sha256"`
+	StopReview                grantDocument                    `json:"stop_review"`
+	RootOperationScope        grantDocument                    `json:"root_operation_scope"`
+	PreflightGrantSHA256      string                           `json:"preflight_grant_sha256"`
+	PreflightExecutableSHA256 string                           `json:"preflight_executable_sha256"`
+	digest                    string
+	notBefore                 time.Time
+	expires                   time.Time
+}
+
+func parseDecimal100NS(s string) (int64, error) {
+	if s == "" || (len(s) > 1 && s[0] == '0') {
+		return 0, errors.New("noncanonical creation time")
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || v <= 0 {
+		return 0, errors.New("invalid creation time")
+	}
+	return v, nil
+}
+
+func (n grantNativeIdentity) observed() (supervisor.OwnedCoreNativeIdentity, error) {
+	c, err := parseDecimal100NS(n.Created100NS)
+	if err != nil {
+		return supervisor.OwnedCoreNativeIdentity{}, err
+	}
+	p, err := parseDecimal100NS(n.ParentCreated100NS)
+	if err != nil {
+		return supervisor.OwnedCoreNativeIdentity{}, err
+	}
+	// Windows FILETIME.Nanoseconds() is the observed representation in the
+	// retained native handle. The grant stores the exact 100ns unit as a string.
+	if c > int64(^uint64(0)>>1)/100 || p > int64(^uint64(0)>>1)/100 {
+		return supervisor.OwnedCoreNativeIdentity{}, errors.New("creation time overflow")
+	}
+	return supervisor.OwnedCoreNativeIdentity{PID: n.PID, CreatedNS: c * 100, SID: n.SID, ImagePath: n.ImagePath, ImageSHA256: n.ImageSHA256, ImageVolume: n.ImageVolume, ImageIndex: n.ImageIndex, ParentPID: n.ParentPID, ParentCreatedNS: p * 100, ParentSID: n.ParentSID, ParentImagePath: n.ParentImagePath, ParentImageSHA256: n.ParentImageSHA256, ParentImageVolume: n.ParentImageVolume, ParentImageIndex: n.ParentImageIndex}, nil
+}
+
+func validGrantDocument(d grantDocument) bool {
+	return cleanOwnedLocalPath(d.Path) == nil && validSHA(d.SHA256)
+}
+
+func parseCompiledOperationGrant(encoded string) (operationGrant, error) {
+	var g operationGrant
+	if encoded == "" {
+		return g, errors.New("STOP_GRANT_UNCONFIGURED")
+	}
+	if len(encoded) > base64.StdEncoding.EncodedLen(64<<10) {
+		return g, errors.New("STOP_GRANT_INVALID: oversized base64")
+	}
+	raw, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	if err != nil || len(raw) == 0 || len(raw) > 64<<10 || base64.StdEncoding.EncodeToString(raw) != encoded {
+		return g, errors.New("STOP_GRANT_INVALID: noncanonical base64")
+	}
+	if err = strictJSON(raw, &g); err != nil {
+		return operationGrant{}, fmt.Errorf("STOP_GRANT_INVALID: %w", err)
+	}
+	canonical, err := canonicalMapJSON(raw)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		return operationGrant{}, errors.New("STOP_GRANT_INVALID: noncanonical JSON")
+	}
+	g.digest = digest(raw)
+	if err = g.validateStructure(); err != nil {
+		return operationGrant{}, fmt.Errorf("STOP_GRANT_INVALID: %w", err)
+	}
+	return g, nil
+}
+
+func canonicalMapJSON(raw []byte) ([]byte, error) {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.UseNumber()
+	var v map[string]any
+	if err := d.Decode(&v); err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, errors.New("JSON object required")
+	}
+	out, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(out, '\n'), nil
+}
+
+func loadCompiledOperationGrant() (operationGrant, error) {
+	compiledGrantOnce.Do(func() { compiledGrant, compiledGrantErr = parseCompiledOperationGrant(compiledOperationGrantBase64) })
+	return compiledGrant, compiledGrantErr
+}
+
+func (g *operationGrant) validateStructure() error {
+	if g.Schema != grantSchema || !validID(g.OperationID) || g.Purpose != "EXACT_RETAINED_CORE_CRASH_STOP" || g.TrustedOperatorSID == "" || g.RulesetVersion != "strict-closure-v1" || !validSHA(g.SchemaSHA256) {
+		return errors.New("grant identity/ruleset")
+	}
+	issued, e1 := time.Parse(time.RFC3339Nano, g.IssuedAt)
+	before, e2 := time.Parse(time.RFC3339Nano, g.NotBefore)
+	expiry, e3 := time.Parse(time.RFC3339Nano, g.ExpiresAt)
+	if e1 != nil || e2 != nil || e3 != nil || !issued.Equal(before) && issued.After(before) || !expiry.After(before) || expiry.Sub(before) > 30*time.Minute {
+		return errors.New("grant interval")
+	}
+	g.notBefore, g.expires = before, expiry
+	for _, f := range []grantFileIdentity{g.DataRoot, g.Database, g.OperationDir} {
+		if cleanOwnedLocalPath(f.Path) != nil || f.Volume == 0 || f.Index == 0 {
+			return errors.New("grant native file identity")
+		}
+	}
+	if outsideDataRoot(g.OperationDir.Path, g.DataRoot.Path) != nil || g.Database.Path != filepath.Join(g.DataRoot.Path, "researchos.sqlite") {
+		return errors.New("grant root/database path")
+	}
+	n, err := g.Native.observed()
+	if err != nil || n.PID == 0 || n.ParentPID == 0 || n.SID != g.TrustedOperatorSID || n.ParentSID != g.TrustedOperatorSID || !validSHA(n.ImageSHA256) || !validSHA(n.ParentImageSHA256) || n.ImageIndex == 0 || n.ParentImageIndex == 0 || cleanOwnedLocalPath(n.ImagePath) != nil || cleanOwnedLocalPath(n.ParentImagePath) != nil {
+		return errors.New("grant native process identity")
+	}
+	if g.Host.DataRoot != g.DataRoot.Path || g.Host.Database != g.Database.Path || g.Host.DatabaseVolume != g.Database.Volume || g.Host.DatabaseIndex != g.Database.Index || g.Host.SID != g.TrustedOperatorSID || g.Host.SchemaVersion != 24 || g.Host.HostID == "" || g.Host.OwnerID == "" || g.Host.OwnerRoot == "" || g.Host.PrincipalRef == "" || !validSHA(g.Host.HostStateSHA256) {
+		return errors.New("grant Host/Owner identity")
+	}
+	if g.Subject.Run != OldRun || g.Subject.Epoch != 1 || g.Subject.DispatchKey != OldDispatch || g.Subject.RequestKey != OldRequest || g.Subject.Project == "" {
+		return errors.New("grant old subject")
+	}
+	if len(g.RequiredProofKinds) != len(proofKinds) {
+		return errors.New("proof classes")
+	}
+	for i, k := range proofKinds {
+		if g.RequiredProofKinds[i] != k {
+			return errors.New("proof class mismatch")
+		}
+	}
+	if !validGrantDocument(g.HistoricalManifest) {
+		return errors.New("historical manifest pin")
+	}
+	switch g.GrantKind {
+	case "PREFLIGHT_ONLY":
+		if g.TerminateCount != 0 || len(g.AllowedActions) != 2 || g.AllowedActions[0] != "preflight" || g.AllowedActions[1] != "inspect" || !validGrantDocument(g.Proposal) || !validGrantDocument(g.PreflightScope) || !validGrantDocument(g.PreflightReview) || g.PlanSHA256 != "" || g.PreflightManifestSHA256 != "" || g.StopReview.Path != "" || g.RootOperationScope.Path != "" || g.PreflightGrantSHA256 != "" || g.PreflightExecutableSHA256 != "" {
+			return errors.New("preflight grant actions/pins")
+		}
+	case "STOP_ONCE":
+		if g.TerminateCount != 1 || len(g.AllowedActions) != 2 || g.AllowedActions[0] != "commit" || g.AllowedActions[1] != "inspect" || !validSHA(g.PlanSHA256) || !validSHA(g.PreflightManifestSHA256) || !validGrantDocument(g.StopReview) || !validGrantDocument(g.RootOperationScope) || !validSHA(g.PreflightGrantSHA256) || !validSHA(g.PreflightExecutableSHA256) || g.Proposal.Path != "" || g.PreflightScope.Path != "" || g.PreflightReview.Path != "" {
+			return errors.New("stop grant actions/pins")
+		}
+	default:
+		return errors.New("grant kind")
+	}
+	return nil
+}
+
+func (g operationGrant) checkAction(action string, live bool) (time.Time, error) {
+	allowed := false
+	for _, a := range g.AllowedActions {
+		if a == action {
+			allowed = true
+		}
+	}
+	if !allowed {
+		return time.Time{}, errors.New("STOP_GRANT_ACTION_DENIED")
+	}
+	if !live {
+		return time.Time{}, nil
+	}
+	now := time.Now()
+	if now.Before(g.notBefore) || !now.Before(g.expires) {
+		return time.Time{}, errors.New("STOP_GRANT_EXPIRED")
+	}
+	return now.Add(g.expires.Sub(now)), nil
+}
+
+const (
+	InputSchema      = "researchos.owned-core-stop-input.v1"
+	PlanSchema       = "researchos.owned-core-stop-plan.v1"
+	ResultSchema     = "researchos.owned-core-stop-result.v1"
+	SourceBaseCommit = "4f4023c956f84d65743f39ce77d6c8899a21ada1"
+	OldRun           = "f3dcb996b2e43cf52cba874be7abfc70"
+	OldDispatch      = "705b11ec99044fef19e85f57e2d2b712"
+	OldRequest       = "bc269e772ada7e1bce54439fd080550c"
+)
+
+type EvidenceRef struct {
+	Kind   string `json:"kind"`
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+}
+
+// Input names the historical subject and evidence locations, not permission
+// flags. It cannot assert that a proof is accepted or a native child is closed.
+type Input struct {
+	Schema           string                 `json:"schema"`
+	OperationID      string                 `json:"operation_id"`
+	SourceRepository string                 `json:"source_repository"`
+	DataRoot         string                 `json:"data_root"`
+	CorePID          uint32                 `json:"core_pid"`
+	Subject          store.OwnedStopSubject `json:"subject"`
+	Evidence         []EvidenceRef          `json:"evidence"`
+	PlanReviewPath   string                 `json:"plan_review_path"`
+}
+
+type Plan struct {
+	Schema                    string                             `json:"schema"`
+	OperationID               string                             `json:"operation_id"`
+	SourceBaseCommit          string                             `json:"source_base_commit"`
+	OutputDir                 string                             `json:"output_dir"`
+	InputSHA256               string                             `json:"input_sha256"`
+	GrantSHA256               string                             `json:"grant_sha256,omitempty"`
+	PreflightExecutableSHA256 string                             `json:"preflight_executable_sha256,omitempty"`
+	Input                     Input                              `json:"input"`
+	Native                    supervisor.OwnedCoreNativeIdentity `json:"native"`
+	Host                      host.OwnedCoreStopPublicIdentity   `json:"host"`
+	BackupPath                string                             `json:"backup_path"`
+	BackupSHA256              string                             `json:"backup_sha256"`
+	Baseline                  store.OwnedStopCensus              `json:"baseline"`
+	PreflightSafety           store.OwnedStopSafetySnapshot      `json:"preflight_safety"`
+	EvidenceSHA256            string                             `json:"evidence_sha256,omitempty"`
+	Eligibility               string                             `json:"eligibility"`
+	Missing                   []string                           `json:"missing,omitempty"`
+}
+
+type Result struct {
+	Schema          string                          `json:"schema"`
+	OperationID     string                          `json:"operation_id"`
+	PlanSHA256      string                          `json:"plan_sha256"`
+	StopGrantSHA256 string                          `json:"stop_grant_sha256,omitempty"`
+	State           string                          `json:"state"`
+	Reason          string                          `json:"reason,omitempty"`
+	Native          *supervisor.OwnedCoreNativeExit `json:"native,omitempty"`
+	Postflight      *store.OwnedStopCensus          `json:"postflight,omitempty"`
+}
+
+func digest(raw []byte) string { sum := sha256.Sum256(raw); return hex.EncodeToString(sum[:]) }
+func validSHA(s string) bool {
+	b, e := hex.DecodeString(s)
+	if e != nil || len(b) != 32 || strings.ToLower(s) != s {
+		return false
+	}
+	for _, v := range b {
+		if v != 0 {
+			return true
+		}
+	}
+	return false
+}
+func validID(s string) bool {
+	b, e := hex.DecodeString(s)
+	return e == nil && len(b) == 16 && strings.ToLower(s) == s
+}
+
+func strictJSON(raw []byte, v any) error {
+	if err := rejectDuplicateJSON(raw); err != nil {
+		return err
+	}
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if err := d.Decode(v); err != nil {
+		return err
+	}
+	var rest any
+	if err := d.Decode(&rest); err != io.EOF {
+		return errors.New("trailing JSON data")
+	}
+	return nil
+}
+
+func rejectDuplicateJSON(raw []byte) error {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	var walk func(int) error
+	walk = func(depth int) error {
+		if depth > 64 {
+			return errors.New("JSON nesting too deep")
+		}
+		tok, err := d.Token()
+		if err != nil {
+			return err
+		}
+		opening, ok := tok.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch opening {
+		case '{':
+			seen := make(map[string]struct{})
+			for d.More() {
+				keyToken, err := d.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return errors.New("JSON object key expected")
+				}
+				if _, exists := seen[key]; exists {
+					return errors.New("duplicate JSON key: " + key)
+				}
+				seen[key] = struct{}{}
+				if err := walk(depth + 1); err != nil {
+					return err
+				}
+			}
+		case '[':
+			for d.More() {
+				if err := walk(depth + 1); err != nil {
+					return err
+				}
+			}
+		default:
+			return errors.New("unexpected JSON delimiter")
+		}
+		_, err = d.Token()
+		return err
+	}
+	if err := walk(0); err != nil {
+		return err
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return errors.New("trailing JSON data")
+	}
+	return nil
+}
+func canonicalJSON(v any) ([]byte, error) {
+	raw, e := json.MarshalIndent(v, "", "  ")
+	if e != nil {
+		return nil, e
+	}
+	return append(raw, '\n'), nil
+}
+
+func readInput(path string) (Input, string, error) {
+	var in Input
+	raw, e := os.ReadFile(path)
+	if e != nil {
+		return in, "", e
+	}
+	if len(raw) > 64<<10 {
+		return in, "", errors.New("bounded input required")
+	}
+	if e = strictJSON(raw, &in); e != nil {
+		return in, "", e
+	}
+	if e = validateInput(in); e != nil {
+		return in, "", e
+	}
+	return in, digest(raw), nil
+}
+
+func validateInput(in Input) error {
+	if in.Schema != InputSchema || !validID(in.OperationID) || in.CorePID == 0 {
+		return errors.New("invalid input identity")
+	}
+	if in.Subject.Run != OldRun || in.Subject.Epoch != 1 || in.Subject.DispatchKey != OldDispatch || in.Subject.RequestKey != OldRequest || in.Subject.Project == "" {
+		return errors.New("subject differs from frozen historical window")
+	}
+	for _, path := range []string{in.SourceRepository, in.DataRoot} {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(filepath.VolumeName(path)) != 2 {
+			return errors.New("canonical absolute local roots required")
+		}
+	}
+	return nil
+}
+
+func validatePlan(p Plan) error {
+	if p.Schema != PlanSchema || p.SourceBaseCommit != SourceBaseCommit || p.OperationID != p.Input.OperationID || p.OutputDir == "" || p.BackupPath != filepath.Join(p.OutputDir, "backup.sqlite") || !validSHA(p.InputSHA256) || !validSHA(p.BackupSHA256) || p.Native.PID != p.Input.CorePID || p.Host.DataRoot != p.Input.DataRoot || p.Host.SID != p.Native.SID || p.Host.SID != p.Native.ParentSID {
+		return errors.New("plan field binding invalid")
+	}
+	if e := validateInput(p.Input); e != nil {
+		return e
+	}
+	if p.Baseline.SHA256 == "" || p.Baseline.QuickCheck != "ok" || p.Host.SchemaVersion != 24 {
+		return errors.New("plan baseline invalid")
+	}
+	return nil
+}

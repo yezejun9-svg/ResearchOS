@@ -33,15 +33,27 @@ func fileIdentity(path string) (volume string, fileID uint64, final string, err 
 	id := uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)
 	buf := make([]uint16, 4096)
 	n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
-	if err != nil || n == 0 {
-		return vol, id, "", fmt.Errorf("final path unavailable for %s: %v", path, err)
+	if err != nil {
+		return vol, id, "", fmt.Errorf("final path unavailable for %s: %w", path, err)
 	}
-	final = windows.UTF16PtrToString(&buf[0])
-	if l := int(n); len(final) > l {
-		final = final[:l]
+	final, err = boundedFinalPathUTF16(buf, n)
+	if err != nil {
+		return vol, id, "", fmt.Errorf("final path unavailable for %s: %w", path, err)
 	}
 	final = strings.TrimPrefix(final, `\\?\`)
 	return vol, id, final, nil
+}
+
+// GetFinalPathNameByHandleW reports UTF-16 code units, not UTF-8 bytes. On
+// insufficient capacity its return is the required capacity, including NUL.
+func boundedFinalPathUTF16(buf []uint16, n uint32) (string, error) {
+	if n == 0 {
+		return "", fmt.Errorf("empty final path")
+	}
+	if n >= uint32(len(buf)) {
+		return "", fmt.Errorf("final path needs %d UTF-16 units; capacity is %d", n, len(buf))
+	}
+	return windows.UTF16ToString(buf[:n]), nil
 }
 
 // chainHasReparsePoint walks every prefix of the path, so a junction anywhere above the target
