@@ -1,0 +1,7 @@
+# Web app structure
+
+`src/main.jsx` owns bootstrap, shared queries, and top level routing state. `src/navigation.jsx` owns route parsing, history navigation, route labels, and links; screens import these from navigation rather than the entry module. `src/screens.jsx`, `src/workbench.jsx`, and `src/continuity.jsx` own their existing product workflows and protocol-facing state. `src/components/` contains production-only presentational React components: `ui.jsx` for small accessible primitives, `app-shell.jsx` for global navigation and status, and `workbench-layout.jsx` for the three-region research workspace. These components receive data and actions through props and do not call transport, native bridges, or storage.
+
+`src/style.css` owns application layout and visual rules, layered over unchanged design token values. Add class names for roles or states, not individual screens. Keep keyboard focus and reduced-motion behavior visible. All routes, native/browser separation, explicit confirmation, writer lease, and error states remain reachable.
+
+Browser/native-shaped fixtures live under `tests/ui/` and must intercept their network/bridge boundary. Task-generated artifacts and temporary data live in the owned `.local/react-workbench-redesign-20261025-tmp/` directory; command recipes and retained verification evidence live in the owned execution receipt directory. Do not import fixture data or bridge stubs into production modules. Remove disposable task files after retained evidence is complete.

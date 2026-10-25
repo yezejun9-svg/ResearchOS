@@ -1,20 +1,17 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError, classify, etagOf, itemsOf } from './api'
 import { useQueries } from './hooks'
-import { Link, taskLabels, runLabels } from './main'
+import { Link, taskLabels, runLabels } from './navigation'
 import { ArtifactPreview } from './preview'
 import { ProfileDraft } from './profile-draft'
 import { DevicePanel } from './Pairing'
 import { Continuity } from './continuity'
 import { ResourceRecovery } from './resource-recovery.jsx'
 import { NativeModelConfiguration, NativeProjectEntry, NativeWorkbench } from './workbench.jsx'
+import { Header, Section, Tag, Empty, JsonDetails } from './components/ui'
 
 const briefDate = raw => raw ? new Date(raw).toLocaleString() : '未记录'
 const short = raw => raw ? String(raw).slice(0, 12) : '—'
-function Header({ title, description, action }) { return <header className="page-heading"><div><h1>{title}</h1>{description && <p>{description}</p>}</div>{action}</header> }
-function Section({ title, aside, children, className = '' }) { return <section className={`panel ${className}`}><div className="section-heading"><h2>{title}</h2>{aside}</div>{children}</section> }
-function Tag({ value, type }) { return <span className={`tag ${type || (/失败|受阻|拒绝|限流|过期|PARTIAL|RATE_LIMITED/.test(String(value)) ? 'warning' : /验收|COMPLETE|CURRENT|IMPROVED/.test(String(value)) ? 'good' : '')}`}>{value ?? '未知'}</span> }
-function Empty({ children }) { return <p className="empty-state">{children || '当前没有记录。'}</p> }
 function StateNotice({ state, empty, onRetry }) {
   if (state.loading) return <div className="loading-state" role="status"><span className="loading-line"/><span className="loading-line short"/>正在读取已保存状态…</div>
   const entries = Object.entries(state.errors)
@@ -22,7 +19,6 @@ function StateNotice({ state, empty, onRetry }) {
   if (empty) return <Empty/>
   return null
 }
-function JsonDetails({ value, label = '查看原始字段' }) { return <details className="raw-details"><summary>{label}</summary><pre>{JSON.stringify(value, null, 2)}</pre></details> }
 function Table({ headers, rows }) { return <div className="table-wrap"><table><thead><tr>{headers.map(x => <th key={x}>{x}</th>)}</tr></thead><tbody>{rows.map((row, i) => <tr key={i}>{row.map((cell, j) => <td key={j}>{cell}</td>)}</tr>)}</tbody></table></div> }
 function refFor(value, kind) { return { entity_type: kind, id: value.id, revision: value.revision, content_hash: value.content_hash ?? null } }
 
@@ -70,11 +66,49 @@ function Workbench({ api, projectId, navigate, shared, refresh, onRefresh }) {
   const more = useQueries(api, projectId, [{ op: 'listGoal' }, { op: 'listTask' }, { op: 'listResearchCycle' }, { op: 'listResourceRequest' }], refresh)
   const state = shared.data.getProjectState, profile = shared.data.getProjectProfile
   const tasks = itemsOf(more.data.listTask), goals = itemsOf(more.data.listGoal), cycles = itemsOf(more.data.listResearchCycle)
-  const planningTasks = tasks.filter(t => t.task_type === 'intent_planning')
-  const businessTasks = tasks.filter(t => !['intent_planning', 'runtime_qualification'].includes(t.task_type))
-  const active = cycles.find(c => c.id === state?.active_cycle_id) || cycles.at(-1)
+  const planningTasks = tasks.filter(task => task.task_type === 'intent_planning')
+  const businessTasks = tasks.filter(task => !['intent_planning', 'runtime_qualification'].includes(task.task_type))
+  const active = cycles.find(cycle => cycle.id === state?.active_cycle_id) || cycles.at(-1)
   const release = itemsOf(shared.data.listMilestoneRelease).at(-1)
-  return <><Header title={profile?.name || '研究工作台'} description="先看有效进展，再查看执行细节。" action={<IdeaForm key={projectId} api={api} projectId={projectId} onCreated={onRefresh}/>}/><StateNotice state={shared} onRetry={onRefresh}/><StateNotice state={more} onRetry={onRefresh}/><Section title="持续目标" className="goal-section">{goals.length ? goals.filter(g => g.status === 'ACTIVE' || g.status === 'DRAFT').slice(-2).map(goal => <div key={goal.id}><h3>{goal.title}</h3><p>{goal.original_intent}</p><div className="meta-line"><Tag value={goal.status}/><span>修订 {goal.revision}</span></div></div>) : <Empty>尚无目标。用右上角“提出新想法”开始规划。</Empty>}</Section><div className="summary-strip"><div><span>业务已验收</span><strong>{businessTasks.filter(t => t.status === 'ACCEPTED').length}</strong><small>业务任务 {businessTasks.length}</small><small>待执行 {businessTasks.filter(task => task.status === 'READY').length}</small></div><div><span>待评审</span><strong>{businessTasks.filter(t => ['EXECUTION_REPORTED', 'VERIFYING'].includes(t.status)).length}</strong><small>执行结果不算已验收</small></div><div><span>{state?.active_cycle_id ? '当前周期' : '最近周期'}</span><strong>{active ? active.status : '—'}</strong><small>{active ? briefDate(active.started_at) : '尚未开始'}</small></div></div><Section title="意图规划"><p className="small-muted">规划检查通过只表示提案可追溯、结构可检验，业务成果另行验收。</p>{planningTasks.length ? planningTasks.map(task => <Link key={task.id} className="record-row" to={`/p/${projectId}/tasks/${task.id}`} navigate={navigate}><strong>{goals.find(g => g.id === task.goal_id)?.original_intent || task.title}</strong><span>{task.status === 'ACCEPTED' ? '规划提案检查通过' : taskLabels[task.status] || task.status}</span><small>查看提案、执行与独立检查 →</small></Link>) : <Empty>提交一句想法即可开始。</Empty>}</Section><Section title="当前推进" aside={<span className="small-muted">按服务端任务状态</span>}>{tasks.length ? <div className="record-list">{tasks.slice(-8).reverse().map(task => <Link key={task.id} className="task-row" to={`/p/${projectId}/tasks/${task.id}`} navigate={navigate}><span><strong>{task.title}</strong><small>{task.stage} · {short(task.id)}</small></span><Tag value={taskLabels[task.status] || task.status}/></Link>)}</div> : <Empty>尚无任务。</Empty>}</Section><div className="two-column"><Section title="来源覆盖">{active?.source_coverage?.length ? active.source_coverage.map(c => <div className="coverage-row" key={c.source_id}><span>{short(c.source_id)}</span><Tag value={c.status}/><small>{c.gap_reason || `${c.record_count} 条记录`}</small></div>) : <Empty>尚无活动研究周期。</Empty>}</Section><Section title="最近成果">{release ? <Link to={`/p/${projectId}/releases/${release.id}`} navigate={navigate} className="feature-link"><strong>{release.summary}</strong><span>里程碑 {release.sequence} · {briefDate(release.created_at)}</span></Link> : <Empty>还没有已验收成果。执行结果提交后仍需独立验收。</Empty>}</Section></div><Section title="下一步">{itemsOf(more.data.listResourceRequest).filter(r => r.status !== 'RESOLVED').length ? <Link to={`/p/${projectId}/resources`} navigate={navigate}>查看待处理的资源请求 →</Link> : <p>查看当前任务、来源覆盖和待评审结果，按服务端回执推进。</p>}</Section></>
+  const pendingResources = itemsOf(more.data.listResourceRequest).filter(request => request.status !== 'RESOLVED')
+  const currentGoals = goals.filter(goal => goal.status === 'ACTIVE' || goal.status === 'DRAFT').slice(-2)
+  return <>
+    <Header title={profile?.name || '研究工作台'} description="查看当前目标、任务和下一步。" action={<IdeaForm key={projectId} api={api} projectId={projectId} onCreated={onRefresh}/>}/>
+    <StateNotice state={shared} onRetry={onRefresh}/><StateNotice state={more} onRetry={onRefresh}/>
+    <div className="browser-workbench">
+      <div className="browser-primary">
+        <Section title="当前目标" className="goal-section">{currentGoals.length ? currentGoals.map(goal => <div key={goal.id}>
+          <h3>{goal.title}</h3><p>{goal.original_intent}</p><div className="meta-line"><Tag value={goal.status}/><span>修订 {goal.revision}</span></div>
+        </div>) : <Empty>尚无目标。用右上角“提出新想法”开始规划。</Empty>}</Section>
+        <Section title="当前推进" aside={<span className="small-muted">按服务端任务状态</span>}>
+          {tasks.length ? <div className="record-list">{tasks.slice(-8).reverse().map(task => <Link key={task.id} className="task-row" to={`/p/${projectId}/tasks/${task.id}`} navigate={navigate}>
+            <span><strong>{task.title}</strong><small>{task.stage} · {short(task.id)}</small></span><Tag value={taskLabels[task.status] || task.status}/>
+          </Link>)}</div> : <Empty>尚无任务。提交想法后，可在这里查看真实规划与执行状态。</Empty>}
+        </Section>
+        <Section title="意图规划"><p className="small-muted">规划检查通过只表示提案可追溯、结构可检验；业务成果另行验收。</p>
+          {planningTasks.length ? planningTasks.map(task => <Link key={task.id} className="record-row" to={`/p/${projectId}/tasks/${task.id}`} navigate={navigate}>
+            <strong>{goals.find(goal => goal.id === task.goal_id)?.original_intent || task.title}</strong>
+            <span>{task.status === 'ACCEPTED' ? '规划提案检查通过' : taskLabels[task.status] || task.status}</span><small>查看提案、执行与独立检查 →</small>
+          </Link>) : <Empty>提交一句想法即可开始。</Empty>}
+        </Section>
+      </div>
+      <aside className="browser-inspector" aria-label="项目上下文与结果">
+        <Section title="下一步">{pendingResources.length ? <Link to={`/p/${projectId}/resources`} navigate={navigate}>查看 {pendingResources.length} 项待处理资源请求 →</Link> :
+          <p>查看当前任务、来源覆盖和待评审结果，按服务端回执推进。</p>}</Section>
+        <Section title="项目状态"><dl className="workbench-facts">
+          <div><dt>业务已验收</dt><dd>{businessTasks.filter(task => task.status === 'ACCEPTED').length} / {businessTasks.length}</dd></div>
+          <div><dt>待评审</dt><dd>{businessTasks.filter(task => ['EXECUTION_REPORTED', 'VERIFYING'].includes(task.status)).length}</dd></div>
+          <div><dt>{state?.active_cycle_id ? '当前周期' : '最近周期'}</dt><dd>{active ? `${active.status} · ${briefDate(active.started_at)}` : '尚未开始'}</dd></div>
+        </dl><p className="small-muted">执行结果不等于业务验收。</p></Section>
+        <Section title="来源覆盖">{active?.source_coverage?.length ? active.source_coverage.map(coverage => <div className="coverage-row" key={coverage.source_id}>
+          <span>{short(coverage.source_id)}</span><Tag value={coverage.status}/><small>{coverage.gap_reason || `${coverage.record_count} 条记录`}</small>
+        </div>) : <Empty>尚无活动研究周期。</Empty>}</Section>
+        <Section title="最近成果">{release ? <Link to={`/p/${projectId}/releases/${release.id}`} navigate={navigate} className="feature-link">
+          <strong>{release.summary}</strong><span>里程碑 {release.sequence} · {briefDate(release.created_at)}</span>
+        </Link> : <Empty>还没有已验收成果。执行结果提交后仍需独立验收。</Empty>}</Section>
+      </aside>
+    </div>
+  </>
 }
 
 function Cycle({ route, api, navigate, refresh, onRefresh }) {

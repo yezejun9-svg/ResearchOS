@@ -2,9 +2,13 @@ import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { integer, previous, display } from '../../desktop/main/lib/wire-values.mjs'
 import { ArtifactPreview } from './preview.jsx'
 import { SessionContinuation } from './session-continuation.jsx'
+import { WorkbenchLayout } from './components/workbench-layout.jsx'
 
 const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
 const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
+const sessionStates = { WAITING: '等待消息', QUEUED: '排队中', STARTING: '启动中', RUNNING: '执行中', PAUSED: '已暂停', SETTLED: '执行已结束', COMPLETED: '已结束', FAILED: '执行失败', CANCELLED: '已取消', RECONCILING: '恢复核对中' }
+const configurationStates = { NOT_REQUESTED: '尚未发起请求', AWAITING_CONFIRMATION: '等待明确确认', AWAITING_CODING_CONFIRMATION: '等待明确确认', QUALIFIED_PURPOSE_AUTHORIZED: '用途授权已核对', CODING_CONFIGURED: '编码配置已保存，运行资格待核对', HOST_UNAVAILABLE: '本机主机不可核对', CONTEXT_CHANGED_PENDING: '会话已变化，需复核原请求', EXPIRED: '原请求已过期', CURRENT_RECHECK_REQUIRED: '当前状态待复核', FAILED: '未通过', REGISTERED: '已登记，资格待核对' }
+const statusLabel = (value, dictionary, fallback) => value ? dictionary[value] || '状态待核对' : fallback
 const settled = value => value?.completed === true && (value?.protocol_status || value?.kind) === 'COMPLETED'
 const sameConfiguration = (value, request) => !!value?.model_config_ref &&
   ['config_revision', 'provider_id', 'base_url', 'model_id', 'credential_ref'].every(key => value[key] === request[key])
@@ -230,8 +234,9 @@ export function DesktopQualification({ projectId, sessionId }) {
   const pending = state?.state === 'AWAITING_CONFIRMATION' && !state?.consumed &&
     Date.parse(state?.expires_at) > Date.now()
   return <Panel title="本地模型运行资格">
-    <p>先打开会话并取得写入权，再准备当前会话的模型资格确认。准备阶段不会调用模型。</p>
-    <p className="small-muted">确认后最多调用模型 1 次，工具 0 个，用途仅为 mu_turn（600 秒）；费用依据 UNKNOWN，金额无法预估。确认可能消耗一次性请求，失败或超时后请用“复核原请求”查询，不要重复确认。</p>
+    <p>{!sessionId ? '尚未打开会话，请先选择或创建会话。' : state && !state.available ? '当前资格请求不可操作，请查看状态并复核原请求。' : '当前会话可准备模型资格请求；准备阶段不会调用模型。'}</p>
+    <p className="small-muted">明确确认后最多调用本地模型 1 次；费用未知。</p>
+    <details className="raw-details"><summary>查看用途、限制与失败后的处理</summary><p>工具调用 0 次，用途仅为 mu_turn（600 秒）。金额无法预估。确认可能消耗一次性请求；失败或超时后请复核原请求，不要重复确认。</p></details>
     {state?.model && <p>当前待确认模型：{state.model.provider_id} · {state.model.model_id}</p>}
     {state?.request_id && <p className="break-all">原请求：{state.request_id}；有效至 {state.expires_at || '未知'}</p>}
     {state?.previous_request_id && <p className="break-all small-muted">已退役的过期原请求：{state.previous_request_id}；过期于 {state.previous_expires_at || '未知'}。该记录仅供审计，不代表当前资格。</p>}
@@ -242,7 +247,8 @@ export function DesktopQualification({ projectId, sessionId }) {
       state?.state === 'QUALIFIED_PURPOSE_AUTHORIZED' ? '保留上次用途授权结果；当前授权尚未确认，请复核原请求。' :
       state?.state === 'HOST_UNAVAILABLE' ? '本机主机身份已变化或无法确认；旧请求仅作历史记录，当前不可用。' :
       state?.state === 'CONTEXT_CHANGED_PENDING' ? '项目或会话已变更，原请求保留，当前不可确认。' :
-      state?.state || '正在读取托管状态'}{state?.reason ? ` · ${state.reason}` : ''}</p>
+      statusLabel(state?.state, configurationStates, '正在读取资格状态')}{state?.reason ? ` · ${state.reason}` : ''}</p>
+    {state?.state && <details className="raw-details"><summary>原始状态</summary><code>{state.state}</code></details>}
     <div className="button-row">
       <button disabled={!!busy || !state?.available || !sessionId ||
         (!!state?.request_id && !(state?.state === 'EXPIRED' && !state?.consumed))}
@@ -345,6 +351,7 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured 
     Date.parse(state.expires_at) > Date.now()
   return <Panel title="显式工作区编码授权">
     <p>选择当前会话的可读、可写相对文件和离线 Go 检查。准备只冻结文件与检查计划；明确确认才写入新的模型配置，期间模型调用为 0。</p>
+    <details className="setup-disclosure"><summary>编辑授权范围与离线检查</summary>
     <div className="button-row"><button disabled={!!busy || !sessionId} onClick={() => pick('toolchain')}>选择 Go 工具链目录</button>
       <span>{toolchain || '尚未选择'}</span><button disabled={!!busy || !sessionId} onClick={() => pick('vendor')}>选择离线 vendor（可选）</button><span>{vendor || '未选择'}</span></div>
     <label>可读相对路径（每行一个）<textarea value={readPaths} onChange={event => setReadPaths(event.target.value)}/></label>
@@ -362,6 +369,7 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured 
       <label>进程上限<input type="number" value={limits.process_limit} onChange={setLimit('process_limit')}/></label>
       <label>内存上限（MiB）<input type="number" value={limits.memory_mib} onChange={setLimit('memory_mib')}/></label>
       <label>输出上限（字节）<input type="number" value={limits.max_text_bytes} onChange={setLimit('max_text_bytes')}/></label></div>
+    </details>
     {state?.scope && <div><h3>本次冻结摘要</h3><p>可读：{state.scope.read_paths.join('、')}；可写：{state.scope.write_paths.join('、')}</p>
       <p>检查：{state.scope.checks.map(check => `${check.id} ${check.package} ${check.test_pattern}（${check.source_paths.join('、')}）`).join('；')}</p>
       <p>限制：读取 {state.scope.max_read_bytes} 字节/文件，写入 {state.scope.max_write_bytes} 字节/文件，
@@ -371,7 +379,8 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured 
         Go 工具链{check.toolchain_selected ? '已选' : '未选'}，离线 vendor {check.vendor_selected ? '已选' : '未选'}。</p>)}
       <p>最多 8 次普通模型调用；资格验证最多 1 次模型调用、0 次工具调用。当前模型调用：{state.model_calls}。</p>
       <p>截止：{state.expires_at || '未知'}；冻结检查摘要：{state.frozen_checks?.map(check => check.id).join('、') || '无'}。</p></div>}
-    <p role="status">{state?.state || '正在读取编码授权状态'}{state?.reason ? ` · ${state.reason}` : ''}</p>
+    <p role="status">{statusLabel(state?.state, configurationStates, '正在读取编码授权状态')}{state?.reason ? ` · ${state.reason}` : ''}</p>
+    {state?.state && <details className="raw-details"><summary>原始状态</summary><code>{state.state}</code></details>}
     <div className="button-row"><button disabled={!!busy || !state?.available || !sessionId || !toolchain ||
       (!!state?.scope && !(state?.state === 'EXPIRED' && !state?.consumed))}
       onClick={() => action('准备', 'codingPrepare', intent())}>准备并冻结</button>
@@ -528,11 +537,8 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
     {!online && <p className="connection-banner" role="status">已离线，显示最后读取的会话；重新连接后核对最新状态。</p>}
     {state.loading && <div className="loading-state" role="status" aria-busy="true">正在读取本机会话…</div>}
     {!state.loading && state.host && !state.host.model_configurations?.length && <NativeModelConfiguration projectId={projectId} initialHost={state.host} onConfigured={(host, configured) => { setState(old => ({ ...old, host })); setModel(configured.model_config_ref); setNotice(`配置已保存（修订 ${configured.config_revision}）；运行时资格仍待验证。`) }} />}
-    <DesktopQualification key={`${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId} sessionId={state.snapshot?.session_id || null}/>
-    <DesktopCodingAuthorization key={`coding:${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId}
-      sessionId={state.snapshot?.session_id || null} onConfigured={reconcileCodingCommit}/>
-    <div className="session-layout">
-      <Panel title="项目会话"><ul className="session-picker">{state.sessions.map(item => <li key={item.session_id}><button aria-current={snapshot?.session_id === item.session_id ? 'page' : undefined} disabled={disabled} onClick={() => open(item.session_id)}>{item.title || '未命名会话'}<small>{item.run_status || (item.archived_at ? '已归档' : '等待消息')}</small></button></li>)}</ul>
+    <WorkbenchLayout sessions={<>
+      <Panel title="项目会话"><ul className="session-picker">{state.sessions.map(item => <li key={item.session_id}><button aria-current={snapshot?.session_id === item.session_id ? 'page' : undefined} disabled={disabled} onClick={() => open(item.session_id)}>{item.title || '未命名会话'}<small title={item.run_status ? `原始状态：${item.run_status}` : undefined}>{item.archived_at ? '已归档' : statusLabel(item.run_status, sessionStates, '等待消息')}</small></button></li>)}</ul>
         {state.nextCursor && <button disabled={disabled} onClick={moreSessions}>加载更多会话</button>}
         {!state.sessions.length && !state.loading && <p className="empty-state">{state.error ? '会话列表尚未读取，请恢复连接或权限后重试。' : '还没有会话，选择已配置模型后开始。'}</p>}
         <details><summary>新建会话</summary><label>名称<input value={title} onChange={event => setTitle(event.target.value)}/></label>
@@ -540,8 +546,8 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
           <label>模型<select value={model} onChange={event => setModel(event.target.value)}><option value="">选择配置记录（资格未确认）</option>{(state.host?.model_configurations || []).map(item => <option key={item.model_config_ref} value={item.model_config_ref}>{item.provider_id} · {item.model_id}</option>)}</select></label>
           {!state.host?.model_configurations?.length ? <p>还没有模型配置，请先使用上方表单或项目设置保存。</p> : <p className="small-muted">配置记录不代表运行时已具备资格；创建会话时由服务端检查。</p>}<button disabled={disabled || !workspace || !model} onClick={create}>创建会话</button></details>
       </Panel>
-      <div className="session-center"><Panel title={snapshot?.title || '开始协作'} aside={snapshot && <span className="tag">{snapshot.run_status || '等待消息'}</span>}>
-        {snapshot ? <><div className="button-row"><button disabled={disabled || writer} onClick={() => command('接管写入', async () => { unwrap(await window.researchos.v2['session.attach']({ after_sequence: snapshot.event_sequence, request_write_owner: true })); await readSnapshot(); composer.current?.focus() })}>{writer ? '当前可写' : '在此继续'}</button>
+    </>} conversation={<div className="session-center"><Panel title={snapshot?.title || '开始协作'} aside={snapshot && <span className="tag" title={snapshot.run_status ? `原始状态：${snapshot.run_status}` : undefined}>{statusLabel(snapshot.run_status, sessionStates, '等待消息')}</span>}>
+        {snapshot ? <><div className="button-row">{writer ? <span className="tag good" role="status">当前可写</span> : <button disabled={disabled} onClick={() => command('接管写入', async () => { unwrap(await window.researchos.v2['session.attach']({ after_sequence: snapshot.event_sequence, request_write_owner: true })); await readSnapshot(); composer.current?.focus() })}>在此继续</button>}
           {['PAUSE', 'RESUME', 'CANCEL'].map((action, index) => <button key={action} disabled={disabled || !writer || (action !== 'RESUME' && !snapshot.active_run_id)} onClick={() => command(action, async () => { unwrap(await window.researchos.v2['session.control']({ action, target_id: action === 'RESUME' ? snapshot.session_id : snapshot.active_run_id, reason: '用户从桌面会话操作' })); await readSnapshot() })}>{['暂停', '恢复', '取消'][index]}</button>)}</div>
           {snapshot.resume_requires_explicit_user && <p className="callout">会话等待明确恢复。查看上次结果后再继续。</p>}
           <div className="conversation-transcript" aria-label="会话记录">{(snapshot.messages || []).map(message => <article className={`conversation-message role-${message.role.toLowerCase()}`} key={message.message_id}><h3>{labels[message.role] || message.role}</h3><div className="message-text">{(message.parts || []).map(part => part.text).join('')}</div>{!message.complete && <small>正在接收…</small>}</article>)}{!snapshot.messages?.length && <p className="empty-state">发送第一条消息，说明希望完成的事。</p>}</div>
@@ -559,9 +565,12 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
       {snapshot?.project_id === projectId && <SessionContinuation key={`${projectId}:${snapshot.session_id}:${snapshot.goal_id || ''}:${snapshot.revision}`} api={api} projectId={projectId} snapshot={snapshot} navigate={navigate}/>}
       {tools.length > 0 && <Panel title="工具与结果"><ol className="event-list">{tools.map(event => <li key={event.event_id}><strong>{event.kind === 'TOOL_STARTED' ? '开始工具' : event.kind === 'TOOL_RESULT' ? '工具结果' : event.kind}</strong><span>{event.payload?.tool_name || event.payload?.summary || event.payload?.message || ''}</span><details><summary>查看完整回执</summary><pre>{display(event.payload)}</pre></details></li>)}</ol></Panel>}
       {(snapshot?.pending_permissions || []).map(prompt => <PermissionDecision key={prompt.request.id} prompt={prompt} api={api} projectId={projectId} disabled={disabled || !writer} respond={decision => command('处理授权', async () => { unwrap(await window.researchos.v2['permission.respond']({ resource_request_id: prompt.request.id, resource_request_revision: prompt.request.revision, action_digest: prompt.action_digest, decision, reason: '用户在桌面明确选择' })); await readSnapshot() })}/>)}
-      </div>
-    </div>
-    {snapshot && <WorkspaceFiles snapshot={snapshot} api={api} projectId={projectId} writer={writer} disabled={disabled} command={command} readSnapshot={readSnapshot} setAttachment={setAttachment} selectedFile={selectedFile} setSelectedFile={setSelectedFile} setFileDirty={setFileDirty}/>}
+      </div>} context={<>
+      {snapshot && <WorkspaceFiles snapshot={snapshot} api={api} projectId={projectId} writer={writer} disabled={disabled} command={command} readSnapshot={readSnapshot} setAttachment={setAttachment} selectedFile={selectedFile} setSelectedFile={setSelectedFile} setFileDirty={setFileDirty}/>}
+      <DesktopQualification key={`${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId} sessionId={state.snapshot?.session_id || null}/>
+      <DesktopCodingAuthorization key={`coding:${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId}
+        sessionId={state.snapshot?.session_id || null} onConfigured={reconcileCodingCommit}/>
+    </>}/>
   </>
 }
 
