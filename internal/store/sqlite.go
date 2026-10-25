@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"researchos.local/research-os/internal/qualificationmaintenancejournal"
 	_ "modernc.org/sqlite"
 )
 
@@ -17,6 +18,9 @@ func Open(path string) (*sql.DB, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
+	}
+	if err := qualificationmaintenancejournal.CheckOrdinary(filepath.Dir(abs)); err != nil {
+		return nil, fmt.Errorf("maintenance journal blocks store.Open: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0700); err != nil {
 		return nil, err

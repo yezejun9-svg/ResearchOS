@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 	"unsafe"
@@ -614,7 +615,29 @@ func RuntimeVerifierReplacement(ctx context.Context, in RuntimeVerifierReplaceme
 		return out, e
 	}
 	defer windows.CloseHandle(dbGuard)
-	lease, e := rt.AcquireDataRootLease(in.DataRoot)
+	var p replacementPlan
+	var raw []byte
+	ownInspection := false
+	if in.Action == "commit" || in.Action == "recover" {
+		p, raw, e = replacementLoadPlan(in.Plan, in.ExpectPlanSHA256)
+		if e != nil {
+			return out, e
+		}
+		if p.DataRoot != in.DataRoot {
+			return out, errors.New("plan root differs")
+		}
+		_, statErr := os.Lstat(filepath.Join(p.HostPath, replacementJournal, p.OperationID))
+		if statErr != nil && !os.IsNotExist(statErr) {
+			return out, statErr
+		}
+		ownInspection = in.Action == "recover" || statErr == nil
+	}
+	var lease *rt.DataRootLease
+	if ownInspection {
+		lease, e = rt.AcquireDataRootLeaseForReplacementRecovery(in.DataRoot, p.OperationID, in.ExpectPlanSHA256, raw)
+	} else {
+		lease, e = rt.AcquireDataRootLease(in.DataRoot)
+	}
 	if e != nil {
 		return out, e
 	}
@@ -659,12 +682,9 @@ func RuntimeVerifierReplacement(ctx context.Context, in RuntimeVerifierReplaceme
 	if in.Action != "commit" && in.Action != "recover" {
 		return out, errors.New("unknown replacement action")
 	}
-	p, raw, e := replacementLoadPlan(in.Plan, in.ExpectPlanSHA256)
-	if e != nil {
-		return out, e
-	}
-	if p.DataRoot != in.DataRoot {
-		return out, errors.New("plan root differs")
+	freshPlan, freshRaw, e := replacementLoadPlan(in.Plan, in.ExpectPlanSHA256)
+	if e != nil || !bytes.Equal(raw, freshRaw) || !reflect.DeepEqual(p, freshPlan) {
+		return out, errors.New("replacement plan changed across lease acquisition")
 	}
 	out = replacementResult(in.Action, p, in.ExpectPlanSHA256, "REJECTED", "NOT_APPLIED")
 	if _, existing := os.Lstat(filepath.Join(p.HostPath, replacementJournal, p.OperationID)); in.Action == "recover" || existing == nil {

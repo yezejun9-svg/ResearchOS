@@ -52,20 +52,13 @@ type LocalUpgradeOptions struct {
 	SourceRoot, TargetRoot                 string
 	SourceProgram, TargetProgram           string
 	Plan                                   string
+	sourceLease                            *backupSourceLease
 }
 
 // Public callers cannot replace the concrete authenticated LIVE service with a
 // JSON declaration, environment switch, fake Provider, or an arbitrary callback.
 func UpgradeLocal(ctx context.Context, opt LocalUpgradeOptions) (RestoreReport, error) {
-	return upgradeLocal(ctx, opt, upgradeVerifier{
-		provider: &protectedstore.FrozenProvider{},
-		summary: func(ctx context.Context) (protectedstore.SafeSummary, error) {
-			if e := ctx.Err(); e != nil {
-				return protectedstore.SafeSummary{}, e
-			}
-			return protectedstore.QueryFrozenService("aggregate")
-		},
-	})
+	return RestoreReport{Status: "FAILED"}, fmt.Errorf("UPGRADE_SOURCE_LEASE_REQUIRED")
 }
 
 type upgradeVerifier struct {
@@ -151,6 +144,11 @@ func upgradePaths(opt *LocalUpgradeOptions) error {
 	for i := 1; i < len(infos); i++ {
 		if os.SameFile(infos[0], infos[i]) || (i > 1 && os.SameFile(infos[1], infos[i])) {
 			return fmt.Errorf("UPGRADE_FILE_ALIAS")
+		}
+	}
+	if opt.sourceLease != nil {
+		if err := opt.sourceLease.Check(filepath.Dir(opt.Source), opt.Source); err != nil {
+			return err
 		}
 	}
 	return nil

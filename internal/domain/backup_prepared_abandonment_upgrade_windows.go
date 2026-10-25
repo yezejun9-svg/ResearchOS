@@ -18,21 +18,33 @@ import (
     "researchos.local/research-os/internal/recoveryauthority"
 )
 
-type preparedUpgradeRootLease struct { native *runtimeadapter.DataRootLease }
+type preparedUpgradeRootLease struct {
+    native *runtimeadapter.DataRootLease
+    inherited *backupSourceLease
+    root, source string
+    closed bool
+}
 
-func acquirePreparedUpgradeRootLease(root string) (*preparedUpgradeRootLease, error) {
+func acquirePreparedUpgradeRootLease(root, source string, inherited *backupSourceLease) (*preparedUpgradeRootLease, error) {
+    if inherited != nil {
+        if err := inherited.Check(root, source); err != nil { return nil, err }
+        return &preparedUpgradeRootLease{inherited: inherited, root: root, source: source}, nil
+    }
     lease, err := runtimeadapter.AcquireDataRootLease(root)
     if err != nil { return nil, err }
     return &preparedUpgradeRootLease{native: lease}, nil
 }
 func (l *preparedUpgradeRootLease) Check() error {
-    if l == nil || l.native == nil || !l.native.Held() {
-        return fmt.Errorf("PREPARED_UPGRADE_DATA_ROOT_LEASE_REQUIRED")
-    }
+    if l == nil || l.closed { return fmt.Errorf("PREPARED_UPGRADE_DATA_ROOT_LEASE_REQUIRED") }
+    if l.inherited != nil { return l.inherited.Check(l.root, l.source) }
+    if l.native == nil || !l.native.Held() { return fmt.Errorf("PREPARED_UPGRADE_DATA_ROOT_LEASE_REQUIRED") }
     return nil
 }
 func (l *preparedUpgradeRootLease) Close() error {
-    if l == nil { return nil }
+    if l == nil || l.closed { return nil }
+    l.closed = true
+    if l.inherited != nil { return nil }
+    if l.native == nil { return fmt.Errorf("PREPARED_UPGRADE_DATA_ROOT_LEASE_REQUIRED") }
     return l.native.Close()
 }
 

@@ -14,6 +14,7 @@ import (
 
 	"researchos.local/research-os/evaluation/evolution"
 	"researchos.local/research-os/internal/domain"
+	"researchos.local/research-os/internal/qualificationmaintenancejournal"
 	"researchos.local/research-os/internal/store"
 )
 
@@ -80,6 +81,10 @@ func replayOutputLease(data string) (*os.File, error) {
 	}
 	h, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
 	if err != nil {
+		return nil, err
+	}
+	if err := qualificationmaintenancejournal.CheckOrdinary(data); err != nil {
+		windows.CloseHandle(h)
 		return nil, err
 	}
 	return os.NewFile(uintptr(h), path), nil

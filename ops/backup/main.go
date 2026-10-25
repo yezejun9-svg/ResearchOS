@@ -23,7 +23,7 @@ func main() {
 		os.Exit(1)
 	}
 }
-func run() error {
+func run() (runErr error) {
 	if len(os.Args) < 2 {
 		return fmt.Errorf("usage: backup keygen|create|export|restore|upgrade-local|upgrade-prepared-backup [flags]")
 	}
@@ -39,8 +39,8 @@ func run() error {
 	sourceProgram := f.String("source-program", "", "upgrade: preserved matching old program")
 	targetProgram := f.String("target-program", "", "upgrade: reviewed target program")
 	plan := f.String("plan", "", "upgrade: schema13-to14-remote-access-v1 or schema13-to20-research-runtime-v1 (exact releases only)")
-    handoffBinding := f.String("handoff-binding", "", "upgrade-prepared-backup: externally reviewed and pinned producer binding")
-    handoffSHA256 := f.String("handoff-binding-sha256", "", "upgrade-prepared-backup: expected sha256: digest of binding")
+	handoffBinding := f.String("handoff-binding", "", "upgrade-prepared-backup: externally reviewed and pinned producer binding")
+	handoffSHA256 := f.String("handoff-binding-sha256", "", "upgrade-prepared-backup: expected sha256: digest of binding")
 	if e := f.Parse(os.Args[2:]); e != nil {
 		return e
 	}
@@ -75,20 +75,38 @@ func run() error {
 	if *out == "" {
 		return fmt.Errorf("--out required")
 	}
-    if command == "upgrade-prepared-backup" {
-        r, e := domain.UpgradePreparedAbandonmentBackup(context.Background(), domain.PreparedBackupHandoffOptions{
-            Upgrade: domain.LocalUpgradeOptions{
-                Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
-                SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
-                TargetProgram: *targetProgram, Plan: *plan,
-            },
-            BindingFile: *handoffBinding, BindingSHA256: *handoffSHA256,
-        })
-        if e != nil { return e }
-        return json.NewEncoder(os.Stdout).Encode(r)
-    }
+	var sourceOwner *backupSourceOwner
+	if command != "restore" {
+		if *source == "" {
+			return fmt.Errorf("--db required")
+		}
+		var err error
+		sourceOwner, err = openBackupSourceLease(*source)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if closeErr := sourceOwner.Close(); runErr == nil && closeErr != nil {
+				runErr = closeErr
+			}
+		}()
+	}
+	if command == "upgrade-prepared-backup" {
+		r, e := sourceOwner.UpgradePrepared(context.Background(), domain.PreparedBackupHandoffOptions{
+			Upgrade: domain.LocalUpgradeOptions{
+				Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
+				SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
+				TargetProgram: *targetProgram, Plan: *plan,
+			},
+			BindingFile: *handoffBinding, BindingSHA256: *handoffSHA256,
+		})
+		if e != nil {
+			return e
+		}
+		return json.NewEncoder(os.Stdout).Encode(r)
+	}
 	if command == "upgrade-local" {
-		r, e := domain.UpgradeLocal(context.Background(), domain.LocalUpgradeOptions{
+		r, e := sourceOwner.UpgradeLocal(context.Background(), domain.LocalUpgradeOptions{
 			Source: *source, Snapshot: *backup, Destination: *out, KeyFile: *keyfile,
 			SourceRoot: *sourceRoot, TargetRoot: *root, SourceProgram: *sourceProgram,
 			TargetProgram: *targetProgram, Plan: *plan,

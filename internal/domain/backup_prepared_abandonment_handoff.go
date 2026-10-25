@@ -169,7 +169,7 @@ func preparedHandoffVerifyBackup(opt LocalUpgradeOptions, key []byte, b prepared
 // Separate public entry point. Its report is not a Native MigrationToken and
 // the receipt filename is intentionally not the original-apply receipt name.
 func UpgradePreparedAbandonmentBackup(ctx context.Context, handoff PreparedBackupHandoffOptions) (RestoreReport, error) {
-    return upgradePreparedAbandonmentBackup(ctx, handoff, preparedUpgradeConcreteVerifier())
+    return RestoreReport{Status: "FAILED"}, fmt.Errorf("UPGRADE_SOURCE_LEASE_REQUIRED")
 }
 
 
@@ -178,7 +178,10 @@ func upgradePreparedAbandonmentBackup(ctx context.Context, handoff PreparedBacku
     report = RestoreReport{Started: Now(), Status: "FAILED"}
     if opt.Plan != PreparedAbandonmentSchemaUpgradePlan { return report, fmt.Errorf("PREPARED_UPGRADE_PLAN_UNSUPPORTED") }
     if err := preparedHandoffPaths(&opt, &handoff); err != nil { return report, err }
-    lease, err := acquirePreparedUpgradeRootLease(filepath.Dir(opt.Source))
+    if opt.sourceLease != nil {
+        if err := opt.sourceLease.Check(filepath.Dir(opt.Source), opt.Source); err != nil { return report, err }
+    }
+    lease, err := acquirePreparedUpgradeRootLease(filepath.Dir(opt.Source), opt.Source, opt.sourceLease)
     if err != nil { return report, err }
     defer func() {
         if closeErr := lease.Close(); closeErr != nil && err == nil { err = closeErr }

@@ -224,7 +224,10 @@ func TestRuntimeVerifierReplacementActualCLIAndStartup(t *testing.T) {
 		os.WriteFile(filepath.Join(web, "index.html"), []byte("fixture"), 0600)
 		before, _ := os.ReadFile(filepath.Join(root, "researchos.sqlite"))
 		out, code = run(t, base, []string{"RESEARCHOS_DATA_DIR=" + root, "RESEARCHOS_WEB_DIR=" + web})
-		if code == 0 || !bytes.Contains(out, []byte("runtime verifier replacement recovery required")) {
+		// The shared two-namespace reader now rejects the incomplete own
+		// inventory while acquiring the root lease, before the legacy Host
+		// startup gate is reached.
+		if code == 0 || !bytes.Contains(out, []byte("control data-root lease unavailable: replacement journal inventory bound")) {
 			t.Fatalf("actual main did not gate: exit=%d %s", code, out)
 		}
 		after, _ := os.ReadFile(filepath.Join(root, "researchos.sqlite"))

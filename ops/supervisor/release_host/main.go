@@ -10,9 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"researchos.local/research-os/adapters/protectedstore"
-	rt "researchos.local/research-os/adapters/runtime"
 	"researchos.local/research-os/internal/domain"
 	"researchos.local/research-os/internal/store"
 )
@@ -36,16 +34,16 @@ func run() error {
 	if *dbPath == "" || *contracts == "" || *migration == "" || *private == "" || *project == "" || *operation == "" {
 		return fmt.Errorf("R2_FIXTURE_ARGUMENTS_REQUIRED")
 	}
+	lease, err := openReleaseHostSourceLease(*dbPath)
+	if err != nil {
+		return fmt.Errorf("offline legacy fixture authority required: %w", err)
+	}
+	defer lease.Close()
 	protected, err := protectedstore.OpenCanary(*private)
 	if err != nil {
 		return err
 	}
 	defer protected.Close()
-	lease, err := rt.AcquireDataRootLease(filepath.Dir(*dbPath))
-	if err != nil {
-		return fmt.Errorf("offline legacy fixture authority required: %w", err)
-	}
-	defer lease.Close()
 	db, err := store.Open(*dbPath)
 	if err != nil {
 		return err

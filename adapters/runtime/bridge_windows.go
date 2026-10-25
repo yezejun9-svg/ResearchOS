@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"researchos.local/research-os/internal/canonical"
+	"researchos.local/research-os/internal/qualificationmaintenancejournal"
 	sandbox "researchos.local/research-os/ops/experiment_sandbox"
 )
 
@@ -163,18 +164,31 @@ func canonicalHash(raw []byte) (string, error) {
 // LockDataRoot is held for the complete control coordinator lifetime. It uses
 // an OS-exclusive non-inherited handle, not the SQLite connection count.
 func LockDataRoot(directory string) (*os.File, error) {
-	abs, e := filepath.Abs(directory)
+	f, actual, e := lockDataRootRaw(directory)
 	if e != nil {
 		return nil, e
 	}
-	if e = os.MkdirAll(abs, 0700); e != nil {
+	if e := qualificationmaintenancejournal.CheckOrdinary(actual); e != nil {
+		_ = f.Close()
 		return nil, e
+	}
+	return f, nil
+}
+
+func lockDataRootRaw(directory string) (*os.File, string, error) {
+	abs, e := filepath.Abs(directory)
+	if e != nil {
+		return nil, "", e
+	}
+	if e = os.MkdirAll(abs, 0700); e != nil {
+		return nil, "", e
 	}
 	actual, e := filepath.EvalSymlinks(abs)
 	if e != nil || !strings.EqualFold(filepath.Clean(abs), filepath.Clean(actual)) {
-		return nil, errors.New("canonical non-reparse data root required")
+		return nil, "", errors.New("canonical non-reparse data root required")
 	}
-	return lockFile(filepath.Join(actual, "coordinator.lock"))
+	f, e := lockFile(filepath.Join(actual, "coordinator.lock"))
+	return f, actual, e
 }
 
 func (w *Bridge) persist() error {

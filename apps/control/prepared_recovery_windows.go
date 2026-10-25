@@ -15,6 +15,7 @@ import (
     "time"
 
     "researchos.local/research-os/internal/domain"
+    hostboundary "researchos.local/research-os/internal/host"
     "researchos.local/research-os/internal/recoveryauthority"
 )
 
@@ -29,6 +30,10 @@ func runPreparedRecoveryMaintenance(args []string) (bool,error) {
     token,ownerToken,err:=recoveryauthority.ReceiveInherited(ctx); if err!=nil { return true,err }
     defer token.Close()
     adoption,err:=token.Adoption(); if err!=nil { return true,err }
+    adoptionProof:=domain.Digest(domain.Bytes(adoption))
+    if err=token.Check(adoption.Root,adoption.Database,adoptionProof); err!=nil { return true,err }
+    if err=hostboundary.QualificationMaintenanceRootGate(adoption.Root); err!=nil { return true,err }
+    if err=token.Check(adoption.Root,adoption.Database,adoptionProof); err!=nil { return true,err }
     db,err:=openExclusiveRecoveryDB(ctx,adoption.Database); if err!=nil { return true,err }; defer db.Close()
     result,err:=domain.ExecutePreparedAbandonmentMaintenance(ctx,db,filepath.Join("spec","v2.0","contracts"),token,ownerToken)
     ownerToken=""
@@ -50,6 +55,9 @@ func openExclusiveRecoveryDB(ctx context.Context,path string) (*sql.DB,error) {
 func runPreparedSchemaMaintenance(ctx context.Context) error {
     token,ownerToken,err:=recoveryauthority.ReceiveMigrationInherited(ctx); if err!=nil { return err }; defer token.Close()
     binding,err:=token.Binding(); if err!=nil { return err }
+    if err=token.Check(binding); err!=nil { return err }
+    if err=hostboundary.QualificationMaintenanceRootGate(binding.Root); err!=nil { return err }
+    if err=token.Check(binding); err!=nil { return err }
     raw,err:=token.Options(); if err!=nil { return err }
     var opt domain.LocalUpgradeOptions
     decoder:=json.NewDecoder(bytes.NewReader(raw)); decoder.DisallowUnknownFields()

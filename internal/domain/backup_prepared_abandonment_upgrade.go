@@ -413,7 +413,7 @@ func upgradePreparedAbandonmentLocal(ctx context.Context, opt LocalUpgradeOption
     report = RestoreReport{Started: Now(), Status: "FAILED"}
     if opt.Plan != PreparedAbandonmentSchemaUpgradePlan { return report, fmt.Errorf("PREPARED_UPGRADE_PLAN_UNSUPPORTED") }
     if err := upgradePaths(&opt); err != nil { return report, err }
-    lease, err := acquirePreparedUpgradeRootLease(filepath.Dir(opt.Source))
+    lease, err := acquirePreparedUpgradeRootLease(filepath.Dir(opt.Source), opt.Source, opt.sourceLease)
     if err != nil { return report, err }
     defer func() {
         if closeErr := lease.Close(); closeErr != nil && err == nil { err = closeErr }
