@@ -5,6 +5,7 @@ package recoveryboundary
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -856,6 +857,9 @@ func tokenSecurityShape(token windows.Token, pid uint32, businessSID string) (bu
 	if err != nil || len(privBytes) < int(unsafe.Sizeof(windows.Tokenprivileges{})) {
 		return shape, errors.Join(err, errors.New("token privileges unavailable"))
 	}
+	if err = rejectFenceBypassPrivileges(privBytes); err != nil {
+		return shape, err
+	}
 	var privilegeLines []string
 	for _, priv := range (*windows.Tokenprivileges)(unsafe.Pointer(&privBytes[0])).AllPrivileges() {
 		privilegeLines = append(privilegeLines, fmt.Sprintf("%08x:%08x:%08x", uint32(priv.Luid.HighPart), priv.Luid.LowPart, priv.Attributes))
@@ -864,6 +868,39 @@ func tokenSecurityShape(token windows.Token, pid uint32, businessSID string) (bu
 	privJSON, _ := json.Marshal(privilegeLines)
 	shape = businessTokenShape{SessionID: session, ElevationType: elevation, IntegritySID: (*windows.Tokenmandatorylabel)(unsafe.Pointer(&labelBytes[0])).Label.Sid.String(), LogonSID: logonSID, PrivilegesSHA256: digest(privJSON), GroupsSHA256: groupSHA, EffectiveSIDs: effective}
 	return shape, nil
+}
+
+// This is admission for the native business token only. A privilege present
+// but disabled can be enabled later, so its Attributes cannot make it safe.
+// The management token's separate owner-restoration path is unaffected.
+func rejectFenceBypassPrivileges(raw []byte) error {
+	const countBytes = 4
+	if len(raw) < countBytes {
+		return errors.New("business token privilege inventory truncated")
+	}
+	count := binary.LittleEndian.Uint32(raw[:countBytes])
+	start := uint64(unsafe.Offsetof(windows.Tokenprivileges{}.Privileges))
+	stride := uint64(unsafe.Sizeof(windows.LUIDAndAttributes{}))
+	if start+uint64(count)*stride > uint64(len(raw)) {
+		return errors.New("business token privilege inventory length invalid")
+	}
+	privileges := (*windows.Tokenprivileges)(unsafe.Pointer(&raw[0])).AllPrivileges()
+	for _, name := range [...]string{"SeTakeOwnershipPrivilege", "SeRestorePrivilege", "SeBackupPrivilege"} {
+		namePtr, err := windows.UTF16PtrFromString(name)
+		if err != nil {
+			return err
+		}
+		var luid windows.LUID
+		if err := windows.LookupPrivilegeValue(nil, namePtr, &luid); err != nil {
+			return fmt.Errorf("business token privilege lookup %s: %w", name, err)
+		}
+		for _, privilege := range privileges {
+			if privilege.Luid == luid {
+				return fmt.Errorf("business token assigned fence-bypass privilege %s", name)
+			}
+		}
+	}
+	return nil
 }
 
 // Existing Explorer supplies a fresh business process token after restart.
