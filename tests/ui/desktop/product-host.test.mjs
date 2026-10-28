@@ -60,6 +60,33 @@ test('location-bound inventory and installation identity fail closed', t => {
   assert.throws(() => product.loadProductLayout(f.root), /PRODUCT_MANIFEST_INVALID/);
 });
 
+test('physical inventory treats an ASAR archive as a file and still detects tampering', t => {
+  const f = fixture(t);
+  const relative = 'runtime/electron/resources/default_app.asar';
+  const archive = path.join(f.root, ...relative.split('/'));
+  const bytes = Buffer.from('physical ASAR fixture bytes');
+  fs.mkdirSync(path.dirname(archive), { recursive: true });
+  fs.writeFileSync(archive, bytes);
+  f.marker.files.push({ path: relative, bytes: bytes.length, sha256: hash(bytes) });
+  f.marker.files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  f.marker.inventory_digest = product.inventoryIdentity(f.marker.files);
+  f.marker.installation_id = product.installationIdentity(f.marker);
+  fs.writeFileSync(path.join(f.root, 'installed-product.json'), JSON.stringify(f.marker));
+
+  const virtualFs = Object.create(fs);
+  virtualFs.lstatSync = file => file === archive
+    ? { isSymbolicLink: () => false, isFile: () => false, isDirectory: () => true }
+    : fs.lstatSync(file);
+  assert.throws(() => product.loadProductLayout(f.root, virtualFs), /PRODUCT_PATH_TYPE/);
+  assert.equal(product.loadProductLayout(f.root, fs).installID, f.marker.installation_id);
+  fs.writeFileSync(archive, 'tampered archive');
+  assert.throws(() => product.loadProductLayout(f.root, fs), /PRODUCT_FILE_CHANGED/);
+  fs.unlinkSync(archive);
+  assert.equal(fs.existsSync(archive), false);
+  fs.mkdirSync(archive);
+  assert.throws(() => product.loadProductLayout(f.root, fs), /PRODUCT_PATH_TYPE/);
+});
+
 test('generated tree refuses a removed marker while a development tree remains unmarked', t => {
   const f = fixture(t);
   fs.mkdirSync(path.join(f.root, 'runtime', 'electron'));
