@@ -194,7 +194,7 @@ func newV2Context(name string, args []string, cfg cliConfig, baseURL string) *v2
 	if credential == "" {
 		if d, _, err := hostDiscovery(); err == nil && d.URL == baseURL {
 			credential, _ = cliSessionCredential(d)
-			if credential == "" && cfg.ProjectID != "" && cfg.WorkspaceRef != "" {
+			if credential == "" && (productInstalled() || cfg.ProjectID != "" && cfg.WorkspaceRef != "") && name != "doctor" {
 				credential, _ = cliInitCredential(d, cliEnv("RESEARCHOS_CLI_CLIENT_ID", defaultClientID()))
 			}
 		}
@@ -227,10 +227,19 @@ func cliInteractive(args []string) {
 	if err != nil || d.URL == "" {
 		fail("interactive", exitNotImplemented, "INTERACTIVE_HOST_UNAVAILABLE", path)
 	}
-	cfg, _ := readConfig()
+	cfg, cfgErr := readConfig()
+	if productInstalled() && cfgErr != nil && !os.IsNotExist(cfgErr) {
+		fail("interactive", exitFailed, "CONFIG_UNREADABLE", cfgErr.Error())
+	}
 	c := newV2Context("interactive", args, cfg, d.URL)
 	if c.credential == "" {
 		fail("interactive", exitNotImplemented, "CREDENTIAL_ABSENT")
+	}
+	if productInstalled() {
+		if reason := productInteractiveSelectionReason(cfg, c.projectID); reason != "" {
+			fail("interactive", exitUsage, reason,
+				"run researchos init <workspace-path> to select an owned project")
+		}
 	}
 	signals, stop := interruptGuard()
 	defer stop()
@@ -321,6 +330,10 @@ func cliInteractive(args []string) {
 				}
 			}
 			if name == "run" || name == "/run" {
+				if productInstalled() && c.sessionID == "" && cfg.Model == "" {
+					fail("interactive", exitUsage, "MODEL_CONFIGURATION_REQUIRED",
+						"save an offline model reference with researchos config set-model before creating a session")
+				}
 				prompt, _ := firstPositional(commandArgs)
 				if reason, code := cliInteractivePrepare(c, cfg, prompt, options, false); code != 0 {
 					out := map[string]any{"command": "interactive", "status": "REJECTED", "reason": reason, "exit_code": code, "requests_sent": c.requestLog}
@@ -335,6 +348,16 @@ func cliInteractive(args []string) {
 			}
 		}
 	}
+}
+
+func productInteractiveSelectionReason(cfg cliConfig, requestedProject string) string {
+	if cfg.ProjectID == "" || cfg.WorkspaceRef == "" {
+		return "PROJECT_SELECTION_REQUIRED"
+	}
+	if requestedProject != cfg.ProjectID {
+		return "PROJECT_SELECTION_CONFLICT"
+	}
+	return ""
 }
 
 // Opening a session is read-only. An explicit ordinary message may acquire an

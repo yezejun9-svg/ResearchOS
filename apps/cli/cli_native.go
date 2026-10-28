@@ -31,7 +31,7 @@ type cliNativeReply struct {
 func cliHostInstanceID(d discovery) (string, error) {
 	// Discovery is written by the local control process. Keep this field local to
 	// first-use until every older CLI call site has migrated to the new discovery.
-	raw, err := os.ReadFile(cliEnv("RESEARCHOS_CLI_DISCOVERY", discoveryPath))
+	raw, err := os.ReadFile(productDiscoveryFile())
 	if err != nil {
 		return "", err
 	}
@@ -89,7 +89,7 @@ func cliNativeRequest(d discovery, clientID, kind string, payload map[string]any
 	if err != nil {
 		return nil, err
 	}
-	raw, err := cliNativeDial(host.PipeName(id), frame)
+	raw, err := productNativeRequest(id, frame)
 	if err != nil {
 		return nil, err
 	}
@@ -114,6 +114,9 @@ func cliSessionCredential(d discovery) (string, error) {
 		return "", errors.New("HOST_DATA_DIR_ABSENT")
 	}
 	path := filepath.Join(d.DataDir, "host", "session.json")
+	if err := productGuardPath(path); err != nil {
+		return "", err
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		return "", err
@@ -146,8 +149,22 @@ func cliInitCredential(d discovery, clientID string) (string, error) {
 	if token, err := cliSessionCredential(d); err == nil {
 		return token, nil
 	}
-	if _, err := cliNativeRequest(d, clientID, host.KindUserBootstrapRequest, map[string]any{}); err != nil {
+	payload, err := cliNativeRequest(d, clientID, host.KindUserBootstrapRequest, map[string]any{})
+	if err != nil {
 		return "", err
+	}
+	if productInstalled() {
+		id, idErr := cliHostInstanceID(d)
+		var proof struct {
+			HostID            string `json:"host_instance_id"`
+			ClientID          string `json:"client_id"`
+			Protocol          string `json:"protocol_version"`
+			CredentialExposed bool   `json:"credential_exposed_to_renderer"`
+		}
+		if idErr != nil || json.Unmarshal(payload, &proof) != nil || proof.HostID != id ||
+			proof.ClientID != clientID || proof.Protocol != clientProtocol || proof.CredentialExposed {
+			return "", errors.New("PRODUCT_NATIVE_BOOTSTRAP_IDENTITY")
+		}
 	}
 	return cliSessionCredential(d)
 }

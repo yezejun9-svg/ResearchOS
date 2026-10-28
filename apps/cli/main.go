@@ -32,9 +32,23 @@ func main() {
 	if len(args) > 0 {
 		cmd = args[0]
 	}
+	rest := []string(nil)
+	if len(args) > 0 {
+		rest = args[1:]
+	}
+	if err := initProductLayout(); err != nil {
+		fail("startup", exitFailed, "PRODUCT_LAYOUT_INVALID", err.Error())
+	}
+	// A product CLI owns no scheduler. Host-bound commands first discover or
+	// start the same per-user Electron parent that owns Core's private pipe.
+	if requiresProductHost(cmd, rest...) {
+		if err := ensureProductHost(); err != nil {
+			fail(cmd, exitFailed, "PRODUCT_HOST_UNAVAILABLE", err.Error())
+		}
+	}
 	// The contract writes the interactive entry as `researchos [--project <path-or-id>]`, so an empty argv and a
 	// leading flag are the interactive command, not a help page. `chat` is not a contract command at all.
-	if cmd == "" || (strings.HasPrefix(cmd, "--") && cmd != "--version" && cmd != "--help") {
+	if cmd == "" || interactiveLeadingFlag(cmd) {
 		cliInteractive(args)
 		return
 	}
@@ -60,4 +74,32 @@ func main() {
 			"reason": "NOT_IMPLEMENTED", "detail": cmd + " is registered to a later card; no silent success"})
 		os.Exit(3)
 	}
+}
+
+func requiresProductHost(cmd string, rest ...string) bool {
+	if interactiveLeadingFlag(cmd) {
+		return true
+	}
+	switch cmd {
+	case "doctor", "version", "--version", "help", "--help", "/help", "commands":
+		return false
+	case "config":
+		return len(rest) > 0 && rest[0] == "set-model"
+	case "/model":
+		return true
+	}
+	if cmd == "" || cmd == "task" || cmd == "run" || cmd == "worker" {
+		return true
+	}
+	row, registered := contractCommands[cmd]
+	return registered && strings.Contains(row.needs, "host")
+}
+
+func interactiveLeadingFlag(cmd string) bool {
+	for _, name := range []string{"project", "session", "expected-revision", "writer-epoch"} {
+		if cmd == "--"+name || strings.HasPrefix(cmd, "--"+name+"=") {
+			return true
+		}
+	}
+	return false
 }
