@@ -296,6 +296,25 @@ func writeNew(path string, raw []byte) error {
 	return closeErr
 }
 
+// MoveFileW fails if target exists. os.Rename replaces an existing target on
+// Windows, so it cannot publish the marker under the create-new contract.
+func publishMarkerNoReplace(temp, target string, beforeMove func() error) error {
+	if beforeMove != nil {
+		if err := beforeMove(); err != nil {
+			return err
+		}
+	}
+	from, err := syscall.UTF16PtrFromString(temp)
+	if err != nil {
+		return err
+	}
+	to, err := syscall.UTF16PtrFromString(target)
+	if err != nil {
+		return err
+	}
+	return syscall.MoveFile(from, to)
+}
+
 func finalize(root, manifest string, bound string) (string, error) {
 	raw, err := os.ReadFile(manifest)
 	if err != nil {
@@ -349,13 +368,7 @@ func finalize(root, manifest string, bound string) (string, error) {
 	if err = writeNew(temp, markerRaw); err != nil {
 		return "", err
 	}
-	if _, err = os.Lstat(filepath.Join(root, markerPath)); err == nil {
-		return "", errors.New("product marker already exists")
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return "", err
-	}
-	if err = os.Rename(temp, filepath.Join(root, markerPath)); err != nil {
+	if err = publishMarkerNoReplace(temp, filepath.Join(root, markerPath), nil); err != nil {
 		return "", err
 	}
 	return marker["installation_id"].(string), nil

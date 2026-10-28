@@ -225,3 +225,46 @@ func TestRejectJunctionDirectory(t *testing.T) {
 		t.Fatal("junction directory accepted")
 	}
 }
+
+func TestPublishMarkerNoReplace(t *testing.T) {
+	for _, scenario := range []string{"success", "preexisting", "appears-before-commit"} {
+		t.Run(scenario, func(t *testing.T) {
+			root := t.TempDir()
+			temp := filepath.Join(root, ".installed-product.json.tmp")
+			target := filepath.Join(root, markerPath)
+			if err := writeNew(temp, []byte("new marker")); err != nil {
+				t.Fatal(err)
+			}
+			var hook func() error
+			if scenario == "preexisting" {
+				if err := writeNew(target, []byte("owned sentinel")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "appears-before-commit" {
+				hook = func() error { return writeNew(target, []byte("racing sentinel")) }
+			}
+			err := publishMarkerNoReplace(temp, target, hook)
+			actual, readErr := os.ReadFile(target)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if scenario == "success" {
+				if err != nil || string(actual) != "new marker" {
+					t.Fatalf("publication failed: %v, %q", err, actual)
+				}
+				if _, statErr := os.Stat(temp); !os.IsNotExist(statErr) {
+					t.Fatal("temp marker not consumed")
+				}
+				return
+			}
+			want := "owned sentinel"
+			if scenario == "appears-before-commit" {
+				want = "racing sentinel"
+			}
+			if err == nil || string(actual) != want {
+				t.Fatalf("target clobbered: %v, %q", err, actual)
+			}
+		})
+	}
+}

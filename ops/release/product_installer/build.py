@@ -21,6 +21,8 @@ SOURCE_COMMIT = "5c4c94022bd92da68ef544f2779527bfe065c428"
 VERIFIER_PATH = "apps/desktop/resources/control/runtime-verifier-installation.json"
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 ROLES = ("cli", "control", "electron", "verifier", "validator")
+REVISION_SCOPE = Path(r"D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\resume_cp528_codex\20261025-current-chat\continuation-cp570\Installer-P1a-exact4-revision-scope.json")
+REVISION_SCOPE_SHA256 = "27a928d09ede129bab29090d4db9c7705354fd02cb2788fad0db80922ec3b3bf"
 
 
 def digest(data):
@@ -107,6 +109,65 @@ def source_extras(root, rows):
             for key, name in sorted(exact_tree(root).items()) if key not in expected]
 
 
+def canonical_path(value, require_existing=False):
+    """Reject lexical aliases and existing Windows reparse/case aliases."""
+    if not isinstance(value, str) or not Path(value).is_absolute() or os.path.normpath(value) != value:
+        raise ValueError(f"noncanonical absolute path: {value!r}")
+    path = Path(value)
+    if not re.fullmatch(r"[A-Z]:\\", path.anchor):
+        raise ValueError(f"canonical drive path required: {value!r}")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        if part.endswith((".", " ")) or part in (".", ".."):
+            raise ValueError(f"noncanonical path component: {part!r}")
+        if not current.is_dir():
+            break
+        names = os.listdir(current)
+        if part not in names:
+            if any(name.casefold() == part.casefold() for name in names):
+                raise ValueError(f"case alias path component: {part!r}")
+            break
+        current /= part
+        stat = current.lstat()
+        if current.is_symlink() or getattr(stat, "st_file_attributes", 0) & 0x400:
+            raise ValueError(f"reparse ancestor: {current}")
+    if require_existing and not path.is_dir():
+        raise ValueError(f"required directory absent: {value}")
+    if path.resolve(strict=False) != path:
+        raise ValueError(f"redirected path: {value}")
+    return path
+
+
+def related(left, right):
+    l, r = str(left).casefold(), str(right).casefold()
+    return l == r or l.startswith(r + os.sep.casefold()) or r.startswith(l + os.sep.casefold())
+
+
+def validate_destinations(candidate_raw, output_raw, receipts_raw, artifact_raw, receipt_root_raw):
+    candidate = canonical_path(candidate_raw, require_existing=True)
+    artifact = canonical_path(artifact_raw, require_existing=True)
+    receipt_root = canonical_path(receipt_root_raw, require_existing=True)
+    output = canonical_path(output_raw)
+    receipts = canonical_path(receipts_raw)
+    if output.parent != artifact or receipts.parent != receipt_root:
+        raise ValueError("output and receipts must be direct children of authorized roots")
+    if any(related(a, b) for a, b in ((candidate, output), (candidate, receipts),
+                                       (candidate, artifact), (candidate, receipt_root),
+                                       (output, receipts), (artifact, receipt_root))):
+        raise ValueError("source, output and receipt roots overlap")
+    if output.exists() or receipts.exists():
+        raise ValueError("output and receipts must be create-new")
+    return candidate, output, receipts
+
+
+def bound_roots(scope_raw):
+    scope = canonical_path(scope_raw)
+    if scope != REVISION_SCOPE or digest(scope.read_bytes()) != REVISION_SCOPE_SHA256:
+        raise ValueError("revision scope differs from approved exact4 authority")
+    document = json.loads(scope.read_bytes())
+    return document["artifact_root"], document["receipt_root"]
+
+
 def freeze(candidate):
     marker_path = candidate / "installed-product.json"
     if regular(marker_path).st_size != 20401 or digest(marker_path.read_bytes()) != MARKER_SHA256:
@@ -140,14 +201,11 @@ def freeze(candidate):
                                   if key not in ("executable", "executable_hash")}}
 
 
-def build(args):
-    candidate, output, receipts = (Path(value).absolute() for value in
-                                   (args.candidate, args.output, args.receipts))
-    if output.exists() or receipts.exists():
-        raise ValueError("output and receipts must be create-new")
-    local = ROOT / ".local"
-    if not output.is_relative_to(local) or candidate == output or output.is_relative_to(candidate):
-        raise ValueError("output must be isolated under worktree .local")
+def build(args, authorized_roots=None):
+    args._owned_receipts = None
+    artifact_root, receipt_root = authorized_roots or bound_roots(args.scope)
+    candidate, output, receipts = validate_destinations(
+        args.candidate, args.output, args.receipts, artifact_root, receipt_root)
     locked = json.loads((ROOT / "execution/toolchains/locked.json").read_bytes())["tools"]
     go = Path(args.go).absolute()
     if digest(go.read_bytes()) != locked["go"]["sha256"]:
@@ -155,8 +213,10 @@ def build(args):
     manifest = freeze(candidate)
     source_extra_before = source_extras(candidate, json.loads((candidate / "installed-product.json").read_bytes())["files"])
     raw = encode(manifest)
-    output.mkdir(parents=True, exist_ok=False)
-    receipts.mkdir(parents=True, exist_ok=False)
+    receipts.mkdir(exist_ok=False)
+    owned = receipts.lstat()
+    args._owned_receipts = (receipts, owned.st_dev, owned.st_ino)
+    output.mkdir(exist_ok=False)
     (receipts / "candidate-before.json").write_bytes(encode({"marker_sha256": MARKER_SHA256,
         "source_commit": SOURCE_COMMIT, "files": len(manifest["files"]),
         "unreviewed_source_extras_excluded": source_extra_before}))
@@ -205,17 +265,32 @@ def build(args):
     print((receipts / "result.json").read_text(encoding="utf-8"), end="")
 
 
+def write_owned_failure(args, exc):
+    owned = getattr(args, "_owned_receipts", None)
+    if owned is None:
+        return False
+    target, device, inode = owned
+    try:
+        stat = target.lstat()
+        if stat.st_dev != device or stat.st_ino != inode or target.is_symlink() or \
+                getattr(stat, "st_file_attributes", 0) & 0x400:
+            return False
+        with (target / "failed.json").open("xb") as file:
+            file.write(encode({"status": "FIRST_FAILURE_RETAINED",
+                "error_type": type(exc).__name__, "error": str(exc)}))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    for flag in ("candidate", "output", "receipts", "go"):
+    for flag in ("candidate", "output", "receipts", "go", "scope"):
         parser.add_argument("--" + flag, required=True)
     arguments = parser.parse_args()
     try:
         build(arguments)
     except Exception as exc:
-        target = Path(arguments.receipts)
-        if target.is_dir() and not (target / "failed.json").exists():
-            (target / "failed.json").write_bytes(encode({"status": "FIRST_FAILURE_RETAINED",
-                "error_type": type(exc).__name__, "error": str(exc)}))
+        write_owned_failure(arguments, exc)
         print(f"static payload build refused: {exc}", file=sys.stderr)
         raise SystemExit(1)
