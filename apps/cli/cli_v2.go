@@ -154,7 +154,7 @@ func v2EnvelopeFor(ctx *v2Context, method string, payload map[string]any) (*v2En
 	if ctx.projectID != "" && method != "workspace.register" && method != "project.bootstrap" {
 		env.ProjectID = &ctx.projectID
 	}
-	if ctx.sessionID != "" {
+	if ctx.sessionID != "" && method != "host.status" && method != "workspace.list" {
 		env.SessionID = &ctx.sessionID
 	}
 	if method == "session.attach" {
