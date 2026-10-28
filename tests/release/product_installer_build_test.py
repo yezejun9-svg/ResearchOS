@@ -65,13 +65,82 @@ class BuildValidationTests(unittest.TestCase):
             sentinel = occupied / "sentinel.txt"
             sentinel.write_bytes(b"do not touch")
             args = SimpleNamespace(candidate=str(source), output=str(artifacts / "new"),
-                                   receipts=str(occupied), go="unused", scope="unused")
+                                   receipts=str(occupied), go="unused", scope="unused",
+                                   scope_sha256="unused")
             before = {path.name: path.read_bytes() for path in occupied.iterdir()}
             with self.assertRaisesRegex(ValueError, "create-new") as raised:
                 builder.build(args, authorized_roots=(str(artifacts), str(receipts)))
             self.assertFalse(builder.write_owned_failure(args, raised.exception))
             self.assertEqual(before, {path.name: path.read_bytes() for path in occupied.iterdir()})
             self.assertFalse((artifacts / "new").exists())
+
+    def test_explicit_pin_accepts_new_scope_path_and_new_roots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            first_art, first_receipt, second_art, second_receipt = (
+                base / name for name in ("artifacts-a", "receipts-a", "artifacts-b", "receipts-b"))
+            for root in (first_art, first_receipt, second_art, second_receipt):
+                root.mkdir()
+            def scope_for(artifact, receipt, schema):
+                return {"schema": schema, "owner": builder.SCOPE_OWNER,
+                        "worktree": str(builder.ROOT), "artifact_root": str(artifact),
+                        "receipt_root": str(receipt)}
+            first = builder.encode(scope_for(first_art, first_receipt,
+                "researchos.installer-p1a-exact4-revision-scope.v1"))
+            first_path, copy_path, new_path = (base / name for name in
+                                               ("scope-a.json", "scope-copy.json", "scope-new.json"))
+            first_path.write_bytes(first)
+            copy_path.write_bytes(first)
+            pin = builder.digest(first)
+            self.assertEqual(builder.bound_roots(str(first_path), pin),
+                             (str(first_art), str(first_receipt)))
+            self.assertEqual(builder.bound_roots(str(copy_path), pin),
+                             (str(first_art), str(first_receipt)))
+            second = builder.encode(scope_for(second_art, second_receipt,
+                "researchos.installer-p1a-exact2-scope-admission-revision.v1"))
+            new_path.write_bytes(second)
+            self.assertEqual(builder.bound_roots(str(new_path), builder.digest(second)),
+                             (str(second_art), str(second_receipt)))
+
+    def test_wrong_pin_and_scope_shape_refuse_before_writes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            source, artifact, receipts = (base / name for name in ("source", "artifact", "receipts"))
+            for root in (source, artifact, receipts):
+                root.mkdir()
+            scope = {"schema": "researchos.installer-p1a-exact2-scope-admission-revision.v1",
+                     "owner": builder.SCOPE_OWNER, "worktree": str(builder.ROOT),
+                     "artifact_root": str(artifact), "receipt_root": str(receipts)}
+            path = base / "scope.json"
+            raw = builder.encode(scope)
+            path.write_bytes(raw)
+            output, receipt = artifact / "candidate", receipts / "run"
+            args = SimpleNamespace(scope=str(path), scope_sha256="0" * 64,
+                                   candidate=str(source), output=str(output),
+                                   receipts=str(receipt), go="unused")
+            for bad_pin in ("", "not-a-digest", "0" * 64):
+                args.scope_sha256 = bad_pin
+                with self.assertRaises(ValueError):
+                    builder.build(args)
+                self.assertFalse(output.exists())
+                self.assertFalse(receipt.exists())
+            for changed in ({**scope, "schema": "unrecognized"},
+                            {**scope, "owner": "other"},
+                            {**scope, "artifact_root": str(artifact / ".." / "escape")},
+                            {**scope, "receipt_root": str(artifact)}):
+                payload = builder.encode(changed)
+                path.write_bytes(payload)
+                args.scope_sha256 = builder.digest(payload)
+                with self.assertRaises(ValueError):
+                    builder.build(args)
+                self.assertFalse(output.exists())
+                self.assertFalse(receipt.exists())
+            path.write_bytes(raw + b" ")
+            args.scope_sha256 = builder.digest(raw)
+            with self.assertRaises(ValueError):
+                builder.build(args)
+            self.assertFalse(output.exists())
+            self.assertFalse(receipt.exists())
 
 
 if __name__ == "__main__":

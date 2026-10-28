@@ -21,8 +21,11 @@ SOURCE_COMMIT = "5c4c94022bd92da68ef544f2779527bfe065c428"
 VERIFIER_PATH = "apps/desktop/resources/control/runtime-verifier-installation.json"
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 ROLES = ("cli", "control", "electron", "verifier", "validator")
-REVISION_SCOPE = Path(r"D:\作品集\ResearchOS\research-os\execution\v2.4\receipts\W05\W05-99\resume_cp528_codex\20261025-current-chat\continuation-cp570\Installer-P1a-exact4-revision-scope.json")
-REVISION_SCOPE_SHA256 = "27a928d09ede129bab29090d4db9c7705354fd02cb2788fad0db80922ec3b3bf"
+SCOPE_SCHEMAS = {
+    "researchos.installer-p1a-exact4-revision-scope.v1",
+    "researchos.installer-p1a-exact2-scope-admission-revision.v1",
+}
+SCOPE_OWNER = "codex:/root/installer_p1a_builder"
 
 
 def digest(data):
@@ -160,12 +163,25 @@ def validate_destinations(candidate_raw, output_raw, receipts_raw, artifact_raw,
     return candidate, output, receipts
 
 
-def bound_roots(scope_raw):
+def bound_roots(scope_raw, expected_sha256):
+    if not isinstance(expected_sha256, str) or not HASH.fullmatch(expected_sha256):
+        raise ValueError("an external scope SHA-256 pin is required")
     scope = canonical_path(scope_raw)
-    if scope != REVISION_SCOPE or digest(scope.read_bytes()) != REVISION_SCOPE_SHA256:
-        raise ValueError("revision scope differs from approved exact4 authority")
-    document = json.loads(scope.read_bytes())
-    return document["artifact_root"], document["receipt_root"]
+    raw = scope.read_bytes()
+    if digest(raw) != expected_sha256:
+        raise ValueError("scope bytes differ from external SHA-256 pin")
+    document = json.loads(raw)
+    if not isinstance(document, dict) or document.get("schema") not in SCOPE_SCHEMAS or \
+            document.get("owner") != SCOPE_OWNER or document.get("worktree") != str(ROOT):
+        raise ValueError("unrecognized scope contract, owner or worktree")
+    artifact, receipt = document.get("artifact_root"), document.get("receipt_root")
+    if not isinstance(artifact, str) or not isinstance(receipt, str):
+        raise ValueError("scope roots required")
+    canonical_path(artifact, require_existing=True)
+    canonical_path(receipt, require_existing=True)
+    if related(Path(artifact), Path(receipt)):
+        raise ValueError("scope roots overlap")
+    return artifact, receipt
 
 
 def freeze(candidate):
@@ -203,7 +219,7 @@ def freeze(candidate):
 
 def build(args, authorized_roots=None):
     args._owned_receipts = None
-    artifact_root, receipt_root = authorized_roots or bound_roots(args.scope)
+    artifact_root, receipt_root = authorized_roots or bound_roots(args.scope, args.scope_sha256)
     candidate, output, receipts = validate_destinations(
         args.candidate, args.output, args.receipts, artifact_root, receipt_root)
     locked = json.loads((ROOT / "execution/toolchains/locked.json").read_bytes())["tools"]
@@ -285,7 +301,7 @@ def write_owned_failure(args, exc):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    for flag in ("candidate", "output", "receipts", "go", "scope"):
+    for flag in ("candidate", "output", "receipts", "go", "scope", "scope-sha256"):
         parser.add_argument("--" + flag, required=True)
     arguments = parser.parse_args()
     try:
