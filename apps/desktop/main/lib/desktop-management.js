@@ -427,10 +427,7 @@ class DesktopManagement {
       } else if (this.fsImpl.existsSync(o.discoveryFile)) throw failure('DISCOVERY_UNCERTAIN');
       this.parentIdentity = this.observe(process.pid);
       if (this.parentIdentity.PID !== process.pid) throw failure('DESKTOP_PROCESS_CHANGED');
-      const env = {};
-      for (const name of ['SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'])
-        if (process.env[name]) env[name] = process.env[name];
-      Object.assign(env, { RESEARCHOS_DATA_DIR: o.dataRoot, RESEARCHOS_WEB_DIR: o.webDir, RESEARCHOS_LISTEN: '127.0.0.1:0' });
+      const env = managedControlEnvironment(process.env, o);
       this.state = 'STARTING';
       const readyPromise = new Promise((resolve, reject) => {
         const timer = setTimeout(() => this.broken('READY_TIMEOUT'), START_LIMIT_MS);
@@ -791,6 +788,20 @@ class DesktopManagement {
   }
 }
 
+// Preserve installed CLI discovery and the normal OS account home. Native CLIs
+// own their authentication; Core receives no ambient tokens or runtime overrides.
+function managedControlEnvironment(ambient, options) {
+  const env = {};
+  for (const name of ['SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA',
+    'LOCALAPPDATA', 'PATH', 'PATHEXT', 'COMSPEC']) {
+    const entries = Object.entries(ambient).filter(([key]) => key.toUpperCase() === name.toUpperCase());
+    if (entries.length > 1) throw failure('ENV_CASE_COLLISION');
+    if (entries.length && typeof entries[0][1] === 'string' && entries[0][1]) env[name] = entries[0][1];
+  }
+  return Object.assign(env, { RESEARCHOS_DATA_DIR: options.dataRoot,
+    RESEARCHOS_WEB_DIR: options.webDir, RESEARCHOS_LISTEN: '127.0.0.1:0' });
+}
+
 function createDesktopManagement(options) { return new DesktopManagement(options); }
 module.exports = { PROTOCOL, FRAME_LIMIT, strictJSON, installedResources, observeWindowsProcess,
-  createDesktopManagement, DesktopManagement };
+  createDesktopManagement, DesktopManagement, managedControlEnvironment };
