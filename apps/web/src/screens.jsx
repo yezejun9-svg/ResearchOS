@@ -8,6 +8,7 @@ import { DevicePanel } from './Pairing'
 import { Continuity } from './continuity'
 import { ResourceRecovery } from './resource-recovery.jsx'
 import { NativeModelConfiguration, NativeProjectEntry, NativeWorkbench } from './workbench.jsx'
+import { projectGroups, readRecentProjects } from './startup.js'
 import { Header, Section, Tag, Empty, JsonDetails } from './components/ui'
 
 const briefDate = raw => raw ? new Date(raw).toLocaleString() : '未记录'
@@ -59,6 +60,19 @@ function Projects({ api, navigate, refresh, onRefresh }) {
   const [name, setName] = useState(''), [intent, setIntent] = useState(''), [scope, setScope] = useState(''), [busy, setBusy] = useState(false), [error, setError] = useState('')
   const projects = itemsOf(state.data.listProjects)
   async function create(e) { e.preventDefault(); setBusy(true); setError(''); try { const created = await api.call('createProject', { body: { name, intent, facts: [], accepted_scope: [scope], constraints: [], source_configs: [], source_document_refs: [], read_snapshot_ids: [] } }); onRefresh(); navigate(`/p/${created.project_id}`) } catch (cause) { setError(cause.message) } finally { setBusy(false) } }
+  if (window.researchos?.desktop) {
+    const groups = projectGroups(projects, readRecentProjects())
+    const projectRows = rows => <div className="assistant-projects">{rows.map(project => <Link key={project.project_id} className="assistant-project" to={`/p/${encodeURIComponent(project.project_id)}`} navigate={navigate}><span className="project-monogram" aria-hidden="true">{(project.name || 'P').slice(0, 1)}</span><span><strong>{project.name || '未命名项目'}</strong><small>{project.intent || '打开项目工作台'}</small></span><span className="project-open" aria-hidden="true">↗</span></Link>)}</div>
+    return <div className="assistant-home">
+      <section className="assistant-intro" aria-labelledby="assistant-title"><span className="assistant-eyebrow"><span aria-hidden="true">✳</span> YOUR LOCAL WORKSPACE</span><h1 id="assistant-title">把想法，<span>推进一步。</span></h1><p>从你的项目开始，和 Codex 理清下一步。<br/>对话、任务与每一步真实进展，都在一个工作台。</p></section>
+      <NativeProjectEntry navigate={navigate} onRefresh={onRefresh}/>
+      <section className="assistant-project-section" aria-label="项目"><div className="assistant-section-heading"><h2>{groups.recent.length ? '最近项目' : '可访问项目'}</h2><span>{state.data.listProjects ? `${projects.length} 个项目` : '读取项目中'}</span></div><StateNotice state={state} onRetry={onRefresh}/>
+        {groups.recent.length ? <>{projectRows(groups.recent)}{groups.other.length > 0 && <details className="other-projects"><summary>其他可访问项目（{groups.other.length}）</summary>{projectRows(groups.other)}</details>}</> : groups.other.length ? projectRows(groups.other) : !state.loading && !state.errors.listProjects && <div className="assistant-empty"><span aria-hidden="true">⌁</span><p>你的下一个项目，从这里开始。</p><small>打开一个本地目录，它就会出现在这里。</small></div>}
+      </section>
+      <ol className="assistant-method" aria-label="使用流程"><li><span>01</span> 打开项目</li><li><span>02</span> 描述目标</li><li><span>03</span> 查看真实轨迹</li></ol>
+      <p className="assistant-footnote">本机 Host 协调任务 · 具体能力以工作台实际状态为准</p>
+    </div>
+  }
   return <><Header title="项目入口" description="从一个项目的真实背景开始，逐步形成可验收的目标。"/><StateNotice state={state} onRetry={onRefresh}/><Section title="已有项目" aside={<span className="small-muted">{state.data.listProjects ? `${projects.length} 个可访问项目` : '尚未读取项目列表'}</span>}>{projects.length ? <div className="record-list">{projects.map(p => <Link key={p.project_id} className="record-row" to={`/p/${p.project_id}`} navigate={navigate}><strong>{p.name}</strong><span>{p.intent}</span><small>打开工作台 →</small></Link>)}</div> : !state.loading && <Empty>{state.errors.listProjects ? '项目列表未能读取，请先恢复连接或访问权限。' : '当前还没有可访问的项目。'}</Empty>}</Section>{window.researchos?.desktop ? <NativeProjectEntry navigate={navigate} onRefresh={onRefresh}/> : <Section title="建立项目"><form className="form-grid" onSubmit={create}><label>项目名称<input value={name} onChange={e => setName(e.target.value)} required/></label><label>要解决的问题<input value={intent} onChange={e => setIntent(e.target.value)} required/></label><label className="full-row">首个明确范围<input value={scope} onChange={e => setScope(e.target.value)} required/></label>{error && <p className="form-error full-row" role="alert">{error}</p>}<button disabled={busy} type="submit" className="primary">{busy ? '正在创建…' : '创建项目'}</button></form></Section>}</>
 }
 

@@ -7,6 +7,7 @@ import { Screen } from './screens'
 import { useRoute } from './navigation'
 import { AppShell } from './components/app-shell'
 import { PairingGate, useDeviceSession } from './Pairing'
+import { readTheme, saveTheme, rememberProject, startHostHealthMonitor } from './startup.js'
 import './style.css'
 import './workbench.css'
 
@@ -20,8 +21,13 @@ function AuthGate({ onToken }) {
 function App() {
   const [token, setToken] = useState('')
   const deviceSession = useDeviceSession(setToken)
-  const [theme, setTheme] = useState(() => localStorage.getItem('researchos.theme') === 'dark' ? 'dark' : 'light')
+  const [theme, setTheme] = useState(() => readTheme())
   const [route, navigate] = useRoute()
+  const [hostHealth, setHostHealth] = useState({ state: 'checking', label: '正在检查 Host' })
+  useEffect(() => {
+    if (!nativeDesktop) return
+    return startHostHealthMonitor({ read: () => window.researchos.statusHealth({}), onChange: setHostHealth })
+  }, [])
   const [drawer, setDrawer] = useState(null)
   const [compact, setCompact] = useState(() => matchMedia('(max-width: 767px)').matches)
   const [feedback, setFeedback] = useState(null)
@@ -37,7 +43,7 @@ function App() {
     Object.entries(tokens.themes[theme]).forEach(([name, value]) => document.documentElement.style.setProperty(`--${name.replaceAll('_', '-')}`, value))
     const size = { 'body-size': `${tokens.font.body_size_px}px`, 'body-line-height': tokens.font.body_line_height, 'title-size': `${tokens.font.title_size_px}px`, 'small-size': `${tokens.font.small_size_px}px`, 'header-height': `${tokens.layout.header_height_px}px`, 'nav-width': `${tokens.layout.nav_width_px}px`, 'progress-width': `${tokens.layout.progress_width_px}px`, 'mobile-target': `${tokens.layout.mobile_target_px}px`, 'control-radius': `${tokens.radius_px.control}px`, 'card-radius': `${tokens.radius_px.card}px`, 'panel-radius': `${tokens.radius_px.panel}px` }
     Object.entries(size).forEach(([name, value]) => document.documentElement.style.setProperty(`--${name}`, value))
-    localStorage.setItem('researchos.theme', theme)
+    saveTheme(theme)
   }, [theme])
   useEffect(() => { setDrawer(null) }, [route.key])
   useEffect(() => { const media = matchMedia('(max-width: 767px)'); const changed = () => setCompact(media.matches); media.addEventListener('change', changed); return () => media.removeEventListener('change', changed) }, [])
@@ -58,6 +64,8 @@ function App() {
   const projectId = route.projectId
   const state = shared.data.getProjectState
   const profile = shared.data.getProjectProfile
+  useEffect(() => { if (projectId && profile) rememberProject(projectId) }, [projectId, profile])
+  const connection = nativeDesktop ? hostHealth : { state: events.online ? 'ready' : 'unavailable', label: events.online ? '项目事件已连接' : '项目事件未连接' }
   const notifications = itemsOf(shared.data.listNotification)
   const unread = notifications.filter(item => item.status === 'UNREAD').length
   function openDrawer(name, event) { drawerOpener.current = event.currentTarget; setDrawer(name) }
@@ -84,7 +92,7 @@ function App() {
   if (!nativeDesktop && !token && (location.pathname === '/pair' || deviceSession.error || location.hostname.endsWith('.trycloudflare.com'))) return <PairingGate sessionError={deviceSession.error} onSession={session => { deviceSession.accept(session); navigate(`/p/${session.device.project_ids[0]}`) }}/>
   if (!nativeDesktop && !token) return <AuthGate onToken={setToken}/>
   return <AppShell route={route} navigate={navigate} drawer={drawer} setDrawer={setDrawer} compact={compact}
-    openDrawer={openDrawer} events={events} projectId={projectId} profile={profile} unread={unread}
+    openDrawer={openDrawer} connection={connection} events={events} projectId={projectId} profile={profile} unread={unread}
     theme={theme} setTheme={setTheme} notifications={notifications} shared={shared} state={state}
     feedback={feedback} setFeedback={setFeedback} deviceSession={deviceSession} api={api}
     mutate={mutate} navUrl={navUrl}>

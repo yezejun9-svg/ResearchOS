@@ -4,6 +4,7 @@ import { ArtifactPreview } from './preview.jsx'
 import { SessionContinuation } from './session-continuation.jsx'
 import { WorkbenchLayout } from './components/workbench-layout.jsx'
 import { ActivityRail } from './components/activity-rail.jsx'
+import { workspaceProjectPath } from './startup.js'
 import { composerSubmitKey, appendPrompt } from './activity.js'
 import { HARNESS_CAPABILITIES, canSubmitHarness, hasHarnessCapability, harnessStatusLabel, createHarnessController } from './harness.js'
 
@@ -177,17 +178,18 @@ export function NativeProjectEntry({ navigate, onRefresh }) {
       const reply = await window.researchos.desktop.chooseWorkspace({ display_name: name.trim() })
       if (!reply?.ok) throw new Error(reply?.reason || reply?.error_code || '项目初始化未完成')
       const value = reply.result || reply
-      if (!value.project_id || !value.workspace?.authorized_workspace_ref) throw new Error('主机没有返回完整的项目与工作区引用')
+      if (!workspaceProjectPath(value)) throw new Error('主机没有返回完整的项目与工作区引用')
       setResult(value); onRefresh()
     } catch (cause) { setError(cause) }
     finally { setBusy(false) }
   }
-  return <Panel title="从本地目录开始"><p>选择项目目录后，主机会登记授权范围并盘点已有文件。已有项目会接续原身份。</p>
-    <Failure error={hostError} retry={checkHost}/>{host && <p className="small-muted">本地主机已连接 · {host.workspaces?.length || 0} 个已登记工作区</p>}
-    <label>项目显示名称<input value={name} onChange={event => setName(event.target.value)} placeholder="留空时使用目录名称"/></label>
-    <div className="button-row"><button className="primary" disabled={busy} onClick={choose}>{busy ? '等待目录选择与本地盘点…' : '选择本地项目目录'}</button></div>
-    <Failure error={error}/>{result && <div role="status"><p>本地盘点已保存。接下来可在项目工作台配置模型；配置保存后仍须由服务端验证运行资格。</p><p className="break-all">{result.workspace.display_path}</p><button onClick={() => navigate(`/p/${result.project_id}`)}>配置模型并打开工作台</button></div>}
-  </Panel>
+  return <section className="local-project-entry" aria-labelledby="local-project-title">
+    <div className="local-project-main"><span className="local-project-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M3 6h7l2 2h9v11H3z"/><path d="M3 6V4h7l2 2"/></svg></span><div><h2 id="local-project-title">打开本地项目</h2><p>选择目录，连接你的工作空间。</p></div><button className="primary" disabled={busy} onClick={choose}>{busy ? '正在打开…' : '选择目录'} <span aria-hidden="true">↗</span></button></div>
+    <details className="project-name-option"><summary>自定义项目名称</summary><label>显示名称<input value={name} onChange={event => setName(event.target.value)} placeholder="默认使用目录名称"/></label></details>
+    <div className="local-project-note"><span>在本机登记目录并盘点文件，保留原内容。</span>{host && <span>已登记 {host.workspaces?.length || 0} 个工作区</span>}</div>
+    <Failure error={hostError} retry={checkHost}/><Failure error={error}/>
+    {result && <div className="project-open-result" role="status"><div><strong>项目已登记</strong><p className="break-all">{result.workspace.display_path}</p></div><button className="primary" onClick={() => navigate(workspaceProjectPath(result))}>打开工作台 <span aria-hidden="true">→</span></button></div>}
+  </section>
 }
 
 export function DesktopQualification({ projectId, sessionId }) {
