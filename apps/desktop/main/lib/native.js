@@ -3,6 +3,8 @@
 const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
+const crypto = require('node:crypto');
+const { privateJSON } = require('./http-wire.js');
 
 const HOST_ID = /^host-[0-9a-f]{12}$/;
 const MAX_FRAME = 8192;
@@ -25,33 +27,40 @@ function hostInstanceId(fsImpl, discovery) {
   return id;
 }
 
-function dialNative(pipeName, frame, timeoutMs = 5000) {
+function dialNative(pipeName, frame, timeoutMs = 5000, rawReply = false) {
   return new Promise((resolve, reject) => {
     const request = Buffer.from(JSON.stringify(frame));
     if (!request.length || request.length > MAX_FRAME) return reject(Error('NATIVE_FRAME_TOO_LARGE'));
     const socket = net.connect(pipeName);
     let done = false;
+    let rawDeadline;
     const parts = [];
     let size = 0;
     function finish(error, reply) {
       if (done) return;
       done = true;
+      if (rawDeadline) clearTimeout(rawDeadline);
       socket.destroy();
       if (error) reject(error); else resolve(reply);
     }
     socket.setTimeout(timeoutMs, () => finish(Error('NATIVE_TRANSPORT_TIMEOUT')));
+    // Only the new attestation raw lane waits for complete server EOF. Its
+    // absolute deadline cannot be extended by a stream of partial data.
+    if (rawReply) rawDeadline=setTimeout(() => finish(Error('NATIVE_TRANSPORT_TIMEOUT')),timeoutMs);
     socket.on('connect', () => socket.write(request));
     socket.on('data', part => {
       size += part.length;
       if (size > MAX_FRAME) return finish(Error('NATIVE_FRAME_TOO_LARGE'));
       parts.push(part);
+      if (rawReply) return;
       // The host writes one message frame per connection. A complete JSON reply is
       // sufficient; waiting for EOF can deadlock against FlushFileBuffers on Windows.
-      try { finish(null, JSON.parse(Buffer.concat(parts).toString('utf8'))); }
+      try { const raw=Buffer.concat(parts); const parsed=JSON.parse(raw.toString('utf8')); finish(null, rawReply ? raw : parsed); }
       catch { /* the message may span Node data chunks */ }
     });
     socket.on('error', error => finish(error));
-    socket.on('end', () => finish(Error('NATIVE_MALFORMED_REPLY')));
+    socket.on('end', () => rawReply ? finish(null,Buffer.concat(parts)) : finish(Error('NATIVE_MALFORMED_REPLY')));
+    socket.on('close', () => { if (rawReply) finish(Error('NATIVE_MALFORMED_REPLY')); });
   });
 }
 
@@ -108,4 +117,53 @@ function createCredentialProvider({ fsImpl = fs, dial = dialNative, now = Date.n
   };
 }
 
-module.exports = { HOST_ID, MAX_FRAME, hostInstanceId, dialNative, readSession, createCredentialProvider };
+// Separate from credential acquisition: this operation never bootstraps,
+// renews, reads session.json or accepts a renderer-provided proof label.
+function createClientAttestor({ fsImpl = fs, dial = (pipe, frame) => dialNative(pipe, frame, 5000, true), now = Date.now } = {}) {
+  const closed = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value,key));
+  const validExpiry = value => {
+    if (typeof value!=='string') return false;
+    const m=/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+    if (!m) return false;
+    const y=Number(m[1]),month=Number(m[2]),day=Number(m[3]);
+    const days=[31,28+Number(y%4===0&&(y%100!==0||y%400===0)),31,30,31,30,31,31,30,31,30,31];
+    return month>=1 && month<=12 && day>=1 && day<=days[month-1] && Number(m[4])<=23 &&
+      Number(m[5])<=59 && Number(m[6])<=59 && (m[7]==='Z' || (Number(m[7].slice(1,3))<=23 && Number(m[7].slice(4))<=59)) && Date.parse(value)>now();
+  };
+  return async function attestCreate(discovery, raw, headers) {
+    try {
+      if (!Buffer.isBuffer(raw)) throw Error();
+      const id=hostInstanceId(fsImpl,discovery);
+      const identity=JSON.stringify([id,discovery.url,discovery.data_dir,discovery.pid]);
+      const request=privateJSON(new TextDecoder('utf-8',{fatal:true}).decode(raw));
+      const auth=headers?.Authorization;
+      if (typeof auth!=='string' || !auth.startsWith('Bearer ')) throw Error();
+      const credential=auth.slice(7);
+      if (!credential || [...credential].length>1024 || [...credential].some(c=>c.codePointAt(0)>=0xd800&&c.codePointAt(0)<=0xdfff) || request.method!=='session.create' ||
+          typeof request.client_id!=='string' || !request.client_id ||
+          !/^[A-Za-z0-9._:-]{1,64}$/.test(request.command_id) ||
+          typeof request.project_id!=='string' || !request.project_id ||
+          request.session_id!==null || request.expected_revision!==null || request.writer_epoch!==null) throw Error();
+      const frame={kind:'NATIVE_CLIENT_ATTEST_REQUEST',client_id:request.client_id,payload:{
+        schema_version:1,credential_value:credential,command_id:request.command_id,method:'session.create',
+        project_id:request.project_id,request_raw_sha256:'sha256:'+crypto.createHash('sha256').update(raw).digest('hex'),
+        session_id:null,expected_revision:null,writer_epoch:null}};
+      if (Buffer.byteLength(JSON.stringify(frame))>MAX_FRAME) throw Error();
+      const response=await dial('\\\\.\\pipe\\ResearchOSHost-v1-'+id.slice(5),frame);
+      if (!Buffer.isBuffer(response) && typeof response!=='string') throw Error();
+      if (Buffer.byteLength(response)>MAX_FRAME) throw Error();
+      const reply=privateJSON(new TextDecoder('utf-8',{fatal:true}).decode(Buffer.from(response)));
+      if (!closed(reply,['kind','payload']) || reply.kind!=='NATIVE_CLIENT_ATTEST_RESULT') throw Error();
+      const proof=reply.payload;
+      if (!closed(proof,['schema_version','attestation_ref','client_instance_ref','host_instance_id','expires_at']) ||
+          proof.schema_version!==1 || typeof proof.attestation_ref!=='string' || !/^natt-[0-9a-f]{64}$/.test(proof.attestation_ref) ||
+          typeof proof.client_instance_ref!=='string' || !/^nci-[0-9a-f]{32}$/.test(proof.client_instance_ref) || proof.host_instance_id!==id ||
+          !validExpiry(proof.expires_at)) throw Error();
+      if (identity!==JSON.stringify([hostInstanceId(fsImpl,discovery),discovery.url,discovery.data_dir,discovery.pid])) throw Error();
+      return proof.attestation_ref;
+    } catch { throw Error('NATIVE_CREATE_ATTESTATION_UNAVAILABLE'); }
+  };
+}
+
+module.exports = { HOST_ID, MAX_FRAME, hostInstanceId, dialNative, readSession, createCredentialProvider, createClientAttestor };

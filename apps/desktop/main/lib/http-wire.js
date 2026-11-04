@@ -157,7 +157,8 @@ function boundLocalInput(value) {
 }
 function createTransport({ appRoot, record = () => {} }) {
   const lane = { blocked:false, handles:new Set(), pending:0, bytes:0, tail:Promise.resolve() };
-  return async function transport(verb,url,envelope,headers) {
+  return async function transport(verb,url,envelope,headers,beforeSend) {
+    const originalHeaders=headers;
     let raw;
     try { boundLocalInput(envelope); const captured = structuredClone(envelope); headers = {...headers}; raw=Buffer.from((await values()).stringify(captured)); } catch(e) { return {ok:false,reason:e.reason||e.message,dispatch_state:'NOT_SENT'}; }
     if (verb !== 'POST' || raw.length > LIMIT.request || lane.pending >= 9 || lane.bytes + raw.length + LIMIT.response > LIMIT.queued || lane.blocked) return {ok:false,reason:'LOCAL_RESOURCE_LIMIT',dispatch_state:'NOT_SENT'};
@@ -175,6 +176,20 @@ function createTransport({ appRoot, record = () => {} }) {
       if (!Buffer.from((await values()).stringify(envelope)).equals(raw)) throw error('REQUEST_CHANGED_AFTER_PREFLIGHT');
       // Validate bytes/modules again after child reaping, before exposing any request.
       if(resource(appRoot).descriptorHash!==fixed.descriptorHash) throw error('VALIDATOR_RESOURCE_CHANGED');
+      if (beforeSend !== undefined) {
+        if (typeof beforeSend !== 'function' || envelope.method !== 'session.create') throw error('NATIVE_CREATE_ATTESTATION_UNAVAILABLE');
+        const ref=await beforeSend(Buffer.from(raw),Object.freeze({...headers}));
+        if (typeof ref!=='string' || !/^natt-[0-9a-f]{64}$/.test(ref)) throw error('NATIVE_CREATE_ATTESTATION_UNAVAILABLE');
+        boundLocalInput(envelope);
+        if (!Buffer.from((await values()).stringify(envelope)).equals(raw)) throw error('REQUEST_CHANGED_AFTER_ATTESTATION');
+        if (Object.keys(originalHeaders).length!==Object.keys(headers).length ||
+            Object.keys(originalHeaders).some(key=>!Object.hasOwn(headers,key) || originalHeaders[key]!==headers[key])) throw error('HEADERS_CHANGED_AFTER_ATTESTATION');
+        if(resource(appRoot).descriptorHash!==fixed.descriptorHash) throw error('VALIDATOR_RESOURCE_CHANGED');
+        headers['X-ResearchOS-Native-Attestation']=ref; // This attempt only, never retained in IPC state.
+      }
+      // No await follows this current-origin check before post enters its
+      // synchronous http.request call. Earlier proof checks are insufficient.
+      if (beforeSend !== undefined && (typeof beforeSend.verifyOrigin!=='function' || beforeSend.verifyOrigin()!==true)) throw error('HOST_CHANGED_BEFORE_SEND');
       dispatchAttempted=true;
       const reply=await post(url,raw,headers,record); const after=packet('RESPONSE');after.http_status=reply.status;after.response_raw_base64=reply.raw.toString('base64');
       const result=await child(fixed,after,record,lane);
@@ -188,4 +203,4 @@ function createTransport({ appRoot, record = () => {} }) {
     finally{lane.pending--;lane.bytes-=raw.length+LIMIT.response;}
   };
 }
-module.exports={createTransport};
+module.exports={createTransport,privateJSON};

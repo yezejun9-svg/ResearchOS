@@ -256,6 +256,17 @@ func v2CallTransportDetailed(budget context.Context, ctx *v2Context, method stri
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+ctx.credential)
+	if method == "session.create" && os.Getenv("RESEARCHOS_NATIVE_CREATE_PILOT") == "1" {
+		bound := *ctx
+		ref, attestErr := cliAttestCreate(&bound, env, body)
+		current, refusal := v2EnvelopeFor(ctx, method, payload)
+		currentRaw, marshalErr := json.Marshal(current)
+		if attestErr != nil || refusal != "" || marshalErr != nil || !bytes.Equal(currentRaw, body) ||
+			ctx.credential != bound.credential || ctx.baseURL != bound.baseURL || budget.Err() != nil {
+			return map[string]any{"dispatch_state": "NOT_SENT"}, "NATIVE_CREATE_ATTESTATION_NOT_SENT", exitNotImplemented, cliTransportCause{}
+		}
+		req.Header.Set(cliNativeAttestHeader, ref)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "HOST_UNREACHABLE:" + err.Error(), exitFailed, cliTransportCause{cancelled: errors.Is(err, context.Canceled), unreachable: true}

@@ -1,18 +1,114 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"researchos.local/research-os/internal/host"
 )
+
+// Private pilot constants intentionally do not depend on an unadopted Host API.
+const cliNativeAttestRequest = "NATIVE_CLIENT_ATTEST_REQUEST"
+const cliNativeAttestResult = "NATIVE_CLIENT_ATTEST_RESULT"
+const cliNativeAttestHeader = "X-ResearchOS-Native-Attestation"
+
+var cliAttestationRefPattern = regexp.MustCompile(`^natt-[0-9a-f]{64}$`)
+var cliClientInstancePattern = regexp.MustCompile(`^nci-[0-9a-f]{32}$`)
+
+func cliClosedNativeJSON(raw []byte, target any, requiredKeys ...string) error {
+	if len(raw) == 0 || len(raw) > 8192 || !jsontext.Value(raw).IsValid() {
+		return errors.New("NATIVE_ATTESTATION_INVALID")
+	}
+	// encoding/json matches struct fields without regard to case. Check the
+	// decoded exact key set first; its typed decoder is not a closure check.
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || len(fields) != len(requiredKeys) {
+		return errors.New("NATIVE_ATTESTATION_INVALID")
+	}
+	for _, key := range requiredKeys {
+		if _, ok := fields[key]; !ok {
+			return errors.New("NATIVE_ATTESTATION_INVALID")
+		}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(target) != nil || decoder.Decode(new(any)) != io.EOF {
+		return errors.New("NATIVE_ATTESTATION_INVALID")
+	}
+	return nil
+}
+
+// The commitment describes final HTTP bytes and the bearer chosen for this
+// attempt. Only the Host's current private witness map can turn it into proof.
+func cliAttestCreate(c *v2Context, env *v2Envelope, raw []byte) (string, error) {
+	refuse := errors.New("NATIVE_CREATE_ATTESTATION_UNAVAILABLE")
+	if env.Method != "session.create" || env.ProjectID == nil || *env.ProjectID == "" ||
+		env.SessionID != nil || env.ExpectedRevision != nil || env.WriterEpoch != nil ||
+		!commandIDPattern.MatchString(env.CommandID) || c.credential == "" || !utf8.ValidString(c.credential) || utf8.RuneCountInString(c.credential) > 1024 {
+		return "", refuse
+	}
+	resolved, err := resolveCLIHostDiscovery()
+	if err != nil || resolved.discovery.URL != c.baseURL {
+		return "", refuse
+	}
+	d := resolved.discovery
+	id, err := cliHostInstanceID(d)
+	if err != nil {
+		return "", refuse
+	}
+	digest := sha256.Sum256(raw)
+	frame, err := json.Marshal(map[string]any{"kind": cliNativeAttestRequest, "client_id": env.ClientID,
+		"payload": map[string]any{"schema_version": 1, "credential_value": c.credential,
+			"command_id": env.CommandID, "method": "session.create", "project_id": *env.ProjectID,
+			"request_raw_sha256": fmt.Sprintf("sha256:%x", digest), "session_id": nil,
+			"expected_revision": nil, "writer_epoch": nil}})
+	if err != nil || len(frame) > 8192 {
+		return "", refuse
+	}
+	replyRaw, err := cliNativeDial(host.PipeName(id), frame)
+	if err != nil {
+		return "", refuse // Never expose native error args, bearer or witness ref.
+	}
+	var reply struct {
+		Kind    string          `json:"kind"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if cliClosedNativeJSON(replyRaw, &reply, "kind", "payload") != nil || reply.Kind != cliNativeAttestResult {
+		return "", refuse
+	}
+	var proof struct {
+		Schema         int    `json:"schema_version"`
+		Ref            string `json:"attestation_ref"`
+		ClientInstance string `json:"client_instance_ref"`
+		HostID         string `json:"host_instance_id"`
+		ExpiresAt      string `json:"expires_at"`
+	}
+	if cliClosedNativeJSON(reply.Payload, &proof, "schema_version", "attestation_ref", "client_instance_ref", "host_instance_id", "expires_at") != nil || proof.Schema != 1 ||
+		!cliAttestationRefPattern.MatchString(proof.Ref) || !cliClientInstancePattern.MatchString(proof.ClientInstance) || proof.HostID != id {
+		return "", refuse
+	}
+	expires, err := time.Parse(time.RFC3339Nano, proof.ExpiresAt)
+	if err != nil || !time.Now().Before(expires) {
+		return "", refuse
+	}
+	currentID, err := cliHostInstanceID(d)
+	if err != nil || currentID != id {
+		return "", refuse
+	}
+	return proof.Ref, nil
+}
 
 // The native bridge is the only path from a CLI path hint to a trusted selection.
 // The host's folder picker still requires the user's confirmation.
