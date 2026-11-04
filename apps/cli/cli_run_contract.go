@@ -38,6 +38,14 @@ func looksLikeAcceptedRun(args []string) bool {
 }
 
 func runDispatch(args []string) {
+	prompt, hostArgs, problem := parseExplicitCLIPrompt(args)
+	if problem != nil {
+		fail("run", problem.code, problem.reason, problem.detail)
+	}
+	if prompt != nil {
+		cliHostCommandWithPrompt("run", hostArgs, prompt)
+		return
+	}
 	if out, has := flagValue(args, "output"); has && out != "jsonl" {
 		fail("run", exitUsage, "OUTPUT_FORMAT_UNSUPPORTED",
 			"the contract's headless format is JSONL; --output accepts only jsonl, got "+out)

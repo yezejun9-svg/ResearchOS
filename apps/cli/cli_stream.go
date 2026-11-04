@@ -94,22 +94,22 @@ func defaultCLIFollowOptions(signals <-chan os.Signal) cliFollowOptions {
 }
 
 type cliFlow struct {
-	c                    *v2Context
-	budget               context.Context
-	options              cliFollowOptions
-	base                 string
-	ordinal              int
-	cancelRequested      bool
-	cancelDeadline       time.Time
-	operations           []map[string]any
-	admissionCommand     string
-	goalFlow             bool
-	inputs               <-chan cliInputLine
-	cancelCommand        *v2Context
-	cancelPayload        map[string]any
-	readInterrupt        *cliReadInterrupt
-	responseExit         int
-	transportUnreachable bool
+	c                           *v2Context
+	budget                      context.Context
+	options                     cliFollowOptions
+	base                        string
+	ordinal                     int
+	cancelRequested             bool
+	cancelDeadline              time.Time
+	operations                  []map[string]any
+	admissionCommand            string
+	goalFlow                    bool
+	inputs                      <-chan cliInputLine
+	cancelCommand               *v2Context
+	cancelPayload               map[string]any
+	readInterrupt               *cliReadInterrupt
+	responseExit                int
+	transportUnreachable        bool
 	lastVerifiedSessionSnapshot map[string]any
 }
 
@@ -621,6 +621,10 @@ func followCLIExecution(f *cliFlow, snapshot map[string]any, message, explicitRu
 }
 
 func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options cliFollowOptions) (map[string]any, int) {
+	return runCLIVerbWithPrompt(name, args, c, cfg, options, nil)
+}
+
+func runCLIVerbWithPrompt(name string, args []string, c *v2Context, cfg cliConfig, options cliFollowOptions, input *cliPromptText) (map[string]any, int) {
 	originalContext := c
 	readOnly := name == "status" || name == "/status"
 	if readOnly {
@@ -644,7 +648,7 @@ func runCLIVerb(name string, args []string, c *v2Context, cfg cliConfig, options
 	if input, ok := cliInputPumps.Load(c); ok {
 		f.inputs = input.(<-chan cliInputLine)
 	}
-	steps, reason, detail := verbSteps(name, args, c, cfg)
+	steps, reason, detail := verbStepsWithPrompt(name, args, c, cfg, input)
 	out := map[string]any{"command": name, "client_id": c.clientID, "host_url": c.baseURL}
 	code := 0
 	var snapshot map[string]any

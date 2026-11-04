@@ -65,6 +65,10 @@ func intFlag(args []string, name string, def int64) int64 {
 
 // verbSteps returns the operations the contract assigns to this verb, in the order the contract lists them.
 func verbSteps(name string, args []string, ctx *v2Context, cfg cliConfig) ([]v2Step, string, string) {
+	return verbStepsWithPrompt(name, args, ctx, cfg, nil)
+}
+
+func verbStepsWithPrompt(name string, args []string, ctx *v2Context, cfg cliConfig, input *cliPromptText) ([]v2Step, string, string) {
 	switch name {
 	case "status", "/status":
 		steps := []v2Step{}
@@ -146,7 +150,12 @@ func verbSteps(name string, args []string, ctx *v2Context, cfg cliConfig) ([]v2S
 		return []v2Step{{"session.control", map[string]any{"action": "CANCEL", "target_id": target,
 			"reason": reason}, ""}}, "", ""
 	case "run", "/run":
-		prompt, has := firstPositional(args)
+		prompt, has := "", false
+		if input != nil {
+			prompt, has = input.text, true
+		} else {
+			prompt, has = firstPositional(args)
+		}
 		if !has {
 			return nil, "MISSING_PROMPT", "run takes a prompt: researchos run \"<prompt>\" --project <id> --output jsonl"
 		}
@@ -172,6 +181,10 @@ func verbSteps(name string, args []string, ctx *v2Context, cfg cliConfig) ([]v2S
 // cliHostCommand sends every step the contract assigns to the verb. The exit code is the worst one any step earned,
 // so a host that refuses one leg cannot be reported as a completed command.
 func cliHostCommand(name string, args []string) {
+	cliHostCommandWithPrompt(name, args, nil)
+}
+
+func cliHostCommandWithPrompt(name string, args []string, input *cliPromptText) {
 	d, path, err := hostDiscovery()
 	if err != nil || d.URL == "" {
 		fail(name, exitNotImplemented, "HOST_DISCOVERY_UNAVAILABLE", path)
@@ -180,7 +193,12 @@ func cliHostCommand(name string, args []string) {
 	c := newV2Context(name, args, cfg, d.URL)
 	signals, stop := interruptGuard()
 	defer stop()
-	out, code := runCLIVerb(name, args, c, cfg, defaultCLIFollowOptions(signals))
+	flowName := name
+	if input != nil {
+		flowName = "run"
+	}
+	out, code := runCLIVerbWithPrompt(flowName, args, c, cfg, defaultCLIFollowOptions(signals), input)
+	out["command"] = name
 	code = cliFlowSummary(out, code, c, &cfg)
 	if code != 0 {
 		os.Exit(code)

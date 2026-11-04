@@ -49,7 +49,7 @@ func main() {
 	case "doctor":
 		cliDoctor()
 	case "task":
-		runCodingTask(args[1:])
+		taskDispatch(args[1:])
 	default:
 		if h, registered := commandHandlers[cmd]; registered {
 			h(args[1:])
