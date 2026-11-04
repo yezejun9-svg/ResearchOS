@@ -29,47 +29,28 @@ type cliNativeReply struct {
 }
 
 func cliHostInstanceID(d discovery) (string, error) {
-	// Discovery is written by the local control process. Keep this field local to
-	// first-use until every older CLI call site has migrated to the new discovery.
-	raw, err := os.ReadFile(cliEnv("RESEARCHOS_CLI_DISCOVERY", discoveryPath))
+	resolved, err := resolveCLIHostDiscovery()
 	if err != nil {
 		return "", err
 	}
-	var id struct {
-		URL            string `json:"url"`
-		PID            int    `json:"pid"`
-		DataDir        string `json:"data_dir"`
-		HostInstanceID string `json:"host_instance_id"`
-	}
-	if err := json.Unmarshal(raw, &id); err != nil {
-		return "", err
-	}
-	if d.URL == "" || d.DataDir == "" || id.URL != d.URL || id.PID != d.PID || id.DataDir != d.DataDir {
+	actual := resolved.discovery
+	if d.URL == "" || d.DataDir == "" || actual.URL != d.URL || actual.PID != d.PID || actual.DataDir != d.DataDir {
 		return "", errors.New("HOST_NATIVE_DISCOVERY_INCOMPLETE")
 	}
-	if id.HostInstanceID == "" {
-		// An older launcher discovery lacks the native id. The control process
-		// writes its own current file; accept that identity only when the three
-		// launcher identity fields match exactly.
-		fallback, err := os.ReadFile(filepath.Join(d.DataDir, "discovery.json"))
-		if err != nil {
-			return "", errors.New("HOST_NATIVE_DISCOVERY_INCOMPLETE")
-		}
-		var current struct {
-			URL            string `json:"url"`
-			PID            int    `json:"pid"`
-			DataDir        string `json:"data_dir"`
-			HostInstanceID string `json:"host_instance_id"`
-		}
-		if err := json.Unmarshal(fallback, &current); err != nil || current.URL != d.URL || current.PID != d.PID || current.DataDir != d.DataDir {
+	id := resolved.hostID
+	if id == "" {
+		// Preserve the older explicit/cwd launcher's native identity fallback.
+		// Shared locators require a direct, matching ID in the resolver already.
+		current, err := readCLIHost(filepath.Join(d.DataDir, "discovery.json"), nil)
+		if err != nil || current.discovery.URL != d.URL || current.discovery.PID != d.PID || current.discovery.DataDir != d.DataDir {
 			return "", errors.New("HOST_NATIVE_DISCOVERY_MISMATCH")
 		}
-		id.HostInstanceID = current.HostInstanceID
+		id = current.hostID
 	}
-	if !cliHostIDPattern.MatchString(id.HostInstanceID) {
+	if !cliHostIDPattern.MatchString(id) {
 		return "", errors.New("HOST_NATIVE_DISCOVERY_INCOMPLETE")
 	}
-	return id.HostInstanceID, nil
+	return id, nil
 }
 
 func cliFirstUseCommandID(step string) (string, error) {

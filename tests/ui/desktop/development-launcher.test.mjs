@@ -88,6 +88,7 @@ test('mock complete tree dry-run validates every hash and does not create state 
     assert.equal(prepared.env.ROS_DESKTOP_SMOKE, '1');
     assert.equal(prepared.env.ROS_DESKTOP_NATIVE_SMOKE, '1');
     assert.equal(prepared.env.RESEARCHOS_DATA_DIR, path.join(state, 'data'));
+    assert.equal(prepared.env.RESEARCHOS_SHARED_HOST_LOCATOR_DISABLED, '1');
     assert.equal(prepared.env.node_options, undefined);
     assert.equal(prepared.env.researchos_project_id, undefined);
     assert.equal(prepared.env.ROS_DESKTOP_LEGACY_WORKBENCH, undefined);
@@ -129,11 +130,12 @@ test('Windows env case collisions and lowercase injection cannot become child va
     assert.throws(() => buildChildEnv({ SystemRoot: 'C:\\Windows', systemroot: 'C:\\Windows' }, bundle, state), /ENV_CASE_COLLISION/);
     assert.throws(() => buildChildEnv({ SystemRoot: 'C:\\Windows', NODE_OPTIONS: 'x', node_options: 'y' }, bundle, state), /ENV_CASE_COLLISION/);
     const env = buildChildEnv({ SystemRoot: 'C:\\Windows', node_options: 'x', researchos_data_dir: 'foreign',
-      ros_desktop_smoke: '0', ELECTRON_RUN_AS_NODE: '1' }, bundle, state, true);
+      ros_desktop_smoke: '0', ELECTRON_RUN_AS_NODE: '1', RESEARCHOS_SHARED_HOST_LOCATOR_DISABLED: '0' }, bundle, state, true);
     assert.equal(env.NODE_OPTIONS, undefined);
     assert.equal(env.ELECTRON_RUN_AS_NODE, undefined);
     assert.equal(env.RESEARCHOS_DATA_DIR, path.join(state, 'data'));
     assert.equal(env.ROS_DESKTOP_SMOKE, '1');
+    assert.equal(env.RESEARCHOS_SHARED_HOST_LOCATOR_DISABLED, '1');
   } finally { removeFixture(root); }
 });
 
