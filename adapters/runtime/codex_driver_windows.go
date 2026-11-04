@@ -59,6 +59,43 @@ func (d *codexCLI) arguments(cwd, source string) []string {
 		"-c", "notify=[]", "-c", `web_search="disabled"`, "-"}
 }
 
+const codexExecutionInputLimit = 1 << 20
+
+// codexExecutionInput adds execution-only Host metadata. The canonical user
+// request and launch authority remain unchanged; JSON keeps user content from
+// becoming another source-context field. This grants no additional access.
+func codexExecutionInput(workspace, cwd, prompt string) ([]byte, error) {
+	if !utf8.ValidString(workspace) || !utf8.ValidString(cwd) {
+		return nil, errors.New("CODEX_SOURCE_CONTEXT_INVALID")
+	}
+	context := struct {
+		SourceWorkspace         string `json:"source_workspace"`
+		ProcessWorkingDirectory string `json:"process_working_directory"`
+		Access                  string `json:"access"`
+		Instructions            string `json:"instructions"`
+	}{
+		SourceWorkspace:         workspace,
+		ProcessWorkingDirectory: cwd,
+		Access:                  "READ_ONLY",
+		Instructions: "Use source_workspace as the source project root and resolve project-relative paths there. " +
+			"process_working_directory is a separate Host-owned working directory, not the source project. " +
+			"The existing read-only permission profile and native platform policy still govern access; this context grants no additional permissions.",
+	}
+	input := struct {
+		Schema        string `json:"schema"`
+		SourceContext any    `json:"source_context"`
+		UserRequest   string `json:"user_request"`
+	}{Schema: "researchos.codex-source-context.v1", SourceContext: context, UserRequest: prompt}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > codexExecutionInputLimit {
+		return nil, errors.New("CODEX_EXECUTION_INPUT_LIMIT")
+	}
+	return raw, nil
+}
+
 type codexRun struct {
 	mu              sync.Mutex
 	cancel          context.CancelFunc
@@ -96,6 +133,11 @@ func (d *codexCLI) Start(ctx context.Context, in CodexLaunch, cb CodexCallbacks)
 		return nil, errors.New("CODEX_EPOCH_INVALID")
 	}
 	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+	cwd := filepath.Join(in.Directory, "cwd")
+	executionInput, err := codexExecutionInput(in.Workspace, cwd, in.Prompt)
+	if err != nil {
 		return nil, err
 	}
 	binary, err := os.Open(d.options.Executable)
@@ -143,7 +185,6 @@ func (d *codexCLI) Start(ctx context.Context, in CodexLaunch, cb CodexCallbacks)
 		closeAll()
 		return nil, err
 	}
-	cwd := filepath.Join(in.Directory, "cwd")
 	if err = os.Mkdir(cwd, 0700); err != nil {
 		closeJob(job)
 		closeAll()
@@ -174,7 +215,7 @@ func (d *codexCLI) Start(ctx context.Context, in CodexLaunch, cb CodexCallbacks)
 	stderrW.Close()
 	child, cancel := context.WithTimeout(ctx, in.Timeout)
 	r := &codexRun{cancel: cancel, done: make(chan struct{})}
-	go d.run(child, cancel, r, proc, job, jobName, stdinW, stdoutR, stderrR, in, cb)
+	go d.run(child, cancel, r, proc, job, jobName, stdinW, stdoutR, stderrR, in, executionInput, cb)
 	return r, nil
 }
 
@@ -183,7 +224,7 @@ type codexStreamResult struct {
 	err error
 }
 
-func (d *codexCLI) run(ctx context.Context, cancel context.CancelFunc, r *codexRun, p *process, job windows.Handle, jobName string, stdinW, stdoutR, stderrR *os.File, in CodexLaunch, cb CodexCallbacks) {
+func (d *codexCLI) run(ctx context.Context, cancel context.CancelFunc, r *codexRun, p *process, job windows.Handle, jobName string, stdinW, stdoutR, stderrR *os.File, in CodexLaunch, executionInput []byte, cb CodexCallbacks) {
 
 	var eventMu sync.Mutex
 	eventCount := 0
@@ -273,7 +314,7 @@ func (d *codexCLI) run(ctx context.Context, cancel context.CancelFunc, r *codexR
 	}()
 	inputDone := make(chan error, 1)
 	go func() {
-		_, err := io.WriteString(stdinW, in.Prompt)
+		_, err := stdinW.Write(executionInput)
 		closeErr := stdinW.Close()
 		inputDone <- errors.Join(err, closeErr)
 	}()

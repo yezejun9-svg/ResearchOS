@@ -30,11 +30,13 @@ func harnessExecutable(t *testing.T) string {
 	source := filepath.Join(dir, "main.go")
 	binary := filepath.Join(dir, "owned-codex-fixture.exe")
 	program := `package main
- import("os";"io";"fmt";"time")
- func main(){prompt,_:=io.ReadAll(os.Stdin);if string(prompt)=="WAIT"{time.Sleep(time.Minute)}
+ import("os";"io";"fmt";"time";"encoding/json")
+ func main(){raw,_:=io.ReadAll(os.Stdin);var input map[string]json.RawMessage;var schema,prompt string;var source map[string]string
+ if json.Unmarshal(raw,&input)!=nil||json.Unmarshal(input["schema"],&schema)!=nil||schema!="researchos.codex-source-context.v1"||json.Unmarshal(input["source_context"],&source)!=nil||source["source_workspace"]==""||source["process_working_directory"]==""||source["access"]!="READ_ONLY"||json.Unmarshal(input["user_request"],&prompt)!=nil{os.Exit(73)}
+ if prompt=="WAIT"{time.Sleep(time.Minute)}
  fmt.Println("{\"type\":\"thread.started\",\"thread_id\":\"fixture-cli-thread\"}")
  fmt.Println("{\"type\":\"item.completed\",\"item\":{\"id\":\"a\",\"type\":\"agent_message\",\"text\":\"finite fixture response\"}}")
- if string(prompt)=="UNKNOWN"{return};if string(prompt)=="FAIL"{os.Exit(7)}
+ if prompt=="UNKNOWN"{return};if prompt=="FAIL"{os.Exit(7)}
  fmt.Println("{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}")
  }`
 	if err := os.WriteFile(source, []byte(program), 0600); err != nil {
