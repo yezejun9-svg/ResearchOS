@@ -46,6 +46,9 @@ func main() {
 			"product": productName, "version": buildVersion, "protocol": clientProtocol})
 	case "help", "--help":
 		cliHelpSurface(true)
+		diag("harness: readonly native Harness; use researchos harness help")
+	case "harness":
+		cliHarness(args[1:])
 	case "doctor":
 		cliDoctor()
 	case "task":
