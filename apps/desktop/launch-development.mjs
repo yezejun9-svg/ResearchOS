@@ -172,6 +172,7 @@ export function buildChildEnv(ambient, bundle, state, smoke = false) {
     TEMP: path.join(state, 'tmp'), TMP: path.join(state, 'tmp'),
     RESEARCHOS_DATA_DIR: path.join(state, 'data'),
     RESEARCHOS_CLI_DISCOVERY: path.join(state, 'discovery.json'),
+    RESEARCHOS_SHARED_HOST_LOCATOR_DISABLED: '1',
     RESEARCHOS_DESKTOP_USER_DATA: path.join(state, 'electron-user-data'),
     RESEARCHOS_CONTROL_EXE: path.join(bundle, 'apps/desktop/resources/control/researchos-control.exe'),
     RESEARCHOS_DESKTOP_VERIFIER_MANIFEST: path.join(bundle, 'apps/desktop/resources/control/runtime-verifier-installation.json'),
