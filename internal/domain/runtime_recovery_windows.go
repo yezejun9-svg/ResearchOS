@@ -354,3 +354,34 @@ func (c *RuntimeCoordinator) recoverEffects(ctx context.Context, project, run, d
 	}
 	return tx.Commit()
 }
+
+// recoverHarness consumes only Host-ingested observations and sealed original
+// ArtifactUse rows. An untrusted CLI disk receipt cannot authorize recovery.
+func (c *RuntimeCoordinator) recoverHarness(ctx context.Context, project, runID string, epoch int64) (bool, error) {
+	tx, err := c.service.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	dispatch, err := runtimeDispatch(tx, project, runID, epoch)
+	if err != nil {
+		tx.Rollback()
+		return false, err
+	}
+	admission := dispatch["manifest"].(map[string]any)["admission"].(map[string]any)
+	if admission["admission_kind"] != "HOST_HARNESS_V1" {
+		tx.Rollback()
+		return false, nil
+	}
+	run, err := load(tx, project, "Run", runID)
+	if err != nil {
+		tx.Rollback()
+		return true, err
+	}
+	_, observationErr := runtimeObservation(tx, project, run)
+	terminal := runTerminal(run)
+	tx.Rollback()
+	if terminal || observationErr == nil {
+		return true, c.finishHarness(ctx, project, runID, epoch)
+	}
+	return true, c.harnessUnknown(ctx, project, runID, epoch, "native terminal observation absent after restart; no relaunch")
+}

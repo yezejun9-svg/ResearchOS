@@ -71,6 +71,9 @@ func newJob(name string) (windows.Handle, error) {
 // Job membership is assigned atomically at creation, before a suspended process can run.
 // This also closes the worker-crash gap between CreateProcess and AssignProcessToJobObject.
 func launch(job windows.Handle, c Command, env []string, stdin, stdout, stderr *os.File) (*process, error) {
+	return launchWithCallback(job, c, env, stdin, stdout, stderr, nil)
+}
+func launchWithCallback(job windows.Handle, c Command, env []string, stdin, stdout, stderr *os.File, before func(*process) error) (*process, error) {
 	handles := []windows.Handle{windows.Handle(stdin.Fd()), windows.Handle(stdout.Fd()), windows.Handle(stderr.Fd())}
 	for _, h := range handles {
 		if e := windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); e != nil {
@@ -126,7 +129,12 @@ func launch(job windows.Handle, c Command, env []string, stdin, stdout, stderr *
 	var created, exit, kernel, user windows.Filetime
 	if e = windows.GetProcessTimes(pi.Process, &created, &exit, &kernel, &user); e == nil {
 		p.created = created.Nanoseconds()
-		_, e = windows.ResumeThread(pi.Thread)
+		if before != nil {
+			e = before(p)
+		}
+		if e == nil {
+			_, e = windows.ResumeThread(pi.Thread)
+		}
 	}
 	windows.CloseHandle(pi.Thread)
 	if e != nil {

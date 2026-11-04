@@ -10,6 +10,12 @@ const runtimeSandboxProfile = "appcontainer-zero-capabilities-v1"
 const runtimeBridgeRevision = "windows-appcontainer-v1"
 
 func validateRuntimeDispatchProfile(profile Object) error {
+	if profile["backend"] == "codex-cli-readonly-v1" {
+		if profile["adapter"] != "codex-cli-harness-v1" || profile["adapter_revision"] != "codex-cli-readonly-v1" || profile["platform"] != "windows-amd64" || profile["sandbox"] != "codex-permissions-workspace-read-v1" || Str(profile, "build_hash") == "" || Str(profile, "harness_owner") == "" {
+			return Fail(422, "GATE_FAILED", "bound native readonly profile required")
+		}
+		return nil
+	}
 	if e := validateRuntimeModelConfig(profile); e != nil {
 		return e
 	}
@@ -151,7 +157,7 @@ func (s *Service) currentDispatchAdmission(tx *sql.Tx, project string, task, run
 	}
 	// Runtime health/lifecycle revisions are not a technical identity. Every
 	// profile, permission, qualification proof and expiry fact remains exact.
-	for _, key := range []string{"mode", "profile_hash", "profile", "technical_hash", "qualification_ids", "qualification_evidence", "permission", "credential_revision", "expires_at", "requested_capabilities", "qualification_bootstrap"} {
+	for _, key := range []string{"mode", "profile_hash", "profile", "technical_hash", "qualification_ids", "qualification_evidence", "permission", "credential_revision", "expires_at", "requested_capabilities", "qualification_bootstrap", "admission_kind"} {
 		if Hash(prior[key]) != Hash(admission[key]) {
 			return nil, Fail(412, "STALE_INPUT", "dispatch authority snapshot changed")
 		}

@@ -256,6 +256,9 @@ func mustRuntimeObservation(tx *sql.Tx, project string, run Object) Object {
 // currentRuntimeAdmission returns only current, verified authority facts.
 // Legacy fixture registrations retain their old local-only path, never dispatch authority.
 func (s *Service) currentRuntimeAdmission(tx *sql.Tx, project string, task, runtime Object, requestedCapabilities []any, operation string) (Object, error) {
+	if runtime["adapter"] == "codex-cli-harness-v1" {
+		return s.nativeHarnessAdmission(tx, project, task, runtime, requestedCapabilities, operation)
+	}
 	if runtime["measurement_mode"] == "LIVE" && len(Arr(runtime, "qualification_ids")) == 0 {
 		return nil, Fail(503, "RESOURCE_UNAVAILABLE", "LIVE runtime has no current qualification")
 	}

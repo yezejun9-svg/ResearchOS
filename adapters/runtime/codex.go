@@ -3,9 +3,11 @@ package runtime
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type Protocol struct {
@@ -123,4 +125,42 @@ func Redact(b []byte) []byte {
 		b = r.ReplaceAll(b, replacement)
 	}
 	return b
+}
+
+// CodexDescriptor is Host-owned metadata. Verification is not inferred from
+// installation or authentication; secrets/config contents never appear here.
+type CodexDescriptor struct {
+	Present                                                     bool
+	Version, ExecutableHash, AuthState, AuthKind, AuthCheckedAt string
+	ConfigurationControlled                                     bool
+	UnavailableReason                                           string
+}
+type CodexLaunch struct {
+	TaskID, RunID, Epoch, Workspace, Prompt, Directory string
+	Timeout                                            time.Duration
+}
+type CodexIdentity struct {
+	PID     uint32
+	Created int64
+	Job     string
+}
+type CodexEvent struct{ Kind, Text, ToolID, ToolName, ToolPhase, NativeID string }
+type CodexResult struct {
+	State, Failure, ThreadID, Assistant      string
+	ExitCode                                 int
+	Identity                                 CodexIdentity
+	Stopped, StreamsDrained, CleanupComplete bool
+	Stdout, Stderr                           []byte
+}
+type CodexCallbacks struct {
+	BeforeResume func(CodexIdentity) error
+	Event        func(CodexEvent) error
+}
+type CodexHandle interface {
+	Cancel()
+	Wait(context.Context) (CodexResult, error)
+}
+type CodexDriver interface {
+	Descriptor() CodexDescriptor
+	Start(context.Context, CodexLaunch, CodexCallbacks) (CodexHandle, error)
 }

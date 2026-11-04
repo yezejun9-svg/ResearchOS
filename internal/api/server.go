@@ -65,6 +65,11 @@ func HandlerWithConfigurationHost(db *sql.DB, webDir string, service *domain.Ser
 		}
 	}
 	mux.HandleFunc("POST /v2/command", v2.serve)
+	var harness domain.HarnessAPI
+	if provider, ok := runtime.(interface{ HarnessV1() domain.HarnessAPI }); ok {
+		harness = provider.HarnessV1()
+	}
+	mountHarnessV1(mux, harness)
 	if v2.loadErr != nil {
 		log.Printf("v2 typed service closed: %v", v2.loadErr)
 	}
