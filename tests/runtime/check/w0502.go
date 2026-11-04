@@ -253,28 +253,9 @@ func firstLine(s string) string {
 	return s
 }
 
-// routingW0502OK asserts this card's routing as data, under this card's own id: the selector the
-// dispatcher forwards either has a suite here or is forwarded to the legacy harness, and an id nobody
-// serves must never be answered with another card's assertions.
+// Share the exact selector truth table with W05-01, including rejected combinations.
 func routingW0502OK() {
-	rows := []struct {
-		task, check, caseID string
-		legacy              bool
-		why                 string
-	}{
-		{"W05", "W05-02", "", false, "this card is served by this program"},
-		{"W05", "W05-01", "", false, "the accepted W05-01 id stays served by this program"},
-		{"W12", "W05-G01", "", true, "an accepted W12 check id stays with the legacy harness"},
-		{"W12", "", "C11", true, "case C11 stays with the legacy harness"},
-		{"", "", "A04", true, "the live case stays with the legacy harness"},
-		{"W05", "W99-DOES-NOT-EXIST", "", true, "an id with no suite here is forwarded, never borrowed"},
-	}
-	bad := []string{}
-	for _, r := range rows {
-		if got := routesToLegacy(r.check, r.caseID, r.task); got != r.legacy {
-			bad = append(bad, r.why+" routed "+boolText(got)+" want "+boolText(r.legacy))
-		}
-	}
+	bad := runtimeRoutingMismatches()
 	ok("W0502-SELECTOR-ROUTING-IS-DATA-NOT-ACCIDENT", len(bad) == 0, bad)
 }
 
