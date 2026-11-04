@@ -8,6 +8,7 @@ import { useRoute } from './navigation'
 import { AppShell } from './components/app-shell'
 import { PairingGate, useDeviceSession } from './Pairing'
 import './style.css'
+import './workbench.css'
 
 const nativeDesktop = !!window.researchos?.desktop?.context
 

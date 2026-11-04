@@ -3,6 +3,8 @@ import { integer, previous, display } from '../../desktop/main/lib/wire-values.m
 import { ArtifactPreview } from './preview.jsx'
 import { SessionContinuation } from './session-continuation.jsx'
 import { WorkbenchLayout } from './components/workbench-layout.jsx'
+import { ActivityRail } from './components/activity-rail.jsx'
+import { composerSubmitKey, appendPrompt } from './activity.js'
 
 const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
 const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
@@ -42,7 +44,7 @@ function unwrap(reply) {
   }
   return reply.result
 }
-function Panel({ title, children, aside }) { return <section className="panel"><div className="section-heading"><h2>{title}</h2>{aside}</div>{children}</section> }
+function Panel({ title, children, aside, className = '' }) { return <section className={`panel ${className}`}><div className="section-heading"><h2>{title}</h2>{aside}</div>{children}</section> }
 function Failure({ error, retry }) { return error && <div className="state-notice" role="alert"><p>{error.message}。输入仍保留，请核对当前状态。</p>{retry && <button onClick={retry}>重新读取</button>}</div> }
 
 export function NativeModelConfiguration({ projectId, initialHost, onConfigured }) {
@@ -411,7 +413,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
     if (!snapshot || snapshot.project_id !== projectId) throw new Error('会话与当前项目不一致')
     if (current.current.snapshot?.session_id !== snapshot.session_id) current.current.eventSequence = previous(snapshot.earliest_event_sequence)
     current.current.snapshot = snapshot
-    setState(old => ({ ...old, snapshot, error: null }))
+    setState(old => ({ ...old, snapshot, events: old.snapshot?.session_id === snapshot.session_id ? old.events : [], error: null }))
   }
   async function readSnapshot(generation = current.current.generation) {
     const value = unwrap(await window.researchos.v2['session.get']({}))
@@ -485,7 +487,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
         if (page.events?.length) {
           setState(old => {
             const seen = new Set(old.events.map(item => item.event_id))
-            return { ...old, events: [...old.events, ...page.events.filter(item => !seen.has(item.event_id))].slice(-500) }
+            return { ...old, events: [...old.events, ...page.events.filter(item => item.session_id === snapshot.session_id && !seen.has(item.event_id))].slice(-500) }
           })
           await readSnapshot(generation)
         }
@@ -529,15 +531,16 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
   const snapshot = state.snapshot
   const writer = snapshot?.writer?.client_id === state.host?.client_id && Date.parse(snapshot?.writer?.expires_at) > Date.now()
   const disabled = !!busy || !online
-  const tools = state.events.filter(event => ['TOOL_STARTED', 'TOOL_RESULT', 'ERROR', 'USAGE', 'ARTIFACT', 'JUDGE_DECISION'].includes(event.kind))
+  const selectedModel = state.host?.model_configurations?.find(item => item.model_config_ref === (snapshot?.model_config_ref || model))
+  const selectedWorkspace = state.host?.workspaces?.find(item => item.authorized_workspace_ref === (snapshot?.workspace_ref || workspace))
   return <>
-    <header className="page-heading"><div><h1>{profile?.name || '会话工作台'}</h1><p>消息、工具结果和成果保留在当前项目中。</p></div><button disabled={!!busy} onClick={load}>刷新会话</button></header>
+    <header className="page-heading workbench-heading"><div><span className="workbench-eyebrow">RESEARCH / WORKSPACE</span><h1>{profile?.name || '会话工作台'}</h1><p>把想法交给 Agent，让每一次迭代都有据可查。</p></div><button className="workbench-refresh" disabled={!!busy} onClick={load}>刷新会话</button></header>
     <Failure error={state.error} retry={load}/>
     {Object.values(shared?.errors || {}).map((error, index) => <Failure key={index} error={new Error(`部分项目资料尚未读取：${error.message}`)} retry={() => { onRefresh(); load() }}/>) }
     {!online && <p className="connection-banner" role="status">已离线，显示最后读取的会话；重新连接后核对最新状态。</p>}
     {state.loading && <div className="loading-state" role="status" aria-busy="true">正在读取本机会话…</div>}
     {!state.loading && state.host && !state.host.model_configurations?.length && <NativeModelConfiguration projectId={projectId} initialHost={state.host} onConfigured={(host, configured) => { setState(old => ({ ...old, host })); setModel(configured.model_config_ref); setNotice(`配置已保存（修订 ${configured.config_revision}）；运行时资格仍待验证。`) }} />}
-    <WorkbenchLayout sessions={<>
+    <WorkbenchLayout hasSession={!!snapshot} sessions={<>
       <Panel title="项目会话"><ul className="session-picker">{state.sessions.map(item => <li key={item.session_id}><button aria-current={snapshot?.session_id === item.session_id ? 'page' : undefined} disabled={disabled} onClick={() => open(item.session_id)}>{item.title || '未命名会话'}<small title={item.run_status ? `原始状态：${item.run_status}` : undefined}>{item.archived_at ? '已归档' : statusLabel(item.run_status, sessionStates, '等待消息')}</small></button></li>)}</ul>
         {state.nextCursor && <button disabled={disabled} onClick={moreSessions}>加载更多会话</button>}
         {!state.sessions.length && !state.loading && <p className="empty-state">{state.error ? '会话列表尚未读取，请恢复连接或权限后重试。' : '还没有会话，选择已配置模型后开始。'}</p>}
@@ -546,32 +549,37 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
           <label>模型<select value={model} onChange={event => setModel(event.target.value)}><option value="">选择配置记录（资格未确认）</option>{(state.host?.model_configurations || []).map(item => <option key={item.model_config_ref} value={item.model_config_ref}>{item.provider_id} · {item.model_id}</option>)}</select></label>
           {!state.host?.model_configurations?.length ? <p>还没有模型配置，请先使用上方表单或项目设置保存。</p> : <p className="small-muted">配置记录不代表运行时已具备资格；创建会话时由服务端检查。</p>}<button disabled={disabled || !workspace || !model} onClick={create}>创建会话</button></details>
       </Panel>
-    </>} conversation={<div className="session-center"><Panel title={snapshot?.title || '开始协作'} aside={snapshot && <span className="tag" title={snapshot.run_status ? `原始状态：${snapshot.run_status}` : undefined}>{statusLabel(snapshot.run_status, sessionStates, '等待消息')}</span>}>
-        {snapshot ? <><div className="button-row">{writer ? <span className="tag good" role="status">当前可写</span> : <button disabled={disabled} onClick={() => command('接管写入', async () => { unwrap(await window.researchos.v2['session.attach']({ after_sequence: snapshot.event_sequence, request_write_owner: true })); await readSnapshot(); composer.current?.focus() })}>在此继续</button>}
+    </>} conversation={<div className="session-center"><Panel className="conversation-canvas" title={snapshot?.title || '开始协作'} aside={snapshot && <span className="tag" title={snapshot.run_status ? `原始状态：${snapshot.run_status}` : undefined}>{statusLabel(snapshot.run_status, sessionStates, '等待消息')}</span>}>
+        {snapshot ? <><div className="button-row session-run-controls">{writer ? <span className="tag good" role="status">当前可写</span> : <button disabled={disabled} onClick={() => command('接管写入', async () => { unwrap(await window.researchos.v2['session.attach']({ after_sequence: snapshot.event_sequence, request_write_owner: true })); await readSnapshot(); composer.current?.focus() })}>在此继续</button>}
           {['PAUSE', 'RESUME', 'CANCEL'].map((action, index) => <button key={action} disabled={disabled || !writer || (action !== 'RESUME' && !snapshot.active_run_id)} onClick={() => command(action, async () => { unwrap(await window.researchos.v2['session.control']({ action, target_id: action === 'RESUME' ? snapshot.session_id : snapshot.active_run_id, reason: '用户从桌面会话操作' })); await readSnapshot() })}>{['暂停', '恢复', '取消'][index]}</button>)}</div>
           {snapshot.resume_requires_explicit_user && <p className="callout">会话等待明确恢复。查看上次结果后再继续。</p>}
-          <div className="conversation-transcript" aria-label="会话记录">{(snapshot.messages || []).map(message => <article className={`conversation-message role-${message.role.toLowerCase()}`} key={message.message_id}><h3>{labels[message.role] || message.role}</h3><div className="message-text">{(message.parts || []).map(part => part.text).join('')}</div>{!message.complete && <small>正在接收…</small>}</article>)}{!snapshot.messages?.length && <p className="empty-state">发送第一条消息，说明希望完成的事。</p>}</div>
+          <div className="conversation-transcript" aria-label="会话记录">{(snapshot.messages || []).map(message => <article className={`conversation-message role-${message.role.toLowerCase()}`} key={message.message_id}><h3>{labels[message.role] || message.role}</h3><div className="message-text">{(message.parts || []).map(part => part.text).join('')}</div>{!message.complete && <small>正在接收…</small>}</article>)}{!snapshot.messages?.length && <ConversationWelcome setDraft={setDraft} composer={composer}/>}</div>
           {snapshot.has_earlier_messages && <div><p>这里只显示最近记录，可读取已封存的完整会话记录。</p>{snapshot.transcript_artifact_ref ? <BoundArtifact reference={snapshot.transcript_artifact_ref} api={api} projectId={projectId} label="读取完整会话记录"/> : <p role="status">完整记录尚未封存，请刷新后重试。</p>}</div>}
           {snapshot.pending_command_ids?.length > 0 && <p role="status">{snapshot.pending_command_ids.length} 条命令等待处理。</p>}
-          <form className="session-composer" onSubmit={event => { event.preventDefault(); command('发送消息', async () => { unwrap(await window.researchos.v2['session.send']({ text: draft, attachment_artifact_ids: attachment ? [attachment] : [], delivery })); setDraft(''); setAttachment(''); await readSnapshot(); setNotice('消息已接收，等待运行结果。') }) }}>
-            <label>发送给 Agent<textarea ref={composer} aria-label="会话消息" value={draft} onChange={event => setDraft(event.target.value)} placeholder="说明目标、约束或要修改的文件…" required/></label>
-            <div className="composer-controls"><label>投递方式<select value={delivery} onChange={event => setDelivery(event.target.value)}><option value="NORMAL">正常消息</option><option value="STEER">引导当前执行</option><option value="FOLLOW_UP">追加后续</option></select></label><button className="primary" type="submit" disabled={disabled || !writer || !draft.trim()}>发送</button></div>
+        </> : <div className="conversation-transcript"><ConversationWelcome setDraft={setDraft} composer={composer}/></div>}
+          <form className="session-composer" onSubmit={event => { event.preventDefault(); if (disabled || !snapshot || !writer || !draft.trim()) return; command('发送消息', async () => { unwrap(await window.researchos.v2['session.send']({ text: draft, attachment_artifact_ids: attachment ? [attachment] : [], delivery })); setDraft(''); setAttachment(''); await readSnapshot(); setNotice('消息已接收，等待运行结果。') }) }}>
+            <div className="composer-context"><span className="composer-prompt">researchos &gt;</span><span title={selectedModel?.model_id}>{selectedModel?.model_id || '尚未选择模型'}</span>{selectedWorkspace?.display_name && <span title={selectedWorkspace.display_name}>{selectedWorkspace.display_name}</span>}</div>
+            <label className="composer-message-label"><span className="visually-hidden">发送给 Agent</span><textarea ref={composer} aria-label="会话消息" value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (composerSubmitKey(event)) { event.preventDefault(); if (!disabled && snapshot && writer && draft.trim()) event.currentTarget.form.requestSubmit() } }} placeholder="描述目标、提出问题，或告诉 Agent 下一步做什么…" required/></label>
+            <div className="composer-controls"><label><span className="visually-hidden">投递方式</span><select aria-label="投递方式" value={delivery} onChange={event => setDelivery(event.target.value)}><option value="NORMAL">正常消息</option><option value="STEER">引导当前执行</option><option value="FOLLOW_UP">追加后续</option></select></label><small className="composer-shortcut">Enter 发送 · Shift+Enter 换行</small><button className="primary" type="submit" disabled={disabled || !snapshot || !writer || !draft.trim()}>发送</button></div>
             {attachment && <p>已附加受控产物：<span className="break-all">{attachment}</span><button type="button" onClick={() => setAttachment('')}>移除附件</button></p>}
-            {!writer && <p className="small-muted">当前为只读，请先选择“在此继续”。</p>}
+            {(!snapshot || !writer) && <p className="composer-access-note">{snapshot ? '当前为只读，请先选择“在此继续”。' : '在上方选择或创建会话；输入内容会保留。'}</p>}
           </form>
-        </> : <p className="empty-state">打开已有会话，或选择工作区和模型创建会话。</p>}
         <p className="small-muted" role="status" aria-live="polite">{busy ? `${busy}…` : notice}</p>
       </Panel>
-      {snapshot?.project_id === projectId && <SessionContinuation key={`${projectId}:${snapshot.session_id}:${snapshot.goal_id || ''}:${snapshot.revision}`} api={api} projectId={projectId} snapshot={snapshot} navigate={navigate}/>}
-      {tools.length > 0 && <Panel title="工具与结果"><ol className="event-list">{tools.map(event => <li key={event.event_id}><strong>{event.kind === 'TOOL_STARTED' ? '开始工具' : event.kind === 'TOOL_RESULT' ? '工具结果' : event.kind}</strong><span>{event.payload?.tool_name || event.payload?.summary || event.payload?.message || ''}</span><details><summary>查看完整回执</summary><pre>{display(event.payload)}</pre></details></li>)}</ol></Panel>}
       {(snapshot?.pending_permissions || []).map(prompt => <PermissionDecision key={prompt.request.id} prompt={prompt} api={api} projectId={projectId} disabled={disabled || !writer} respond={decision => command('处理授权', async () => { unwrap(await window.researchos.v2['permission.respond']({ resource_request_id: prompt.request.id, resource_request_revision: prompt.request.revision, action_digest: prompt.action_digest, decision, reason: '用户在桌面明确选择' })); await readSnapshot() })}/>)}
       </div>} context={<>
-      {snapshot && <WorkspaceFiles snapshot={snapshot} api={api} projectId={projectId} writer={writer} disabled={disabled} command={command} readSnapshot={readSnapshot} setAttachment={setAttachment} selectedFile={selectedFile} setSelectedFile={setSelectedFile} setFileDirty={setFileDirty}/>}
-      <DesktopQualification key={`${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId} sessionId={state.snapshot?.session_id || null}/>
-      <DesktopCodingAuthorization key={`coding:${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId}
-        sessionId={state.snapshot?.session_id || null} onConfigured={reconcileCodingCommit}/>
+      <ActivityRail events={state.events} snapshot={snapshot} projection={shared?.data?.getProgressProjection} projectState={shared?.data?.getProjectState} releases={shared?.data?.listMilestoneRelease} projectId={projectId} navigate={navigate}/>
+      {snapshot?.project_id === projectId && <details className="inspector-disclosure"><summary>目标与双端接续</summary><SessionContinuation key={`${projectId}:${snapshot.session_id}:${snapshot.goal_id || ''}:${snapshot.revision}`} api={api} projectId={projectId} snapshot={snapshot} navigate={navigate}/></details>}
+      {snapshot && <details className="inspector-disclosure"><summary>工作区文件与差异</summary><WorkspaceFiles snapshot={snapshot} api={api} projectId={projectId} writer={writer} disabled={disabled} command={command} readSnapshot={readSnapshot} setAttachment={setAttachment} selectedFile={selectedFile} setSelectedFile={setSelectedFile} setFileDirty={setFileDirty}/></details>}
+      <details className="inspector-disclosure"><summary>模型运行资格</summary><DesktopQualification key={`${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId} sessionId={state.snapshot?.session_id || null}/></details>
+      <details className="inspector-disclosure"><summary>工作区与编码授权</summary><DesktopCodingAuthorization key={`coding:${projectId}:${state.snapshot?.session_id || ''}`} projectId={projectId}
+        sessionId={state.snapshot?.session_id || null} onConfigured={reconcileCodingCommit}/></details>
     </>}/>
   </>
+}
+
+function ConversationWelcome({ setDraft, composer }) {
+  return <div className="conversation-welcome"><span className="workbench-eyebrow">YOUR NEXT ITERATION</span><h2>让想法，开始迭代。</h2><p>从当前项目出发，一起研究、构建和验证。</p><div className="conversation-starters">{['梳理项目现状与下一步', '检查当前改动并运行必要测试', '继续尚未完成的工作'].map(text => <button type="button" key={text} onClick={() => { setDraft(previous => appendPrompt(previous, text)); composer.current?.focus() }}>{text}</button>)}</div></div>
 }
 
 function BoundArtifact({ reference, api, projectId, label = '读取引用产物', onVerified }) {
