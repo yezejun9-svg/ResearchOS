@@ -10,12 +10,14 @@
 package host
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -53,15 +55,15 @@ var (
 // the existing host inputs (same values apps/control uses) so domain validation stays one
 // implementation rather than a second one tuned for tests.
 type Config struct {
-	DB            *sql.DB
-	Dir           string
+	DB  *sql.DB
+	Dir string
 	// Trial-only read access to one existing DPAPI record; the new DB stays isolated.
-	ReadOnlyModelVaultDir string
+	ReadOnlyModelVaultDir      string
 	ReadOnlyModelCredentialRef string
-	ReadOnlyModelProvider string
-	ContractsDir  string
-	MigrationFile string
-	SessionTTL    time.Duration
+	ReadOnlyModelProvider      string
+	ContractsDir               string
+	MigrationFile              string
+	SessionTTL                 time.Duration
 	// SchemaDir holds the pinned client.protocol.schema.json plus domain.schema.json the bridge
 	// grades its frames against. Without it the host refuses to start rather than accepting
 	// frames nobody has graded.
@@ -89,7 +91,9 @@ type Host struct {
 	dir      string
 	ttl      time.Duration
 	identity auth.Identity
-	now      func() time.Time
+	// Fresh for this Host object only; never a stable identity or a wire credential.
+	bootGeneration [32]byte
+	now            func() time.Time
 
 	doc schemaDocument
 
@@ -105,13 +109,29 @@ type Host struct {
 // New verifies the OS identity first: a host that cannot name the local principal is not
 // allowed to bootstrap, renew, or accept native calls at all.
 func New(cfg Config) (*Host, error) {
+	return newHost(cfg, rand.Reader)
+}
+
+// The entropy seam is private: production always uses crypto/rand, while tests
+// can prove that failure precedes any directory, vault or database mutation.
+func newHost(cfg Config, entropy io.Reader) (*Host, error) {
 	if cfg.DB == nil || cfg.Dir == "" || cfg.ContractsDir == "" || cfg.MigrationFile == "" || cfg.SchemaDir == "" {
 		return nil, fmt.Errorf("%w: db, dir, contracts, migration and schema are required", ErrBadState)
+	}
+	var generation [32]byte
+	if entropy == nil {
+		return nil, fmt.Errorf("%w: boot generation entropy unavailable", ErrBadState)
+	}
+	if _, err := io.ReadFull(entropy, generation[:]); err != nil {
+		return nil, fmt.Errorf("%w: boot generation entropy: %w", ErrBadState, err)
+	}
+	if generation == ([32]byte{}) {
+		return nil, fmt.Errorf("%w: empty boot generation", ErrBadState)
 	}
 	if cfg.ReadOnlyModelVaultDir != "" {
 		if cfg.ReadOnlyModelCredentialRef == "" || cfg.ReadOnlyModelProvider == "" ||
 			filepath.Base(cfg.Dir) != "host" ||
-            ValidateTrialStorageLayout(filepath.Dir(cfg.Dir), cfg.Dir, cfg.ReadOnlyModelVaultDir) != nil {
+			ValidateTrialStorageLayout(filepath.Dir(cfg.Dir), cfg.Dir, cfg.ReadOnlyModelVaultDir) != nil {
 			return nil, ErrUnknownCredential
 		}
 	} else if cfg.ReadOnlyModelCredentialRef != "" || cfg.ReadOnlyModelProvider != "" {
@@ -150,7 +170,7 @@ func New(cfg Config) (*Host, error) {
 	if err != nil {
 		return nil, err
 	}
-	h := &Host{db: cfg.DB, domain: svc, dir: cfg.Dir, ttl: ttl, identity: id, now: now, doc: doc}
+	h := &Host{db: cfg.DB, domain: svc, dir: cfg.Dir, ttl: ttl, identity: id, bootGeneration: generation, now: now, doc: doc}
 	h.peerLookup = cfg.PeerIdentityResolver
 	if h.peerLookup == nil {
 		h.peerLookup = auth.ProcessIdentity

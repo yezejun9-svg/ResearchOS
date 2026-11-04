@@ -65,37 +65,45 @@ func (s *Service) RevokePrincipal(ctx context.Context, id string) error {
 	return e
 }
 func authenticate(tx *sql.Tx, token string) (Principal, error) {
+	p, _, err := authenticateWithCredential(tx, token)
+	return p, err
+}
+
+func authenticateWithCredential(tx *sql.Tx, token string) (Principal, authenticatedCredential, error) {
 	var p Principal
+	hash := Digest([]byte(token))
 	var roles, expires string
-	e := tx.QueryRow("SELECT p.id,p.roles,p.can_create_project,c.expires_at FROM auth_credentials c JOIN auth_principals p ON p.id=c.principal WHERE c.token_hash=? AND c.revoked=0 AND p.revoked=0", Digest([]byte(token))).Scan(&p.ID, &roles, &p.CanCreateProject, &expires)
+	e := tx.QueryRow("SELECT p.id,p.roles,p.can_create_project,c.expires_at FROM auth_credentials c JOIN auth_principals p ON p.id=c.principal WHERE c.token_hash=? AND c.revoked=0 AND p.revoked=0", hash).Scan(&p.ID, &roles, &p.CanCreateProject, &expires)
 	if e != nil {
-		return p, Fail(401, "UNAUTHENTICATED", "valid credential required")
+		return p, authenticatedCredential{}, Fail(401, "UNAUTHENTICATED", "valid credential required")
 	}
 	t, e := time.Parse(time.RFC3339Nano, expires)
 	if e != nil || !time.Now().Before(t) {
-		return p, Fail(401, "UNAUTHENTICATED", "credential expired")
+		return p, authenticatedCredential{}, Fail(401, "UNAUTHENTICATED", "credential expired")
 	}
 	if e = json.Unmarshal([]byte(roles), &p.Roles); e != nil {
-		return p, e
+		return p, authenticatedCredential{}, e
 	}
 	rows, e := tx.Query("SELECT project,task,run,restricted FROM auth_grants WHERE principal=?", p.ID)
 	if e != nil {
-		return p, e
+		return p, authenticatedCredential{}, e
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var g Grant
 		if e = rows.Scan(&g.ProjectID, &g.TaskID, &g.RunID, &g.Restricted); e != nil {
-			return p, e
+			return p, authenticatedCredential{}, e
 		}
 		p.Grants = append(p.Grants, g)
 	}
 	if e = rows.Err(); e != nil {
-		return p, e
+		return p, authenticatedCredential{}, e
 	}
 	rows.Close()
-	e = constrainRemotePrincipal(tx, &p)
-	return p, e
+	if e = constrainRemotePrincipal(tx, &p); e != nil {
+		return p, authenticatedCredential{}, e
+	}
+	return p, authenticatedCredential{principal: p.ID, hash: hash, expiresAt: t}, nil
 }
 func (p Principal) HasRole(want string) bool {
 	for _, r := range p.Roles {

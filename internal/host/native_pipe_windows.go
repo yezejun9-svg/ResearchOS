@@ -133,13 +133,9 @@ func (h *Host) serveNativeConnection(ph windows.Handle, chooser func(string) (st
 	// The peer is asked of the OS, never of the client: the DACL only proves "a process this user
 	// can open the pipe to", so the resolved principal must also equal the principal the host
 	// bootstrapped for. A lookup that fails is a refusal, not a maybe.
-	peer, err := h.peerLookup(pid)
+	peer, err := h.verifyNativePeer(pid)
 	if err != nil {
-		_ = writeNativeFrame(ph, errorFrame(fmt.Errorf("%w: peer identity unresolved: %v", ErrFrameUntrusted, err)))
-		return
-	}
-	if !h.Identity().SameUser(peer) {
-		_ = writeNativeFrame(ph, errorFrame(ErrHostIdentity))
+		_ = writeNativeFrame(ph, errorFrame(err))
 		return
 	}
 	raw, err := readNativeFrame(ph)
@@ -148,7 +144,7 @@ func (h *Host) serveNativeConnection(ph windows.Handle, chooser func(string) (st
 	}
 	// The path in a frame is only an initial suggestion. The Shell dialog runs
 	// in this trusted, same-user host process and requires an explicit choice.
-	reply, err := h.HandleNative(raw, true, chooser)
+	reply, err := h.handleVerifiedNative(raw, peer, chooser)
 	if err != nil {
 		reply = errorFrame(err)
 	}

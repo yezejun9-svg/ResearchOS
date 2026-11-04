@@ -152,7 +152,16 @@ func (v *v2Service) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	env, decErr := domain.DecodeEnvelope(body)
-	principal, authErr := domain.AuthenticateToken(r.Context(), v.db, bearerToken(r))
+	// Authentication and command execution share one transaction, so credential
+	// revocation, principal/grant checks and command effects see the same state.
+	// Begin failure remains an auth-stage rejection, as in AuthenticateToken.
+	tx, authErr := v.db.BeginTx(r.Context(), nil)
+	var authContext context.Context
+	var principal domain.Principal
+	if authErr == nil {
+		defer tx.Rollback()
+		authContext, principal, authErr = domain.AuthenticateCommandTx(r.Context(), tx, bearerToken(r), v.svc)
+	}
 	if authErr != nil {
 		if env != nil {
 			// The envelope is well formed, so the client gets the typed rejection it asked for.
@@ -175,12 +184,6 @@ func (v *v2Service) serve(w http.ResponseWriter, r *http.Request) {
 		writeTypedError(w, status, nil, code, decErr.Error())
 		return
 	}
-	tx, err := v.db.BeginTx(r.Context(), nil)
-	if err != nil {
-		writeTypedError(w, http.StatusInternalServerError, env, "INTERNAL_ERROR", "host transaction unavailable")
-		return
-	}
-	defer tx.Rollback()
 	// Grants are the existing per-principal project authorisations; a null project command
 	// (host.status) still requires an authenticated principal but no project grant.
 	if env.ProjectID != nil && *env.ProjectID != "" && !principal.Allowed(*env.ProjectID, "", "", false) {
@@ -188,7 +191,7 @@ func (v *v2Service) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, resp)
 		return
 	}
-	resp, replayed, err := v.svc.Execute(r.Context(), tx, env, principal.ID)
+	resp, replayed, err := v.svc.Execute(authContext, tx, env, principal.ID)
 	if err != nil {
 		if err == domain.ErrIdemConflict {
 			writeTypedError(w, http.StatusConflict, env, "COMMAND_ID_CONFLICT", "command_id reused with a different request")
