@@ -1,13 +1,13 @@
 import React, { useEffect, useState } from 'react'
-import { activityRows } from '../activity.js'
+import { activityRows, harnessActivityRows } from '../activity.js'
 import { display } from '../../../desktop/main/lib/wire-values.mjs'
 import { Link, stages } from '../navigation'
 import { itemsOf } from '../api'
 
-export function ActivityRail({ events, snapshot, projection, projectState, releases, projectId, navigate }) {
+export function ActivityRail({ events, snapshot, harnessTask, projection, projectState, releases, projectId, navigate }) {
   const [expanded, setExpanded] = useState(false)
-  useEffect(() => setExpanded(false), [snapshot?.session_id])
-  const activity = activityRows(events, snapshot?.session_id)
+  useEffect(() => setExpanded(false), [snapshot?.session_id, harnessTask?.task_ref?.task_id])
+  const activity = harnessTask ? harnessActivityRows(events, harnessTask.task_ref) : activityRows(events, snapshot?.session_id)
   const visibleActivity = expanded ? activity : activity.slice(0, 12)
   const latestRelease = itemsOf(releases).at(-1)
   return <>
@@ -29,7 +29,7 @@ export function ActivityRail({ events, snapshot, projection, projectState, relea
       <div className="inspector-heading"><div><span className="workbench-eyebrow">ACTIVITY</span><h2>执行轨迹</h2></div><span className="inspector-label">当前会话</span></div>
       {activity.length ? <ol className="activity-timeline">{visibleActivity.map(({ event, title, summary, tone }) => <li className={`activity-item activity-${tone}`} key={event.event_id}>
         <span className="activity-marker" aria-hidden="true"/><details><summary><span className="activity-item-heading"><strong>{title}</strong><span>#{String(event.sequence)}</span></span><span className="activity-summary">{summary}</span></summary>
-          <div className="activity-receipt"><small>事件 {event.event_id}</small>{event.run_id && <small>运行 {event.run_id}</small>}<details><summary>技术回执</summary><pre>{display(event.payload)}</pre></details></div>
+          <div className="activity-receipt"><small>事件 {event.event_id}</small>{(event.run_id || event.run?.run_id) && <small>运行 {event.run_id || event.run.run_id}{event.run?.epoch ? ` · epoch ${event.run.epoch}` : ''}</small>}<details><summary>技术回执</summary><pre>{display(event.payload)}</pre></details></div>
         </details>
       </li>)}</ol> : <div className="inspector-empty"><p>每一步，都有迹可循。</p><small>开始会话后，工具调用、执行结果和产物会显示在这里。</small></div>}
       {activity.length > 12 && <button type="button" className="activity-expand" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? '只看最近 12 条' : `展开已读取轨迹（${activity.length}）`}</button>}

@@ -5,6 +5,7 @@ import { SessionContinuation } from './session-continuation.jsx'
 import { WorkbenchLayout } from './components/workbench-layout.jsx'
 import { ActivityRail } from './components/activity-rail.jsx'
 import { composerSubmitKey, appendPrompt } from './activity.js'
+import { HARNESS_CAPABILITIES, canSubmitHarness, hasHarnessCapability, harnessStatusLabel, createHarnessController } from './harness.js'
 
 const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
 const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
@@ -393,10 +394,100 @@ export function DesktopCodingAuthorization({ projectId, sessionId, onConfigured 
   </Panel>
 }
 
-export function NativeWorkbench({ projectId, profile, api, navigate, shared, onRefresh }) {
+export function NativeWorkbench(props) {
+  const [harness, setHarness] = useState('codex')
+  const [codexDraft, setCodexDraft] = useState(''), [muDraft, setMuDraft] = useState('')
+  const [guard, setGuard] = useState({})
+  function choose(value) {
+    if (guard.busy) return
+    if (guard.fileDirty && !confirm('文件有未保存草稿，切换 Harness 会关闭文件编辑。继续吗？')) return
+    if (guard.active && !confirm('当前任务仍由 Host 执行，切换 Harness 不会取消它。继续吗？')) return
+    setHarness(value)
+  }
+  return <><div className="button-row composer-context"><label>Harness <select aria-label="Harness" value={harness} disabled={guard.busy} onChange={event => choose(event.target.value)}><option value="codex">Codex CLI · 只读任务</option><option value="mu">Mu · 原有模型会话</option></select></label><small>各 Harness 的登录、模型与能力分别核对；草稿在本页保留。</small></div>
+    {harness === 'codex' ? <NativeHarnessWorkbench {...props} draft={codexDraft} setDraft={setCodexDraft} onGuardChange={setGuard}/> :
+      <NativeMuWorkbench {...props} draft={muDraft} setDraft={setMuDraft} onGuardChange={setGuard}/>}</>
+}
+
+function NativeHarnessWorkbench({ projectId, profile, navigate, shared, draft, setDraft, onGuardChange }) {
+  const [state, setState] = useState({ loading: true, busy: false, tasks: [], task: null, events: [], capabilities: null, pending: null })
+  const [workspaces, setWorkspaces] = useState([]), [workspace, setWorkspace] = useState('')
+  const [hostError, setHostError] = useState(null), [notice, setNotice] = useState('')
+  const [online, setOnline] = useState(navigator.onLine)
+  const controller = useRef(null), composer = useRef(null)
+  const draftVersion = useRef(0), draftScope = useRef({ projectId, workspace })
+  if (draftScope.current.projectId !== projectId || draftScope.current.workspace !== workspace) {
+    draftVersion.current++
+    draftScope.current = { projectId, workspace }
+  }
+  function editDraft(value) {
+    draftVersion.current++
+    setDraft(value)
+  }
+  useEffect(() => {
+    let stopped = false
+    const control = createHarnessController(window.researchos.harness, projectId)
+    controller.current = control
+    const unsubscribe = control.subscribe(() => { if (!stopped) setState(control.getSnapshot()) })
+    async function load() {
+      try {
+        const selected = await window.researchos.desktop.selectProject(projectId)
+        if (!selected?.ok) throw new Error(selected?.reason || 'PROJECT_NOT_SELECTED')
+        if (stopped) return
+        try {
+          const host = unwrap(await window.researchos.v2['host.status']({}))
+          if (stopped) return
+          const values = (host.workspaces || []).filter(item => item.project_id === projectId && item.status === 'ACTIVE')
+          setWorkspaces(values)
+          setWorkspace(old => values.some(item => item.authorized_workspace_ref === old) ? old : values[0]?.authorized_workspace_ref || '')
+          setHostError(null)
+        } catch (error) { if (!stopped) setHostError(error) }
+        if (!stopped) await control.load()
+      } catch (error) { if (!stopped) { setHostError(error); setState(old => ({ ...old, loading: false })) } }
+    }
+    load()
+    const changed = () => setOnline(navigator.onLine)
+    const tick = () => { if (navigator.onLine) control.tick() }
+    const visible = () => { if (document.visibilityState === 'visible') tick() }
+    const timer = setInterval(tick, 1200)
+    addEventListener('online', changed); addEventListener('offline', changed); addEventListener('online', tick)
+    document.addEventListener('visibilitychange', visible)
+    return () => { stopped = true; draftVersion.current++; if (controller.current === control) controller.current = null; unsubscribe(); control.dispose(); clearInterval(timer); removeEventListener('online', changed); removeEventListener('offline', changed); removeEventListener('online', tick); document.removeEventListener('visibilitychange', visible) }
+  }, [projectId])
+  useEffect(() => { onGuardChange({ busy: state.busy, fileDirty: false, active: !!state.task && !state.task.terminal }) }, [state.busy, state.task, onGuardChange])
+  const capabilities = state.capabilities, task = state.task
+  const disabled = state.busy || state.loading || !online
+  const canSend = !disabled && !state.pending && !!workspace && !!draft.trim() && canSubmitHarness(capabilities)
+  const assistant = state.events.filter(event => event.kind === 'ASSISTANT_MESSAGE' && typeof event.payload?.text === 'string')
+  async function send(event) {
+    event.preventDefault()
+    if (!canSend) return
+    const control = controller.current, submittedVersion = draftVersion.current
+    if (!control) return
+    setNotice('')
+    if (await control.submit({ workspace_ref: workspace, prompt: draft })) {
+      if (controller.current !== control) return
+      if (draftVersion.current === submittedVersion) setDraft('')
+      setNotice('任务已接收，等待真实运行回执。')
+    }
+  }
+  return <><header className="page-heading workbench-heading"><div><span className="workbench-eyebrow">RESEARCH / WORKSPACE</span><h1>{profile?.name || '项目工作台'}</h1><p>通过本机 Codex 执行一次只读临时任务，查看真实执行回执。</p></div><button disabled={disabled} onClick={() => controller.current.load()}>刷新任务</button></header>
+    <Failure error={hostError}/><Failure error={state.error}/>
+    {!online && <p className="connection-banner" role="status">当前离线。保留已读任务；恢复连接后核对状态，不会重新提交。</p>}
+    {state.pending && <div className="state-notice" role="status"><p>原{state.pending.kind === 'cancel' ? '取消' : '提交'}请求需核对：{state.pending.request_id}。不会自动重发或创建新任务。</p><button disabled={disabled} onClick={() => controller.current.reconcile()}>只读核对原请求</button></div>}
+    <WorkbenchLayout hasSession={!!task} sessions={<Panel title="Codex 任务"><ul className="session-picker">{state.tasks.map(item => <li key={item.task_ref.task_id}><button disabled={disabled} aria-current={task?.task_ref.task_id === item.task_ref.task_id ? 'page' : undefined} onClick={() => { if (!draft || confirm('当前草稿会保留在输入框。切换查看此任务？')) controller.current.select(item.task_ref.task_id) }}>{item.prompt.slice(0, 80) || item.task_ref.task_id}<small>{harnessStatusLabel(item.status)}</small></button></li>)}</ul>{!state.tasks.length && <p className="empty-state">{state.loading ? '正在读取真实任务…' : '尚无任务。选择授权工作区后输入目标。'}</p>}<label>工作区<select aria-label="Codex 工作区" value={workspace} disabled={disabled} onChange={event => setWorkspace(event.target.value)}><option value="">选择已授权目录</option>{workspaces.map(item => <option key={item.authorized_workspace_ref} value={item.authorized_workspace_ref}>{item.display_name}</option>)}</select></label>{!workspaces.length && <p>请先从项目入口选择并授权工作区；不需要 provider 模型配置。</p>}</Panel>}
+      conversation={<Panel className="conversation-canvas" title="Codex · 只读任务" aside={<span className="tag">{task ? harnessStatusLabel(task.status) : '等待输入'}</span>}>
+        <div className="button-row session-run-controls"><button disabled={disabled || !!state.pending || !task || task.terminal || !hasHarnessCapability(capabilities, 'cancel')} onClick={() => controller.current.cancel()}>取消当前任务</button><button disabled title="当前 Harness 不支持暂停">暂停</button><button disabled title="当前 Harness 不支持恢复执行">恢复执行</button></div>
+        <div className="conversation-transcript" aria-label="Codex 任务记录">{task ? <><article className="conversation-message role-user"><h3>你</h3><div className="message-text">{task.prompt}</div></article>{assistant.map(event => <article className="conversation-message role-assistant" key={event.event_id}><h3>Codex</h3><div className="message-text">{event.payload.text}</div></article>)}{task.result?.assistant_text && !assistant.some(event => event.payload.text === task.result.assistant_text) && <article className="conversation-message role-assistant"><h3>Codex</h3><div className="message-text">{task.result.assistant_text}</div></article>}{task.failure && <p role="status">{task.failure.code}：{task.failure.message}</p>}<p className="small-muted">Task {task.task_ref.task_id} · 修订 {task.task_revision}{task.run ? ` · Run ${task.run.run_id} · epoch ${task.run.epoch}` : ' · 尚无 Run'}。执行状态不代表业务验收。</p></> : <ConversationWelcome setDraft={editDraft} composer={composer}/>}</div>
+        <form className="session-composer" onSubmit={send}><div className="composer-context"><span className="composer-prompt">researchos &gt;</span><span>Codex CLI</span><span>模型由 Codex 配置决定</span><span>workspace-read · ephemeral</span></div><textarea ref={composer} aria-label="Codex 任务输入" value={draft} onChange={event => editDraft(event.target.value)} onKeyDown={event => { if (composerSubmitKey(event)) { event.preventDefault(); if (canSend) event.currentTarget.form.requestSubmit() } }} placeholder="输入一次只读任务，例如：检查项目结构并解释主要入口。" required/><div className="composer-controls"><small>Enter 发送 · Shift+Enter 换行</small><button className="primary" type="submit" disabled={!canSend}>提交只读任务</button></div>{notice && <p role="status">{notice}</p>}</form>
+      </Panel>}
+      context={<><Panel title="Codex 状态与能力">{capabilities ? <><p>安装：{capabilities.installation.present ? capabilities.installation.version || '已发现' : '未发现'} · 登录：{({ UNPROBED: '未探测', LOGGED_IN: '已登录', LOGGED_OUT: '未登录', ERROR: '探测失败' })[capabilities.authentication.state]}</p><p>执行验证：{capabilities.verification.execution} · 只读范围验证：{capabilities.verification.workspace_read_scope} · 取消验证：{capabilities.verification.cancellation}</p><p>平台策略管理；只读边界{capabilities.security_scope.enforcement_verified ? '已由 Host 标记验证' : '未验证'}。登录与执行验证分别记录。</p><div className="record-list">{HARNESS_CAPABILITIES.map(([key, label]) => <div className="record-row" key={key}><span>{label}</span><span>{hasHarnessCapability(capabilities, key) ? '已实现' : '不支持'}</span></div>)}</div>{!capabilities.can_submit && <p role="status">暂不能提交：{capabilities.reason_codes.join('、')}</p>}</> : <p>{state.loading ? '正在读取 Host 能力…' : '能力尚未读取；操作保持禁用。'}</p>}</Panel><ActivityRail events={state.events} harnessTask={task} projection={shared?.data?.getProgressProjection} projectState={shared?.data?.getProjectState} releases={shared?.data?.listMilestoneRelease} projectId={projectId} navigate={navigate}/><details className="inspector-disclosure"><summary>文件、产物与授权</summary><p>此 Harness 首版未提供文件列表、diff、文件产物、附件或逐工具授权能力，相关操作不可用。</p><button disabled>读取文件差异</button><button disabled>写入文件</button><button disabled>批准工具</button></details></>}/>
+  </>
+}
+
+function NativeMuWorkbench({ projectId, profile, api, navigate, shared, onRefresh, draft, setDraft, onGuardChange }) {
   const [state, setState] = useState({ loading: true, sessions: [], host: null, snapshot: null, events: [], error: null })
   const [busy, setBusy] = useState('')
-  const [draft, setDraft] = useState('')
   const [delivery, setDelivery] = useState('NORMAL')
   const [model, setModel] = useState('')
   const [workspace, setWorkspace] = useState('')
@@ -404,6 +495,7 @@ export function NativeWorkbench({ projectId, profile, api, navigate, shared, onR
   const [attachment, setAttachment] = useState('')
   const [selectedFile, setSelectedFile] = useState('')
   const [fileDirty, setFileDirty] = useState(false)
+  useEffect(() => { onGuardChange({ busy: !!busy, fileDirty, active: !!state.snapshot?.active_run_id && !['SETTLED', 'COMPLETED', 'FAILED', 'CANCELLED'].includes(state.snapshot?.run_status) }) }, [busy, fileDirty, state.snapshot, onGuardChange])
   const [notice, setNotice] = useState('')
   const current = useRef({ projectId, generation: 0, snapshot: null, busy: false })
   const [online, setOnline] = useState(navigator.onLine)

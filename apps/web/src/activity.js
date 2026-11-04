@@ -1,4 +1,5 @@
 import { integer, compare } from '../../desktop/main/lib/wire-values.mjs'
+import { decimal, sameTask, harnessStatusLabel } from './harness.js'
 
 const activityKinds = new Set(['TOOL_STARTED', 'TOOL_RESULT', 'RUN_STATE', 'GOAL_STATE', 'ARTIFACT', 'JUDGE_DECISION', 'ERROR', 'USAGE'])
 const outcomes = { SUCCEEDED: '工具成功', FAILED: '工具失败', CANCELLED: '已取消', BLOCKED: '受阻', UNKNOWN: '结果待核对' }
@@ -41,4 +42,22 @@ export function composerSubmitKey(event) {
 
 export function appendPrompt(draft, prompt) {
   return draft.trim() ? `${draft}\n\n${prompt}` : prompt
+}
+
+export function harnessActivityRows(events, ref) {
+  if (!ref) return []
+  const seen = new Set()
+  return events.filter(event => {
+    if (!sameTask(event.task_ref, ref) || !event.event_id || !decimal(event.sequence, true) || seen.has(event.event_id)) return false
+    seen.add(event.event_id)
+    return true
+  }).sort((a, b) => BigInt(a.sequence) < BigInt(b.sequence) ? -1 : BigInt(a.sequence) > BigInt(b.sequence) ? 1 : 0).map(event => {
+    const value = event.payload || {}
+    let title = '执行回执', summary = value.text || '', tone = 'neutral'
+    if (event.kind === 'TOOL_EVENT') { title = value.tool?.name || '工具事件'; summary = `${value.tool?.phase || '待核对'} · ${value.tool?.summary || ''}`; if (value.tool?.phase === 'FAILED') tone = 'error' }
+    else if (['TASK_QUEUED', 'RUN_STARTED', 'RUN_STATE', 'TASK_TERMINAL'].includes(event.kind)) { title = harnessStatusLabel(value.status); summary = value.error?.message || 'Host 持久化状态回执'; if (value.status === 'FAILED') tone = 'error' }
+    else if (event.kind === 'ASSISTANT_MESSAGE') title = 'Codex 消息'
+    else if (event.kind === 'LOG') title = '执行诊断'
+    return { event, title, summary, tone }
+  }).reverse()
 }

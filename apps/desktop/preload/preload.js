@@ -29,6 +29,10 @@ for (const method of V2_METHODS) {
   v2api[method] = (body) => ipcRenderer.invoke('ros:v2:' + method, body);
 }
 api.v2 = Object.freeze(v2api);
+// Readonly Harness intents use their own versioned Host lane, never V2/Mu.
+api.harness = Object.freeze(Object.fromEntries(
+  ['capabilities', 'list', 'get', 'events', 'submit', 'cancel', 'pending', 'reconcile']
+    .map(name => [name, body => ipcRenderer.invoke('ros:harness:' + name, body)])));
 api.desktop = Object.freeze({
   context: () => ipcRenderer.invoke('ros:desktop:context'),
   selectProject: (projectId) => ipcRenderer.invoke('ros:desktop:selectProject', { project_id: projectId }),
