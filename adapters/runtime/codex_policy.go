@@ -13,10 +13,16 @@ const (
 	CodexNativeCommandID      = "codex-mxc-readonly-v2"
 	CodexWindowsSandbox       = "mxc"
 	CodexPermissionProfile    = "researchos-readonly"
+	CodexExecTransport        = "exec-ephemeral-v1"
+	CodexRPCTransport         = "app-server-stdio-first-local-turn-v1"
+	CodexRPCPolicyRevision    = "researchos-codex-mxc-rpc-readonly-v1"
+	CodexRPCSandboxID         = "codex-mxc-rpc-permissions-workspace-read-v3"
+	CodexRPCCommandID         = "codex-mxc-rpc-readonly-v3"
+	CodexRPCHelperContract    = "native-0166-windows-fresh-arg0-read-v1"
 )
 
 type CodexPolicyIdentity struct {
-	Revision, WindowsSandbox, PermissionProfile, RequestedConfigSHA256, BinarySHA256 string
+	Revision, WindowsSandbox, PermissionProfile, RequestedConfigSHA256, BinarySHA256, Transport, HelperContract string
 }
 
 type CodexReadiness struct {
@@ -49,7 +55,33 @@ func CodexRequestedPolicyIdentity(binarySHA256 string) CodexPolicyIdentity {
 	raw, _ := json.Marshal(codexRequestedArguments("<host-cwd>", "<source-workspace>"))
 	sum := sha256.Sum256(raw)
 	return CodexPolicyIdentity{CodexNativePolicyRevision, CodexWindowsSandbox, CodexPermissionProfile,
-		"sha256:" + hex.EncodeToString(sum[:]), binarySHA256}
+		"sha256:" + hex.EncodeToString(sum[:]), binarySHA256, CodexExecTransport, ""}
+}
+
+func codexTransport(d CodexDescriptor) string {
+	if d.NativeTransport == "" {
+		return CodexExecTransport
+	}
+	return d.NativeTransport
+}
+
+func expectedPermissionProfile(transport string) string {
+	if transport == CodexRPCTransport {
+		return "researchos-readonly-${PROFILE_NONCE}"
+	}
+	return CodexPermissionProfile
+}
+
+// CodexExpectedPolicyIdentity selects only the constructor-sealed transport.
+func CodexExpectedPolicyIdentity(d CodexDescriptor) CodexPolicyIdentity {
+	if d.NativeTransport == CodexRPCTransport {
+		return CodexRPCPolicyIdentity(d.ExecutableHash)
+	}
+	return CodexRequestedPolicyIdentity(d.ExecutableHash)
+}
+
+func CodexAllowsPreparation(r CodexReadiness) bool {
+	return r.State == "PREPARATION_READY" || r.State == "READY"
 }
 
 // Every caller uses this predicate. A READY snapshot is useful only when its
@@ -71,13 +103,16 @@ func EvaluateCodexReadiness(d CodexDescriptor, snapshot CodexReadiness, expected
 		return blocked(d.UnavailableReason)
 	}
 	if expected.BinarySHA256 == "" || expected.BinarySHA256 != d.ExecutableHash ||
-		expected.Revision != CodexNativePolicyRevision || expected.WindowsSandbox != CodexWindowsSandbox ||
-		expected.PermissionProfile != CodexPermissionProfile || expected.RequestedConfigSHA256 == "" ||
+		((codexTransport(d) == CodexRPCTransport && expected.Revision != CodexRPCPolicyRevision) || (codexTransport(d) != CodexRPCTransport && expected.Revision != CodexNativePolicyRevision)) || expected.Transport != codexTransport(d) || expected.WindowsSandbox != CodexWindowsSandbox ||
+		expected.PermissionProfile != expectedPermissionProfile(codexTransport(d)) || expected.RequestedConfigSHA256 == "" ||
 		snapshot.PolicyIdentity != expected {
 		return blocked("CODEX_POLICY_IDENTITY_MISMATCH")
 	}
 	if snapshot.Reason != "" {
 		return blocked(snapshot.Reason)
+	}
+	if d.NativeTransport == CodexRPCTransport && snapshot.State == "PREPARATION_READY" {
+		return CodexReadiness{State: "PREPARATION_READY", PolicyIdentity: expected}
 	}
 	if snapshot.State != "READY" {
 		return blocked("PERMISSION_PROFILE_UNVERIFIED")

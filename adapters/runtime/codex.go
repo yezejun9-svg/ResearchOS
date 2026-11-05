@@ -134,15 +134,26 @@ type CodexDescriptor struct {
 	Version, ExecutableHash, AuthState, AuthKind, AuthCheckedAt string
 	ConfigurationControlled                                     bool
 	UnavailableReason                                           string
+	NativeTransport                                             string
 }
 type CodexLaunch struct {
-	TaskID, RunID, Epoch, Workspace, Prompt, Directory string
-	Timeout                                            time.Duration
+	TaskID, RunID, Epoch, Workspace, Prompt, Directory, SourceBindingHash string
+	Timeout                                                               time.Duration
 }
 type CodexIdentity struct {
 	PID     uint32
 	Created int64
 	Job     string
+}
+
+// CodexTurnEvidence is a value-only projection of the live RPC barrier.
+// A serialized copy cannot recreate the driver's private one-use permit.
+type CodexTurnEvidence struct {
+	PolicyIdentity                                                  CodexPolicyIdentity
+	RenderedConfigSHA256, SourceBindingHash, ProfileNonce, ThreadID string
+	TaskID, RunID, Epoch                                            string
+	Process                                                         CodexIdentity
+	CaptureBytes                                                    int64
 }
 type CodexEvent struct{ Kind, Text, ToolID, ToolName, ToolPhase, NativeID string }
 type CodexResult struct {
@@ -153,8 +164,9 @@ type CodexResult struct {
 	Stdout, Stderr                           []byte
 }
 type CodexCallbacks struct {
-	BeforeResume func(CodexIdentity) error
-	Event        func(CodexEvent) error
+	BeforeResume    func(CodexIdentity) error
+	BeforeModelTurn func(CodexTurnEvidence) error
+	Event           func(CodexEvent) error
 }
 type CodexHandle interface {
 	Cancel()

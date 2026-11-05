@@ -44,6 +44,7 @@ func NewCodexCLI(options CodexCLIOptions) (CodexDriver, error) {
 	if len(options.PermissionOverrides) != 0 {
 		return nil, errors.New("CODEX_POLICY_OVERRIDE_FORBIDDEN")
 	}
+	options.Descriptor.NativeTransport = CodexExecTransport
 	return &codexCLI{options: options}, nil
 }
 func (d *codexCLI) Descriptor() CodexDescriptor { return d.options.Descriptor }

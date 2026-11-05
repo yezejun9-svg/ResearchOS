@@ -96,3 +96,47 @@ func TestCodexReadinessFailClosed(t *testing.T) {
 		t.Fatal("production constructor minted readiness", err)
 	}
 }
+
+func TestCodexRPCPreparationGate(t *testing.T) {
+	hash := "sha256:" + strings.Repeat("b", 64)
+	descriptor := CodexDescriptor{Present: true, ExecutableHash: hash, AuthState: "LOGGED_IN",
+		ConfigurationControlled: true, NativeTransport: CodexRPCTransport}
+	identity := CodexExpectedPolicyIdentity(descriptor)
+	preparation := CodexReadiness{State: "PREPARATION_READY", PolicyIdentity: identity}
+	if got := EvaluateCodexReadiness(descriptor, preparation, identity); got.State != "PREPARATION_READY" ||
+		!CodexAllowsPreparation(got) {
+		t.Fatal("canonical RPC could not queue preparation", got)
+	}
+	execDescriptor := descriptor
+	execDescriptor.NativeTransport = CodexExecTransport
+	execIdentity := CodexExpectedPolicyIdentity(execDescriptor)
+	if got := EvaluateCodexReadiness(execDescriptor,
+		CodexReadiness{State: "PREPARATION_READY", PolicyIdentity: execIdentity}, execIdentity); CodexAllowsPreparation(got) {
+		t.Fatal("legacy exec prepared from unverified snapshot", got)
+	}
+	for _, tc := range []struct {
+		name       string
+		descriptor CodexDescriptor
+		snapshot   CodexReadiness
+		expected   CodexPolicyIdentity
+	}{
+		{"transport", descriptor, preparation, func() CodexPolicyIdentity { x := identity; x.Transport = "exec-ephemeral-v1"; return x }()},
+		{"helper", descriptor, func() CodexReadiness { x := preparation; x.PolicyIdentity.HelperContract = "old"; return x }(), identity},
+		{"template", descriptor, func() CodexReadiness {
+			x := preparation
+			x.PolicyIdentity.RequestedConfigSHA256 = "sha256:bad"
+			return x
+		}(), identity},
+		{"binary", descriptor, func() CodexReadiness { x := preparation; x.PolicyIdentity.BinarySHA256 = "sha256:bad"; return x }(), identity},
+		{"auth", func() CodexDescriptor { x := descriptor; x.AuthState = "UNKNOWN"; return x }(), preparation, identity},
+		{"reason", descriptor, CodexReadiness{State: "PREPARATION_READY", Reason: "UNAVAILABLE", PolicyIdentity: identity}, identity},
+		{"old_seal", descriptor, preparation, CodexRequestedPolicyIdentity(hash)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := EvaluateCodexReadiness(tc.descriptor, tc.snapshot, tc.expected)
+			if CodexAllowsPreparation(got) {
+				t.Fatal("mismatch opened preparation", got)
+			}
+		})
+	}
+}
