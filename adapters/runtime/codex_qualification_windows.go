@@ -691,7 +691,7 @@ func (q *nativeQualifier) ensureLaunch(ctx context.Context, in CodexLaunch) (obs
 	receipt.RenderedArgvHash = obs.RenderedArgvHash
 	receipt.RenderedArgv = append([]string(nil), args...)
 	obs.PreflightNoChild = false
-	obs.Capture = collectQualification(ctx, q.rpc.options.Executable, args, Environment(""), working, qualificationJobName(in.RunID, in.Epoch, nonce), receiptPath)
+	obs.Capture = collectQualification(ctx, q.rpc.options.Executable, args, Environment(""), working, qualificationJobName(in.RunID, in.Epoch, nonce), receiptPath, receipt)
 	reason := ""
 	record := func(next string) {
 		if next == "" {
