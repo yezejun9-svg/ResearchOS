@@ -12,10 +12,94 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	rt "researchos.local/research-os/adapters/runtime"
 	"strings"
 	"time"
 )
+
+// These values are supplied only by a reviewed Core build. Empty build pins
+// deliberately leave the production factory closed. Neither is read from a
+// request, environment variable, persisted receipt, or Native configuration.
+var codexQualificationApprovedRoot string
+var codexQualificationHelperSHA256 string
+
+var codexBuildDigest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+type closedCodexHarness struct{ descriptor rt.CodexDescriptor }
+
+func (d closedCodexHarness) Descriptor() rt.CodexDescriptor { return d.descriptor }
+func (d closedCodexHarness) ReadinessSnapshot() rt.CodexReadiness {
+	return rt.CodexReadiness{State: "UNAVAILABLE", Reason: "QUALIFICATION_REQUIRED", PolicyIdentity: rt.CodexExpectedPolicyIdentity(d.descriptor)}
+}
+func (d closedCodexHarness) Start(context.Context, rt.CodexLaunch, rt.CodexCallbacks) (rt.CodexHandle, error) {
+	return nil, errors.New("QUALIFICATION_REQUIRED")
+}
+
+func closedQualificationHarness(descriptor rt.CodexDescriptor) rt.CodexDriver {
+	descriptor.NativeTransport = rt.CodexRPCTransport
+	descriptor.UnavailableReason = "QUALIFICATION_REQUIRED"
+	return closedCodexHarness{descriptor: descriptor}
+}
+
+// codexQualificationScope checks a build-pinned exact synthetic source and
+// shipped helper. It never derives a trusted expected digest from the source.
+func codexQualificationScope(root, expectedHelper string) (rt.CodexNativeQualificationOptions, error) {
+	var zero rt.CodexNativeQualificationOptions
+	if root == "" || expectedHelper == "" || !filepath.IsAbs(root) || strings.Contains(root, ";") || !codexBuildDigest.MatchString(expectedHelper) {
+		return zero, errors.New("QUALIFICATION_REQUIRED")
+	}
+	clean := filepath.Clean(root)
+	actual, err := filepath.EvalSymlinks(clean)
+	if err != nil || !strings.EqualFold(clean, actual) {
+		return zero, errors.New("QUALIFICATION_REQUIRED")
+	}
+	source := filepath.Join(actual, "S")
+	resolvedSource, err := filepath.EvalSymlinks(source)
+	if err != nil || !strings.EqualFold(source, resolvedSource) {
+		return zero, errors.New("QUALIFICATION_REQUIRED")
+	}
+	stat, err := os.Stat(source)
+	if err != nil || !stat.IsDir() {
+		return zero, errors.New("QUALIFICATION_REQUIRED")
+	}
+	helper := filepath.Join(source, "qualification-helper.exe")
+	resolvedHelper, err := filepath.EvalSymlinks(helper)
+	if err != nil || !strings.EqualFold(helper, resolvedHelper) {
+		return zero, errors.New("QUALIFICATION_REQUIRED")
+	}
+	helperHash, err := codexFileSHA256(helper)
+	if err != nil || helperHash != expectedHelper {
+		return zero, errors.New("QUALIFICATION_REQUIRED")
+	}
+	return rt.CodexNativeQualificationOptions{ApprovedRoot: actual, SyntheticSource: source, ShippedHelper: helper, ShippedHelperSHA256: expectedHelper}, nil
+}
+
+func codexFileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.New()
+	_, readErr := io.Copy(digest, f)
+	closeErr := f.Close()
+	if readErr != nil || closeErr != nil {
+		return "", errors.New("CODEX_FILE_HASH_UNAVAILABLE")
+	}
+	return "sha256:" + hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func codexHostBuildSHA256() (string, error) {
+	path, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil || !filepath.IsAbs(path) {
+		return "", errors.New("CODEX_HOST_BUILD_UNAVAILABLE")
+	}
+	return codexFileSHA256(path)
+}
 
 // HarnessPrincipal revalidates the OS-bound Host, then returns its existing
 // authenticated domain principal. HTTP identity claims cannot construct it.
@@ -122,7 +206,19 @@ func (h *Host) NewCodexHarness(ctx context.Context) (rt.CodexDriver, error) {
 	if err != nil {
 		return nil, err
 	}
-	return rt.NewCodexRPC(rt.CodexRPCOptions{Executable: executable, Descriptor: descriptor, NormalHome: home})
+	scope, err := codexQualificationScope(codexQualificationApprovedRoot, codexQualificationHelperSHA256)
+	if err != nil {
+		return closedQualificationHarness(descriptor), nil
+	}
+	scope.HostBuildSHA256, err = codexHostBuildSHA256()
+	if err != nil {
+		return closedQualificationHarness(descriptor), nil
+	}
+	driver, err := rt.NewCodexRPCWithNativeQualification(rt.CodexRPCOptions{Executable: executable, Descriptor: descriptor, NormalHome: home}, scope)
+	if err != nil {
+		return closedQualificationHarness(descriptor), nil
+	}
+	return driver, nil
 }
 
 func codexNormalHome(home string) (string, error) {
