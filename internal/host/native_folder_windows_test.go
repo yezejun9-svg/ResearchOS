@@ -265,3 +265,92 @@ func TestNativeFolderHiddenHelper(t *testing.T) {
 	ole32Uninitialize.Call()
 	emit(nativeFolderObservation{Event: "com-balanced-and-fail-closed"})
 }
+
+func recordingNativeFolderUI(events *[]string, visible bool) nativeFolderUIEffects {
+	return nativeFolderUIEffects{
+		setSelection: func(hwnd, suggested uintptr) {
+			*events = append(*events, fmt.Sprintf("select:%x:%x", hwnd, suggested))
+		},
+		show: func(hwnd uintptr) { *events = append(*events, fmt.Sprintf("show:%x", hwnd)) },
+		visible: func(hwnd uintptr) bool {
+			*events = append(*events, fmt.Sprintf("visible:%x", hwnd))
+			return visible
+		},
+		foreground:  func(hwnd uintptr) { *events = append(*events, fmt.Sprintf("foreground:%x", hwnd)) },
+		warnInvalid: func(hwnd uintptr) { *events = append(*events, fmt.Sprintf("warning:%x", hwnd)) },
+	}
+}
+
+func TestNativeFolderValidationCallbackRetainsOwnedDialog(t *testing.T) {
+	for _, parameter := range []uintptr{0, 1, ^uintptr(0)} {
+		var events []string
+		// 4 is BFFM_VALIDATEFAILEDW; neither Shell's invalid-text parameter nor
+		// the suggested-path pointer is valid memory in this test.
+		result := handleNativeFolderBrowseMessage(0x25, 4, parameter, ^uintptr(0), recordingNativeFolderUI(&events, false))
+		if result != 1 || strings.Join(events, ",") != "warning:25" {
+			t.Fatalf("invalid Unicode input must warn its owner once and retain chooser: result=%d events=%v", result, events)
+		}
+	}
+}
+
+func TestNativeFolderValidationIgnoresOtherMessages(t *testing.T) {
+	// ANSI validation is 3, not the W chooser's message 4. Selection-change
+	// and unknown notifications must not read either pointer or perform UI.
+	for _, message := range []uint32{0, 2, 3, 5, 0xffffffff} {
+		var events []string
+		result := handleNativeFolderBrowseMessage(0x25, message, 1, ^uintptr(0), recordingNativeFolderUI(&events, false))
+		if result != 0 || len(events) != 0 {
+			t.Fatalf("message %d: result=%d events=%v", message, result, events)
+		}
+	}
+}
+
+func TestNativeFolderInitializationEffectsPreserved(t *testing.T) {
+	for _, visible := range []bool{false, true} {
+		for _, suggested := range []uintptr{0, 0x1234} {
+			t.Run(fmt.Sprintf("visible=%v/suggested=%x", visible, suggested), func(t *testing.T) {
+				var events, want []string
+				if suggested != 0 {
+					want = append(want, "select:25:1234")
+				}
+				want = append(want, "show:25", "visible:25")
+				if !visible {
+					want = append(want, "show:25")
+				}
+				want = append(want, "foreground:25")
+				result := handleNativeFolderBrowseMessage(0x25, 1, ^uintptr(0), suggested, recordingNativeFolderUI(&events, visible))
+				if result != 0 || strings.Join(events, ",") != strings.Join(want, ",") {
+					t.Fatalf("initialization changed: result=%d events=%v want=%v", result, events, want)
+				}
+			})
+		}
+	}
+}
+
+func TestNativeFolderCancelledChoiceDoesNotGrant(t *testing.T) {
+	for _, withPath := range []bool{false, true} {
+		t.Run(fmt.Sprintf("error-with-path=%v", withPath), func(t *testing.T) {
+			h := firstUseHost(t)
+			frame := nativeFirstUseFrame(t, KindWorkspaceChooseRequest,
+				map[string]any{"requested_path": nil, "requested_access": AccessReadWrite})
+			picked := ""
+			if withPath {
+				picked = t.TempDir()
+			}
+			calls := 0
+			reply, err := h.HandleNative(frame, true, func(initial string) (string, error) {
+				calls++
+				if initial != "" {
+					t.Fatalf("unexpected initial path %q", initial)
+				}
+				return picked, fmt.Errorf("%w: folder selection cancelled", ErrFrameShape)
+			})
+			if calls != 1 || reply != nil || !errors.Is(err, ErrFrameShape) {
+				t.Fatalf("cancel result: calls=%d reply=%s err=%v", calls, reply, err)
+			}
+			if len(h.Roots()) != 0 || h.selections.Outstanding() != 0 {
+				t.Fatalf("cancel granted authority: roots=%d selections=%d", len(h.Roots()), h.selections.Outstanding())
+			}
+		})
+	}
+}

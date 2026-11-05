@@ -26,7 +26,10 @@ type browseInfoW struct {
 
 const (
 	bifReturnOnlyFileSystemDirs = 0x0001
+	bifEditBox                  = 0x0010
+	bifValidate                 = 0x0020
 	bffmInitialized             = 1
+	bffmValidateFailedW         = 4
 	bffmSetSelectionW           = 0x0467
 )
 
@@ -40,26 +43,68 @@ var (
 	user32ShowFolder       = windows.NewLazySystemDLL("user32.dll").NewProc("ShowWindow")
 	user32FolderVisible    = windows.NewLazySystemDLL("user32.dll").NewProc("IsWindowVisible")
 	user32ForegroundFolder = windows.NewLazySystemDLL("user32.dll").NewProc("SetForegroundWindow")
-	nativeFolderCallback   = syscall.NewCallback(func(hwnd uintptr, message uint32, _ uintptr, suggested uintptr) uintptr {
-		if message != bffmInitialized {
-			return 0
-		}
-		if suggested != 0 {
+	user32FolderMessage    = windows.NewLazySystemDLL("user32.dll").NewProc("MessageBoxW")
+	nativeFolderEffects    = nativeFolderUIEffects{
+		setSelection: func(hwnd, suggested uintptr) {
 			user32Send.Call(hwnd, bffmSetSelectionW, 1, suggested)
+		},
+		show: func(hwnd uintptr) { user32ShowFolder.Call(hwnd, 1) }, // SW_SHOWNORMAL.
+		visible: func(hwnd uintptr) bool {
+			visible, _, _ := user32FolderVisible.Call(hwnd)
+			return visible != 0
+		},
+		foreground:  func(hwnd uintptr) { user32ForegroundFolder.Call(hwnd) },
+		warnInvalid: warnNativeFolderInvalidPath,
+	}
+	nativeFolderCallback = syscall.NewCallback(func(hwnd uintptr, message uint32, parameter, suggested uintptr) uintptr {
+		return handleNativeFolderBrowseMessage(hwnd, message, parameter, suggested, nativeFolderEffects)
+	})
+)
+
+// nativeFolderUIEffects keeps the synchronous, owning-thread UI calls together.
+// Tests can observe these effects without opening a dialog or changing the wire API.
+type nativeFolderUIEffects struct {
+	setSelection func(hwnd, suggested uintptr)
+	show         func(hwnd uintptr)
+	visible      func(hwnd uintptr) bool
+	foreground   func(hwnd uintptr)
+	warnInvalid  func(hwnd uintptr)
+}
+
+func handleNativeFolderBrowseMessage(hwnd uintptr, message uint32, _ uintptr, suggested uintptr, ui nativeFolderUIEffects) uintptr {
+	switch message {
+	case bffmValidateFailedW:
+		// SHBrowseForFolderW supplies an unbounded UTF-16 path pointer here.
+		// Do not read or retain it: a fixed warning is enough, and only a
+		// subsequently confirmed Shell PIDL may become a selected path.
+		ui.warnInvalid(hwnd)
+		return 1 // Keep the chooser open after invalid input.
+	case bffmInitialized:
+		if suggested != 0 {
+			ui.setSelection(hwnd, suggested)
 		}
 		// A background Core starts with STARTF_USESHOWWINDOW/SW_HIDE. Windows
 		// may apply that startup state to the first ShowWindow call. Show only
 		// this Shell-owned chooser, then repeat if the startup state hid it.
 		// All calls finish on its owning thread; no deferred HWND survives it.
-		user32ShowFolder.Call(hwnd, 1) // SW_SHOWNORMAL, never SW_SHOWDEFAULT.
-		if visible, _, _ := user32FolderVisible.Call(hwnd); visible == 0 {
-			user32ShowFolder.Call(hwnd, 1)
+		ui.show(hwnd)
+		if !ui.visible(hwnd) {
+			ui.show(hwnd)
 		}
 		// Foreground activation is best-effort under Windows focus rules.
-		user32ForegroundFolder.Call(hwnd)
-		return 0
-	})
-)
+		ui.foreground(hwnd)
+	}
+	return 0
+}
+
+func warnNativeFolderInvalidPath(hwnd uintptr) {
+	// These fixed strings cannot contain embedded NULs. Never echo invalid input.
+	text, _ := windows.UTF16PtrFromString("文件夹路径无效或不存在。请输入已有的文件夹路径后重试。")
+	title, _ := windows.UTF16PtrFromString("ResearchOS")
+	user32FolderMessage.Call(hwnd, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(title)), 0x30) // MB_OK | MB_ICONWARNING.
+	runtime.KeepAlive(text)
+	runtime.KeepAlive(title)
+}
 
 // chooseNativeFolderWindows is called only after the pipe ACL and peer SID
 // checks. A client-supplied path merely preselects the dialog; the returned
@@ -87,7 +132,7 @@ func chooseNativeFolderWindows(initial string) (string, error) {
 	}
 	var display [260]uint16
 	info := browseInfoW{displayName: &display[0], title: title,
-		flags: bifReturnOnlyFileSystemDirs, callback: nativeFolderCallback,
+		flags: bifReturnOnlyFileSystemDirs | bifEditBox | bifValidate, callback: nativeFolderCallback,
 		callbackArg: uintptr(unsafe.Pointer(initialPath))}
 	selected, _, _ := shell32Browse.Call(uintptr(unsafe.Pointer(&info)))
 	runtime.KeepAlive(initialPath)
