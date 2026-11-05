@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	rt "researchos.local/research-os/adapters/runtime"
 	"strings"
@@ -111,7 +112,22 @@ func (h *Host) NewCodexHarness(ctx context.Context) (rt.CodexDriver, error) {
 	} else if err != nil {
 		descriptor.AuthState = "LOGGED_OUT"
 	}
-	// The requested permission profile is supplied per launch from trusted Host
-	// code. Managed native platform requirements remain authoritative (D03).
-	return rt.NewCodexCLI(rt.CodexCLIOptions{Executable: executable, Descriptor: descriptor})
+	// The RPC constructor seals the transport; the old exec constructor is never
+	// a fallback. NormalHome comes from the actual OS user, not caller input.
+	account, err := user.Current()
+	if err != nil {
+		return nil, errors.New("CODEX_NORMAL_HOME_UNAVAILABLE")
+	}
+	home, err := codexNormalHome(account.HomeDir)
+	if err != nil {
+		return nil, err
+	}
+	return rt.NewCodexRPC(rt.CodexRPCOptions{Executable: executable, Descriptor: descriptor, NormalHome: home})
+}
+
+func codexNormalHome(home string) (string, error) {
+	if home == "" || !filepath.IsAbs(home) || strings.Contains(home, ";") {
+		return "", errors.New("CODEX_NORMAL_HOME_UNAVAILABLE")
+	}
+	return filepath.Clean(home), nil
 }

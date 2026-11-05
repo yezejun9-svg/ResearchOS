@@ -4,8 +4,21 @@ package host
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 )
+
+func TestCodexNormalHomeRejectsUncontrolledPaths(t *testing.T) {
+	for _, home := range []string{"", "relative\\home", `C:\normal;injected`} {
+		if _, err := codexNormalHome(home); err == nil {
+			t.Fatalf("accepted uncontrolled home %q", home)
+		}
+	}
+	got, err := codexNormalHome(`C:\Users\owner\..\owner`)
+	if err != nil || got != filepath.Clean(`C:\Users\owner\..\owner`) {
+		t.Fatalf("normal home rejected: %q, %v", got, err)
+	}
+}
 
 func TestHarnessHostPrincipalActualBinding(t *testing.T) {
 	h := firstUseHost(t)

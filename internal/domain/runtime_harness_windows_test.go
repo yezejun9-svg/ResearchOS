@@ -5,12 +5,14 @@ package domain
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	rt "researchos.local/research-os/adapters/runtime"
 	goruntime "runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +21,47 @@ import (
 type harnessAuthorityFixture struct {
 	principal string
 	err       error
+}
+
+func TestHarnessRPCPolicySealIsDistinctFromHistoricalExec(t *testing.T) {
+	rpc := rt.CodexRPCPolicyIdentity("sha256:binary")
+	profile := map[string]any{
+		"sandbox": rt.CodexRPCSandboxID, "command_id": rt.CodexRPCCommandID,
+		"native_policy_revision": rpc.Revision, "windows_sandbox": rpc.WindowsSandbox,
+		"permission_profile": rpc.PermissionProfile, "requested_config_sha256": rpc.RequestedConfigSHA256,
+		"build_hash": rpc.BinarySHA256, "native_transport": rpc.Transport,
+		"helper_contract": rpc.HelperContract,
+	}
+	if !harnessPolicyMatches(profile, rpc) {
+		t.Fatal("exact RPC identity rejected")
+	}
+	profile["backend"] = "codex-cli-readonly-v1"
+	profile["adapter"] = "codex-cli-harness-v1"
+	profile["adapter_revision"] = "codex-cli-readonly-v1"
+	profile["platform"] = "windows-amd64"
+	profile["harness_owner"] = "owner"
+	if err := validateRuntimeDispatchProfile(Object(profile)); err != nil {
+		t.Fatal("sealed RPC profile rejected by dispatch admission", err)
+	}
+	profile["permission_profile"] = "researchos-readonly"
+	if err := validateRuntimeDispatchProfile(Object(profile)); err == nil {
+		t.Fatal("legacy permission profile accepted as RPC")
+	}
+	profile["permission_profile"] = rpc.PermissionProfile
+	legacy := rt.CodexRequestedPolicyIdentity("sha256:binary")
+	if harnessPolicyMatches(profile, legacy) {
+		t.Fatal("historical exec identity upgraded to RPC")
+	}
+	for _, field := range []string{"sandbox", "command_id", "native_policy_revision", "native_transport", "helper_contract", "build_hash", "requested_config_sha256"} {
+		altered := make(map[string]any, len(profile))
+		for k, v := range profile {
+			altered[k] = v
+		}
+		altered[field] = "stale"
+		if harnessPolicyMatches(altered, rpc) {
+			t.Fatalf("changed RPC %s accepted", field)
+		}
+	}
 }
 
 func (a *harnessAuthorityFixture) HarnessPrincipal(context.Context) (string, error) {
@@ -407,5 +450,303 @@ func TestHarnessUnknownTransitionAtomic(t *testing.T) {
 	n, _ = countTerminal()
 	if n != 1 || driver.starts.Load() != 1 {
 		t.Fatal("reconciliation duplicated terminal event or execution")
+	}
+}
+
+// This driver is deliberately in-process. It exercises the real coordinator's
+// two callbacks and database fences but never starts Native or writes a prompt.
+type harnessRPCTurnFixtureDriver struct {
+	descriptor    rt.CodexDescriptor
+	snapshot      rt.CodexReadiness
+	resumed       chan error
+	proceed       chan struct{}
+	launch        rt.CodexLaunch
+	firstErr      error
+	secondErr     error
+	duplicate     bool
+	tamperProcess bool
+	starts        atomic.Int64
+	turns         atomic.Int64
+}
+
+func (d *harnessRPCTurnFixtureDriver) Descriptor() rt.CodexDescriptor       { return d.descriptor }
+func (d *harnessRPCTurnFixtureDriver) ReadinessSnapshot() rt.CodexReadiness { return d.snapshot }
+func (d *harnessRPCTurnFixtureDriver) Start(ctx context.Context, in rt.CodexLaunch, cb rt.CodexCallbacks) (rt.CodexHandle, error) {
+	d.starts.Add(1)
+	d.launch = in
+	if err := os.MkdirAll(in.Directory, 0700); err != nil {
+		return nil, err
+	}
+	process := rt.CodexIdentity{PID: 42, Created: 12345, Job: "trusted-go-only-job"}
+	err := cb.BeforeResume(process)
+	d.resumed <- err
+	if err != nil {
+		return nil, err
+	}
+	<-d.proceed
+	evidence := rt.CodexTurnEvidence{PolicyIdentity: rt.CodexRPCPolicyIdentity(d.descriptor.ExecutableHash),
+		RenderedConfigSHA256: "sha256:trusted-rendered", SourceBindingHash: in.SourceBindingHash,
+		ProfileNonce: "trusted-go-nonce", ThreadID: "trusted-go-thread", TaskID: in.TaskID,
+		RunID: in.RunID, Epoch: in.Epoch, Process: process, CaptureBytes: 12}
+	if d.tamperProcess {
+		evidence.Process.Created++
+	}
+	d.firstErr = cb.BeforeModelTurn(evidence)
+	if d.firstErr == nil {
+		d.turns.Add(1)
+	}
+	if d.duplicate {
+		d.secondErr = cb.BeforeModelTurn(evidence)
+	}
+	return nil, errors.New("trusted Go fixture stops before model prompt")
+}
+
+func harnessRPCTurnFixture(t *testing.T) (*fixture, *RuntimeCoordinator, *WorkspaceBinding, *harnessRPCTurnFixtureDriver) {
+	t.Helper()
+	f := contextFixtureFrom(setupWithConstructor(t, NewCurrentMu))
+	b := &WorkspaceBinding{AuthorizedRef: "workspace-harness", DisplayName: "fixture", DisplayPath: "fixture", RealPath: t.TempDir(), Access: "READ_ONLY", ProjectID: &f.project, Revision: 1, Status: WorkspaceActive, PrincipalID: f.owner, ClientID: "fixture-client", HostPrincipalRef: "fixture-host", CreatedAt: Now()}
+	sourceTx(t, f.db, func(tx *sql.Tx) error {
+		return f.s.putOpaque(context.Background(), tx, "", KindWorkspaceBinding, b.AuthorizedRef, b.record())
+	})
+	d := &harnessRPCTurnFixtureDriver{descriptor: rt.CodexDescriptor{Present: true, Version: "0.166.0", ExecutableHash: "sha256:trusted-go-only", AuthState: "LOGGED_IN", AuthKind: "chatgpt", ConfigurationControlled: true, NativeTransport: rt.CodexRPCTransport}, resumed: make(chan error, 1), proceed: make(chan struct{})}
+	d.snapshot = rt.CodexReadiness{State: "PREPARATION_READY", PolicyIdentity: rt.CodexRPCPolicyIdentity(d.descriptor.ExecutableHash)}
+	var seq int
+	var name, dbpath string
+	if err := f.db.QueryRow("PRAGMA database_list").Scan(&seq, &name, &dbpath); err != nil {
+		t.Fatal(err)
+	}
+	c, err := f.s.NewRuntimeCoordinator(context.Background(), RuntimeCoordinatorConfig{DataRoot: filepath.Dir(dbpath), APIURL: "http://127.0.0.1:1", WorkspaceAuthority: clientWorkspaceAuthority{}, HarnessAuthority: &harnessAuthorityFixture{principal: f.owner}, HarnessDriver: d})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return f, c, b, d
+}
+
+// A bound profile is immutable. A rejected SQL update leaves the original
+// authorized profile intact, so the second fence should still allow one turn.
+func harnessRPCAssertImmutableBinding(t *testing.T, f *fixture, d *harnessRPCTurnFixtureDriver) {
+	t.Helper()
+	tx, err := f.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	run, err := load(tx, f.project, "Run", d.launch.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := load(tx, f.project, "RuntimeRegistration", Str(run, "runtime_id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior, _, err := f.s.currentRuntimeBinding(tx, f.project, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw, profileHash, technicalHash string
+	if err = tx.QueryRow("SELECT profile_ref,profile_hash,technical_hash FROM runtime_bindings WHERE project=? AND runtime=?", f.project, runtime["id"]).Scan(&raw, &profileHash, &technicalHash); err != nil {
+		t.Fatal(err)
+	}
+	if Hash(prior) != profileHash || technicalHash != runtimeTechnicalHash(runtime) {
+		t.Fatal("original binding invalid before attempted update")
+	}
+	_, err = tx.Exec("UPDATE runtime_bindings SET profile_ref=? WHERE project=? AND runtime=?", `{"entity_type":"Artifact","id":"replacement"}`, f.project, runtime["id"])
+	if err == nil || !strings.Contains(err.Error(), "runtime binding immutable") {
+		t.Fatal("immutable binding update did not fail at installed trigger", err)
+	}
+	if err = tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	var afterRaw, afterHash, afterTechnical string
+	if err = f.db.QueryRow("SELECT profile_ref,profile_hash,technical_hash FROM runtime_bindings WHERE project=? AND runtime=?", f.project, runtime["id"]).Scan(&afterRaw, &afterHash, &afterTechnical); err != nil {
+		t.Fatal(err)
+	}
+	if raw != afterRaw || profileHash != afterHash || technicalHash != afterTechnical {
+		t.Fatal("rejected update changed original sealed binding")
+	}
+}
+
+// Revocation creates a new Artifact version through the existing store. The
+// immutable binding still points to its old revision and must fail closed.
+func harnessRPCRevokeCurrentProfile(t *testing.T, f *fixture, d *harnessRPCTurnFixtureDriver) {
+	t.Helper()
+	sourceTx(t, f.db, func(tx *sql.Tx) error {
+		run, err := load(tx, f.project, "Run", d.launch.RunID)
+		if err != nil {
+			return err
+		}
+		runtime, err := load(tx, f.project, "RuntimeRegistration", Str(run, "runtime_id"))
+		if err != nil {
+			return err
+		}
+		_, artifact, err := f.s.currentRuntimeBinding(tx, f.project, runtime)
+		if err != nil {
+			return err
+		}
+		revoked, err := Decode(Bytes(artifact))
+		if err != nil {
+			return err
+		}
+		revoked["validity"] = "REVOKED"
+		if err = bump(revoked); err != nil {
+			return err
+		}
+		if err = f.s.put(tx, "Artifact", revoked); err != nil {
+			return err
+		}
+		if _, _, err = f.s.currentRuntimeBinding(tx, f.project, runtime); err == nil {
+			return errors.New("revoked bound profile still admitted")
+		}
+		return nil
+	})
+}
+
+func TestHarnessRPCTurnSecondFence(t *testing.T) {
+	for _, mode := range []string{"one_turn", "duplicate", "binding_immutable", "owner", "source_rebind", "source_revision", "policy_readiness", "profile_revoked", "auth_metadata", "process_identity", "lease_epoch", "cancel", "artifact_fault"} {
+		t.Run(mode, func(t *testing.T) {
+			f, c, b, d := harnessRPCTurnFixture(t)
+			caps, err := c.HarnessV1().Capabilities(context.Background(), f.token)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data := caps["data"].(map[string]any)
+			verification := data["verification"].(map[string]any)
+			if data["can_submit"] != true || verification["execution"] != "UNVERIFIED" || verification["workspace_read_scope"] != "UNVERIFIED" || verification["cancellation"] != "UNVERIFIED" || data["security_scope"].(map[string]any)["enforcement_verified"] != false {
+				t.Fatal("preparation misrepresented as verified execution", caps)
+			}
+			id, _ := harnessSubmitFixture(t, f, c, b, "trusted Go callback fixture only")
+			if mode == "duplicate" || mode == "artifact_fault" {
+				d.duplicate = true
+			}
+			if mode == "process_identity" {
+				d.tamperProcess = true
+			}
+			if err := c.Scan(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-d.resumed:
+				if err != nil {
+					t.Fatal("first fence rejected fixture", err)
+				}
+			case <-time.After(10 * time.Second):
+				close(d.proceed)
+				c.workers.Wait()
+				t.Fatal("first fence did not arrive")
+			}
+			released := false
+			defer func() {
+				if !released {
+					close(d.proceed)
+					c.workers.Wait()
+				}
+			}()
+			originalAuthority := c.config.HarnessAuthority
+			switch mode {
+			case "owner":
+				c.config.HarnessAuthority = &harnessAuthorityFixture{principal: "foreign"}
+			case "source_rebind", "source_revision":
+				sourceTx(t, f.db, func(tx *sql.Tx) error {
+					if mode == "source_rebind" {
+						b.RealPath = t.TempDir()
+					}
+					b.Revision++
+					return f.s.putOpaque(context.Background(), tx, "", KindWorkspaceBinding, b.AuthorizedRef, b.record())
+				})
+			case "policy_readiness":
+				d.snapshot.PolicyIdentity = rt.CodexRPCPolicyIdentity("sha256:stale-binary")
+			case "binding_immutable":
+				harnessRPCAssertImmutableBinding(t, f, d)
+			case "profile_revoked":
+				harnessRPCRevokeCurrentProfile(t, f, d)
+			case "auth_metadata":
+				d.descriptor.AuthState = "LOGGED_OUT"
+			case "lease_epoch":
+				sourceTx(t, f.db, func(tx *sql.Tx) error {
+					run, err := load(tx, f.project, "Run", d.launch.RunID)
+					if err != nil {
+						return err
+					}
+					run["lease_epoch"] = int64(99)
+					if err = bump(run); err != nil {
+						return err
+					}
+					return f.s.put(tx, "Run", run)
+				})
+			case "cancel":
+				view := harnessViewFixture(t, f, c, id)
+				run := view["run"].(map[string]any)
+				runID, epoch := Str(run, "run_id"), Str(run, "epoch")
+				if _, err := c.HarnessV1().Cancel(context.Background(), f.token, f.project, id, HarnessCancel{RequestID: "cancel-at-second-fence", ExpectedTaskRevision: Str(view, "task_revision"), ExpectedRunID: &runID, ExpectedEpoch: &epoch}); err != nil {
+					t.Fatal(err)
+				}
+			case "artifact_fault":
+				if _, err := f.db.Exec("CREATE TRIGGER harness_turn_artifact_fault BEFORE INSERT ON domain_objects WHEN NEW.kind='Artifact' BEGIN SELECT RAISE(ABORT,'trusted turn artifact fault'); END"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			close(d.proceed)
+			released = true
+			c.workers.Wait()
+			if mode == "owner" {
+				if _, err := c.HarnessV1().Get(context.Background(), f.token, f.project, id); err == nil {
+					t.Fatal("foreign Host principal read historical Task")
+				}
+				c.config.HarnessAuthority = originalAuthority
+			}
+			if d.starts.Load() != 1 {
+				t.Fatal("fixture started more than one Run")
+			}
+			marker := filepath.Join(d.launch.Directory, "native-turn-authorization.json")
+			_, markerErr := os.Stat(marker)
+			wantMarker := mode == "one_turn" || mode == "duplicate" || mode == "binding_immutable" || mode == "artifact_fault"
+			if (markerErr == nil) != wantMarker {
+				t.Fatalf("turn marker mismatch for %s: %v", mode, markerErr)
+			}
+			if mode == "one_turn" || mode == "duplicate" || mode == "binding_immutable" {
+				if d.firstErr != nil || d.turns.Load() != 1 {
+					t.Fatal("one trusted callback failed", d.firstErr)
+				}
+				var audits int
+				if err := f.db.QueryRow("SELECT count(*) FROM uploaded_content WHERE sealed=1 AND CAST(bytes AS TEXT) LIKE '%researchos.native-turn-authorization.v1%'").Scan(&audits); err != nil || audits != 1 {
+					t.Fatal("sanitized turn LOG not durable once", audits, err)
+				}
+				if mode == "duplicate" && !errors.Is(d.secondErr, os.ErrExist) {
+					t.Fatal("duplicate turn did not fail at exclusive marker", d.secondErr)
+				}
+			} else if d.firstErr == nil || d.turns.Load() != 0 {
+				t.Fatal("stale or failed second fence granted turn", mode)
+			}
+			if mode == "artifact_fault" {
+				if _, err := f.db.Exec("DROP TRIGGER harness_turn_artifact_fault"); err != nil {
+					t.Fatal(err)
+				}
+				if d.firstErr == nil {
+					t.Fatal("artifact failure allowed turn")
+				}
+				if !errors.Is(d.secondErr, os.ErrExist) {
+					t.Fatal("failed artifact transaction reused consumed marker", d.secondErr)
+				}
+				var audits int
+				if err := f.db.QueryRow("SELECT count(*) FROM uploaded_content WHERE sealed=1 AND CAST(bytes AS TEXT) LIKE '%researchos.native-turn-authorization.v1%'").Scan(&audits); err != nil || audits != 0 {
+					t.Fatal("rolled-back artifact escaped failed turn", audits, err)
+				}
+			}
+			if view := harnessViewFixture(t, f, c, id); view["result"] != nil {
+				t.Fatal("fixture produced a model result")
+			}
+			if err := c.Scan(context.Background()); err != nil && (mode == "one_turn" || mode == "duplicate" || mode == "binding_immutable") {
+				t.Fatal(err)
+			}
+			c.workers.Wait()
+			if d.starts.Load() != 1 {
+				t.Fatal("consumed Run relaunched")
+			}
+		})
 	}
 }

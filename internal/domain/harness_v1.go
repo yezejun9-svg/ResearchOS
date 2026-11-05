@@ -204,7 +204,10 @@ func (s *Service) nativeHarnessAdmission(tx *sql.Tx, project string, task, runti
 	if err != nil {
 		return nil, err
 	}
-	if profile["backend"] != "codex-cli-readonly-v1" || profile["sandbox"] != "codex-mxc-permissions-workspace-read-v2" || profile["command_id"] != "codex-mxc-readonly-v2" || profile["native_policy_revision"] != "researchos-codex-mxc-readonly-v1" || profile["windows_sandbox"] != "mxc" || profile["permission_profile"] != "researchos-readonly" || Str(profile, "requested_config_sha256") == "" || profile["credential_revision"] != "CLI_OWNED" {
+	legacy := profile["native_policy_revision"] == "researchos-codex-mxc-readonly-v1" && profile["sandbox"] == "codex-mxc-permissions-workspace-read-v2" && profile["command_id"] == "codex-mxc-readonly-v2"
+	rpc := profile["native_policy_revision"] == "researchos-codex-mxc-rpc-readonly-v1" && profile["sandbox"] == "codex-mxc-rpc-permissions-workspace-read-v3" && profile["command_id"] == "codex-mxc-rpc-readonly-v3" && profile["native_transport"] == "app-server-stdio-first-local-turn-v1" && profile["helper_contract"] == "native-0166-windows-fresh-arg0-read-v1"
+	permission := (legacy && profile["permission_profile"] == "researchos-readonly") || (rpc && profile["permission_profile"] == "researchos-readonly-${PROFILE_NONCE}")
+	if profile["backend"] != "codex-cli-readonly-v1" || !permission || profile["windows_sandbox"] != "mxc" || Str(profile, "requested_config_sha256") == "" || profile["credential_revision"] != "CLI_OWNED" {
 		return nil, Fail(422, "GATE_FAILED", "native Harness profile required")
 	}
 	record, err := harnessTaskInput(tx, project, task)
