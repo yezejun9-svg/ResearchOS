@@ -33,6 +33,7 @@ type codexCLI struct {
 	options     CodexCLIOptions
 	fixtureArgs []string
 	fixtureEnv  []string
+	readiness   CodexReadinessProvider
 }
 
 func NewCodexCLI(options CodexCLIOptions) (CodexDriver, error) {
@@ -40,23 +41,37 @@ func NewCodexCLI(options CodexCLIOptions) (CodexDriver, error) {
 		!strings.HasPrefix(options.Descriptor.ExecutableHash, "sha256:") || len(options.Descriptor.ExecutableHash) != 71 {
 		return nil, errors.New("CODEX_EXECUTABLE_INVALID")
 	}
-	options.PermissionOverrides = append([]string(nil), options.PermissionOverrides...)
+	if len(options.PermissionOverrides) != 0 {
+		return nil, errors.New("CODEX_POLICY_OVERRIDE_FORBIDDEN")
+	}
 	return &codexCLI{options: options}, nil
 }
 func (d *codexCLI) Descriptor() CodexDescriptor { return d.options.Descriptor }
+
+// Only trusted Go composition can inject a fixture provider. NewCodexCLI and
+// the actual Host composition always remain UNVERIFIED in Slice A.
+func NewCodexCLIForTrustedGoTest(options CodexCLIOptions, provider CodexReadinessProvider) (CodexDriver, error) {
+	if provider == nil {
+		return nil, errors.New("CODEX_TEST_PROVIDER_REQUIRED")
+	}
+	driver, err := NewCodexCLI(options)
+	if err != nil {
+		return nil, err
+	}
+	driver.(*codexCLI).readiness = provider
+	return driver, nil
+}
+func (d *codexCLI) ReadinessSnapshot() CodexReadiness {
+	if d.readiness != nil {
+		return d.readiness.Snapshot()
+	}
+	return CodexReadiness{State: "UNVERIFIED", Reason: "PERMISSION_PROFILE_UNVERIFIED", PolicyIdentity: CodexRequestedPolicyIdentity(d.options.Descriptor.ExecutableHash)}
+}
+func (d *codexCLI) evaluatedReadiness() CodexReadiness {
+	return EvaluateCodexReadiness(d.Descriptor(), d.ReadinessSnapshot(), CodexRequestedPolicyIdentity(d.options.Descriptor.ExecutableHash))
+}
 func (d *codexCLI) arguments(cwd, source string) []string {
-	// Fixed requested profile; managed platform policy is authoritative. TOML
-	// strings use JSON-compatible escaping; no shell interpolation is involved.
-	q := strconv.Quote
-	return []string{"exec", "--json", "--ephemeral", "--ignore-user-config", "--skip-git-repo-check", "-C", cwd,
-		"-c", `default_permissions="researchos-readonly"`,
-		"-c", `permissions.researchos-readonly.filesystem={":root"="deny",":minimal"="read",":workspace_roots"={"."="read"}}`,
-		"-c", "permissions.researchos-readonly.workspace_roots={" + q(source) + "=true}",
-		"-c", "permissions.researchos-readonly.network.enabled=false",
-		"-c", `project_root_markers=[".researchos-codex-root"]`, "-c", `approval_policy="never"`,
-		"-c", "features.hooks=false", "-c", "features.plugins=false", "-c", "features.remote_plugin=false",
-		"-c", "features.skill_mcp_dependency_install=false", "-c", "features.apps=false",
-		"-c", "notify=[]", "-c", `web_search="disabled"`, "-"}
+	return codexRequestedArguments(cwd, source)
 }
 
 const codexExecutionInputLimit = 1 << 20
@@ -120,6 +135,9 @@ func (r *codexRun) Wait(ctx context.Context) (CodexResult, error) {
 	}
 }
 func (d *codexCLI) Start(ctx context.Context, in CodexLaunch, cb CodexCallbacks) (CodexHandle, error) {
+	if gate := d.evaluatedReadiness(); gate.State != "READY" {
+		return nil, errors.New(gate.Reason)
+	}
 	if !d.options.Descriptor.ConfigurationControlled {
 		return nil, errors.New("CONFIG_INHERITANCE_UNVERIFIED")
 	}
@@ -203,6 +221,9 @@ func (d *codexCLI) Start(ctx context.Context, in CodexLaunch, cb CodexCallbacks)
 	}
 	proc, err := launchWithCallback(job, Command{Executable: d.options.Executable, Args: args, Directory: cwd}, env, stdinR, stdoutW, stderrW,
 		func(p *process) error {
+			if gate := d.evaluatedReadiness(); gate.State != "READY" {
+				return errors.New(gate.Reason)
+			}
 			return cb.BeforeResume(CodexIdentity{PID: p.pid, Created: p.created, Job: jobName})
 		})
 	if err != nil {

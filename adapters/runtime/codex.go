@@ -162,5 +162,6 @@ type CodexHandle interface {
 }
 type CodexDriver interface {
 	Descriptor() CodexDescriptor
+	ReadinessSnapshot() CodexReadiness
 	Start(context.Context, CodexLaunch, CodexCallbacks) (CodexHandle, error)
 }

@@ -30,8 +30,8 @@ func harnessExecutable(t *testing.T) string {
 	source := filepath.Join(dir, "main.go")
 	binary := filepath.Join(dir, "owned-codex-fixture.exe")
 	program := `package main
- import("os";"io";"fmt";"time";"encoding/json")
- func main(){raw,_:=io.ReadAll(os.Stdin);var input map[string]json.RawMessage;var schema,prompt string;var source map[string]string
+ import("os";"io";"fmt";"time";"encoding/json";"strings")
+ func main(){args:=strings.Join(os.Args[1:],"|");if strings.Count(args,"windows.sandbox=\"mxc\"")!=1||!strings.Contains(args,"--ignore-user-config")||!strings.Contains(args,"approval_policy=\"never\""){os.Exit(74)};raw,_:=io.ReadAll(os.Stdin);var input map[string]json.RawMessage;var schema,prompt string;var source map[string]string
  if json.Unmarshal(raw,&input)!=nil||json.Unmarshal(input["schema"],&schema)!=nil||schema!="researchos.codex-source-context.v1"||json.Unmarshal(input["source_context"],&source)!=nil||source["source_workspace"]==""||source["process_working_directory"]==""||source["access"]!="READ_ONLY"||json.Unmarshal(input["user_request"],&prompt)!=nil{os.Exit(73)}
  if prompt=="WAIT"{time.Sleep(time.Minute)}
  fmt.Println("{\"type\":\"thread.started\",\"thread_id\":\"fixture-cli-thread\"}")
@@ -60,7 +60,9 @@ func harnessFixture(t *testing.T, exe string) (*fixture, *RuntimeCoordinator, *W
 	if err != nil {
 		t.Fatal(err)
 	}
-	driver, err := rt.NewCodexCLI(rt.CodexCLIOptions{Executable: exe, Descriptor: rt.CodexDescriptor{Present: true, ExecutableHash: Digest(raw), AuthState: "LOGGED_IN", AuthKind: "other", ConfigurationControlled: true}})
+	driver, err := rt.NewCodexCLIForTrustedGoTest(rt.CodexCLIOptions{Executable: exe, Descriptor: rt.CodexDescriptor{Present: true, ExecutableHash: Digest(raw), AuthState: "LOGGED_IN", AuthKind: "other", ConfigurationControlled: true}}, rt.CodexReadinessFunc(func() rt.CodexReadiness {
+		return rt.CodexReadiness{State: "READY", PolicyIdentity: rt.CodexRequestedPolicyIdentity(Digest(raw))}
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,11 +113,11 @@ func harnessViewFixture(t *testing.T, f *fixture, c *RuntimeCoordinator, id stri
 }
 func TestHarnessCoordinatorFakeChain(t *testing.T) {
 	exe := harnessExecutable(t)
-	for _, mode := range []string{"COMPLETE", "FAIL", "UNKNOWN", "WAIT", "QUEUED_CANCEL", "AUTHORITY", "WORKSPACE"} {
+	for _, mode := range []string{"COMPLETE", "FAIL", "UNKNOWN", "WAIT", "QUEUED_CANCEL", "AUTHORITY", "WORKSPACE", "WORKSPACE_REBIND"} {
 		t.Run(mode, func(t *testing.T) {
 			f, c, b := harnessFixture(t, exe)
 			prompt := mode
-			if mode == "QUEUED_CANCEL" || mode == "AUTHORITY" || mode == "WORKSPACE" {
+			if mode == "QUEUED_CANCEL" || mode == "AUTHORITY" || mode == "WORKSPACE" || mode == "WORKSPACE_REBIND" {
 				prompt = "COMPLETE"
 			}
 			id, _ := harnessSubmitFixture(t, f, c, b, prompt)
@@ -144,10 +146,20 @@ func TestHarnessCoordinatorFakeChain(t *testing.T) {
 						return f.s.putOpaque(context.Background(), tx, "", KindWorkspaceBinding, b.AuthorizedRef, b.record())
 					})
 				}
+				if mode == "WORKSPACE_REBIND" {
+					sourceTx(t, f.db, func(tx *sql.Tx) error {
+						b.RealPath = t.TempDir()
+						b.Revision++
+						return f.s.putOpaque(context.Background(), tx, "", KindWorkspaceBinding, b.AuthorizedRef, b.record())
+					})
+				}
 				if err = c.Scan(context.Background()); err != nil && mode != "AUTHORITY" {
 					t.Fatal("same Scan", err)
 				}
-				if mode == "AUTHORITY" || mode == "WORKSPACE" {
+				if mode == "AUTHORITY" || mode == "WORKSPACE" || mode == "WORKSPACE_REBIND" {
+					if mode == "WORKSPACE_REBIND" && harnessViewFixture(t, f, c, id)["status"] == "" {
+						t.Fatal("historical Task unreadable")
+					}
 					var runs int
 					f.db.QueryRow("SELECT count(*) FROM domain_objects WHERE kind='Run'").Scan(&runs)
 					if runs != 0 {
@@ -221,6 +233,71 @@ func TestHarnessCoordinatorFakeChain(t *testing.T) {
 			}
 			t.Log(fmt.Sprintf("real same-DB chain %s, Runs=%d", expected, after))
 		})
+	}
+}
+
+// The binding changes after runHarness captures the old source path and before
+// its suspended child resumes. No output from that child may enter the Task.
+type harnessRebindAtStartDriver struct {
+	rt.CodexDriver
+	db                    *sql.DB
+	service               *Service
+	binding               *WorkspaceBinding
+	original, replacement string
+	starts                atomic.Int64
+}
+
+func (d *harnessRebindAtStartDriver) Start(ctx context.Context, in rt.CodexLaunch, cb rt.CodexCallbacks) (rt.CodexHandle, error) {
+	d.starts.Add(1)
+	if in.Workspace != d.original {
+		return nil, fmt.Errorf("driver source was not the admitted source")
+	}
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	d.binding.RealPath = d.replacement
+	d.binding.Revision++
+	if err = d.service.putOpaque(ctx, tx, "", KindWorkspaceBinding, d.binding.AuthorizedRef, d.binding.record()); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return d.CodexDriver.Start(ctx, in, cb)
+}
+func TestHarnessSourceRebindBeforeResume(t *testing.T) {
+	exe := harnessExecutable(t)
+	f, c, b := harnessFixture(t, exe)
+	id, _ := harnessSubmitFixture(t, f, c, b, "COMPLETE")
+	driver := &harnessRebindAtStartDriver{CodexDriver: c.config.HarnessDriver, db: f.db, service: f.s,
+		binding: b, original: b.RealPath, replacement: t.TempDir()}
+	c.config.HarnessDriver = driver
+	if err := c.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.workers.Wait()
+	view := harnessViewFixture(t, f, c, id)
+	if driver.starts.Load() != 1 || view["status"] == "COMPLETED" || view["result"] != nil {
+		t.Fatalf("rebound source resumed or fabricated result: starts=%d view=%s", driver.starts.Load(), Bytes(view))
+	}
+	events, err := c.HarnessV1().Events(context.Background(), f.token, HarnessEvents{ProjectID: f.project, TaskID: id, Cursor: "0", Limit: 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range Arr(events["data"].(map[string]any), "events") {
+		row := item.(map[string]any)
+		if row["kind"] == "ASSISTANT_DELTA" {
+			t.Fatal("suspended rebound child emitted assistant content")
+		}
+	}
+	if err = c.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.workers.Wait()
+	if driver.starts.Load() != 1 {
+		t.Fatal("rebound dispatch relaunched")
 	}
 }
 

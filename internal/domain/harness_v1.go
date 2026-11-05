@@ -54,6 +54,21 @@ func (e *HarnessError) Error() string { return e.Code + ": " + e.Message }
 func harnessFail(status int, code, message string) error {
 	return &HarnessError{Status: status, Code: code, Message: message}
 }
+
+// The input artifact is Host-sealed; this snapshot never comes from the
+// renderer. It binds the selected source to the task across admission and resume.
+func harnessSourceBinding(b *WorkspaceBinding) Object {
+	return Object{"binding_ref": b.AuthorizedRef, "principal_id": b.PrincipalID,
+		"project_id": *b.ProjectID, "access": "READ_ONLY", "binding_access": b.Access,
+		"revision": strconv.FormatInt(b.Revision, 10), "canonical_path_sha256": Digest([]byte(b.RealPath))}
+}
+func harnessSourceBindingMatches(record Object, b *WorkspaceBinding) bool {
+	if b == nil || b.ProjectID == nil {
+		return false
+	}
+	snapshot, ok := record["source_binding"].(map[string]any)
+	return ok && Hash(snapshot) == Hash(harnessSourceBinding(b))
+}
 func harnessLabel(s string, max int) bool {
 	return len(s) > 0 && len(s) <= max && utf8.ValidString(s) && strings.TrimSpace(s) != "" && !strings.ContainsAny(s, "\x00\r\n")
 }
@@ -189,7 +204,7 @@ func (s *Service) nativeHarnessAdmission(tx *sql.Tx, project string, task, runti
 	if err != nil {
 		return nil, err
 	}
-	if profile["backend"] != "codex-cli-readonly-v1" || profile["sandbox"] != "codex-permissions-workspace-read-v1" || profile["credential_revision"] != "CLI_OWNED" {
+	if profile["backend"] != "codex-cli-readonly-v1" || profile["sandbox"] != "codex-mxc-permissions-workspace-read-v2" || profile["command_id"] != "codex-mxc-readonly-v2" || profile["native_policy_revision"] != "researchos-codex-mxc-readonly-v1" || profile["windows_sandbox"] != "mxc" || profile["permission_profile"] != "researchos-readonly" || Str(profile, "requested_config_sha256") == "" || profile["credential_revision"] != "CLI_OWNED" {
 		return nil, Fail(422, "GATE_FAILED", "native Harness profile required")
 	}
 	record, err := harnessTaskInput(tx, project, task)
@@ -212,6 +227,9 @@ func (s *Service) nativeHarnessAdmission(tx *sql.Tx, project string, task, runti
 	binding, err := s.binding(context.Background(), tx, Str(request, "workspace_ref"))
 	if err != nil || binding.PrincipalID != principal || binding.ProjectID == nil || *binding.ProjectID != project || binding.Status != WorkspaceActive {
 		return nil, Fail(403, "FORBIDDEN", "native workspace revoked")
+	}
+	if !harnessSourceBindingMatches(record, binding) {
+		return nil, Fail(412, "STALE_INPUT", "native source binding changed or missing")
 	}
 	expires, err := time.Parse(time.RFC3339Nano, Str(profile, "consent_expires_at"))
 	if err != nil || !expires.After(time.Now()) {

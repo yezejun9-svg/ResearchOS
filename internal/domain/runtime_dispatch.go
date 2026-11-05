@@ -11,7 +11,7 @@ const runtimeBridgeRevision = "windows-appcontainer-v1"
 
 func validateRuntimeDispatchProfile(profile Object) error {
 	if profile["backend"] == "codex-cli-readonly-v1" {
-		if profile["adapter"] != "codex-cli-harness-v1" || profile["adapter_revision"] != "codex-cli-readonly-v1" || profile["platform"] != "windows-amd64" || profile["sandbox"] != "codex-permissions-workspace-read-v1" || Str(profile, "build_hash") == "" || Str(profile, "harness_owner") == "" {
+		if profile["adapter"] != "codex-cli-harness-v1" || profile["adapter_revision"] != "codex-cli-readonly-v1" || profile["platform"] != "windows-amd64" || profile["sandbox"] != "codex-mxc-permissions-workspace-read-v2" || profile["command_id"] != "codex-mxc-readonly-v2" || profile["native_policy_revision"] != "researchos-codex-mxc-readonly-v1" || profile["windows_sandbox"] != "mxc" || profile["permission_profile"] != "researchos-readonly" || Str(profile, "requested_config_sha256") == "" || Str(profile, "build_hash") == "" || Str(profile, "harness_owner") == "" {
 			return Fail(422, "GATE_FAILED", "bound native readonly profile required")
 		}
 		return nil
