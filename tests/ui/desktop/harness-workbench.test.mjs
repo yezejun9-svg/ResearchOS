@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import vm from 'node:vm'
 import { decimal, canSubmitHarness, hasHarnessCapability, applyHarnessPage, cancelIntent, createHarnessController, harnessStatusLabel } from '../../../apps/web/src/harness.js'
 import { composerSubmitKey, harnessActivityRows } from '../../../apps/web/src/activity.js'
+import { projectHarnessReceipt } from '../../../apps/web/src/harness-progress.js'
 
 const ref = { project_id: 'fixture-project', task_id: 'fixture-task' }
 const task = (extra = {}) => ({ task_ref: ref, request_id: 'fixture-request', harness_id: 'codex', workspace_ref: 'fixture-workspace', prompt: 'Inspect only', scope: 'workspace-read', ephemeral: true, status: 'QUEUED', terminal: false, task_revision: '1', run: null, created_at: '2026-11-04T00:00:00Z', updated_at: '2026-11-04T00:00:00Z', result: null, failure: null, ...extra })
@@ -64,6 +65,114 @@ test('accepted submission remains accepted if the immediate snapshot read discon
   await control.load()
   assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Inspect only' }), true)
   assert.match(control.getSnapshot().error.message, /disconnected/)
+  assert.match(projectHarnessReceipt(control.getSnapshot(), true).summary, /已接收.*读取失败/)
+})
+test('accepted ACK followed by an immediate failed Task renders the Host failure without replay', async () => {
+  let submits = 0
+  const failure = { code: 'HARNESS_UNAVAILABLE', message: 'Native preparation failed before model launch; no automatic replay' }
+  const control = createHarnessController(bridge({
+    submit: async () => { submits++; return ok({ task_ref: ref, request_id: 'fixture-request', task_revision: '1', status: 'QUEUED', run: null }) },
+    get: async () => ok(task({ status: 'FAILED', terminal: true, failure })),
+  }), ref.project_id)
+  await control.load()
+  assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Inspect only' }), true)
+  const view = projectHarnessReceipt(control.getSnapshot(), true)
+  assert.equal(view.kind, 'FAILED')
+  assert.match(view.summary, /准备阶段失败/)
+  assert.equal(view.message, failure.message)
+  assert.equal(submits, 1)
+  control.dispose()
+})
+test('a later failed Task replaces the queued receipt without resubmitting', async () => {
+  let reads = 0, submits = 0
+  const control = createHarnessController(bridge({
+    submit: async () => { submits++; return ok({ task_ref: ref, request_id: 'fixture-request', task_revision: '1', status: 'QUEUED', run: null }) },
+    get: async () => ok(++reads === 1 ? task() : task({ status: 'FAILED', terminal: true, failure: { code: 'HARNESS_UNAVAILABLE', message: 'Host execution unavailable' } })),
+    events: async () => ok({ task_ref: ref, events: [], next_cursor: '0', has_more: false, end: false, reset: false, snapshot: null }),
+  }), ref.project_id)
+  await control.load()
+  await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Inspect only' })
+  assert.equal(projectHarnessReceipt(control.getSnapshot(), true).kind, 'QUEUED')
+  await control.tick()
+  const view = projectHarnessReceipt(control.getSnapshot(), true)
+  assert.equal(view.kind, 'FAILED')
+  assert.doesNotMatch(view.summary, /准备阶段失败/)
+  assert.equal(submits, 1)
+  control.dispose()
+})
+test('history selection clears the prior ACK before a different Task read fails', async () => {
+  const other = { project_id: ref.project_id, task_id: 'other-task' }
+  let submits = 0
+  const control = createHarnessController(bridge({
+    submit: async () => { submits++; return ok({ task_ref: ref, request_id: 'fixture-request', task_revision: '1', status: 'QUEUED', run: null }) },
+    get: async ({ task_id }) => task_id === other.task_id ? { ok: false, reason: 'READ_DISCONNECTED' } : ok(task()),
+  }), ref.project_id)
+  await control.load()
+  assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Inspect only' }), true)
+  const acknowledgements = []
+  const errorContexts = []
+  let draft = 'initial draft'
+  const edit = vm.runInNewContext('(' + editSource + ')', {
+    draftVersion: { current: 0 },
+    setDraft: value => { draft = value },
+  })
+  edit('new unsent draft')
+  const select = vm.runInNewContext('(' + selectSource + ')', {
+    setAcknowledgement: value => acknowledgements.push(value),
+    setErrorContext: value => errorContexts.push(value),
+    controller: { current: control },
+  })
+  await select(other.task_id)
+  assert.deepEqual(acknowledgements, [null])
+  assert.deepEqual(errorContexts, ['read'])
+  assert.equal(draft, 'new unsent draft')
+  assert.equal(submits, 1)
+  assert.equal(control.getSnapshot().task, null)
+  const receipt = projectHarnessReceipt(control.getSnapshot(), false, 'read')
+  assert.equal(receipt.kind, 'READ_ERROR')
+  assert.doesNotMatch(receipt.summary, /请求已接收/)
+  control.dispose()
+})
+test('UNKNOWN submission keeps the older Task distinct and reconciles only the original request', async () => {
+  let submits = 0, reconciles = 0
+  const unresolved = { request_id: 'new-original-request', kind: 'submit', state: 'UNKNOWN' }
+  const control = createHarnessController(bridge({
+    pending: async () => ok(submits ? unresolved : null),
+    submit: async () => { submits++; return { ok: false, reason: 'HARNESS_TIMEOUT', outcome: 'UNKNOWN', pending: unresolved } },
+    reconcile: async () => { reconciles++; return ok({ pending: unresolved, task: null }) },
+  }), ref.project_id)
+  await control.load(); await control.select(ref.task_id)
+  assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'New task' }), false)
+  const view = projectHarnessReceipt(control.getSnapshot(), false, 'submit')
+  assert.equal(view.kind, 'PENDING')
+  assert.equal(view.requestId, unresolved.request_id)
+  assert.equal(view.pendingKind, 'submit')
+  assert.equal(view.previousTaskId, ref.task_id)
+  assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Retry' }), false)
+  await control.reconcile()
+  assert.equal(submits, 1)
+  assert.equal(reconciles, 1)
+  control.dispose()
+})
+test('UNKNOWN cancellation keeps its original request identity and blocks a second submit', async () => {
+  let cancels = 0, submits = 0, reconciles = 0
+  const unresolved = { request_id: 'cancel-original-request', kind: 'cancel', state: 'UNKNOWN' }
+  const control = createHarnessController(bridge({
+    pending: async () => ok(cancels ? unresolved : null),
+    cancel: async () => { cancels++; return { ok: false, reason: 'HARNESS_TIMEOUT', outcome: 'UNKNOWN', pending: unresolved } },
+    submit: async () => { submits++; throw Error('must stay blocked') },
+    reconcile: async () => { reconciles++; return ok({ pending: unresolved, task: null }) },
+  }), ref.project_id)
+  await control.load(); await control.select(ref.task_id); await control.cancel()
+  const view = projectHarnessReceipt(control.getSnapshot(), false, 'cancel')
+  assert.equal(view.kind, 'PENDING')
+  assert.equal(view.requestId, unresolved.request_id)
+  assert.equal(view.pendingKind, 'cancel')
+  assert.equal(view.previousTaskId, ref.task_id)
+  assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'New task' }), false)
+  await control.reconcile()
+  assert.equal(cancels, 1); assert.equal(submits, 0); assert.equal(reconciles, 1)
+  control.dispose()
 })
 test('Run epoch changes preserve Task history and explicit reset adopts authoritative state', () => {
   let state = { task: task(), events: [], cursor: '9007199254740992', end: false }
@@ -114,25 +223,87 @@ test('activity projects actual tool observations and preserves IME/multiline beh
 const workbench = fs.readFileSync(new URL('../../../apps/web/src/workbench.jsx', import.meta.url), 'utf8')
 const codexBlock = workbench.slice(workbench.indexOf('function NativeHarnessWorkbench('), workbench.indexOf('function NativeMuWorkbench('))
 const sendSource = /async function send\(event\) \{[\s\S]*?\n  \}/.exec(codexBlock)?.[0]
+const cancelSource = /async function cancelTask\(\) \{[\s\S]*?\n  \}/.exec(codexBlock)?.[0]
 const editSource = /function editDraft\(value\) \{[\s\S]*?\n  \}/.exec(codexBlock)?.[0]
+const selectSource = /function selectTask\(id\) \{[\s\S]*?\n  \}/.exec(codexBlock)?.[0]
 const textareaSource = /<textarea[^>]*onChange=\{(event => \w+\(event.target.value\))\}/.exec(codexBlock)?.[1]
 const scopeSource = /  if \(draftScope.current.projectId[\s\S]*?\n  \}/.exec(codexBlock)?.[0]
 const cleanupSource = /return \(\) => \{ stopped = true; draftVersion[^\n]*/.exec(codexBlock)?.[0]?.replace(/^return /, '')
-assert.ok(sendSource && editSource && textareaSource && scopeSource && cleanupSource, 'actual draft handlers and view cleanup must be isolated')
+assert.ok(sendSource && cancelSource && editSource && selectSource && textareaSource && scopeSource && cleanupSource, 'actual send, cancel, draft and selection handlers and view cleanup must be isolated')
+function activeHandlers(control) {
+  let draft = 'Inspect only', acknowledgement = null, errorContext = 'read'
+  const changes = []
+  const context = vm.createContext({
+    canSend: true, projectId: ref.project_id, workspace: 'fixture-workspace', draft,
+    draftVersion: { current: 0 }, controller: { current: control },
+    setDraft: value => { draft = value },
+    setAcknowledgement: value => { acknowledgement = value; changes.push(value) },
+    setErrorContext: value => { errorContext = value },
+  })
+  const send = vm.runInContext('(' + sendSource + ')', context)
+  const cancel = vm.runInContext('(' + cancelSource + ')', context)
+  return { send: () => send({ preventDefault() {} }), cancel, acknowledgement: () => acknowledgement,
+    errorContext: () => errorContext, changes, draft: () => draft }
+}
+test('real send then failed cancel clears ACK before STATE_CONFLICT refresh failure', async () => {
+  let reads = 0, submits = 0, cancels = 0
+  const control = createHarnessController(bridge({
+    submit: async () => { submits++; return ok({ task_ref: ref, request_id: 'fixture-request', task_revision: '1', status: 'QUEUED', run: null }) },
+    get: async () => ++reads === 1 ? ok(task()) : { ok: false, reason: 'READ_DISCONNECTED' },
+    cancel: async () => { cancels++; return { ok: false, reason: 'STATE_CONFLICT', outcome: 'REPLIED' } },
+  }), ref.project_id)
+  await control.load()
+  const view = activeHandlers(control)
+  await view.send()
+  assert.equal(view.acknowledgement().taskId, ref.task_id)
+  await view.cancel()
+  assert.equal(view.acknowledgement(), null)
+  assert.equal(view.errorContext(), 'cancel')
+  assert.equal(projectHarnessReceipt(control.getSnapshot(), !!view.acknowledgement(), view.errorContext()).kind, 'OPERATION_ERROR')
+  assert.equal(control.getSnapshot().error.code, 'STATE_CONFLICT')
+  assert.equal(view.draft(), '')
+  assert.equal(submits, 1); assert.equal(cancels, 1); assert.equal(reads, 2)
+  control.dispose()
+})
+test('real send then UNKNOWN cancel shows the cancel request, never the previous submit ACK', async () => {
+  let submits = 0, cancels = 0, reconciles = 0
+  const unresolved = { request_id: 'original-cancel', kind: 'cancel', state: 'UNKNOWN' }
+  const control = createHarnessController(bridge({
+    submit: async () => { submits++; return ok({ task_ref: ref, request_id: 'fixture-request', task_revision: '1', status: 'QUEUED', run: null }) },
+    pending: async () => ok(cancels ? unresolved : null),
+    cancel: async () => { cancels++; return { ok: false, reason: 'HARNESS_TIMEOUT', outcome: 'UNKNOWN', pending: unresolved } },
+    reconcile: async () => { reconciles++; return ok({ pending: unresolved, task: null }) },
+  }), ref.project_id)
+  await control.load()
+  const view = activeHandlers(control)
+  await view.send()
+  assert.equal(view.acknowledgement().taskId, ref.task_id)
+  await view.cancel()
+  const receipt = projectHarnessReceipt(control.getSnapshot(), !!view.acknowledgement(), view.errorContext())
+  assert.equal(view.acknowledgement(), null)
+  assert.equal(receipt.kind, 'PENDING')
+  assert.equal(receipt.requestId, 'original-cancel')
+  assert.equal(receipt.pendingKind, 'cancel')
+  assert.equal(receipt.previousTaskId, ref.task_id)
+  assert.equal(await control.submit({ workspace_ref: 'fixture-workspace', prompt: 'Must remain blocked' }), false)
+  await control.reconcile()
+  assert.equal(submits, 1); assert.equal(cancels, 1); assert.equal(reconciles, 1)
+  control.dispose()
+})
 function pendingDraftSend() {
   let resolve, currentDraft = 'submitted text'
-  const notices = [], submissions = []
+  const acknowledgements = [], submissions = []
   const accepted = new Promise(done => { resolve = done })
-  const control = { submit: value => { submissions.push(value); return accepted }, dispose() {} }
+  const control = { submit: value => { submissions.push(value); return accepted }, getSnapshot: () => ({ task: { task_ref: ref } }), dispose() {} }
   const context = vm.createContext({ canSend: true, draft: 'submitted text', workspace: 'fixture-workspace', projectId: ref.project_id,
     draftVersion: { current: 0 }, draftScope: { current: { projectId: ref.project_id, workspace: 'fixture-workspace' } },
     controller: { current: control }, control, setDraft: value => { currentDraft = typeof value === 'function' ? value(currentDraft) : value },
-    setNotice: value => notices.push(value), stopped: false, unsubscribe() {}, clearInterval() {}, timer: 1, removeEventListener() {}, changed() {}, tick() {}, visible() {}, document: { removeEventListener() {} } })
+    setAcknowledgement: value => acknowledgements.push(value), setErrorContext() {}, stopped: false, unsubscribe() {}, clearInterval() {}, timer: 1, removeEventListener() {}, changed() {}, tick() {}, visible() {}, document: { removeEventListener() {} } })
   context.editDraft = vm.runInContext('(' + editSource + ')', context)
   const send = vm.runInContext('(' + sendSource + ')', context)
   const onChange = vm.runInContext('(' + textareaSource + ')', context)
   const pending = send({ preventDefault() {} })
-  return { context, pending, resolve, notices, submissions, value: () => currentDraft,
+  return { context, pending, resolve, acknowledgements, submissions, value: () => currentDraft,
     edit: text => onChange({ target: { value: text } }),
     scope: workspace => { context.workspace = workspace; vm.runInContext(scopeSource, context) },
     cleanup: () => vm.runInContext('(' + cleanupSource + ')', context)() }
@@ -152,6 +323,8 @@ test('actual send still clears an unchanged successfully submitted draft', async
   run.resolve(true); await run.pending
   assert.equal(run.value(), '')
   assert.equal(run.submissions[0].prompt, 'submitted text')
+  assert.equal(run.acknowledgements.at(-1).taskId, ref.task_id)
+  assert.equal(run.acknowledgements.at(-1).controller, run.context.controller.current)
 })
 test('actual send keeps draft after view cleanup while its promise is pending', async () => {
   const run = pendingDraftSend()
@@ -159,7 +332,7 @@ test('actual send keeps draft after view cleanup while its promise is pending', 
   run.resolve(true); await run.pending
   assert.equal(run.value(), 'submitted text')
   assert.equal(run.context.controller.current, null)
-  assert.equal(run.notices.length, 1, 'unmounted view cannot publish the late success notice')
+  assert.deepEqual(run.acknowledgements, [null], 'unmounted view cannot publish the late success receipt')
 })
 test('actual scope generations preserve draft after workspace changes away and back', async () => {
   const run = pendingDraftSend()
@@ -173,5 +346,5 @@ test('actual send cannot clear a draft owned by a replacement controller', async
   run.context.controller.current = { submit() { throw Error('unexpected resubmit') } }
   run.resolve(true); await run.pending
   assert.equal(run.value(), 'submitted text')
-  assert.equal(run.notices.length, 1)
+  assert.deepEqual(run.acknowledgements, [null])
 })

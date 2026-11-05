@@ -11,6 +11,44 @@ const terminalText = {
 const sameRun = (left, right) => !!left && !!right &&
   left.run_id === right.run_id && left.epoch === right.epoch
 
+// The Host Task is the receipt. An accepted submit ACK only confirms that a
+// request was recorded; it must never override a later Task or read failure.
+export function projectHarnessReceipt({ task = null, pending = null, error = null } = {}, acknowledged = false, errorContext = 'read') {
+  const failure = task?.failure
+  const message = typeof failure?.message === 'string' ? failure.message : ''
+  const preparationFailed = /preparation failed before model launch|准备阶段失败.{0,20}模型未启动/i.test(message)
+  const summaries = {
+    QUEUED: '任务已记录，等待启动。',
+    STARTING: '任务正在启动。',
+    RUNNING: '任务正在执行。',
+    CANCEL_REQUESTED: '已请求取消，等待原任务确认停止。',
+    COMPLETED: '任务执行已结束；结果仍需核对。',
+    FAILED: preparationFailed ? '准备阶段失败，模型未启动；没有自动重试。' : '任务执行失败；请查看 Host 返回的原因。',
+    CANCELLED: '任务已取消。',
+    BLOCKED: '任务已阻止；请查看原因。',
+    UNKNOWN: '任务结果未知；请核对原请求，避免重复提交。',
+  }
+  const unresolved = pending && {
+    kind: 'PENDING', summary: '原请求结果未确认；请核对原请求，避免重复提交。',
+    requestId: pending.request_id || null, pendingKind: pending.kind || null, pendingState: pending.state || null,
+    previousTaskId: task?.task_ref?.task_id || null,
+  }
+  if (unresolved && (!task || pending.request_id !== task.request_id)) return unresolved
+  if (error && (errorContext === 'cancel' || !acknowledged && errorContext !== 'read')) return {
+    kind: 'OPERATION_ERROR', summary: errorContext === 'cancel' ? '取消请求未确认；请核对当前任务。' : '提交请求未确认；请核对原请求后再操作。',
+    message: error.message || String(error), code: error.code || null, previousTaskId: task?.task_ref?.task_id || null,
+  }
+  if (task) return { kind: task.status, summary: summaries[task.status] || '任务状态待核对。',
+    message, code: failure?.code || null, taskId: task.task_ref?.task_id || null,
+    revision: task.task_revision || null, runId: task.run?.run_id || null, epoch: task.run?.epoch || null,
+    readError: error?.message || null }
+  if (unresolved) return unresolved
+  if (error) return { kind: 'READ_ERROR', summary: acknowledged ? '请求已接收，但当前任务读取失败；请刷新核对。' : '任务状态读取失败；请刷新核对。',
+    message: error.message || String(error), code: error.code || null }
+  if (acknowledged) return { kind: 'ACKNOWLEDGED', summary: '请求已接收，正在读取当前任务。' }
+  return null
+}
+
 export function projectHarnessProgress(task, events = []) {
   if (!task) return { empty: true, stages: [], observedToolCount: 0 }
   const run = task.run

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { projectHarnessProgress } from '../../apps/web/src/harness-progress.js'
+import { projectHarnessProgress, projectHarnessReceipt } from '../../apps/web/src/harness-progress.js'
 import { harnessSubmissionBlockers } from '../../apps/web/src/harness.js'
 
 const ref = { project_id: 'p', task_id: 't' }
@@ -58,4 +58,62 @@ test('read-only permission blockers explain current reasons and retain raw codes
   assert.match(blockers[1].message, /策略/)
   assert.deepEqual(harnessSubmissionBlockers({ can_submit: true, reason_codes: [] }), [])
   assert.match(harnessSubmissionBlockers({ can_submit: false, reason_codes: [] })[0].message, /尚未确认/)
+})
+
+test('receipt follows the authoritative Task after ACK, including terminal and cancel states', () => {
+  for (const status of ['FAILED', 'COMPLETED', 'CANCELLED', 'BLOCKED', 'UNKNOWN', 'CANCEL_REQUESTED']) {
+    const view = projectHarnessReceipt({ task: task(status) }, true)
+    assert.equal(view.kind, status)
+    assert.doesNotMatch(view.summary, /等待真实运行回执/)
+  }
+  assert.match(projectHarnessReceipt({ task: task('UNKNOWN') }, true).summary, /核对原请求/)
+  assert.match(projectHarnessReceipt({ task: task('CANCEL_REQUESTED') }, true).summary, /等待原任务/)
+})
+
+test('preparation wording requires the actual Host message, not an error code alone', () => {
+  const generic = projectHarnessReceipt({ task: { ...task('FAILED'), failure: { code: 'HARNESS_UNAVAILABLE', message: 'Host unavailable' } } }, true)
+  assert.doesNotMatch(generic.summary, /模型未启动/)
+  assert.equal(generic.message, 'Host unavailable')
+  const explicit = projectHarnessReceipt({ task: { ...task('FAILED'), failure: { code: 'HARNESS_UNAVAILABLE', message: 'Native preparation failed before model launch; no automatic replay' } } }, true)
+  assert.match(explicit.summary, /模型未启动/)
+  assert.equal(explicit.code, 'HARNESS_UNAVAILABLE')
+})
+
+test('pending original request and accepted read error retain distinct, reconcilable receipts', () => {
+  const pending = projectHarnessReceipt({ pending: { request_id: 'original', kind: 'submit', state: 'UNKNOWN' } }, false)
+  assert.equal(pending.kind, 'PENDING')
+  assert.equal(pending.requestId, 'original')
+  assert.match(pending.summary, /避免重复提交/)
+  const readError = projectHarnessReceipt({ error: new Error('read disconnected') }, true)
+  assert.equal(readError.kind, 'READ_ERROR')
+  assert.match(readError.summary, /已接收.*读取失败/)
+  assert.equal(readError.message, 'read disconnected')
+  const lastKnown = projectHarnessReceipt({ task: task('QUEUED'), error: new Error('refresh disconnected') }, true)
+  assert.equal(lastKnown.kind, 'QUEUED')
+  assert.equal(lastKnown.readError, 'refresh disconnected')
+  assert.equal(projectHarnessReceipt({}), null)
+})
+
+test('an unresolved different request outranks an older Task and keeps its full identity', () => {
+  const older = { ...task('COMPLETED'), request_id: 'old-request' }
+  const pending = { request_id: 'new-request', kind: 'submit', state: 'UNKNOWN' }
+  const view = projectHarnessReceipt({ task: older, pending, error: new Error('submit outcome unknown') }, false, 'submit')
+  assert.equal(view.kind, 'PENDING')
+  assert.equal(view.requestId, 'new-request')
+  assert.equal(view.pendingKind, 'submit')
+  assert.equal(view.pendingState, 'UNKNOWN')
+  assert.equal(view.previousTaskId, ref.task_id)
+  assert.doesNotMatch(view.summary, /已结束/)
+})
+
+test('operation failures are not called read failures; an accepted get failure is', () => {
+  const submission = projectHarnessReceipt({ task: task(), error: new Error('submit rejected') }, false, 'submit')
+  assert.equal(submission.kind, 'OPERATION_ERROR')
+  assert.doesNotMatch(submission.summary, /读取失败/)
+  const cancellation = projectHarnessReceipt({ task: task(), error: new Error('cancel rejected') }, false, 'cancel')
+  assert.equal(cancellation.kind, 'OPERATION_ERROR')
+  assert.match(cancellation.summary, /取消/)
+  const read = projectHarnessReceipt({ error: new Error('get disconnected') }, true, 'submit')
+  assert.equal(read.kind, 'READ_ERROR')
+  assert.match(read.summary, /读取失败/)
 })

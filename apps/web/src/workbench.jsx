@@ -8,6 +8,7 @@ import { workspaceProjectPath } from './startup.js'
 import { composerSubmitKey, appendPrompt } from './activity.js'
 import { HARNESS_CAPABILITIES, canSubmitHarness, hasHarnessCapability, harnessStatusLabel, createHarnessController } from './harness.js'
 import { HarnessRunProgress, HarnessPermissionNotice } from './components/harness-run-progress.jsx'
+import { projectHarnessReceipt } from './harness-progress.js'
 
 const rows = value => Array.isArray(value) ? value : value?.items || value?.sessions || value?.workspaces || []
 const labels = { USER: '你', ASSISTANT: 'Agent', SYSTEM: '系统' }
@@ -408,14 +409,16 @@ export function NativeWorkbench(props) {
     setHarness(value)
   }
   return <><div className="button-row composer-context"><label>Harness <select aria-label="Harness" value={harness} disabled={guard.busy} onChange={event => choose(event.target.value)}><option value="codex">Codex CLI · 只读任务</option><option value="mu">Mu · 原有模型会话</option></select></label><small>各 Harness 的登录、模型与能力分别核对；草稿在本页保留。</small></div>
-    {harness === 'codex' ? <NativeHarnessWorkbench {...props} draft={codexDraft} setDraft={setCodexDraft} onGuardChange={setGuard}/> :
+    {harness === 'codex' ? <NativeHarnessWorkbench key={props.projectId} {...props} draft={codexDraft} setDraft={setCodexDraft} onGuardChange={setGuard}/> :
       <NativeMuWorkbench {...props} draft={muDraft} setDraft={setMuDraft} onGuardChange={setGuard}/>}</>
 }
 
 function NativeHarnessWorkbench({ projectId, profile, navigate, shared, draft, setDraft, onGuardChange }) {
   const [state, setState] = useState({ loading: true, busy: false, tasks: [], task: null, events: [], capabilities: null, pending: null })
   const [workspaces, setWorkspaces] = useState([]), [workspace, setWorkspace] = useState('')
-  const [hostError, setHostError] = useState(null), [notice, setNotice] = useState('')
+  const [hostError, setHostError] = useState(null)
+  const [acknowledgement, setAcknowledgement] = useState(null)
+  const [errorContext, setErrorContext] = useState('read')
   const [online, setOnline] = useState(navigator.onLine)
   const controller = useRef(null), composer = useRef(null)
   const draftVersion = useRef(0), draftScope = useRef({ projectId, workspace })
@@ -426,6 +429,11 @@ function NativeHarnessWorkbench({ projectId, profile, navigate, shared, draft, s
   function editDraft(value) {
     draftVersion.current++
     setDraft(value)
+  }
+  function selectTask(id) {
+    setAcknowledgement(null)
+    setErrorContext('read')
+    return controller.current?.select(id)
   }
   useEffect(() => {
     let stopped = false
@@ -467,28 +475,56 @@ function NativeHarnessWorkbench({ projectId, profile, navigate, shared, draft, s
     if (!canSend) return
     const control = controller.current, submittedVersion = draftVersion.current
     if (!control) return
-    setNotice('')
+    setAcknowledgement(null)
+    setErrorContext('submit')
     if (await control.submit({ workspace_ref: workspace, prompt: draft })) {
       if (controller.current !== control) return
       if (draftVersion.current === submittedVersion) setDraft('')
-      setNotice('任务已接收，等待真实运行回执。')
+      setAcknowledgement({ projectId, controller: control, taskId: control.getSnapshot().task?.task_ref.task_id || null })
+      setErrorContext('read')
     }
   }
-  return <><header className="page-heading workbench-heading"><div><span className="workbench-eyebrow">RESEARCH / WORKSPACE</span><h1>{profile?.name || '项目工作台'}</h1><p>通过本机 Codex 执行一次只读临时任务，查看真实执行回执。</p></div><button disabled={disabled} onClick={() => controller.current.load()}>刷新任务</button></header>
-    <Failure error={hostError}/><Failure error={state.error}/>
-    {!online && <p className="connection-banner" role="status">当前离线。保留已读任务；恢复连接后核对状态，不会重新提交。</p>}
-    {state.pending && <div className="state-notice" role="status"><p>原{state.pending.kind === 'cancel' ? '取消' : '提交'}请求需核对：{state.pending.request_id}。不会自动重发或创建新任务。</p><button disabled={disabled} onClick={() => controller.current.reconcile()}>只读核对原请求</button></div>}
-    <WorkbenchLayout hasSession={!!task} sessions={<Panel title="Codex 任务"><ul className="session-picker">{state.tasks.map(item => <li key={item.task_ref.task_id}><button disabled={disabled} aria-current={task?.task_ref.task_id === item.task_ref.task_id ? 'page' : undefined} onClick={() => { if (!draft || confirm('当前草稿会保留在输入框。切换查看此任务？')) controller.current.select(item.task_ref.task_id) }}>{item.prompt.slice(0, 80) || item.task_ref.task_id}<small>{harnessStatusLabel(item.status)}</small></button></li>)}</ul>{!state.tasks.length && <p className="empty-state">{state.loading ? '正在读取真实任务…' : '尚无任务。选择授权工作区后输入目标。'}</p>}<label>工作区<select aria-label="Codex 工作区" value={workspace} disabled={disabled} onChange={event => setWorkspace(event.target.value)}><option value="">选择已授权目录</option>{workspaces.map(item => <option key={item.authorized_workspace_ref} value={item.authorized_workspace_ref}>{item.display_name}</option>)}</select></label>{!workspaces.length && <p>请先从项目入口选择并授权工作区；不需要 provider 模型配置。</p>}</Panel>}
-      conversation={<div className="session-center"><Panel className="conversation-canvas" title="Codex · 只读任务" aside={<span className="tag">{task ? harnessStatusLabel(task.status) : '等待输入'}</span>}>
-        <div className="button-row session-run-controls"><button disabled={disabled || !!state.pending || !task || task.terminal || !hasHarnessCapability(capabilities, 'cancel')} onClick={() => controller.current.cancel()}>取消当前任务</button><button disabled title="当前 Harness 不支持暂停">暂停</button><button disabled title="当前 Harness 不支持恢复执行">恢复执行</button></div>
-        <HarnessRunProgress task={task} events={state.events}/>
-        <div className="conversation-transcript" aria-label="Codex 任务记录">{task ? <><article className="conversation-message role-user"><h3>你</h3><div className="message-text">{task.prompt}</div></article>{assistant.map(event => <article className="conversation-message role-assistant" key={event.event_id}><h3>Codex</h3><div className="message-text">{event.payload.text}</div></article>)}{task.result?.assistant_text && !assistant.some(event => event.payload.text === task.result.assistant_text) && <article className="conversation-message role-assistant"><h3>Codex</h3><div className="message-text">{task.result.assistant_text}</div></article>}{task.failure && <p role="status">{task.failure.code}：{task.failure.message}</p>}<p className="small-muted">Task {task.task_ref.task_id} · 修订 {task.task_revision}{task.run ? ` · Run ${task.run.run_id} · epoch ${task.run.epoch}` : ' · 尚无 Run'}。执行状态不代表业务验收。</p></> : <ConversationWelcome setDraft={editDraft} composer={composer}/>}</div>
-        <form className="session-composer" onSubmit={send}><div className="composer-context"><span className="composer-prompt">researchos &gt;</span><span>Codex CLI</span><span>模型由 Codex 配置决定</span><span>workspace-read · ephemeral</span></div><textarea ref={composer} aria-label="Codex 任务输入" value={draft} onChange={event => editDraft(event.target.value)} onKeyDown={event => { if (composerSubmitKey(event)) { event.preventDefault(); if (canSend) event.currentTarget.form.requestSubmit() } }} placeholder="输入一次只读任务，例如：检查项目结构并解释主要入口。" required/><div className="composer-controls"><small>Enter 发送 · Shift+Enter 换行</small><button className="primary" type="submit" disabled={!canSend}>提交只读任务</button></div>{notice && <p role="status">{notice}</p>}</form>
+  async function cancelTask() {
+    const control = controller.current
+    if (!control) return
+    setAcknowledgement(null)
+    setErrorContext('cancel')
+    await control.cancel()
+    if (controller.current === control && !control.getSnapshot().error) setErrorContext('read')
+  }
+  const acknowledged = acknowledgement?.controller === controller.current &&
+    acknowledgement.projectId === projectId &&
+    (!task || acknowledgement.taskId === task.task_ref.task_id)
+  const receipt = projectHarnessReceipt(state, acknowledged, errorContext)
+  const suggestions = ['梳理项目目录与入口', '阅读 README 并概述项目', '查看现有测试说明']
+  return <>
+    <header className="page-heading workbench-heading codex-heading"><div><span className="workbench-eyebrow">PROJECT / READ ONLY</span><h1>{profile?.name || '项目工作台'}</h1></div><button disabled={disabled} onClick={() => { setErrorContext('read'); controller.current?.load() }}>刷新任务</button></header>
+    <Failure error={hostError}/>
+    {!online && <p className="connection-banner" role="status">当前离线。可查看已读取任务；恢复连接后核对状态。新的任务暂不可提交。</p>}
+    <WorkbenchLayout variant="assistant" hasSession={!!task} historyExpanded={false} historyHint={state.tasks.length ? state.tasks.length + ' 个已记录任务' : '查看已记录任务'}
+      sessionTools={<div className="codex-workspace-row"><label>工作区<select aria-label="Codex 工作区" value={workspace} disabled={disabled} onChange={event => setWorkspace(event.target.value)}><option value="">选择已授权目录</option>{workspaces.map(item => <option key={item.authorized_workspace_ref} value={item.authorized_workspace_ref}>{item.display_name}</option>)}</select></label>{!workspaces.length && <small>请从项目入口选择并授权工作区。</small>}</div>}
+      sessions={<Panel title="Codex 任务"><ul className="session-picker">{state.tasks.map(item => <li key={item.task_ref.task_id}><button disabled={disabled} aria-current={task?.task_ref.task_id === item.task_ref.task_id ? 'page' : undefined} onClick={() => { if (!draft || confirm('当前草稿会保留在输入框。切换查看此任务？')) selectTask(item.task_ref.task_id) }}>{item.prompt.slice(0, 80) || item.task_ref.task_id}<small>{harnessStatusLabel(item.status)}</small></button></li>)}</ul>{!state.tasks.length && <p className="empty-state">{state.loading ? '正在读取已记录任务…' : '暂无已记录任务。'}</p>}</Panel>}
+      conversation={<div className="session-center"><Panel className="conversation-canvas" title="对话" aside={task && <span className="tag">{harnessStatusLabel(task.status)}</span>}>
+        <div className="conversation-transcript" aria-label="Codex 任务记录">
+          {task ? <><article className="conversation-message role-user"><h3>你</h3><div className="message-text">{task.prompt}</div></article>
+            {assistant.map(event => <article className="conversation-message role-assistant" key={event.event_id}><h3>Codex</h3><div className="message-text">{event.payload.text}</div></article>)}
+            {task.result?.assistant_text && !assistant.some(event => event.payload.text === task.result.assistant_text) && <article className="conversation-message role-assistant"><h3>Codex</h3><div className="message-text">{task.result.assistant_text}</div></article>}</> :
+            !receipt && <div className="conversation-welcome codex-welcome"><span className="workbench-eyebrow">START WITH THIS PROJECT</span><h2>从项目开始提问。</h2><p>选择已授权工作区，发送一次只读任务。</p><div className="conversation-starters">{suggestions.map(text => <button type="button" key={text} onClick={() => { editDraft(appendPrompt(draft, text)); composer.current?.focus() }}>{text}</button>)}</div></div>}
+          {receipt && <div className={'codex-receipt codex-receipt-' + receipt.kind.toLowerCase()} role="status"><strong>{receipt.summary}</strong>{receipt.message && <p>{receipt.message}</p>}{receipt.readError && <p>最近一次状态读取失败；上方为已读取的 Task 状态，请刷新核对。</p>}{receipt.previousTaskId && <p>上方显示的是此前任务；它不是这次待核对请求的结果。</p>}
+            {(receipt.code || receipt.taskId || receipt.requestId || state.error) && <details><summary>技术回执</summary>{receipt.code && <p>代码：{receipt.code}</p>}{receipt.taskId && <p>Task：{receipt.taskId} · 修订：{receipt.revision}{receipt.runId ? ' · Run：' + receipt.runId + ' · epoch：' + receipt.epoch : ' · 尚无 Run'}</p>}{receipt.requestId && <p>原请求：{receipt.requestId} · {receipt.pendingKind} · {receipt.pendingState}</p>}{state.error && <p>{errorContext === 'cancel' || errorContext === 'submit' && !acknowledged ? '操作错误' : '读取错误'}：{state.error.message}</p>}</details>}
+          </div>}
+          {state.pending && <div className="codex-reconcile"><span>原{state.pending.kind === 'cancel' ? '取消' : '提交'}请求未确认：{state.pending.request_id} · {state.pending.kind} · {state.pending.state}。请勿重复发送。</span><button type="button" disabled={disabled} onClick={() => { setErrorContext('read'); controller.current?.reconcile() }}>只核对原请求</button></div>}
+        </div>
+        <div className="codex-readiness" role="status">{capabilities ? <><p>只读任务 · 执行 {capabilities.verification.execution} · 范围 {capabilities.verification.workspace_read_scope} · 取消 {capabilities.verification.cancellation}</p><HarnessPermissionNotice capabilities={capabilities}/></> : <p>Host 能力待读取；暂不可提交。</p>}</div>
+        <form className="session-composer" onSubmit={send}><div className="composer-context"><span className="composer-prompt">researchos &gt;</span><span>Codex CLI</span><span>workspace-read · ephemeral</span></div><textarea ref={composer} aria-label="Codex 任务输入" value={draft} onChange={event => editDraft(event.target.value)} onKeyDown={event => { if (composerSubmitKey(event)) { event.preventDefault(); if (canSend) event.currentTarget.form.requestSubmit() } }} placeholder="输入一次只读任务，例如：检查项目结构并解释主要入口。" required/><div className="composer-controls"><small>Enter 发送 · Shift+Enter 换行</small><button className="primary" type="submit" disabled={!canSend}>提交只读任务</button></div></form>
       </Panel></div>}
-      context={<><Panel title="Codex 状态与能力">{capabilities ? <><p>安装：{capabilities.installation.present ? capabilities.installation.version || '已发现' : '未发现'} · 登录：{({ UNPROBED: '未探测', LOGGED_IN: '已登录', LOGGED_OUT: '未登录', ERROR: '探测失败' })[capabilities.authentication.state]}</p><p>执行验证：{capabilities.verification.execution} · 只读范围验证：{capabilities.verification.workspace_read_scope} · 取消验证：{capabilities.verification.cancellation}</p><p>平台策略管理；只读边界{capabilities.security_scope.enforcement_verified ? '已由 Host 标记验证' : '未验证'}。登录与执行验证分别记录。</p><div className="record-list">{HARNESS_CAPABILITIES.map(([key, label]) => <div className="record-row" key={key}><span>{label}</span><span>{hasHarnessCapability(capabilities, key) ? '已实现' : '不支持'}</span></div>)}</div><HarnessPermissionNotice capabilities={capabilities}/></> : <p>{state.loading ? '正在读取 Host 能力…' : '能力尚未读取；操作保持禁用。'}</p>}</Panel><ActivityRail events={state.events} harnessTask={task} projection={shared?.data?.getProgressProjection} projectState={shared?.data?.getProjectState} releases={shared?.data?.listMilestoneRelease} projectId={projectId} navigate={navigate}/><details className="inspector-disclosure"><summary>文件、产物与授权</summary><p>此 Harness 首版未提供文件列表、diff、文件产物、附件或逐工具授权能力，相关操作不可用。</p><button disabled>读取文件差异</button><button disabled>写入文件</button><button disabled>批准工具</button></details></>}/>
+      context={<>{task && <><HarnessRunProgress task={task} events={state.events}/>{!task.terminal && task.status !== 'CANCEL_REQUESTED' && hasHarnessCapability(capabilities, 'cancel') && <div className="codex-run-controls"><button disabled={disabled || !!state.pending} onClick={cancelTask}>取消当前任务</button></div>}</>}
+        <ActivityRail events={state.events} harnessTask={task} projection={shared?.data?.getProgressProjection} projectState={shared?.data?.getProjectState} releases={shared?.data?.listMilestoneRelease} projectId={projectId} navigate={navigate}/>
+        <Panel className="codex-capabilities" title="Codex 状态与能力">{capabilities ? <details><summary>安装、登录与能力详情</summary><p>安装：{capabilities.installation.present ? capabilities.installation.version || '已发现' : '未发现'} · 登录：{({ UNPROBED: '未探测', LOGGED_IN: '已登录', LOGGED_OUT: '未登录', ERROR: '探测失败' })[capabilities.authentication.state]}</p><p>平台策略管理；只读边界{capabilities.security_scope.enforcement_verified ? '由 Host 标记验证' : '未验证'}。源码实现与实际执行验证分别记录。</p><div className="record-list">{HARNESS_CAPABILITIES.map(([key, label]) => <div className="record-row" key={key}><span>{label}</span><span>{hasHarnessCapability(capabilities, key) ? '源码已实现' : '不支持'}</span></div>)}</div></details> : <p>{state.loading ? '正在读取 Host 能力…' : '能力尚未读取；操作保持禁用。'}</p>}</Panel>
+        <details className="inspector-disclosure"><summary>文件、产物与授权</summary><p>此 Harness 首版未提供文件列表、diff、文件产物、附件或逐工具授权能力，相关操作不可用。</p></details>
+      </>}/>
   </>
 }
-
 function NativeMuWorkbench({ projectId, profile, api, navigate, shared, onRefresh, draft, setDraft, onGuardChange }) {
   const [state, setState] = useState({ loading: true, sessions: [], host: null, snapshot: null, events: [], error: null })
   const [busy, setBusy] = useState('')
