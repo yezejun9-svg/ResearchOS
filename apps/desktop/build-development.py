@@ -9,6 +9,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -27,16 +28,25 @@ ALLOWLIST = {
     "tests/ui/desktop/development-bundle.test.py",
     "tests/ui/desktop/development-smoke.test.mjs",
     "docs/installation/desktop-development.md",
+    "tests/desktop/test_qualification_build.py",
 }
 SOURCE_PREFIXES = ("adapters/", "internal/", "apps/control/", "apps/runtime-verifier/",
                    "apps/desktop/main/", "apps/desktop/preload/", "apps/desktop/validator/",
-                   "apps/web/src/", "migrations/sqlite/", "spec/v2.0/contracts/")
+                   "apps/web/src/", "migrations/sqlite/", "spec/v2.0/contracts/",
+                   "cmd/researchos-qualification-helper/")
 SOURCE_EXACT = {"go.mod", "go.sum", "go.work", "go.work.sum", "execution/toolchains/locked.json",
                 "apps/desktop/package.json", "apps/desktop/package-lock.json", "apps/web/package.json",
                 "apps/web/package-lock.json", "apps/web/index.html", "apps/desktop/build-validator.py"}
 SCHEMA = "researchos.desktop-development-tree/1"
 MU_COMMIT = "8dfebe36508ac0c2508735bb866756dab9283e74"
 REPARSE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+QUALIFICATION_HELPER_RELATIVE = "apps/desktop/resources/control/native-qualification/qualification-helper.exe"
+QUALIFICATION_HELPER_BUILD_RECEIPT = "execution/product-v1/receipts/single-harness-20261104/native-helper-build01"
+QUALIFICATION_HELPER_SCOPE_ID = "product-v1-native-helper-build-01"
+QUALIFICATION_FIRST_HELPER_SHA256 = "4ac03d2af358ab0ecb4d2f06a12bbc0bcde043e7e3610ee114a64c0416f1b4ef"
+QUALIFICATION_FIRST_HELPER_BYTES = 5335552
+QUALIFICATION_ROOT_SYMBOL = "researchos.local/research-os/internal/host.codexQualificationApprovedRoot"
+QUALIFICATION_HELPER_SYMBOL = "researchos.local/research-os/internal/host.codexQualificationHelperSHA256"
 
 
 def sha256(path):
@@ -64,13 +74,220 @@ def regular(path):
     return path.is_file() and not path.is_symlink() and not (info.st_file_attributes & REPARSE)
 
 
+def qualification_windows_path(value, *, linker_value=False):
+    """Reject Windows aliases before any resolve or filesystem access."""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z]:\\.*", value) or not ntpath.isabs(value):
+        raise RuntimeError("qualification path must be an absolute local Windows drive path")
+    if value.startswith("\\\\") or "/" in value or ntpath.normpath(value) != value or ":" in value[2:]:
+        raise RuntimeError("qualification path spelling is not canonical")
+    if any(ord(char) < 32 or ord(char) == 127 or char in ';"\'' for char in value):
+        raise RuntimeError("qualification path contains forbidden characters")
+    if linker_value and any(char.isspace() for char in value):
+        raise RuntimeError("qualification linker root whitespace is unsupported")
+    for part in value[3:].split("\\"):
+        if part in ("", ".", "..") or part.endswith((".", " ")):
+            raise RuntimeError("qualification path contains an alias component")
+    path = Path(value)
+    if str(path) != value:
+        raise RuntimeError("qualification path was normalized before validation")
+    return path
+
+
+def qualification_no_reparse(path):
+    """Check each existing original-spelling component before resolve."""
+    path = Path(path)
+    for current in (path, *path.parents):
+        info = current.lstat()
+        if current.is_symlink() or getattr(info, "st_file_attributes", 0) & REPARSE:
+            raise RuntimeError(f"qualification path uses reparse point: {current}")
+    resolved = path.resolve(strict=True)
+    if str(resolved).casefold() != str(path).casefold():
+        raise RuntimeError("qualification path resolves to an alias")
+    return path
+
+
+def qualification_inputs(args):
+    values = [getattr(args, name, None) for name in ("qualification_root", "qualification_helper", "qualification_helper_sha256")]
+    if all(value is None for value in values):
+        return {"enabled": False, "status": "CLOSED_NO_QUALIFICATION_LINK"}
+    if any(not isinstance(value, str) or not value for value in values):
+        raise RuntimeError("qualification root, helper and helper-sha256 must be supplied together")
+    root_raw, helper_raw, expected = values
+    if not re.fullmatch(r"[0-9a-f]{64}", expected) or expected != QUALIFICATION_FIRST_HELPER_SHA256:
+        raise RuntimeError("qualification helper digest must match the reviewed first synthetic helper")
+    root = qualification_no_reparse(qualification_windows_path(root_raw, linker_value=True))
+    helper = qualification_no_reparse(qualification_windows_path(helper_raw))
+    if not root.is_dir() or not regular(helper) or helper.suffix.lower() != ".exe":
+        raise RuntimeError("qualification root or helper is not an ordinary directory/executable")
+    source = root / "S"
+    try:
+        source.lstat()
+    except FileNotFoundError:
+        source_status = "DERIVED_NOT_PRESENT_NOT_VALIDATED"
+    else:
+        qualification_no_reparse(source)
+        if not source.is_dir():
+            raise RuntimeError("qualification S exists but is not an ordinary directory")
+        source_status = "EXISTS_ORDINARY_VALIDATED"
+    actual = sha256(helper)
+    size = helper.stat().st_size
+    if actual != expected or size != QUALIFICATION_FIRST_HELPER_BYTES:
+        raise RuntimeError("qualification helper differs from reviewed prebuilt input")
+    return {"enabled": True, "status": "BUILD_BOUND_NOT_NATIVE_TESTED", "root_original": root_raw,
+            "root_canonical": str(root), "source_derived": str(source), "source_validation": source_status,
+            "helper_original": helper_raw, "helper_canonical": str(helper), "helper_expected_sha256": expected,
+            "helper_actual_sha256": actual, "helper_bytes": size, "helper_bundle_relative": QUALIFICATION_HELPER_RELATIVE,
+            "helper_linked_sha256": "sha256:" + expected}
+
+
+def qualification_writable_destinations(output, receipts):
+    output, receipts = Path(output), Path(receipts)
+    return [output, receipts] + [output.with_name(output.name + suffix) for suffix in
+                                 ("-go-cache", "-go-tmp", "-temp", "-mu-stage", "-client-stage", "-client-receipts")]
+
+
+def qualification_destinations_disjoint(binding, output, receipts):
+    if not binding["enabled"]:
+        return
+    protected = [Path(binding["root_canonical"]), Path(binding["helper_canonical"])]
+    for destination in qualification_writable_destinations(output, receipts):
+        candidate = destination.resolve()
+        for source in protected:
+            try:
+                common = ntpath.commonpath((str(candidate), str(source))).casefold()
+            except ValueError:
+                continue
+            if common in (str(candidate).casefold(), str(source).casefold()):
+                raise RuntimeError("qualification root or helper overlaps a writable build destination")
+
+
+def qualification_linker(binding):
+    if not binding["enabled"]:
+        return None
+    root, digest = binding["root_original"], binding["helper_linked_sha256"]
+    return f"-X {QUALIFICATION_ROOT_SYMBOL}={root} -X {QUALIFICATION_HELPER_SYMBOL}={digest}"
+
+
+def core_build_argv(go, control, binding):
+    argv = [go, "build", "-mod=readonly", "-trimpath"]
+    if binding["enabled"]:
+        argv.extend(["-ldflags", qualification_linker(binding)])
+    return argv + ["-o", Path(control) / "researchos-control.exe", "./apps/control"]
+
+
+def verifier_build_argv(go, control):
+    return [go, "build", "-mod=readonly", "-trimpath", "-o", Path(control) / "runtime-verifier.exe", "./apps/runtime-verifier"]
+
+
+def child_environment(ambient, tools, module_cache, go_cache, go_tmp, temp):
+    env = ambient.copy()
+    env.update({"GOENV": "off", "GOFLAGS": "", "GOTOOLCHAIN": "local", "GOROOT": str(tools["go"].parent.parent),
+                "GOPATH": str(Path(module_cache).resolve().parent.parent),
+                "GOMODCACHE": str(Path(module_cache).resolve()), "GOCACHE": str(go_cache),
+                "GOTMPDIR": str(go_tmp), "GOPROXY": "off", "GOSUMDB": "off",
+                "TEMP": str(temp), "TMP": str(temp), "PYTHONDONTWRITEBYTECODE": "1"})
+    return env
+
+
+def qualification_original_build(main_root, binding, snapshot):
+    """Bind the supplied prebuilt bytes to the earlier owned build receipt."""
+    if not binding["enabled"]:
+        return None
+    receipt = Path(main_root) / QUALIFICATION_HELPER_BUILD_RECEIPT
+    names = ("RESULT.json", "POSTCHECK.json", "scope.json", "MANIFEST.json")
+    for name in names:
+        if not regular(receipt / name):
+            raise RuntimeError(f"original helper build receipt missing: {name}")
+    result = json.loads((receipt / "RESULT.json").read_bytes())
+    post = json.loads((receipt / "POSTCHECK.json").read_bytes())
+    prepared = json.loads((receipt / "MANIFEST.json").read_bytes())
+    scope = json.loads((receipt / "scope.json").read_bytes())
+    scope_hash = sha256(receipt / "scope.json")
+    if (scope.get("schema") != "researchos.owned-windows-run/1" or
+            scope.get("scope_id") != QUALIFICATION_HELPER_SCOPE_ID or scope.get("purpose") != "build" or
+            scope.get("authorization") != "ROOT_REVIEWED_EXACT_COMMAND" or
+            result.get("scope_id") != QUALIFICATION_HELPER_SCOPE_ID or result.get("scope_sha256") != scope_hash or
+            post.get("scope_sha256") != scope_hash or result.get("status") != "COMPLETED_OWNED_JOB_STOPPED" or
+            result.get("root_exit_code") != 0 or not result.get("stop_proved") or not result.get("job_active_zero") or
+            result.get("input_drift") is not False or result.get("errors") != [] or
+            result.get("automatic_retry") is not False or result.get("terminate_job_attempts") != 0 or
+            result.get("terminate_original_root_attempts") != 0 or
+            post.get("status") != "BUILT_NOT_EXECUTED_NOT_NATIVE_QUALIFIED" or not post.get("stop_proved") or
+            post.get("forced") is not False or post.get("model_native_helper_execution") is not False or
+            post.get("job_processes") != result.get("job_total_processes") or
+            post.get("sha256") != binding["helper_expected_sha256"] or post.get("bytes") != binding["helper_bytes"] or
+            str(Path(post.get("path", ""))) != binding["helper_canonical"]):
+        raise RuntimeError("original owned helper build does not bind supplied input")
+    helper_path = Path(binding["helper_canonical"])
+    build_root = helper_path.parent.parent
+    expected_cwd = str(build_root / "source")
+    expected_argv = ["build", "-trimpath", "-buildvcs=false", "-o", str(helper_path),
+                     "./cmd/researchos-qualification-helper"]
+    if (build_root.name != "product-v1-native-helper-build01" or helper_path.parent.name != "buildout" or
+            scope.get("argv") != expected_argv or prepared.get("argv") != expected_argv or
+            scope.get("cwd") != expected_cwd or prepared.get("cwd") != expected_cwd or
+            scope.get("controller_sha256") != prepared.get("controller_sha256") or
+            scope.get("executable_sha256") != prepared.get("go_sdk_sha256") or
+            prepared.get("schema") != "researchos.native-qualification-helper-build-manifest/1" or
+            prepared.get("source_binding") != "HELPER_ONLY_SELECTED_GO_FILES_NOT_WHOLE_APPLICATION"):
+        raise RuntimeError("original helper scope command or prepared build identity changed")
+    inputs = scope.get("inputs")
+    prepared_files = prepared.get("files")
+    if not isinstance(inputs, list) or not isinstance(prepared_files, list) or any(not isinstance(row, dict) or not isinstance(row.get("path"), str) or not isinstance(row.get("sha256"), str) for row in inputs + prepared_files):
+        raise RuntimeError("original helper build input inventory unavailable")
+    input_paths = [row["path"].casefold() for row in inputs]
+    prepared_paths = [row["path"].casefold() for row in prepared_files]
+    if len(input_paths) != len(set(input_paths)) or len(prepared_paths) != len(set(prepared_paths)):
+        raise RuntimeError("original helper build input inventory ambiguous")
+    scope_inputs = {row["path"].casefold(): row["sha256"] for row in inputs}
+    manifest_input = str(build_root / "MANIFEST.json").casefold()
+    controller_inputs = [row for row in inputs if Path(row["path"]).name == "owned_run.py"]
+    b3_inputs = [row for row in inputs if row["path"].replace("/", "\\").casefold().endswith("product-v1-native-qualification-producer-author-20261105-rev4\\manifest.json")]
+    if (scope_inputs.get(manifest_input) != sha256(receipt / "MANIFEST.json") or
+            scope_inputs.get(str(Path(scope["executable"])).casefold()) != scope.get("executable_sha256") or
+            len(controller_inputs) != 1 or controller_inputs[0]["sha256"] != scope.get("controller_sha256") or
+            len(b3_inputs) != 1 or b3_inputs[0]["sha256"] != prepared.get("approved_b3_manifest_sha256")):
+        raise RuntimeError("original prepared manifest or compiler detached from registered scope")
+    original_sources = {row["path"].removeprefix("source/"): row["sha256"] for row in prepared_files}
+    current_sources = {row["path"]: row["sha256"] for row in snapshot["files"]}
+    selected = ("cmd/researchos-qualification-helper/main_windows.go", "internal/qualificationprobe/plan.go", "go.mod", "go.sum")
+    if any(sum(row["path"] == "source/" + name for row in prepared_files) != 1 or
+           original_sources.get(name) != current_sources.get(name) or
+           scope_inputs.get(str(Path(expected_cwd) / name).casefold()) != original_sources.get(name)
+           for name in selected):
+        raise RuntimeError("current helper source differs from original prebuilt helper source")
+    return {"provenance": "PREBUILT_ORIGINAL_OWNED_BUILD_RECEIPT_NOT_CURRENT_GO_LIST",
+            "receipt_root": str(receipt), "receipt_sha256": {name: sha256(receipt / name) for name in names},
+            "source_head": prepared.get("source_head"), "selected_source_sha256": {name: current_sources[name] for name in selected},
+            "helper_sha256": binding["helper_expected_sha256"], "helper_bytes": binding["helper_bytes"]}
+
+
+def qualification_copy_helper(binding, output):
+    if not binding["enabled"]:
+        return None
+    output = Path(output)
+    source = qualification_no_reparse(Path(binding["helper_original"]))
+    if sha256(source) != binding["helper_expected_sha256"] or source.stat().st_size != binding["helper_bytes"]:
+        raise RuntimeError("qualification helper changed before bundle copy")
+    target = output / QUALIFICATION_HELPER_RELATIVE
+    if not target.is_relative_to(output) or target.exists() or target.parent.exists():
+        raise RuntimeError("qualification helper bundle target collided")
+    qualification_no_reparse(target.parent.parent)
+    target.parent.mkdir(parents=False, exist_ok=False)
+    qualification_no_reparse(target.parent)
+    exact_copy(source, target)
+    if sha256(source) != binding["helper_expected_sha256"] or sha256(target) != binding["helper_expected_sha256"] or target.stat().st_size != binding["helper_bytes"]:
+        raise RuntimeError("qualification helper copy drift")
+    return target
+
+
 def git(*args):
     return subprocess.run(["git", *args], cwd=ROOT, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, check=True).stdout
 
 
 def source_snapshot():
-    """Freeze tracked source plus the six explicitly admitted new source files."""
+    """Freeze tracked source plus the explicitly admitted build source files."""
     tracked = {item.decode("utf-8") for item in git("ls-files", "-z").split(b"\0") if item}
     changed = {item.decode("utf-8") for item in git("diff", "--name-only", "-z").split(b"\0") if item}
     changed |= {item.decode("utf-8") for item in git("diff", "--cached", "--name-only", "-z").split(b"\0") if item}
@@ -261,12 +478,12 @@ def run_command(receipts, name, argv, cwd, env):
     location = receipts / "commands" / name
     location.mkdir(parents=True, exist_ok=False)
     invocation = {"argv": [str(item) for item in argv], "cwd": str(cwd),
-                  "environment": {key: env.get(key) for key in ["GOENV", "GOTOOLCHAIN", "GOPATH", "GOMODCACHE", "GOCACHE", "GOTMPDIR", "GOPROXY", "GOSUMDB", "TEMP", "TMP"]}}
+                 "environment": {key: env.get(key) for key in ["GOENV", "GOFLAGS", "GOTOOLCHAIN", "GOPATH", "GOMODCACHE", "GOCACHE", "GOTMPDIR", "GOPROXY", "GOSUMDB", "TEMP", "TMP"]}}
     put(location / "recipe.json", invocation)
     started = datetime.datetime.now(datetime.timezone.utc).isoformat()
     with (location / "stdout.raw").open("xb") as stdout, (location / "stderr.raw").open("xb") as stderr:
         process = subprocess.Popen([str(item) for item in argv], cwd=cwd, env=env,
-                                   stdout=stdout, stderr=stderr, stdin=subprocess.DEVNULL)
+                                   stdout=stdout, stderr=stderr, stdin=subprocess.DEVNULL, shell=False)
         code = process.wait()
     ended = datetime.datetime.now(datetime.timezone.utc).isoformat()
     put(location / "result.json", {"started_at": started, "ended_at": ended, "pid": process.pid,
@@ -277,8 +494,11 @@ def run_command(receipts, name, argv, cwd, env):
     return (location / "stdout.raw").read_bytes()
 
 
-def build(args):
+def build(args, receipt_created=None):
+    qualification = qualification_inputs(args)
+    qualification_initial = qualification.copy()
     output, receipts = Path(args.output).resolve(), Path(args.receipts).resolve()
+    qualification_destinations_disjoint(qualification, output, receipts)
     allowed_output = ROOT / ".local"
     if not output.is_relative_to(allowed_output) or output.exists() or receipts.exists():
         raise RuntimeError("output and receipts must be new approved locations")
@@ -314,7 +534,10 @@ def build(args):
     if not (ROOT / ".git").exists():
         raise RuntimeError("source must remain a registered worktree")
     source_before = source_snapshot()
+    qualification_origin = qualification_original_build(mu_common, qualification, source_before)
     receipts.mkdir(parents=True, exist_ok=False)
+    if receipt_created is not None:
+        receipt_created(receipts, qualification)
     output.parent.mkdir(parents=True, exist_ok=True)
     put(receipts / "source.before.json", source_before)
     vendor_before = mu_vendor_closure(mu_common)
@@ -333,12 +556,7 @@ def build(args):
             raise RuntimeError(f"fresh build scratch already exists: {location}")
     for location in [go_cache, go_tmp, temp]:
         location.mkdir()
-    env = os.environ.copy()
-    env.update({"GOENV": "off", "GOTOOLCHAIN": "local", "GOROOT": str(tools["go"].parent.parent),
-                "GOPATH": str(Path(args.module_cache).resolve().parent.parent),
-                "GOMODCACHE": str(Path(args.module_cache).resolve()), "GOCACHE": str(go_cache),
-                "GOTMPDIR": str(go_tmp), "GOPROXY": "off", "GOSUMDB": "off",
-                "TEMP": str(temp), "TMP": str(temp), "PYTHONDONTWRITEBYTECODE": "1"})
+    env = child_environment(os.environ, tools, args.module_cache, go_cache, go_tmp, temp)
     core_go_list = run_command(receipts, "core-go-list", [tools["go"], "list", "-deps", "-compiled", "-json", "./apps/control"], ROOT, env)
     verifier_go_list = run_command(receipts, "verifier-go-list", [tools["go"], "list", "-deps", "-compiled", "-json", "./apps/runtime-verifier"], ROOT, env)
     go_before = go_compiled_closure([core_go_list, verifier_go_list], tools["go"].parent.parent)
@@ -380,8 +598,10 @@ def build(args):
         exact_copy(source, output / "migrations/sqlite" / source.name)
     control = output / "apps/desktop/resources/control"
     control.mkdir(parents=True)
-    run_command(receipts, "core-go-build", [tools["go"], "build", "-mod=readonly", "-trimpath", "-o", control / "researchos-control.exe", "./apps/control"], ROOT, env)
-    run_command(receipts, "verifier-go-build", [tools["go"], "build", "-mod=readonly", "-trimpath", "-o", control / "runtime-verifier.exe", "./apps/runtime-verifier"], ROOT, env)
+    core_argv = core_build_argv(tools["go"], control, qualification)
+    run_command(receipts, "core-go-build", core_argv, ROOT, env)
+    copied_helper = qualification_copy_helper(qualification, output)
+    run_command(receipts, "verifier-go-build", verifier_build_argv(tools["go"], control), ROOT, env)
     verifier_hash = sha256(control / "runtime-verifier.exe")
     put(control / "runtime-verifier-installation.json", {
         "schema": "researchos.runtime-verifier-installation.v1",
@@ -420,14 +640,34 @@ def build(args):
     put(receipts / "external-public.after.json", public_after)
     if public_after != public_before:
         raise RuntimeError("external public Mu producer inputs changed")
+    if qualification["enabled"]:
+        if qualification_inputs(args) != qualification_initial or qualification_original_build(mu_common, qualification, source_after) != qualification_origin:
+            raise RuntimeError("qualification root, helper, or original build provenance drift")
+        qualification_no_reparse(Path(qualification["helper_original"]))
+        qualification_no_reparse(copied_helper)
+        if (sha256(qualification["helper_original"]) != qualification["helper_expected_sha256"] or
+                sha256(copied_helper) != qualification["helper_expected_sha256"] or
+                Path(qualification["helper_original"]).stat().st_size != qualification["helper_bytes"] or
+                copied_helper.stat().st_size != qualification["helper_bytes"]):
+            raise RuntimeError("qualification helper source or bundle copy changed during build")
+        qualification["helper_copied_sha256"] = sha256(copied_helper)
+        qualification["helper_copied_bytes"] = copied_helper.stat().st_size
+        qualification["helper_copied_path"] = str(copied_helper)
+        qualification["original_build"] = qualification_origin
+        qualification["core_linker_values"] = {
+            QUALIFICATION_ROOT_SYMBOL: qualification["root_original"],
+            QUALIFICATION_HELPER_SYMBOL: qualification["helper_linked_sha256"]}
+        qualification["core_linker_flags"] = qualification_linker(qualification)
     files = inventory(output)
     manifest = {
         "schema": SCHEMA,
         "mode": "DEVELOPMENT_ONLY_BUILT_NOT_NATIVE_TESTED",
+        "formal_acceptance": False,
+        "product_acceptance": False,
         "bundle_root": str(output),
         "source": {"head": source_before["head"], "tree": source_before["tree"],
                    "digest": source_before["digest"], "candidate_delta": source_before["candidate_delta"],
-                   "seven_scoped_source_sha256": {row["path"]: row["sha256"] for row in source_before["files"] if row["candidate_delta"]}},
+                   "scoped_source_sha256": {row["path"]: row["sha256"] for row in source_before["files"] if row["candidate_delta"]}},
         "tools": {name: {"path": str(path), "sha256": sha256(path)} for name, path in tools.items()},
         "client_wire": {"build_input_digest": client_result["build_input_digest"],
                         "binary_sha256": client_result["binary_sha256"],
@@ -442,15 +682,18 @@ def build(args):
                "compiled_input_count": mu_compiled_before["compiled_input_count"]},
         "core": {"sha256": sha256(control / "researchos-control.exe"),
                  "verifier_sha256": verifier_hash,
+                 "build_argv": [str(item) for item in core_argv],
                  "migration_count": len(migrations), "cwd_contracts": required_contracts,
                  "compiled_input_manifest_sha256": sha256(receipts / "core-verifier-go-inputs.before.json"),
                  "go_package_count": go_before["package_count"]},
+        "qualification": qualification,
         "electron": {"file_count": electron_count, "source_dist": str(Path(args.electron_dist).resolve())},
         "files": files,
     }
     put(output / "development-manifest.json", manifest)
     exact_copy(output / "development-manifest.json", receipts / "development-manifest.json")
     put(receipts / "result.json", {"status": "BUILT_NOT_NATIVE_TESTED", "source_acceptance": False,
+                                   "qualification_enabled": qualification["enabled"],
                                    "source_drift": False, "public_vendor_drift": False,
                                    "output": str(output), "manifest_sha256": sha256(output / "development-manifest.json"),
                                    "files": len(files), "electron_files": electron_count,
@@ -461,18 +704,33 @@ def build(args):
                       "files": len(files)}, ensure_ascii=False))
 
 
+def write_owned_failure(owned, output, error):
+    if owned is None:
+        return
+    receipts, binding = owned
+    try:
+        qualification_destinations_disjoint(binding, output, receipts)
+        qualification_no_reparse(receipts)
+        if receipts.is_dir() and not (receipts / "failed.json").exists():
+            put(receipts / "failed.json", {"error_type": type(error).__name__, "error": str(error),
+                                           "status": "FIRST_FAILURE_RETAINED_NO_RETRY"})
+    except Exception:
+        # The original failure and outer owned-run raw logs remain authoritative.
+        return
+
+
 def main():
     parser = argparse.ArgumentParser()
     for flag in ["go", "node", "electron-dist", "module-cache", "web-modules", "mu-common", "output", "receipts"]:
         parser.add_argument("--" + flag, required=True)
+    for flag in ["qualification-root", "qualification-helper", "qualification-helper-sha256"]:
+        parser.add_argument("--" + flag)
     args = parser.parse_args()
+    owned_receipts = []
     try:
-        build(args)
+        build(args, lambda path, binding: owned_receipts.append((path, binding)))
     except Exception as error:
-        receipts = Path(args.receipts)
-        if receipts.is_dir() and not (receipts / "failed.json").exists():
-            put(receipts / "failed.json", {"error_type": type(error).__name__, "error": str(error),
-                                           "status": "FIRST_FAILURE_RETAINED_NO_RETRY"})
+        write_owned_failure(owned_receipts[0] if owned_receipts else None, Path(args.output).resolve(), error)
         print(f"development build failed: {error}", file=sys.stderr)
         raise SystemExit(1)
 
