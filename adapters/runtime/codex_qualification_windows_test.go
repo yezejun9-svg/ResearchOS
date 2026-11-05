@@ -42,6 +42,72 @@ func qualifiedFixture(t *testing.T) (*nativeQualifier, CodexTurnEvidence) {
 	e := CodexTurnEvidence{PolicyIdentity: CodexRPCPolicyIdentity(hash), RenderedConfigSHA256: codexRPCConfigHash("researchos-readonly-0123456789abcdef0123456789abcdef", filepath.Join(dir, "cwd"), source), SourceBindingHash: "sha256:source", ProfileNonce: "researchos-readonly-0123456789abcdef0123456789abcdef", ThreadID: "thread", TaskID: "task", RunID: "run", Epoch: "1", Process: CodexIdentity{PID: 42, Created: 123, Job: "model-owned-job"}}
 	return q, e
 }
+func TestQualificationNormalHomeSpelling(t *testing.T) {
+	trusted := `C:\Users\yqyyds`
+	for _, tc := range []struct {
+		name, normalHome, userProfile string
+		want                          bool
+	}{
+		{"same", trusted, trusted, true},
+		{"forward slashes", trusted, "C:/Users/yqyyds", true},
+		{"mixed case and separators", trusted, "c:/uSeRs/YQYYDS", true},
+		{"changed user", trusted, `C:\Users\other`, false},
+		{"prefix sibling", trusted, `C:\Users\yqyyds2`, false},
+		{"changed drive", trusted, `D:\Users\yqyyds`, false},
+		{"changed root", trusted, `C:\Other\yqyyds`, false},
+		{"empty profile", trusted, "", false},
+		{"empty trusted home", "", trusted, false},
+		{"relative", trusted, `Users\yqyyds`, false},
+		{"drive relative", trusted, `C:Users\yqyyds`, false},
+		{"dot segment", trusted, `C:\Users\.\yqyyds`, false},
+		{"parent segment", trusted, `C:\Users\other\..\yqyyds`, false},
+		{"NUL", trusted, trusted + "\x00", false},
+		{"CRLF", trusted, trusted + "\r\n", false},
+		{"semicolon", trusted, trusted + ";", false},
+		{"invalid character", trusted, trusted + "?", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sameQualificationNormalHome(tc.normalHome, tc.userProfile); got != tc.want {
+				t.Fatalf("sameQualificationNormalHome(%q, %q) = %t, want %t", tc.normalHome, tc.userProfile, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestQualificationNormalHomeEarlyGateAcceptsSlashEquivalentProfile(t *testing.T) {
+	q, _ := qualifiedFixture(t)
+	q.rpc.options.NormalHome = filepath.Clean(q.rpc.options.NormalHome)
+	t.Setenv("USERPROFILE", filepath.ToSlash(q.rpc.options.NormalHome))
+	// A deliberately mismatched synthetic helper digest stops before collector
+	// launch, after the home gate and its existing private-root checks.
+	q.options.ShippedHelperSHA256 = Hash([]byte("different synthetic helper"))
+	in := CodexLaunch{TaskID: "task", RunID: "run", Epoch: "1", Workspace: q.options.SyntheticSource, Directory: filepath.Join(q.options.ApprovedRoot, "run"), SourceBindingHash: "sha256:source"}
+	obs, err := q.ensureLaunch(context.Background(), in)
+	if err == nil || err.Error() != "QUALIFICATION_BOOTSTRAP_BLOCKED" || obs.ReceiptPath == "" || !obs.PreflightNoChild || obs.Capture.PID != 0 || q.state != "FAILED" {
+		t.Fatal("separator-equivalent home failed the early gate or reached a child", obs.ReceiptPath, obs.Capture.PID, q.state, err)
+	}
+}
+
+func TestQualificationNormalHomeEarlyGateRejectsChangedOrEmptyProfile(t *testing.T) {
+	for _, tc := range []struct{ name, profile string }{
+		{"changed", `C:\Users\a-different-user`},
+		{"empty", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q, _ := qualifiedFixture(t)
+			t.Setenv("USERPROFILE", tc.profile)
+			in := CodexLaunch{TaskID: "task", RunID: "run", Epoch: "1", Workspace: q.options.SyntheticSource, Directory: filepath.Join(q.options.ApprovedRoot, "run"), SourceBindingHash: "sha256:source"}
+			obs, err := q.ensureLaunch(context.Background(), in)
+			if err == nil || err.Error() != "QUALIFICATION_SCOPE_MISMATCH" || obs.ReceiptPath != "" || q.state != "FAILED" {
+				t.Fatal("changed or empty profile passed the prelaunch gate", obs.ReceiptPath, q.state, err)
+			}
+			if _, err := os.Stat(filepath.Join(q.options.ApprovedRoot, "receipts")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("prelaunch gate created qualification artifacts", err)
+			}
+		})
+	}
+}
+
 func TestCodexNativeQualificationEnsureIsSingleUseAndBound(t *testing.T) {
 	q, e := qualifiedFixture(t)
 	if err := q.Ensure(context.Background(), e); err != nil {

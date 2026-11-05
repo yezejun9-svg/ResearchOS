@@ -244,7 +244,7 @@ func qualificationIntentRecord(executable string, args, env []string, cwd, jobNa
 	if err != nil || !slices.Equal(args, expectedArgs) || !filepath.IsAbs(executable) ||
 		cwd != context.Working || jobName != qualificationJobName(context.RunID, context.Epoch, context.Nonce) ||
 		filepath.Clean(executable) != executable || context.NormalHome == "" || !filepath.IsAbs(context.NormalHome) ||
-		!strings.EqualFold(context.NormalHome, os.Getenv("USERPROFILE")) ||
+		!sameQualificationNormalHome(context.NormalHome, os.Getenv("USERPROFILE")) ||
 		!strings.EqualFold(filepath.Dir(context.Working), root) || !strings.EqualFold(filepath.Dir(context.Denied), root) ||
 		!strings.EqualFold(filepath.Dir(receiptBase), filepath.Join(root, "receipts")) ||
 		filepath.Base(receiptBase) != strings.TrimPrefix(Hash([]byte(context.RunID+"/"+context.Epoch)), "sha256:")+".json" {

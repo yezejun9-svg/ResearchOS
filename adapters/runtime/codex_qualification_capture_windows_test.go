@@ -254,6 +254,28 @@ func (w *qualificationFaultWriter) Close() error {
 	return errors.Join(w.file.Close(), w.closeErr)
 }
 
+func TestQualificationNormalHomeIntentSpelling(t *testing.T) {
+	exe, args, env, cwd, jobName, base, receipt := qualificationFakeCollectorInputs(t, "home-spelling")
+	flags := uint32(windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_JOB_MEMORY)
+	limits := qualificationJobLimits{Flags: flags, Processes: qualificationProcessLimit, Memory: uint64(qualificationJobMemory)}
+	receipt.NormalHome = filepath.Clean(receipt.NormalHome)
+	t.Setenv("USERPROFILE", filepath.ToSlash(receipt.NormalHome))
+	if _, err := qualificationIntentRecord(exe, args, env, cwd, jobName, base, receipt, limits); err != nil {
+		t.Fatal("separator-equivalent OS-account home rejected by intent validator", err)
+	}
+	for _, tc := range []struct{ name, profile string }{
+		{"changed", filepath.Join(filepath.Dir(receipt.NormalHome), "different-user")},
+		{"empty", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("USERPROFILE", tc.profile)
+			if _, err := qualificationIntentRecord(exe, args, env, cwd, jobName, base, receipt, limits); err == nil {
+				t.Fatal("changed or empty home accepted by prelaunch intent validator")
+			}
+		})
+	}
+}
+
 func TestQualificationPrelaunchIntentProvenanceAndMutation(t *testing.T) {
 	exe, args, env, cwd, jobName, base, receipt := qualificationFakeCollectorInputs(t, "record")
 	flags := uint32(windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | windows.JOB_OBJECT_LIMIT_JOB_MEMORY)

@@ -160,6 +160,36 @@ func NewCodexRPCWithNativeQualification(options CodexRPCOptions, scope CodexNati
 	q.rpc.qualifier = q
 	return &qualifiedRPC{rpc: q.rpc, q: q, prepareLaunch: q.ensureLaunch, delegateStart: q.rpc.Start}, nil
 }
+
+// The Host-supplied OS-account NormalHome is the only trusted side of this
+// comparison. Accept ordinary Windows separator and case spelling only;
+// never resolve a different path or take authority from USERPROFILE.
+func sameQualificationNormalHome(normalHome, userProfile string) bool {
+	for _, path := range []string{normalHome, userProfile} {
+		if path == "" {
+			return false
+		}
+		normalized := filepath.FromSlash(path)
+		if !filepath.IsAbs(normalized) || filepath.Clean(normalized) != normalized ||
+			strings.ContainsAny(normalized, `<>"|?*;`) {
+			return false
+		}
+		for _, r := range normalized {
+			if r < ' ' {
+				return false
+			}
+		}
+		if colon := strings.IndexByte(normalized, ':'); colon >= 0 {
+			if colon != 1 || !((normalized[0] >= 'A' && normalized[0] <= 'Z') ||
+				(normalized[0] >= 'a' && normalized[0] <= 'z')) ||
+				strings.Contains(normalized[colon+1:], ":") {
+				return false
+			}
+		}
+	}
+	return strings.EqualFold(filepath.FromSlash(normalHome), filepath.FromSlash(userProfile))
+}
+
 func qualificationSHA(s string) bool {
 	if len(s) != 71 || !strings.HasPrefix(s, "sha256:") {
 		return false
@@ -568,7 +598,7 @@ func (q *nativeQualifier) ensureLaunch(ctx context.Context, in CodexLaunch) (obs
 	root := o.ApprovedRoot
 	obs = nativeQualificationObservation{TaskID: in.TaskID, RunID: in.RunID, Epoch: in.Epoch, SourceBindingHash: in.SourceBindingHash, Source: source, Directory: in.Directory, NativeHash: q.rpc.options.Descriptor.ExecutableHash, HelperHash: o.ShippedHelperSHA256, HostBuildHash: o.HostBuildSHA256, TemplateHash: CodexRPCPolicyIdentity(q.rpc.options.Descriptor.ExecutableHash).RequestedConfigSHA256, EnvironmentHash: Hash(mustJSON(Environment(""))), NormalHome: q.rpc.options.NormalHome, HostBoot: q.boot, PreflightNoChild: true}
 	receipt := qualificationReceiptContext{TaskID: obs.TaskID, RunID: obs.RunID, Epoch: obs.Epoch, SourceBindingHash: obs.SourceBindingHash, Source: source, NativeHash: obs.NativeHash, HelperHash: obs.HelperHash, HostBuildHash: obs.HostBuildHash, TemplateHash: obs.TemplateHash, EnvironmentHash: obs.EnvironmentHash, NormalHome: obs.NormalHome, HostBoot: obs.HostBoot, ExpectedCases: qualificationprobe.FixedCases()}
-	if ctx.Err() != nil || in.SourceBindingHash == "" || in.TaskID == "" || in.RunID == "" || in.Epoch == "" || !strings.EqualFold(in.Workspace, source) || !strings.EqualFold(filepath.Dir(source), root) || !strings.EqualFold(q.rpc.options.NormalHome, os.Getenv("USERPROFILE")) {
+	if ctx.Err() != nil || in.SourceBindingHash == "" || in.TaskID == "" || in.RunID == "" || in.Epoch == "" || !strings.EqualFold(in.Workspace, source) || !strings.EqualFold(filepath.Dir(source), root) || !sameQualificationNormalHome(q.rpc.options.NormalHome, os.Getenv("USERPROFILE")) {
 		return obs, errors.New("QUALIFICATION_SCOPE_MISMATCH")
 	}
 	if exactReal(root) != nil || exactReal(source) != nil || exactReal(o.ShippedHelper) != nil {
