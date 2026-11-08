@@ -1,9 +1,0 @@
-from pathlib import Path
-import json,os,subprocess,hashlib,sys,datetime
-sys.stdout.reconfigure(encoding='utf-8');o=Path(__file__).parent;r=o.parents[6];w=r/'.local/worktrees/codex-w0599-model-stream';b=w/'execution/v2.4/receipts/W05/W05-99/model_stream_executor_codex';s=b/'signed-zero-repair-437e95d3f0ef47b486f0c29594d3f6d2';env=json.loads((b/'closure-39d83fc9302f42ceb4e91d3403a96044/environment.json').read_text(encoding='utf-8'));e=os.environ.copy();e.update(env);e['RESEARCHOS_MODEL_STREAM_EVIDENCE_DIR']=str(o/'actual-fixtures');e['RESEARCHOS_REVIEW_SSE']=str(s/'signed-zero.sse');go=env['RESEARCHOS_GO']
-(o/'probe_test.go').write_bytes((s/'signed_zero_probe.go').read_bytes());(o/'overlay.json').write_text(json.dumps({'Replace':{str(w/'internal/domain/independent_signed_zero_review_test.go'):str(o/'probe_test.go')}},ensure_ascii=False),encoding='utf-8')
-cmds=[('domain',[go,'test','-overlay',str(o/'overlay.json'),'./internal/domain','-run','^(TestIndependentSignedZeroToolIdentity|TestModelStreamQuarantine)','-count=1','-v','-timeout=120s']),('sdk',json.loads((s/'sdk.invocation.json').read_text(encoding='utf-8'))['actualargv']),('cli',[go,'test','./apps/cli','-run','^TestCLIModelStreamSemanticSecretQuarantine$','-count=1','-v','-timeout=180s'])]
-results=[]
-for name,argv in cmds:
- start=datetime.datetime.now(datetime.timezone.utc).isoformat();x=subprocess.run(argv,cwd=w,env=e,capture_output=True);(o/(name+'.stdout')).write_bytes(x.stdout);(o/(name+'.stderr')).write_bytes(x.stderr);v={'argv':argv,'cwd':str(w),'started_at':start,'exit':x.returncode,'stdout_sha256':hashlib.sha256(x.stdout).hexdigest(),'stderr_sha256':hashlib.sha256(x.stderr).hexdigest()};(o/(name+'.invocation.json')).write_text(json.dumps(v,indent=2),encoding='utf-8');results.append(v);print(name,x.returncode,flush=True)
-(o/'replay-results.json').write_text(json.dumps(results,indent=2),encoding='utf-8')

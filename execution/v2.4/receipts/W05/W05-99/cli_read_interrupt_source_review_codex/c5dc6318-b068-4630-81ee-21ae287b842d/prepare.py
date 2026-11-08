@@ -1,7 +1,0 @@
-from pathlib import Path
-import subprocess,json,hashlib,os,datetime,sys
-sys.stdout.reconfigure(encoding='utf-8')
-R=Path.cwd();O=R/'execution/v2.4/receipts/W05/W05-99/cli_read_interrupt_source_review_codex/c5dc6318-b068-4630-81ee-21ae287b842d';W=R/'.local/worktrees/independent-l02-c5dc6318'
-E={k:v for k,v in os.environ.items() if not k.startswith('GIT_')};E['GIT_NO_REPLACE_OBJECTS']='1'
-for name,cwd,args in [('worktree',R,['git','worktree','add','--detach','--no-checkout',str(W),'f565599af3679fef6d5233fe27d16b8c92a61db2']),('sparse',W,['git','sparse-checkout','set','--no-cone','/apps/','/internal/','/adapters/','/migrations/','/spec/','/tests/','/go.mod','/go.sum','/AGENTS.md','/execution/v2.4/component_lock.json','/execution/v2.4/receipts/W05/W05-99/model_stream_executor_codex/test-53a6e07436494837878a09393994fdce/','/execution/v2.4/receipts/W05/W05-99/model_stream_executor_codex/test-f4a65b87734641c8a39d7060dd8b24fb/','/execution/v2.4/receipts/W05/W05-99/model_stream_executor_codex/test-18872d343fdd4a5fa788669ec6516cd9/']),('checkout',W,['git','checkout','--detach','f565599af3679fef6d5233fe27d16b8c92a61db2'])]:
- p=subprocess.run(args,cwd=cwd,env=E,capture_output=True);(O/(name+'.stdout.raw')).write_bytes(p.stdout);(O/(name+'.stderr.raw')).write_bytes(p.stderr);(O/(name+'.invocation.json')).write_text(json.dumps({'argv':args,'cwd':str(cwd),'exit':p.returncode}),encoding='utf-8');p.check_returncode();print(name,p.returncode,flush=True)
